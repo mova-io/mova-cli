@@ -2,7 +2,7 @@
   "info": {
     "name": "Movate — Core Flow",
     "_postman_id": "b9f0c1a2-3d4e-4f56-8a7b-0c1d2e3f4a5b",
-    "description": "A top-to-bottom live demo of the mdk (`movate-cli`) runtime `/api/v1` surface against a deployed Azure Container Apps runtime.\n\nEach request maps to an `mdk <verb>` and demonstrates one core feature: create (init/add), validate, KB, skills, deploy (publish), run, and monitor. Run the folder in order — `test` scripts capture `agent_name` and `run_id` into collection/environment variables so the chain flows without manual copy/paste.\n\n**Auth:** collection-level Bearer using `{{bearer_token}}` (set it in the environment — never hardcoded). The token needs `admin` + `read` (and `run` + `kb:write` for the run/KB steps). See `postman/README.md` for how to mint one with `mdk auth create-key`.\n\n**Source of truth:** request bodies and scopes mirror `src/movate/runtime/app.py` + `src/movate/runtime/schemas.py` and the audit in `docs/front-end-api.md`. You can also `Import → Link → {{runtime_url}}/api/v1/openapi.json` for the full typed API.",
+    "description": "A top-to-bottom live demo of the mdk (`movate-cli`) runtime `/api/v1` surface against a deployed Azure Container Apps runtime.\n\nEach request maps to an `mdk <verb>` (or is labelled **API-first** when there is no CLI equivalent) and demonstrates one core feature. Run the folders in order — `test` scripts capture key IDs (`agent_name`, `run_id`, `session_id`, `project_id`, `graph_node_id`) into collection/environment variables so the chain flows without manual copy/paste.\n\n**Auth:** collection-level Bearer using `{{bearer_token}}` (set it in the environment — never hardcoded). The token needs `admin` + `read` (and `run` + `kb:write` for the run/KB steps). See `postman/README.md` for how to mint one with `mdk auth create-key`.\n\n**Entry point:** start with `GET /api/v1/capabilities` to discover what the runtime supports before running the rest of the flow.\n\n**Source of truth:** request bodies and scopes mirror `src/movate/runtime/app.py` + `src/movate/runtime/schemas.py` and the audit in `docs/front-end-api.md`. You can also `Import → Link → {{runtime_url}}/api/v1/openapi.json` for the full typed API.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -25,9 +25,58 @@
       "key": "run_id",
       "value": "",
       "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "project_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "graph_node_id",
+      "value": "",
+      "type": "string"
     }
   ],
   "item": [
+    {
+      "name": "Capabilities",
+      "description": "API-first entry point — call this first to discover what the deployed runtime supports. No CLI equivalent; use this before anything else to check which models, feature flags, and optional extras are active.",
+      "item": [
+        {
+          "name": "GET capabilities — API-first entry point",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/capabilities",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "capabilities"]
+            },
+            "description": "CLI equivalent: none (API-first). Use this first to see what's enabled.\n\nReturns a capability matrix — reachable models, feature flags (detected from the live route table / importable modules), the scope vocabulary, this tenant's effective limits, and the installed optional extras.\n\nAuth is optional: a missing/bad bearer returns a minimal subset (`mdk_version` + `api_version`, `minimal: true`) for version-fingerprint use. A valid `read`-scoped bearer returns the full matrix. BYOK provider names are listed but the key values are never surfaced.\n\nScope: none required (minimal); `read` for full matrix."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const cap = pm.response.json();",
+                  "console.log('mdk_version', cap.mdk_version, 'api_version', cap.api_version, 'minimal', cap.minimal);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
     {
       "name": "Movate — Core Flow",
       "description": "The ordered demo. Run from top to bottom (Postman Runner or one-by-one).",
@@ -44,7 +93,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "auth", "me"]
             },
-            "description": "The `mdk auth whoami` equivalent. Returns the calling key's `key_id`, `tenant_id`, `env`, `scopes`, and `expires_at`. Use it to confirm the token is valid and carries `admin` + `read` (the demo also exercises `run` and `kb:write`) before running the rest of the flow. No scope gate — only authentication is required."
+            "description": "CLI equivalent: `mdk auth whoami`.\n\nReturns the calling key's `key_id`, `tenant_id`, `env`, `scopes`, and `expires_at`. Use it to confirm the token is valid and carries `admin` + `read` (the demo also exercises `run` and `kb:write`) before running the rest of the flow. No scope gate — only authentication is required."
           },
           "event": [
             {
@@ -79,7 +128,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "agents", "from-wizard"]
             },
-            "description": "The `mdk init` (agent-authoring half) equivalent — create an agent in the runtime registry from the Mova iO \"Onboard Agent\" wizard JSON (`WizardAgentSubmission`). This is the simplest live create path: structured fields → canonical `agent.yaml` + `prompt.md`, no file upload.\n\n`mcp_connectors` → the agent's `skills` and `knowledge_store` → the agent's `contexts`, so this single request demonstrates skills + contexts wiring. **Both must already exist on the runtime** or the bundle 422s on `load_agent()`: register the skill first via request `4` (`POST /skills`) and ensure the named context exists (or remove those two arrays for a no-dependency create). Scope: `admin`. Returns `AgentCreatedView` (`name`, `version`, `agent_dir`, ...).\n\nNote on the CLI caveat: `mdk init` on disk *also* scaffolds a local project — that filesystem half is CLI/ops-only. This endpoint is the runtime \"make this agent exist on the server\" half."
+            "description": "CLI equivalent: `mdk init` (agent-authoring half).\n\nCreate an agent in the runtime registry from the Mova iO \"Onboard Agent\" wizard JSON (`WizardAgentSubmission`). This is the simplest live create path: structured fields → canonical `agent.yaml` + `prompt.md`, no file upload.\n\n`mcp_connectors` → the agent's `skills` and `knowledge_store` → the agent's `contexts`, so this single request demonstrates skills + contexts wiring. **Both must already exist on the runtime** or the bundle 422s on `load_agent()`: register the skill first via request `4` (`POST /skills`) and ensure the named context exists (or remove those two arrays for a no-dependency create). Scope: `admin`. Returns `AgentCreatedView` (`name`, `version`, `agent_dir`, ...).\n\nNote on the CLI caveat: `mdk init` on disk *also* scaffolds a local project — that filesystem half is CLI/ops-only. This endpoint is the runtime \"make this agent exist on the server\" half."
           },
           "event": [
             {
@@ -173,7 +222,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "agents"]
             },
-            "description": "The bundle/multipart variant of the same `mdk init` / `mdk deploy --mode agents` create — `POST /api/v1/agents`. Use this when you already have a pre-built canonical bundle (e.g. produced by `mdk init --llm` locally, since there is NO server-side LLM authoring endpoint — see `docs/front-end-api.md`).\n\nTwo mutually-exclusive modes: attach a single `bundle` .zip (Option A, enabled below), OR enable the four individual files `agent_yaml` + `prompt` + `input_schema` + `output_schema` (Option B). A bundle that ships `skills/<name>/` folders persists those skills into the registry first, then the agent — so the full skill + context wiring can ride in one upload. Scope: `admin`. Returns `AgentCreatedView`.\n\nThis request is illustrative — attach your own file(s) before sending. Disabled by default in the auto-run is the individual-file set; pick one mode."
+            "description": "CLI equivalent: `mdk init` / `mdk deploy --mode agents`.\n\nThe bundle/multipart variant — `POST /api/v1/agents`. Use this when you already have a pre-built canonical bundle (e.g. produced by `mdk init --llm` locally, since there is NO server-side LLM authoring endpoint — see `docs/front-end-api.md`).\n\nTwo mutually-exclusive modes: attach a single `bundle` .zip (Option A, enabled below), OR enable the four individual files `agent_yaml` + `prompt` + `input_schema` + `output_schema` (Option B). A bundle that ships `skills/<name>/` folders persists those skills into the registry first, then the agent — so the full skill + context wiring can ride in one upload. Scope: `admin`. Returns `AgentCreatedView`.\n\nThis request is illustrative — attach your own file(s) before sending. Disabled by default in the auto-run is the individual-file set; pick one mode."
           }
         },
         {
@@ -188,7 +237,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "agents", "{{agent_name}}", "validate"]
             },
-            "description": "The `mdk validate` equivalent — run the prompt linter + cost forecast against the already-stored agent. No request body. Returns `AgentValidationView` (`passed`, `errors[]`, `warnings[]`, `cost_forecast`). This is the soft \"is it shippable?\" gate; the hard structural validation already ran at create time (a malformed bundle 422s before it ever lands). Scope: `read` (read-only despite being a POST)."
+            "description": "CLI equivalent: `mdk validate`.\n\nRun the prompt linter + cost forecast against the already-stored agent. No request body. Returns `AgentValidationView` (`passed`, `errors[]`, `warnings[]`, `cost_forecast`). This is the soft \"is it shippable?\" gate; the hard structural validation already ran at create time (a malformed bundle 422s before it ever lands). Scope: `read` (read-only despite being a POST)."
           },
           "event": [
             {
@@ -227,7 +276,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "agents", "{{agent_name}}", "kb"]
             },
-            "description": "The `mdk kb ingest` equivalent — upload one or more documents into the agent's knowledge base. `multipart/form-data` with a repeating `files` field; each doc is chunked, embedded, and persisted (deduped on content hash). Returns `KbIngestView` (`files[]` with per-file `status`, `total_chunks_saved`). Scope: `kb:write`.\n\nNote: this endpoint takes uploaded files only — there is no inline-text or URL body field. To ingest a URL, fetch it to an .html/.md file first and upload that. Attach your own small doc before sending (this request ships no file)."
+            "description": "CLI equivalent: `mdk kb ingest`.\n\nUpload one or more documents into the agent's knowledge base. `multipart/form-data` with a repeating `files` field; each doc is chunked, embedded, and persisted (deduped on content hash). Returns `KbIngestView` (`files[]` with per-file `status`, `total_chunks_saved`). Scope: `kb:write`.\n\nNote: this endpoint takes uploaded files only — there is no inline-text or URL body field. To ingest a URL, fetch it to an .html/.md file first and upload that. Attach your own small doc before sending (this request ships no file)."
           }
         },
         {
@@ -242,7 +291,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "agents", "{{agent_name}}", "kb", "stats"]
             },
-            "description": "The `mdk kb stats` equivalent — server-side aggregate of the agent's KB. Returns `KbStatsView` (`total_chunks`, `total_chars`, `ocr_chunks`, per-`sources` breakdown, distinct embedding `models`). Confirms the ingest from 3a actually landed. Scope: `read`."
+            "description": "CLI equivalent: `mdk kb stats`.\n\nServer-side aggregate of the agent's KB. Returns `KbStatsView` (`total_chunks`, `total_chars`, `ocr_chunks`, per-`sources` breakdown, distinct embedding `models`). Confirms the ingest from 3a actually landed. Scope: `read`."
           },
           "event": [
             {
@@ -276,7 +325,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "agents", "{{agent_name}}", "kb", "search"]
             },
-            "description": "The `mdk kb search` equivalent — semantic search over the agent's KB (`KbSearchSubmission`: `question`, `k`, `hybrid`). Set `hybrid: true` to fuse vector + BM25 lexical results. Returns `KbSearchView` with scored `results[]`. Shows the retrieval that grounds the run in step 6. Scope: `read`."
+            "description": "CLI equivalent: `mdk kb search`.\n\nSemantic search over the agent's KB (`KbSearchSubmission`: `question`, `k`, `hybrid`). Set `hybrid: true` to fuse vector + BM25 lexical results. Returns `KbSearchView` with scored `results[]`. Shows the retrieval that grounds the run in step 6. Scope: `read`."
           },
           "event": [
             {
@@ -336,7 +385,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "skills"]
             },
-            "description": "The `mdk skills add` (skill-registration) equivalent — create or replace a skill bundle in the runtime's skill registry (PUT semantics: re-uploading the same name overwrites). `multipart/form-data`: `skill_yaml` (required) + optional `impl` / `corpus` / `readme`. Returns `SkillCreatedView`. Scope: `admin`.\n\nRun this BEFORE request 1a if your wizard body references this skill in `mcp_connectors` — an agent declaring `skills: [<name>]` 422s if the skill isn't already registered. Attach your own skill.yaml before sending."
+            "description": "CLI equivalent: `mdk skills add`.\n\nCreate or replace a skill bundle in the runtime's skill registry (PUT semantics: re-uploading the same name overwrites). `multipart/form-data`: `skill_yaml` (required) + optional `impl` / `corpus` / `readme`. Returns `SkillCreatedView`. Scope: `admin`.\n\nRun this BEFORE request 1a if your wizard body references this skill in `mcp_connectors` — an agent declaring `skills: [<name>]` 422s if the skill isn't already registered. Attach your own skill.yaml before sending."
           }
         },
         {
@@ -357,7 +406,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "agents", "{{agent_name}}", "publish"]
             },
-            "description": "The agent-level `mdk deploy` (publish/promote) equivalent — push the agent's canonical bundle to the per-tenant GitHub repo as one commit (ADR 007). `AgentPublishSubmission`: all fields optional (`commit_message`, `author_name`, `author_email`). Returns `AgentPublishedView` (commit SHA + URL). Scope: `admin`.\n\nRequires `MDK_GITHUB_ENABLED=1` + GitHub App config on the runtime, else 503 (the route is still advertised). CLI caveat: this is the *agent promotion* sense of deploy — the *infra* sense (build the runtime image, roll Azure Container Apps) stays CLI/ops-only via `mdk deploy --mode runtime`."
+            "description": "CLI equivalent: `mdk deploy --mode agents`.\n\nPush the agent's canonical bundle to the per-tenant GitHub repo as one commit (ADR 007). `AgentPublishSubmission`: all fields optional (`commit_message`, `author_name`, `author_email`). Returns `AgentPublishedView` (commit SHA + URL). Scope: `admin`.\n\nRequires `MDK_GITHUB_ENABLED=1` + GitHub App config on the runtime, else 503 (the route is still advertised). CLI caveat: this is the *agent promotion* sense of deploy — the *infra* sense (build the runtime image, roll Azure Container Apps) stays CLI/ops-only via `mdk deploy --mode runtime`."
           },
           "event": [
             {
@@ -398,7 +447,7 @@
                 }
               ]
             },
-            "description": "The `mdk run` equivalent — submit an agent run. `AgentRunSubmission`: `input` (matches the agent's input schema — here `{question}`), optional `mock`, `notify_email`, `thread_id`. With `?wait=true` the runtime executes synchronously and returns a `RunView` with the grounded answer (200). Default (`wait=false`) queues a job and returns 202 + `{job_id}`. Scope: `run`.\n\nThe `test` script captures `run_id` into a collection/environment variable so the monitor steps (7a/7b) can fetch it. Tip: add `\"mock\": true` to the body to run against the deterministic MockProvider (no API key, sub-second) for a guaranteed-fast demo."
+            "description": "CLI equivalent: `mdk run <agent>`.\n\nSubmit an agent run. `AgentRunSubmission`: `input` (matches the agent's input schema — here `{question}`), optional `mock`, `notify_email`, `thread_id`, `session_id`. With `?wait=true` the runtime executes synchronously and returns a `RunView` with the grounded answer (200). Default (`wait=false`) queues a job and returns 202 + `{job_id}`. Scope: `run`.\n\nThe `test` script captures `run_id` into a collection/environment variable so the monitor steps (7a/7b) can fetch it. Tip: add `\"mock\": true` to the body to run against the deterministic MockProvider (no API key, sub-second) for a guaranteed-fast demo.\n\nTo run within a session, add `\"session_id\": \"{{session_id}}\"` to the body — the runtime loads prior turns as context and appends the new turn (ADR 045 D10). Session must already exist (see Stateful Sessions folder)."
           },
           "event": [
             {
@@ -432,7 +481,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "runs", "{{run_id}}"]
             },
-            "description": "The `mdk runs get` equivalent — fetch a single run including its `output`, status, timing, and cost. Returns `RunView`. Uses the `{{run_id}}` captured in step 6. Scope: `read`."
+            "description": "CLI equivalent: `mdk runs get`.\n\nFetch a single run including its `output`, status, timing, and cost. Returns `RunView`. Uses the `{{run_id}}` captured in step 6. Scope: `read`."
           },
           "event": [
             {
@@ -460,7 +509,7 @@
               "host": ["{{runtime_url}}"],
               "path": ["api", "v1", "runs", "{{run_id}}", "trace"]
             },
-            "description": "The trace-viewer / `mdk runs trace` equivalent — the reconstructed span tree for the run (prompt, model calls, tool/skill invocations, retrieval). Returns `RunTraceView`. This is the observability payoff of the demo. Scope: `read`."
+            "description": "CLI equivalent: `mdk runs trace`.\n\nThe reconstructed span tree for the run (prompt, model calls, tool/skill invocations, retrieval). Returns `RunTraceView`. This is the observability payoff of the demo. Scope: `read`."
           },
           "event": [
             {
@@ -500,7 +549,7 @@
                 }
               ]
             },
-            "description": "The `mdk report` equivalent — the cross-agent aggregate monitor feed (ADR 032 D2). Returns `ReportView`: tenant-scoped pass-rate trends, cost-over-time, latency p50/p95/p99, top failing cases, and a per-agent/workflow rollup over the requested `window`. This is the fleet-wide \"how are my agents doing?\" panel the Mova iO front end renders — the aggregate complement to the per-run fetch + trace (7a/7b). Tenant-scoped; an empty store returns a zeroed report (200), never a 500. Scope: `read`.\n\nOptional query params (disabled by default — enable to scope the rollup): `?window=<days>` narrows to the last N days (0 = all-time) and `?top=<n>` sets how many failing cases to surface. For a single agent's slice use `GET /api/v1/agents/{name}/metrics` (same `read` scope, same params)."
+            "description": "CLI equivalent: `mdk report`.\n\nThe cross-agent aggregate monitor feed (ADR 032 D2). Returns `ReportView`: tenant-scoped pass-rate trends, cost-over-time, latency p50/p95/p99, top failing cases, and a per-agent/workflow rollup over the requested `window`. This is the fleet-wide \"how are my agents doing?\" panel the Mova iO front end renders — the aggregate complement to the per-run fetch + trace (7a/7b). Tenant-scoped; an empty store returns a zeroed report (200), never a 500. Scope: `read`.\n\nOptional query params (disabled by default — enable to scope the rollup): `?window=<days>` narrows to the last N days (0 = all-time) and `?top=<n>` sets how many failing cases to surface. For a single agent's slice use `GET /api/v1/agents/{name}/metrics` (same `read` scope, same params)."
           },
           "event": [
             {
@@ -511,6 +560,671 @@
                   "pm.test('200 OK', () => pm.response.code === 200);",
                   "const rep = pm.response.json();",
                   "console.log('Report agents', (rep.per_agent||rep.agents||[]).length, 'window(days)', rep.window_days);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Stateful Sessions",
+      "description": "Server-managed conversation sessions (ADR 045 D10). A session binds a series of agent runs into a persisted conversation history with per-session cost rollup. Create a session first, then pass `session_id` on subsequent `POST /agents/{name}/runs` calls so the runtime threads prior turns as context.\n\nCLI surface: sessions appear in `mdk runs list` (each run shows its `session_id` when one is set).",
+      "item": [
+        {
+          "name": "POST sessions — create session",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"agent\": \"{{agent_name}}\",\n  \"title\": \"Postman demo session\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/sessions",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "sessions"]
+            },
+            "description": "CLI equivalent: sessions surface in `mdk runs list` — no dedicated create verb in the CLI.\n\nOpen a new server-managed conversation (ADR 045 D10). Returns a freshly-minted `SessionView` with a new `session_id` (URL-safe hex UUID). The client stores this id and passes it as `session_id` on subsequent `POST /api/v1/agents/{name}/runs` calls — the runtime loads prior turns as context, runs the agent, and appends the new turn.\n\nSessions are bound to ONE agent (set here; fixed for the session's life — open a new session to target a different agent). Scope: `run`.\n\nErrors: **401** missing/bad bearer token; **403** lacks `run` scope; **422** invalid body (missing `agent`, oversize `title`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.code === 201);",
+                  "const s = pm.response.json();",
+                  "if (s.session_id) {",
+                  "  pm.collectionVariables.set('session_id', s.session_id);",
+                  "  pm.environment.set('session_id', s.session_id);",
+                  "  console.log('Created session', s.session_id, 'for agent', s.agent);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET sessions — list sessions",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/sessions",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "sessions"],
+              "query": [
+                {
+                  "key": "agent",
+                  "value": "{{agent_name}}",
+                  "disabled": true,
+                  "description": "OPTIONAL — scope to one agent's sessions."
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "disabled": true,
+                  "description": "OPTIONAL — cap on returned rows (default 100)."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk runs list` (sessions appear in run listings).\n\nList sessions for the authenticated tenant, ordered `updated_at DESC` (most recently active first). Rollup fields (`turn_count` + `total_*`) are included on each row; the per-turn `messages` history is omitted here — fetch it via `GET /sessions/{id}`. Tenant-scoped — a tenant never sees another tenant's sessions. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const r = pm.response.json();",
+                  "console.log('Sessions count', r.count);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET sessions/:session_id — fetch history",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/sessions/{{session_id}}",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "sessions", "{{session_id}}"],
+              "query": [
+                {
+                  "key": "include_messages",
+                  "value": "true",
+                  "disabled": true,
+                  "description": "OPTIONAL — set false to return only session metadata + rollups without the full message history."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk runs list` (sessions surface there with turn counts).\n\nGet a session by id with its full conversation history + the per-session cost rollup (ADR 045 D10). When `include_messages=true` (the default) the response includes a `messages` array sorted ASC by `created_at` — earliest turn first. The `{{session_id}}` variable is captured by the `POST /sessions` test script above. Scope: `read`.\n\nErrors: **401** bad token; **404** session doesn't exist OR belongs to a different tenant (same opaque 404 contract as `GET /runs/{id}` — no cross-tenant existence leak)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const s = pm.response.json();",
+                  "console.log('Session turns', (s.messages||[]).length, 'agent', s.agent);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "DELETE sessions/:session_id — delete session",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/sessions/{{session_id}}",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "sessions", "{{session_id}}"]
+            },
+            "description": "CLI equivalent: none (API-first — no dedicated CLI delete verb for sessions).\n\nHard-delete a session and its messages by id. Returns 204 No Content on success. Tenant-scoped — a cross-tenant `session_id` yields 404 (never 403). Scope: `run`.\n\nErrors: **401** missing/bad token; **403** lacks `run` scope; **404** session not found or cross-tenant."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 No Content or 404 if not found', () => [204, 404].includes(pm.response.code));",
+                  "if (pm.response.code === 204) { console.log('Session deleted:', pm.collectionVariables.get('session_id')); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST agents/:name/runs (stateful) — mdk run with session",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"input\": {\n    \"question\": \"What does the standard plan include?\"\n  },\n  \"session_id\": \"{{session_id}}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "runs"],
+              "query": [
+                {
+                  "key": "wait",
+                  "value": "true",
+                  "description": "Inline synchronous mode — returns RunView (200). Omit for async (202 + job_id)."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk run <agent>` (with `--session <id>` when session support lands in the CLI).\n\nSame as the core-flow run (step 6) but with `session_id` in the body — the runtime loads prior turns as context, executes the agent, and appends the new turn to the session's message history (ADR 045 D10).\n\nRequires a valid `session_id` captured from `POST /sessions`. The session must have been opened for this agent. Scope: `run`.\n\nOn each subsequent stateful run the `messages` array in `GET /sessions/{id}` grows by one turn."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 (inline) or 202 (async)', () => [200, 202].includes(pm.response.code));",
+                  "const r = pm.response.json();",
+                  "const rid = r.run_id || r.id || r.job_id;",
+                  "if (rid) {",
+                  "  pm.collectionVariables.set('run_id', rid);",
+                  "  pm.environment.set('run_id', rid);",
+                  "  console.log('Stateful run_id', rid, 'session', pm.collectionVariables.get('session_id'));",
+                  "}",
+                  "if (r.output) { console.log('Answer:', JSON.stringify(r.output)); }"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Voice",
+      "description": "Full-duplex voice for any agent (ADR 048 / ADR 050). Audio flows through STT → the unchanged text Executor → TTS. The pipeline leaves `core/executor.py` untouched — existing agents gain voice with no prompt changes.\n\nCLI equivalent: `mdk voice try <agent>`.\n\nAuth: WebSocket connections authenticate via `?token=<bearer_token>` query param (browsers cannot set Authorization headers on WebSocket handshakes). On auth failure the server closes with 1008 (Policy Violation).",
+      "item": [
+        {
+          "name": "WS agents/:name/voice — full-duplex pipeline (default mode)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Connection", "value": "Upgrade" },
+              { "key": "Upgrade", "value": "websocket" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/voice?token={{bearer_token}}",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "voice"],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{bearer_token}}",
+                  "description": "Bearer token for WebSocket auth (browsers cannot set Authorization headers on WS handshakes)."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk voice try <agent>`.\n\nFull-duplex WebSocket voice for `{agent_name}` (ADR 048 D4, Phase 1 — pipeline mode). Use Postman's WebSocket request type to connect.\n\n**Protocol (pipeline mode, default):** the client streams binary audio frames then sends `{\"type\":\"end\"}` to commit a turn. The server replies with:\n- `{\"type\":\"transcript.partial\", \"text\":\"...\"}` — interim STT\n- `{\"type\":\"transcript.final\", \"text\":\"...\"}` — committed transcript\n- `{\"type\":\"agent.token\", \"text\":\"...\"}` — streaming LLM tokens\n- binary frames tagged with a small JSON header — TTS audio chunks\n- `{\"type\":\"done\"}` — turn complete\n- `{\"type\":\"error\", \"message\":\"...\"}` — error (connection stays open)\n\n**Auth:** `?token=<bearer>` query param. Needs `run` scope. Close 1008 on failure.\n\n**Realtime mode:** append `?mode=realtime` to switch to full-duplex voice↔voice through a `RealtimeVoiceProvider` (ADR 048 D2b / Phase 2). See the `?mode=realtime` variant below. A runtime with no realtime factory configured rejects with an `error` frame."
+          }
+        },
+        {
+          "name": "WS agents/:name/voice?mode=realtime — realtime variant",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Connection", "value": "Upgrade" },
+              { "key": "Upgrade", "value": "websocket" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/voice?token={{bearer_token}}&mode=realtime",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "agents", "{{agent_name}}", "voice"],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{bearer_token}}",
+                  "description": "Bearer token for WebSocket auth."
+                },
+                {
+                  "key": "mode",
+                  "value": "realtime",
+                  "description": "Realtime full-duplex voice↔voice mode (ADR 048 D2b). Requires a RealtimeVoiceProvider on the runtime."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk voice try <agent> --mode realtime`.\n\nRealtime full-duplex variant of the same WebSocket endpoint (ADR 048 D2b / Phase 2). The `?mode=realtime` flag switches from the text-Executor pipeline to a `RealtimeVoiceProvider` — voice-NATIVE (no text Executor involved).\n\n**Protocol (realtime mode):** the client streams binary mic frames continuously; the provider's own server-side VAD decides turn boundaries. Server emits:\n- `{\"type\":\"speech_started\"}` — VAD detected speech\n- `{\"type\":\"speech_stopped\"}` — VAD silence detected\n- `{\"type\":\"transcript.partial\"}` / `{\"type\":\"transcript.final\"}` — rolling STT\n- `{\"type\":\"response_done\"}` — full TTS response sent\n- binary audio frames — TTS output\n\n**Opt-in / graceful degradation:** a runtime with no realtime factory configured replies with `{\"type\":\"error\", \"message\":\"realtime mode not available\"}` and closes cleanly. The pipeline path (no `?mode`) is unaffected.\n\nAuth: same `?token=<bearer>` + `run` scope as pipeline mode."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Graph Analytics",
+      "description": "Knowledge-graph surface for a project (ADR 046 / ADR 010). Each project maintains a GraphRAG graph; these endpoints expose the graph for rendering (sigma.js / graphology) and entity drill-down.\n\nCLI equivalent: `mdk graph serve --project <id>`.\n\nAll endpoints are tenant-scoped — a cross-tenant `project_id` or `node_id` yields an empty document or 404 (no cross-tenant leak). Scope: `read`.",
+      "item": [
+        {
+          "name": "GET projects/:project_id/graph — windowed subgraph",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/projects/{{project_id}}/graph",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "graph"],
+              "query": [
+                {
+                  "key": "mode",
+                  "value": "knowledge",
+                  "disabled": true,
+                  "description": "OPTIONAL — 'knowledge' (GraphRAG, default) or 'topology' (reserved, empty today)."
+                },
+                {
+                  "key": "root",
+                  "value": "{{graph_node_id}}",
+                  "disabled": true,
+                  "description": "OPTIONAL — center the window on a node (bounded k-hop). Omit for the full-graph overview (still capped)."
+                },
+                {
+                  "key": "depth",
+                  "value": "2",
+                  "disabled": true,
+                  "description": "OPTIONAL — hops from root (capped at 6)."
+                },
+                {
+                  "key": "limit",
+                  "value": "500",
+                  "disabled": true,
+                  "description": "OPTIONAL — node/edge cap (default 500, max 5000)."
+                },
+                {
+                  "key": "type",
+                  "value": "",
+                  "disabled": true,
+                  "description": "OPTIONAL — filter to one node type."
+                },
+                {
+                  "key": "project",
+                  "value": "{{project_id}}",
+                  "disabled": true,
+                  "description": "OPTIONAL — ADR 046 D1 project-scope filter. Omit for the full per-agent graph (backward-compatible)."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk graph serve --project <id>`.\n\nA windowed subgraph for `project_id` as **graphology JSON** — a sigma.js client feeds this to `graph.import(...)` with zero transform. Each node carries `label` / `type` / degree-derived `size` / `color` (+ `community` when stored); layout `x` / `y` are omitted (the client runs ForceAtlas2). Hard-capped (default 500, max 5000 nodes/edges) to protect the browser.\n\n`project_id` is the agent that owns the graph (one graph per agent). The `project` query param (ADR 046 D1) scopes to a project subgraph within that agent's KB — backward-compatible when omitted. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const g = pm.response.json();",
+                  "console.log('Graph nodes', (g.nodes||[]).length, 'edges', (g.edges||[]).length);",
+                  "if (g.nodes && g.nodes.length > 0) {",
+                  "  const nid = g.nodes[0].key || g.nodes[0].id;",
+                  "  if (nid) {",
+                  "    pm.collectionVariables.set('graph_node_id', nid);",
+                  "    pm.environment.set('graph_node_id', nid);",
+                  "    console.log('Captured graph_node_id', nid);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET graph/nodes/:id — node drill-down",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/graph/nodes/{{graph_node_id}}",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "graph", "nodes", "{{graph_node_id}}"],
+              "query": [
+                {
+                  "key": "project",
+                  "value": "",
+                  "disabled": true,
+                  "description": "OPTIONAL — scope lookup to one agent's graph."
+                },
+                {
+                  "key": "project_id",
+                  "value": "{{project_id}}",
+                  "disabled": true,
+                  "description": "OPTIONAL — ADR 046 D1 project-scope filter."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk graph serve --project <id>` (node panel click).\n\nDetail for one graph node: properties + provenance + neighbors. Returns the node's attributes, its `provenance` (each source chunk's url + snippet + extraction_confidence), the `neighbors` (its 1-hop connected entities — tickets/SOPs/docs — each tagged with relation type + direction, the drill-down panel's clickable list), the live neighbor count, the agents that reference it, and `_links.expand` (the neighbors endpoint).\n\n`{{graph_node_id}}` is captured by the subgraph request test script above. `?project=` scopes to one agent's graph; `?project_id=` (ADR 046 D1, additive) further bounds the node + neighborhood to one project's subgraph. Scope: `read`.\n\nErrors: **401** unauthed; **404** unknown / cross-tenant / cross-project node."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK or 404 when graph is empty', () => [200, 404].includes(pm.response.code));",
+                  "if (pm.response.code === 200) {",
+                  "  const n = pm.response.json();",
+                  "  console.log('Node type', n.type, 'neighbors', (n.neighbors||[]).length, 'provenance', (n.provenance||[]).length);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET graph/nodes/:id/neighbors — expand neighbors",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/graph/nodes/{{graph_node_id}}/neighbors",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "graph", "nodes", "{{graph_node_id}}", "neighbors"],
+              "query": [
+                {
+                  "key": "depth",
+                  "value": "1",
+                  "disabled": true,
+                  "description": "OPTIONAL — hops to expand (default 1, capped at 6)."
+                },
+                {
+                  "key": "limit",
+                  "value": "500",
+                  "disabled": true,
+                  "description": "OPTIONAL — node/edge cap (default 500, max 5000)."
+                },
+                {
+                  "key": "project_id",
+                  "value": "{{project_id}}",
+                  "disabled": true,
+                  "description": "OPTIONAL — ADR 046 D1 project-scope filter."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk graph serve --project <id>` (click-to-expand interaction).\n\nExpand-on-demand: a node's neighborhood as **graphology JSON**. Drives the click-to-grow interaction — the client imports this document on top of the current graph. Bounded by `depth` (hops, capped at 6) and `limit` (node/edge cap, default 500, max 5000). Unknown / cross-tenant / cross-project node → empty document. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const g = pm.response.json();",
+                  "console.log('Neighbors subgraph nodes', (g.nodes||[]).length, 'edges', (g.edges||[]).length);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET graph/search — semantic graph search",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/graph/search",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "graph", "search"],
+              "query": [
+                {
+                  "key": "q",
+                  "value": "authentication",
+                  "description": "REQUIRED — search query string."
+                },
+                {
+                  "key": "project",
+                  "value": "",
+                  "disabled": true,
+                  "description": "OPTIONAL — scope to one agent's graph."
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "disabled": true,
+                  "description": "OPTIONAL — max results (default 20)."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk graph serve --project <id>` (search box).\n\nSemantic search over the knowledge graph. Returns matching nodes ranked by relevance. Use `?project=<agent>` to scope to one agent's graph, or omit to search across all agents in the tenant. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const r = pm.response.json();",
+                  "console.log('Graph search results', (r.nodes||r.results||[]).length);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Projects + Catalog",
+      "description": "Projects (ADR 046 — multi-agent scoping) and Catalog (ADR 041 — agent marketplace). Projects group agents + KBs under a shared `project_id`. The catalog is the curated agent marketplace (browse → fork → deploy).\n\nCLI equivalents: `mdk project create`, `mdk project add-agent`, `mdk catalog list`.",
+      "item": [
+        {
+          "name": "POST projects — create project — mdk project create",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"my-demo-project\",\n  \"description\": \"Postman demo project\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/projects",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "projects"]
+            },
+            "description": "CLI equivalent: `mdk project create`.\n\nCreate a project in the caller's tenant. `name` is unique within the tenant. The reserved literal `\"default\"` is rejected (422) — the per-tenant default project is auto-created by storage at first read. `owner_principal_id` defaults to the caller's principal when omitted. Scope: `admin`.\n\nErrors: **401** bad token; **403** no `admin` scope; **409** name collision; **422** name == 'default' (reserved)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created or 409 already exists', () => [201, 409].includes(pm.response.code));",
+                  "if (pm.response.code === 201) {",
+                  "  const p = pm.response.json();",
+                  "  pm.collectionVariables.set('project_id', p.project_id);",
+                  "  pm.environment.set('project_id', p.project_id);",
+                  "  console.log('Created project', p.project_id, 'name', p.name);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET projects — list projects",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/projects",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "projects"],
+              "query": [
+                {
+                  "key": "include_archived",
+                  "value": "false",
+                  "disabled": true,
+                  "description": "OPTIONAL — surface soft-deleted projects (default false)."
+                },
+                {
+                  "key": "limit",
+                  "value": "100",
+                  "disabled": true,
+                  "description": "OPTIONAL — max rows (default 100, max 500)."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk project list`.\n\nList the caller's tenant's projects, newest-first. Tenant-scoped — a tenant never sees another tenant's projects. Supports pagination via `limit` + `after_id`. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const r = pm.response.json();",
+                  "console.log('Projects count', r.count || (r.projects||[]).length);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET projects/:id/agents — list agents in project",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/projects/{{project_id}}/agents/create-stream/{{run_id}}",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "agents", "create-stream", "{{run_id}}"]
+            },
+            "description": "CLI equivalent: `mdk project list-agents` (not yet a dedicated verb — use `mdk agent list --project <id>`).\n\nNote: the `GET /api/v1/projects/{project_id}/agents` route is the streaming creation-status endpoint (`create-stream/{job_id}`). To list agents in a project, use `GET /api/v1/agents` with a project filter, or `GET /api/v1/projects/{project_id}` (project detail includes agent references). The streaming endpoint here is for polling long-running agent creation jobs scoped to a project.\n\nUses `{{run_id}}` from the Core Flow folder as a stand-in for a `job_id`. Scope: `read`."
+          }
+        },
+        {
+          "name": "POST projects/:id/agents — add agent to project — mdk project add-agent",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"description\": \"Add {{agent_name}} to this project via NLP-based agent authoring\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/projects/{{project_id}}/agents",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "agents"]
+            },
+            "description": "CLI equivalent: `mdk project add-agent`.\n\nCreate (or import) an agent scoped to a project — `POST /api/v1/projects/{project_id}/agents` (ADR 046 D1 unified create). Accepts the same discriminated-union body as `POST /api/v1/agents` (JSON wizard submission OR multipart bundle), with project scoping applied automatically.\n\nThis is the NLP-based \"describe the agent in natural language\" path when the body carries a `description` field (the runtime's LLM authoring stage converts it to a wizard submission). All legacy create paths continue to work byte-for-byte — this endpoint composes them. Scope: `admin`.\n\nErrors: **401** bad token; **403** no `admin` scope; **404** project not found or cross-tenant; **422** malformed body."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created or 202 Accepted (async job)', () => [201, 202].includes(pm.response.code));",
+                  "const r = pm.response.json();",
+                  "console.log('Project agent create response', JSON.stringify(r).slice(0, 120));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET catalog/agents — browse catalog — mdk catalog list",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/catalog/agents",
+              "host": ["{{runtime_url}}"],
+              "path": ["api", "v1", "catalog", "agents"],
+              "query": [
+                {
+                  "key": "source",
+                  "value": "movate",
+                  "disabled": true,
+                  "description": "OPTIONAL — narrow to one namespace: 'movate', 'private', 'community'."
+                },
+                {
+                  "key": "tag",
+                  "value": "",
+                  "disabled": true,
+                  "description": "OPTIONAL — single-tag membership match."
+                },
+                {
+                  "key": "shape",
+                  "value": "",
+                  "disabled": true,
+                  "description": "OPTIONAL — exact ADR 028 shape taxonomy match."
+                },
+                {
+                  "key": "q",
+                  "value": "",
+                  "disabled": true,
+                  "description": "OPTIONAL — case-insensitive substring over name / title / description."
+                },
+                {
+                  "key": "limit",
+                  "value": "20",
+                  "disabled": true,
+                  "description": "OPTIONAL — page size (default 100, max 500)."
+                }
+              ]
+            },
+            "description": "CLI equivalent: `mdk catalog list`.\n\nList catalog entries visible to the caller (ADR 041 D2/D5). Visibility join: all `movate` entries + the caller's `private` entries + (future) `community`. Filters (all ANDed): `source`, `tag`, `shape`, `q`. Pagination via `limit` + `after_slug`.\n\nThe catalog is the curated agent marketplace — browse here to find pre-built agents you can fork and deploy into your own project. Scope: `read`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.code === 200);",
+                  "const r = pm.response.json();",
+                  "console.log('Catalog entries', r.count || (r.entries||[]).length);"
                 ]
               }
             }
