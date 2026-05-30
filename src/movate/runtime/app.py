@@ -1041,6 +1041,33 @@ async def _search_graph_nodes(
     return merged[:cap]
 
 
+# Graph-growth live-tail kinds — the typed projection of the ADR 035
+# outbox that the growth stream tails (ADR 046 D6). The publisher
+# (``kb.graph_events.make_outbox_publisher``) records exactly these on
+# every node/edge upsert during a build-graph ingest.
+_GRAPH_GROWTH_KINDS: tuple[str, str] = (
+    EventKind.GRAPH_NODE_ADDED.value,
+    EventKind.GRAPH_EDGE_ADDED.value,
+)
+
+
+def _graph_growth_frame_for_event(ev: EventView, *, project_id: str | None) -> str | None:
+    """Translate one outbox event into a growth SSE frame, or ``None`` to skip.
+
+    The event ``data`` is ``{<graphology fragment>, "project_id": ...}``
+    written by :func:`movate.kb.graph_events.make_outbox_publisher`.
+    When the caller scoped the stream with ``?project=`` we drop any event
+    whose ``project_id`` doesn't match (no cross-project leak into the
+    live view). The fragment is re-emitted verbatim — it is already the
+    same zero-transform graphology doc the snapshot frames carry."""
+    data = dict(ev.data)
+    event_project = data.pop("project_id", None)
+    if project_id is not None and event_project != project_id:
+        return None
+    sse_event = "node.added" if ev.kind == EventKind.GRAPH_NODE_ADDED.value else "edge.added"
+    return _sse_frame(sse_event, data)
+
+
 async def _sse_graph_growth_stream(
     *,
     store: StorageProvider,
@@ -1049,20 +1076,44 @@ async def _sse_graph_growth_stream(
     mode: GraphMode,
     cap: int,
     project_id: str | None = None,
-) -> Any:
-    """SSE growth generator: replay the current graph as add events.
+    live: bool = False,
+    is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    poll_interval_s: float = _EVENTS_SSE_POLL_INTERVAL_S,
+    heartbeat_interval_s: float = _EVENTS_SSE_HEARTBEAT_INTERVAL_S,
+) -> AsyncIterator[str]:
+    """SSE growth generator: replay the current graph, then optionally
+    **live-tail** new nodes/edges as KB ingest persists them (ADR 046 D6).
 
-    Loads a capped window (the same windowing the GET endpoint uses) and
-    emits one ``node.added`` frame per node, then one ``edge.added`` frame
-    per edge, each carrying a single-element graphology document so the
-    client merges every frame with the same zero-transform
-    ``graph.import(...)``. Closes with a ``done`` frame carrying the
-    totals. ``project_id`` (additive) scopes the replayed window to one
-    project's subgraph.
+    Phase 1 (always) — **snapshot replay**: load a capped window (the same
+    windowing the GET endpoint uses) and emit one ``node.added`` frame per
+    node, then one ``edge.added`` frame per edge, each carrying a
+    single-element graphology document so the client merges every frame
+    with the same zero-transform ``graph.import(...)``. ``project_id``
+    (additive) scopes the replayed window to one project's subgraph.
 
-    Snapshot-as-stream today (ADR 046 D3): a live-tail that pushes future
-    ingest writes is the additive follow-on; the frame contract here is
-    forward-compatible with it."""
+    Phase 2 — **live-tail** (only when ``live=True``): anchor a UTC-now
+    cursor and poll the ADR 035 events outbox (the same machinery
+    ``GET /api/v1/events/stream`` uses) for ``graph.node.added`` /
+    ``graph.edge.added`` events with ``subject=agent``, re-emitting each as
+    a growth frame so the sigma viewer animates the graph growing in real
+    time while a crawl/ingest runs. Events are deduped against the snapshot
+    by key, project-filtered, and the loop heartbeats + watches the
+    disconnect predicate so a closed EventSource unwinds cleanly. The
+    stream stays open until disconnect — there is **no** ``done`` frame in
+    live mode.
+
+    Phase 2 (skipped) — when ``live=False`` (the default), the snapshot is
+    followed by a ``done`` frame carrying the totals and the stream closes.
+    This preserves the original snapshot-as-stream contract byte-for-byte,
+    so existing clients (and ``TestClient.get(...).text``) are unaffected.
+
+    The growth stream is **additive eye-candy over the durable store** (ADR
+    046 failure modes): on reconnect the client re-runs the snapshot to
+    reconcile, so no live event is load-bearing for correctness."""
+    seen_nodes: set[str] = set()
+    seen_edges: set[str] = set()
+
+    # ---- Phase 1: snapshot replay ----
     doc: GraphologyDoc = await graph_query.windowed_subgraph(
         store,
         agent=agent,
@@ -1072,12 +1123,89 @@ async def _sse_graph_growth_stream(
         project_id=project_id,
     )
     for node in doc.nodes:
+        seen_nodes.add(node.key)
         frame_doc = GraphologyDoc(nodes=[node], edges=[])
         yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
     for edge in doc.edges:
+        seen_edges.add(edge.key)
         frame_doc = GraphologyDoc(nodes=[], edges=[edge])
         yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
-    yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
+
+    if not live:
+        yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
+        return
+
+    # ---- Phase 2: live-tail the graph-mutation outbox ----
+    # Anchor at now: only events recorded AFTER the snapshot are streamed
+    # live (the snapshot already covered everything before). The id cursor
+    # advances per emitted event so we never re-send one.
+    live_since = datetime.now(UTC)
+    after_id: str | None = None
+    last_heartbeat = asyncio.get_event_loop().time()
+    try:
+        while True:
+            if is_disconnected is not None and await is_disconnected():
+                return
+
+            now = asyncio.get_event_loop().time()
+            if now - last_heartbeat >= heartbeat_interval_s:
+                yield ":keepalive\n\n"
+                last_heartbeat = now
+
+            # One outbox poll covers BOTH graph kinds — list_events filters
+            # by a single kind, so we union the two kind-scoped pages and
+            # re-order by id (the cursor is monotonic per the uuid-keyed
+            # insert order the storage layer guarantees).
+            batch: list[EventView] = []
+            for kind in _GRAPH_GROWTH_KINDS:
+                rows = await store.list_events(
+                    tenant_id,
+                    since=None if after_id is not None else live_since,
+                    kind=kind,
+                    subject=agent,
+                    limit=_EVENTS_SSE_PAGE_SIZE,
+                    after_id=after_id,
+                )
+                batch.extend(EventView.from_record(r) for r in rows)
+            # Stable oldest-first by created_at then id (each kind-page is
+            # already oldest-first; the merge keeps a deterministic order).
+            batch.sort(key=lambda e: (e.created_at, e.id))
+
+            for ev in batch:
+                # Dedupe against the snapshot + earlier live frames by key,
+                # so a node already painted isn't re-animated.
+                key = _graph_event_key(ev)
+                if key is not None:
+                    is_node = ev.kind == EventKind.GRAPH_NODE_ADDED.value
+                    bucket = seen_nodes if is_node else seen_edges
+                    if key in bucket:
+                        after_id = ev.id
+                        continue
+                    bucket.add(key)
+                frame = _graph_growth_frame_for_event(ev, project_id=project_id)
+                if frame is not None:
+                    yield frame
+                after_id = ev.id
+
+            await asyncio.sleep(poll_interval_s)
+    except asyncio.CancelledError:
+        # Client disconnect / server shutdown — unwind cleanly, honoring
+        # the ASGI cancellation contract.
+        raise
+
+
+def _graph_event_key(ev: EventView) -> str | None:
+    """Extract the node/edge ``key`` from a graph-growth outbox event.
+
+    The fragment in ``ev.data`` has exactly one node (for ``node.added``)
+    or one edge (for ``edge.added``); its ``key`` is the dedupe id. Returns
+    ``None`` if the payload is malformed (defensive — a bad event is
+    skipped, never crashes the stream)."""
+    items = ev.data.get("nodes") or ev.data.get("edges") or []
+    if items and isinstance(items[0], dict):
+        key = items[0].get("key")
+        return str(key) if key is not None else None
+    return None
 
 
 def _default_sibling_path(
@@ -6640,38 +6768,54 @@ def build_app(
         mode: str = "knowledge",
         limit: int | None = None,
         project: str | None = None,
+        live: bool = False,
     ) -> StreamingResponse:
         """Growth stream for ``project_id``'s graph over **SSE**.
 
-        Reuses the ADR 035 SSE infrastructure (:func:`_sse_frame`). Emits
-        the current graph as a sequence of growth events the client
-        applies incrementally:
+        Reuses the ADR 035 SSE infrastructure (:func:`_sse_frame` + the
+        events outbox). Emits the current graph as a sequence of growth
+        events the client applies incrementally:
 
         * ``event: node.added`` / ``data: <graphology doc with one node>``
         * ``event: edge.added`` / ``data: <graphology doc with one edge>``
-        * ``event: done`` / ``data: {"nodes": N, "edges": M}``
+        * ``event: done`` / ``data: {"nodes": N, "edges": M}`` — snapshot
+          mode only (terminal frame; omitted in ``?live=true``).
 
         Each ``node.added`` / ``edge.added`` payload is itself a
         graphology-importable document (a single-element ``nodes`` or
         ``edges`` list), so the client merges every frame with the same
         zero-transform ``graph.import(...)`` it uses for the windowed
-        endpoints — no special-case parsing. (``node.updated`` shares the
-        ``node.added`` shape; emitted when a re-ingest changes an existing
-        node.)
+        endpoints — no special-case parsing.
+
+        Two modes (``?live``, default **false** — backward-compatible):
+
+        * **Snapshot** (``?live=false``) — replay the current graph, then a
+          terminal ``done`` and close. The original ADR 046 D3 contract,
+          byte-for-byte.
+        * **Live-tail** (``?live=true``, ADR 046 D6) — replay the snapshot,
+          then keep the connection open and push ``node.added`` /
+          ``edge.added`` frames as KB ingest extracts + persists new
+          nodes/edges, so the sigma viewer **animates the graph growing in
+          real time**. This is a *typed projection of the ADR 035 outbox*:
+          the same SSE machinery, filtered to ``graph.*.added`` events
+          scoped to this agent. No ``done`` frame — the client closes the
+          EventSource (the live-growth toggle) or disconnects. The growth
+          events are additive over the durable store: on reconnect the
+          client re-runs the snapshot to reconcile (no event is
+          load-bearing for correctness).
 
         Bounded by ``limit`` (node/edge cap). ``?project=`` (ADR 046 D1,
-        additive) scopes the replayed window to one project's subgraph.
-        Tenant-scoped. Read scope.
-
-        This is a SNAPSHOT-as-stream today (it replays the current graph
-        then closes with ``done``); the live-tail seam — pushing future
-        ``node.added`` events as ingest writes them — is additive and
-        documented in ADR 046 D3.
+        additive) scopes both the replayed window AND the live-tail to one
+        project's subgraph (a cross-project event never reaches the
+        stream). Tenant-scoped. Read scope.
         """
         store: StorageProvider = request.app.state.storage
         tenant_id = ctx.tenant_id
         cap = graph_query.clamp_cap(limit)
         graph_mode = _graph_mode(mode)
+
+        async def _is_disconnected() -> bool:
+            return await request.is_disconnected()
 
         generator = _sse_graph_growth_stream(
             store=store,
@@ -6680,6 +6824,8 @@ def build_app(
             mode=graph_mode,
             cap=cap,
             project_id=project,
+            live=live,
+            is_disconnected=_is_disconnected if live else None,
         )
         return StreamingResponse(
             generator,
