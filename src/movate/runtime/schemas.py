@@ -328,6 +328,18 @@ class JobCancelView(BaseModel):
     status: JobStatus
 
 
+class DeadLetterPurgeView(BaseModel):
+    """``POST /api/v1/jobs/dead-letter/purge`` response.
+
+    ``purged`` is the number of ``DEAD_LETTER`` rows deleted for the
+    authenticated tenant. Envelope (not a bare int) so the response can
+    grow back-compatibly (e.g. a future ``cutoff`` echo)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    purged: int
+
+
 # ---------------------------------------------------------------------------
 # Workflow HITL signal (ADR 017 D5, PR 2 — resume-on-signal)
 # ---------------------------------------------------------------------------
@@ -3016,6 +3028,7 @@ __all__ = [
     "BenchModelView",
     "BenchResultView",
     "BenchSubmission",
+    "DeadLetterPurgeView",
     "EvalAcceptedView",
     "EvalCaseView",
     "EvalListView",

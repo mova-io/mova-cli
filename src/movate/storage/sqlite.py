@@ -3492,6 +3492,92 @@ class SqliteProvider:
         return record.status if record is not None else None
 
     # ------------------------------------------------------------------
+    # Dead-letter operations (operate retry-exhausted jobs)
+    # ------------------------------------------------------------------
+
+    async def list_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 20,
+        agent: str | None = None,
+    ) -> list[JobRecord]:
+        """Newest-first DEAD_LETTER rows for ``tenant_id`` (optional ``agent``
+        = ``target`` filter). Tenant-scoped in WHERE."""
+        clauses = ["tenant_id = ?", "status = 'dead_letter'"]
+        params: list[object] = [tenant_id]
+        if agent is not None:
+            clauses.append("target = ?")
+            params.append(agent)
+        params.append(limit)
+        sql = f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT ?"
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_job(r) for r in rows]
+
+    async def requeue_dead_letter_job(self, job_id: str, *, tenant_id: str) -> bool:
+        """Reset a DEAD_LETTER job → QUEUED with a fresh attempt budget.
+
+        Status-guarded ``WHERE status = 'dead_letter'`` so a live/other
+        terminal job is never touched. ``changes()`` tells us whether a
+        row actually flipped; returns ``True`` iff one did (so the API/CLI
+        can 404 / error cleanly on a non-dead-letter or cross-tenant id).
+        Runs under ``BEGIN IMMEDIATE`` (same write-lock discipline as the
+        other mutating job paths)."""
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            async with self._db.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued',
+                    attempt_count = 0,
+                    next_retry_at = NULL,
+                    claimed_at = NULL,
+                    completed_at = NULL,
+                    error = NULL
+                WHERE job_id = ? AND tenant_id = ? AND status = 'dead_letter'
+                """,
+                (job_id, tenant_id),
+            ) as cur:
+                changed = cur.rowcount
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+        return changed > 0
+
+    async def purge_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> int:
+        """Delete this tenant's DEAD_LETTER rows; returns the count deleted.
+
+        Tenant + status scoped in WHERE so a purge can never touch another
+        tenant's rows or a live/non-dead-letter job. ``before`` narrows to
+        rows whose ``completed_at`` is strictly older than the cutoff (and
+        non-NULL); ``None`` purges all dead-letter rows for the tenant."""
+        clauses = ["tenant_id = ?", "status = 'dead_letter'"]
+        params: list[object] = [tenant_id]
+        if before is not None:
+            clauses.append("completed_at IS NOT NULL")
+            clauses.append("completed_at < ?")
+            params.append(before.isoformat())
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            async with self._db.execute(
+                f"DELETE FROM jobs WHERE {' AND '.join(clauses)}",
+                params,
+            ) as cur:
+                deleted = cur.rowcount
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+        return max(0, deleted)
+
+    # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)
     # ------------------------------------------------------------------
 

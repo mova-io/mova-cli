@@ -802,6 +802,77 @@ class StorageProvider(Protocol):
         """
 
     # ------------------------------------------------------------------
+    # Dead-letter operations — operate jobs that exhausted their retry
+    # budget and landed in ``DEAD_LETTER`` (see ``movate.core.job_retry``).
+    # All tenant-scoped: an operator inspects, recovers, or prunes only
+    # its own tenant's poisoned jobs. Additive — the normal job lifecycle
+    # (claim / update / requeue / reclaim) is untouched.
+    # ------------------------------------------------------------------
+
+    async def list_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 20,
+        agent: str | None = None,
+    ) -> list[JobRecord]:
+        """List this tenant's ``DEAD_LETTER`` jobs, newest-first.
+
+        A focused convenience over ``list_jobs(status=DEAD_LETTER)``: it is
+        the operator triage surface for retry-exhausted jobs. ``agent``
+        (the ``target`` column) narrows to a single agent/workflow name so
+        an operator can scope a recovery to the failing component. Always
+        tenant-scoped (``tenant_id`` is required, not optional) — there is
+        no cross-tenant dead-letter view.
+        """
+
+    async def requeue_dead_letter_job(self, job_id: str, *, tenant_id: str) -> bool:
+        """Recover ONE ``DEAD_LETTER`` job back onto the queue, tenant-scoped.
+
+        Resets the row to a fresh ``QUEUED`` state so the worker picks it
+        up again on the next claim:
+
+        * ``status`` → ``QUEUED``
+        * ``attempt_count`` → ``0`` (a fresh retry budget)
+        * ``next_retry_at`` → ``NULL`` (claimable immediately)
+        * ``claimed_at`` / ``completed_at`` → ``NULL``
+        * ``error`` → ``NULL`` (the prior failure is cleared)
+
+        The transition is guarded on ``status = 'dead_letter'`` in WHERE,
+        so a job that is not dead-lettered (queued / running / a different
+        terminal status) is NOT touched. Returns ``True`` iff a row was
+        actually requeued; ``False`` if no row matched (missing,
+        cross-tenant, or not in ``DEAD_LETTER``) — the caller maps a
+        ``False`` to a clean "nothing to requeue" error rather than
+        silently corrupting a live job.
+
+        Tenant-scoped in WHERE (``job_id`` AND ``tenant_id``) so a
+        cross-tenant id can never resurrect another tenant's job.
+        """
+
+    async def purge_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> int:
+        """Permanently delete this tenant's ``DEAD_LETTER`` jobs.
+
+        Destructive housekeeping for an operator that has triaged the
+        dead-letter queue and wants the un-recoverable rows gone.
+        Tenant-scoped: deletes ONLY rows where ``status = 'dead_letter'``
+        AND ``tenant_id`` matches — never another tenant's, and never a
+        live (queued/running) or non-dead-letter terminal job.
+
+        ``before`` (when set) restricts the purge to rows whose
+        ``completed_at`` is strictly older than the cutoff, so an operator
+        can keep recent dead-letters for inspection while clearing stale
+        ones. ``None`` purges every dead-letter row for the tenant.
+
+        Returns the number of rows deleted.
+        """
+
+    # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)
     # ------------------------------------------------------------------
 

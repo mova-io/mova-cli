@@ -3698,6 +3698,80 @@ class PostgresProvider:
         return JobStatus(row["status"])
 
     # ------------------------------------------------------------------
+    # Dead-letter operations (operate retry-exhausted jobs)
+    # ------------------------------------------------------------------
+
+    async def list_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 20,
+        agent: str | None = None,
+    ) -> list[JobRecord]:
+        """Newest-first DEAD_LETTER rows for ``tenant_id`` (optional ``agent``
+        = ``target`` filter). Tenant-scoped in WHERE."""
+        params: list[Any] = [tenant_id]
+        clauses = ["tenant_id = $1", "status = 'dead_letter'"]
+        if agent is not None:
+            params.append(agent)
+            clauses.append(f"target = ${len(params)}")
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} "
+            f"ORDER BY created_at DESC LIMIT ${len(params)}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_job(r) for r in rows]
+
+    async def requeue_dead_letter_job(self, job_id: str, *, tenant_id: str) -> bool:
+        """Reset a DEAD_LETTER job → QUEUED with a fresh attempt budget.
+
+        Single ``UPDATE ... RETURNING`` guarded on ``status =
+        'dead_letter'`` (and tenant). The RETURNING row is present iff a
+        row actually flipped, so we report ``True``/``False`` — a
+        non-dead-letter / cross-tenant id returns ``False`` and the
+        API/CLI maps that to a clean error."""
+        row = await self._db.fetchrow(
+            """
+            UPDATE jobs
+            SET status = 'queued',
+                attempt_count = 0,
+                next_retry_at = NULL,
+                claimed_at = NULL,
+                completed_at = NULL,
+                error = NULL
+            WHERE job_id = $1 AND tenant_id = $2 AND status = 'dead_letter'
+            RETURNING job_id
+            """,
+            job_id,
+            tenant_id,
+        )
+        return row is not None
+
+    async def purge_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> int:
+        """Delete this tenant's DEAD_LETTER rows; returns the count deleted.
+
+        Tenant + status scoped in WHERE. ``before`` narrows to rows whose
+        ``completed_at`` is strictly older than the cutoff (and non-NULL);
+        ``None`` purges all dead-letter rows for the tenant."""
+        params: list[Any] = [tenant_id]
+        clauses = ["tenant_id = $1", "status = 'dead_letter'"]
+        if before is not None:
+            params.append(before)
+            clauses.append("completed_at IS NOT NULL")
+            clauses.append(f"completed_at < ${len(params)}")
+        rows = await self._db.fetch(
+            f"DELETE FROM jobs WHERE {' AND '.join(clauses)} RETURNING job_id",
+            *params,
+        )
+        return len(rows)
+
+    # ------------------------------------------------------------------
     # API keys
     # ------------------------------------------------------------------
 

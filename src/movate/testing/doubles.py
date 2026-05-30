@@ -1487,6 +1487,76 @@ class InMemoryStorage:
         return None
 
     # ------------------------------------------------------------------
+    # Dead-letter operations — mirror the SQL backends' semantics.
+    # ------------------------------------------------------------------
+
+    async def list_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 20,
+        agent: str | None = None,
+    ) -> list[JobRecord]:
+        rows = [
+            j for j in self.jobs if j.tenant_id == tenant_id and j.status == JobStatus.DEAD_LETTER
+        ]
+        if agent is not None:
+            rows = [j for j in rows if j.target == agent]
+        return sorted(rows, key=lambda j: j.created_at, reverse=True)[:limit]
+
+    async def requeue_dead_letter_job(self, job_id: str, *, tenant_id: str) -> bool:
+        """Reset a DEAD_LETTER job → QUEUED with a fresh budget.
+
+        Status-guarded: only a ``DEAD_LETTER`` row for this tenant is
+        touched. Returns ``True`` iff a row was actually requeued.
+        Single event loop → atomic by construction.
+        """
+        for i, j in enumerate(self.jobs):
+            if (
+                j.job_id == job_id
+                and j.tenant_id == tenant_id
+                and j.status == JobStatus.DEAD_LETTER
+            ):
+                self.jobs[i] = j.model_copy(
+                    update={
+                        "status": JobStatus.QUEUED,
+                        "attempt_count": 0,
+                        "next_retry_at": None,
+                        "claimed_at": None,
+                        "completed_at": None,
+                        "error": None,
+                    }
+                )
+                return True
+        # Missing, cross-tenant, or not DEAD_LETTER — no-op.
+        return False
+
+    async def purge_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> int:
+        """Delete this tenant's DEAD_LETTER rows (optionally older than
+        ``before`` by ``completed_at``). Returns the count deleted."""
+
+        def _purgeable(j: JobRecord) -> bool:
+            if j.tenant_id != tenant_id or j.status != JobStatus.DEAD_LETTER:
+                return False
+            if before is not None:
+                # Keep rows with no completed_at, or completed at/after the
+                # cutoff — matches the SQL backends' strict ``< before`` plus
+                # ``completed_at IS NOT NULL`` predicate.
+                return j.completed_at is not None and j.completed_at < before
+            return True
+
+        to_delete = [j for j in self.jobs if _purgeable(j)]
+        if to_delete:
+            ids = {j.job_id for j in to_delete}
+            self.jobs = [j for j in self.jobs if j.job_id not in ids]
+        return len(to_delete)
+
+    # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)
     # ------------------------------------------------------------------
 
