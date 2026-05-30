@@ -15,16 +15,19 @@ consistent vocabulary in ``tool_result`` blocks.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 from jsonschema import ValidationError as JSONSchemaValidationError
 
-from movate.core.models import SkillImplementationKind
+from movate.core.models import SkillImplementationKind, SkillSideEffects
 
 if TYPE_CHECKING:
     from movate.core.skill_loader import SkillBundle
+
+_log = logging.getLogger(__name__)
 
 
 class SkillErrorType(StrEnum):
@@ -211,6 +214,24 @@ async def dispatch_skill(
             type=SkillErrorType.VALIDATION_FAILED,
             message=f"input did not match skill {skill.spec.name!r} input schema: {exc.message}",
         ) from exc
+
+    # Soft capabilities/side-effects mismatch check.
+    # If the skill declares read_only: true but the agent's side_effects
+    # is mutates-state we log a warning — NOT an error (enforcement is
+    # soft; hard gating is a future PR).  We compare the skill's
+    # capabilities.read_only flag (new block) against the agent-level
+    # SkillSideEffects.  ctx carries no agent-side_effects today, so we
+    # only fire when the *skill itself* has opted in via capabilities.
+    if (
+        skill.spec.capabilities.read_only is True
+        and skill.spec.side_effects == SkillSideEffects.MUTATES_STATE
+    ):
+        _log.warning(
+            "skill %r declares capabilities.read_only=true but "
+            "side_effects='mutates-state' — contradiction in skill.yaml; "
+            "please align the two fields.",
+            skill.spec.name,
+        )
 
     backend = _backend_for(skill.spec.implementation.kind)
     if backend is None:
