@@ -285,3 +285,85 @@ async def test_node_detail_with_provenance(storage: InMemoryStorage) -> None:
     assert prov.url == "docs/auth.md"
     assert prov.snippet is not None and "SAML SSO" in prov.snippet
     assert prov.extraction_confidence == pytest.approx(0.7)
+
+
+# ----------------------------------------------------------------------
+# Confidence floor (ADR 046 D2) — opt-in read-path filter
+# ----------------------------------------------------------------------
+
+
+def _entity_conf(entity_id: str, confidence: float | None, **kw: object) -> Entity:
+    """An entity with a stored ``metadata["confidence"]`` (or none)."""
+    meta = {"confidence": confidence} if confidence is not None else None
+    e = _entity(entity_id, kw.pop("name", entity_id), **kw)  # type: ignore[arg-type]
+    return e.model_copy(update={"metadata": meta})
+
+
+async def test_min_confidence_default_shows_all(storage: InMemoryStorage) -> None:
+    """The default floor (0.0) is a no-op — every node is returned, including
+    low-confidence ones (back-compat)."""
+    ents = [
+        _entity_conf("hi", 0.9),
+        _entity_conf("lo", 0.1),
+        _entity_conf("none", None),
+    ]
+    await _seed(storage, ents, [])
+    doc = await gq.windowed_subgraph(storage, agent="a1", tenant_id="t1")
+    keys = {n.key for n in doc.nodes}
+    assert keys == {"hi", "lo", "none"}
+
+
+async def test_min_confidence_drops_low_keeps_unscored(storage: InMemoryStorage) -> None:
+    """A positive floor drops nodes below it but KEEPS nodes with no recorded
+    confidence (treated as full-confidence) — the filter is purely additive."""
+    ents = [
+        _entity_conf("hi", 0.9),
+        _entity_conf("mid", 0.5),
+        _entity_conf("lo", 0.2),
+        _entity_conf("none", None),
+    ]
+    await _seed(storage, ents, [])
+    doc = await gq.windowed_subgraph(storage, agent="a1", tenant_id="t1", min_confidence=0.5)
+    keys = {n.key for n in doc.nodes}
+    # 0.5 >= 0.5 stays; 0.2 drops; unscored stays.
+    assert keys == {"hi", "mid", "none"}
+
+
+async def test_min_confidence_prunes_dangling_edges(storage: InMemoryStorage) -> None:
+    """Dropping a low-confidence endpoint also prunes the edge that touched it
+    (the serializer's drop-on-join rule), so no dangling edge survives."""
+    ents = [_entity_conf("hi", 0.9), _entity_conf("lo", 0.1)]
+    rels = [_relation("e1", "hi", "lo", weight=0.8)]
+    await _seed(storage, ents, rels)
+    doc = await gq.windowed_subgraph(storage, agent="a1", tenant_id="t1", min_confidence=0.5)
+    assert {n.key for n in doc.nodes} == {"hi"}
+    assert doc.edges == []
+
+
+async def test_min_confidence_clamped(storage: InMemoryStorage) -> None:
+    """An out-of-range floor is clamped: <=0 is the no-op default, >1 keeps
+    only full-confidence (1.0) + unscored nodes."""
+    ents = [_entity_conf("full", 1.0), _entity_conf("almost", 0.99), _entity_conf("none", None)]
+    await _seed(storage, ents, [])
+    # Negative floor → no-op.
+    doc_all = await gq.windowed_subgraph(storage, agent="a1", tenant_id="t1", min_confidence=-1.0)
+    assert {n.key for n in doc_all.nodes} == {"full", "almost", "none"}
+    # Floor above 1 clamps to 1.0 → only the 1.0 node + the unscored node.
+    doc_strict = await gq.windowed_subgraph(storage, agent="a1", tenant_id="t1", min_confidence=5.0)
+    assert {n.key for n in doc_strict.nodes} == {"full", "none"}
+
+
+async def test_min_confidence_rooted_keeps_seed(storage: InMemoryStorage) -> None:
+    """A rooted window never drops its own seed to the confidence floor, even
+    when the seed itself is low-confidence (so 'show me around this node' is
+    never empty)."""
+    ents = [_entity_conf("root", 0.1), _entity_conf("nbr_hi", 0.9), _entity_conf("nbr_lo", 0.1)]
+    rels = [_relation("e1", "root", "nbr_hi"), _relation("e2", "root", "nbr_lo")]
+    await _seed(storage, ents, rels)
+    doc = await gq.windowed_subgraph(
+        storage, agent="a1", tenant_id="t1", root="root", depth=1, min_confidence=0.5
+    )
+    keys = {n.key for n in doc.nodes}
+    assert "root" in keys  # seed survives despite 0.1 < 0.5
+    assert "nbr_hi" in keys
+    assert "nbr_lo" not in keys
