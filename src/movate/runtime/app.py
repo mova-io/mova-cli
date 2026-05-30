@@ -101,6 +101,7 @@ from movate.core.models import (
 )
 from movate.core.provider_keys import (
     ProviderKeyError,
+    ProviderKeyResolver,
     mint_tenant_provider_key,
     normalize_provider,
 )
@@ -536,6 +537,59 @@ def _voice_ctrl(type_: str, **payload: Any) -> dict[str, Any]:
     return {"type": type_, **payload}
 
 
+# Voice-adapter ``.name`` → BYOK credential namespace (ADR 048 D6 / ADR 018).
+#
+# The speech adapters name themselves by *capability* (``openai_whisper`` STT,
+# ``openai_tts`` TTS, ``openai_realtime``) but a tenant's BYOK key is stored
+# under the *provider family* (``openai``) — one ``openai`` key covers all of
+# that vendor's voice services, mirroring how ``normalize_provider`` collapses
+# ``openai/gpt-4o`` → ``openai`` for the LLM. This edge-only map collapses the
+# multi-service vendors; single-service adapters (``deepgram`` / ``elevenlabs``
+# / ``cartesia``) already name themselves by family and fall through unchanged.
+_VOICE_PROVIDER_FAMILY: dict[str, str] = {
+    "openai_whisper": "openai",
+    "openai_tts": "openai",
+    "openai_realtime": "openai",
+    "azure_speech_stt": "azure",
+    "azure_neural_tts": "azure",
+    "azure_openai_realtime": "azure",
+}
+
+
+async def _resolve_voice_api_key(
+    storage: StorageProvider, tenant_id: str, adapter: Any
+) -> str | None:
+    """Resolve a tenant's BYOK key for a voice adapter, at the edge (ADR 048 D6).
+
+    Maps the adapter's ``.name`` to its BYOK provider family and asks the
+    ADR 018 :class:`ProviderKeyResolver` for the tenant's own key. Returns the
+    plaintext key when the tenant brought one, else ``None`` so the adapter
+    falls through to its existing env-default credential — the no-tenant-key
+    path is byte-for-byte today's behavior (back-compat, ADR 018 D2).
+
+    BYOK is wired **here, at the transport edge** — the adapters stay
+    backend-agnostic and merely accept ``api_key=`` (CLAUDE.md rule 6). This
+    NEVER raises: a misconfigured/disabled key store (an ``AuthError`` from
+    strict isolation, a ``ProviderKeyError`` from a rotated data key, or any
+    storage hiccup) degrades to ``None`` rather than killing a voice
+    connection — the connection then uses the env default, exactly as if BYOK
+    were absent.
+    """
+    name = getattr(adapter, "name", "") or ""
+    provider = _VOICE_PROVIDER_FAMILY.get(name, normalize_provider(name))
+    if not provider:
+        return None
+    try:
+        return await ProviderKeyResolver(storage).resolve(tenant_id, provider)
+    except Exception:
+        # Degrade to the env default rather than killing the connection. This
+        # swallows the resolver's AuthError (strict per-tenant isolation with
+        # no tenant key) and ProviderKeyError (a rotated/misconfigured data
+        # key), plus any storage hiccup — BYOK being unconfigured must never
+        # break voice (CLAUDE.md rule 10, failure modes).
+        return None
+
+
 @dataclass
 class _VoiceTurnConfig:
     """Per-turn settings the client may set via a ``config`` frame.
@@ -707,7 +761,7 @@ async def _read_realtime_leading_config(
     return bool(ctrl.get("type") == "close")
 
 
-async def _run_voice_realtime(websocket: WebSocket, bundle: Any) -> None:
+async def _run_voice_realtime(websocket: WebSocket, bundle: Any, *, tenant_id: str) -> None:
     """Drive a ``?mode=realtime`` voice↔voice session (ADR 048 D2b / Phase 2).
 
     Voice-NATIVE: the inbound mic frames go straight to a
@@ -745,6 +799,11 @@ async def _run_voice_realtime(websocket: WebSocket, bundle: Any) -> None:
     provider = factory()
     instructions = _realtime_instructions(bundle)
     config = _VoiceTurnConfig()
+
+    # BYOK (ADR 048 D6 / ADR 018): the tenant's own realtime-provider key,
+    # resolved at the edge. ``None`` → the adapter's env default (back-compat).
+    store: StorageProvider = websocket.app.state.storage
+    realtime_api_key = await _resolve_voice_api_key(store, tenant_id, provider)
 
     # A queue bridges inbound binary WS frames (filled by a reader task) to the
     # provider's ``audio_in`` async iterator. ``None`` closes the mic stream.
@@ -791,6 +850,7 @@ async def _run_voice_realtime(websocket: WebSocket, bundle: Any) -> None:
             voice_id=config.voice_id,
             instructions=instructions,
             language=config.language,
+            api_key=realtime_api_key,
         ):
             await _send_realtime_chunk(websocket, chunk)
             if chunk.kind == "error":
@@ -14389,7 +14449,7 @@ def build_app(
         # absent / "pipeline") is the unchanged pipeline path below.
         mode = (websocket.query_params.get("mode") or "pipeline").strip().lower()
         if mode == "realtime":
-            await _run_voice_realtime(websocket, bundle)
+            await _run_voice_realtime(websocket, bundle, tenant_id=ctx.tenant_id)
             return
 
         # ── Wire the UNCHANGED Executor + the speech adapters ──
@@ -14405,11 +14465,17 @@ def build_app(
         # Phase-1 reference adapters, built from the app-state factories
         # (default: OpenAI Whisper STT + OpenAI TTS). A tenant swaps providers
         # (Deepgram / ElevenLabs) by registering a different factory behind the
-        # same seam — the route is provider-agnostic (ADR 048 D3). BYOK key
-        # resolution (ADR 018) is the documented next wire-up; for now adapters
-        # read OPENAI_API_KEY (their SDK default) when no per-call key is passed.
+        # same seam — the route is provider-agnostic (ADR 048 D3).
         stt = websocket.app.state.voice_stt_factory()
         tts = websocket.app.state.voice_tts_factory()
+
+        # BYOK (ADR 048 D6 / ADR 018): resolve the tenant's OWN STT/TTS key at
+        # this edge and thread it into the adapters. No tenant key → ``None`` →
+        # the adapter falls back to its env-default credential, byte-for-byte
+        # today's behavior. Resolution is wired here, never inside the adapter
+        # (CLAUDE.md rule 6); the adapters merely accept ``api_key=``.
+        stt_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, stt)
+        tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts)
 
         # Config persists across turns in a session; a per-turn ``config`` frame
         # can override it before that turn's ``end``.
@@ -14447,6 +14513,8 @@ def build_app(
                     input_key=config.input_key,
                     language=config.language,
                     voice_id=config.voice_id,
+                    stt_api_key=stt_api_key,
+                    tts_api_key=tts_api_key,
                 ):
                     await _send_voice_event(websocket, event)
         except WebSocketDisconnect:
