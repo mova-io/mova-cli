@@ -500,6 +500,184 @@ def validate_workflow(
 
 
 # ---------------------------------------------------------------------------
+# Local determinism lint (ADR 054 D5) — surface the Temporal compiler's
+# `lint_temporal` to workflow authors at authoring time.
+#
+# This is a purely *local* command (no MovateClient): it parses + compiles the
+# workflow.yaml to the IR and runs the backend's determinism linter. ADR 054 D5
+# promises compile-time determinism feedback; this is the CLI entry point for
+# it. It is a thin surface over `lint_temporal` — no new lint logic lives here.
+#
+# Forward-compat note (ADR 055 / PR #606): once the `runtime` field lands on
+# WorkflowSpec, `mdk validate` can auto-dispatch to this same `lint_temporal`
+# path for `runtime: temporal` workflows. Until then the `--runtime` flag is
+# the explicit opt-in, so this ships independently of that field.
+# ---------------------------------------------------------------------------
+
+
+@workflow_app.command("lint")
+def lint(
+    path: str = typer.Argument(
+        ".",
+        help="Path to a workflow.yaml or its containing directory (defaults to the cwd).",
+    ),
+    runtime: str = typer.Option(
+        "temporal",
+        "--runtime",
+        help=(
+            "Backend whose determinism rules to apply. Phase 1 supports "
+            "[bold]temporal[/bold] only (ADR 054 D5)."
+        ),
+    ),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="Promote lint warnings to errors (exit 2 on any warning). CI gate flag.",
+    ),
+    no_lint: bool = typer.Option(
+        False,
+        "--no-lint",
+        help="Skip the determinism linter (parse + compile to IR only).",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit a machine-readable JSON result instead of Rich output.",
+    ),
+) -> None:
+    """Lint a local workflow.yaml for backend determinism violations.
+
+    Compiles the workflow to the IR and runs the Temporal compiler's
+    determinism linter (ADR 054 D5), surfacing each finding with its stable
+    code + node id. Phase 1 findings are warnings only; pass
+    [bold]--strict[/bold] to fail CI on any of them. Mirrors the prompt
+    linter's [bold]--strict[/bold] / [bold]--no-lint[/bold] flags.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Lint the workflow in the current directory[/dim]
+      $ mdk workflow lint --runtime temporal
+
+      [dim]# Fail CI on any determinism warning[/dim]
+      $ mdk workflow lint ./workflows/incident-resolution --runtime temporal --strict
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    from movate.core.workflow import (  # noqa: PLC0415
+        WorkflowCompileError,
+        compile_workflow,
+        load_workflow_spec,
+    )
+    from movate.core.workflow.compilers.temporal import LintIssue, lint_temporal  # noqa: PLC0415
+    from movate.core.workflow.spec import WorkflowSpecLoadError  # noqa: PLC0415
+
+    # Phase 1 only the Temporal backend ships determinism rules. The native
+    # runner is the portable floor (no determinism constraints); the LangGraph
+    # lint lands later. Reject other values loudly rather than no-op silently.
+    if runtime != "temporal":
+        error(
+            f"unsupported --runtime {runtime!r}: only [bold]temporal[/bold] is "
+            "supported today (ADR 054 Phase 1). The native runner is the "
+            "portable floor with no determinism constraints.",
+            context="lint",
+        )
+        raise typer.Exit(code=2)
+
+    # Resolve + parse the spec.
+    p = Path(path).resolve()
+    try:
+        spec, parent = load_workflow_spec(p)
+    except WorkflowSpecLoadError as exc:
+        error(str(exc), context="lint")
+        raise typer.Exit(code=2) from None
+
+    # Compile to the IR. ``allow_cycles=True`` because Temporal supports
+    # bounded loops (and the unbounded-loop lint exists precisely to flag a
+    # back-edge with no ``max_iterations`` bound — it can only fire on a graph
+    # that compiled with cycles preserved). We do NOT run ``validate_linear``
+    # here: that is the v0.3 native-runner phase gate; the Temporal backend
+    # accepts the richer shapes (loops, HUMAN gates) the linter reasons about.
+    try:
+        graph = compile_workflow(spec, parent, allow_cycles=True)
+    except WorkflowCompileError as exc:
+        error(str(exc), context="lint")
+        raise typer.Exit(code=2) from None
+
+    issues: list[LintIssue] = [] if no_lint else lint_temporal(graph)
+    errors = [i for i in issues if i.severity == "error"]
+    warnings = [i for i in issues if i.severity == "warning"]
+    # Errors always fail; warnings fail only under --strict (CI gate parity
+    # with the prompt linter). Phase 1 emits warnings only — but we honor the
+    # error severity now so Phase 2's promotion needs no CLI change.
+    ok = not errors and not (strict and warnings)
+
+    if as_json:
+        payload = {
+            "kind": "workflow-lint",
+            "name": graph.name,
+            "runtime": runtime,
+            "linted": not no_lint,
+            "ok": ok,
+            "counts": {"errors": len(errors), "warnings": len(warnings)},
+            "issues": [
+                {
+                    "severity": i.severity,
+                    "code": i.code,
+                    "message": i.message,
+                    "node_id": i.node_id,
+                }
+                for i in issues
+            ],
+        }
+        import json  # noqa: PLC0415
+
+        stdout.print(json.dumps(payload, indent=2), soft_wrap=True, highlight=False)
+        if not ok:
+            raise typer.Exit(code=2)
+        return
+
+    if no_lint:
+        stdout.print(
+            f"[green]✓[/green] {graph.name} [dim]v{graph.version}[/dim] compiled "
+            f"({len(graph.nodes)} nodes) — [dim]determinism lint skipped (--no-lint)[/dim]"
+        )
+        return
+
+    if issues:
+        _render_temporal_lint_issues(issues)
+    else:
+        stdout.print(
+            f"[green]✓[/green] {graph.name} [dim]v{graph.version}[/dim]: "
+            f"no [bold]{runtime}[/bold] determinism issues "
+            f"([dim]{len(graph.nodes)} nodes[/dim])"
+        )
+
+    if not ok:
+        raise typer.Exit(code=2)
+
+
+def _render_temporal_lint_issues(issues: list[Any]) -> None:
+    """Print determinism findings — errors first, then warnings; each with
+    its stable code + node id so authors can pin on them in CI logs.
+
+    Mirrors the prompt linter's ``_render_lint_issues`` rendering (severity
+    colour + code), adapted to the Temporal ``LintIssue`` shape (which carries
+    a ``node_id`` rather than a free-text ``hint``).
+    """
+    ordered = sorted(
+        issues,
+        key=lambda i: (0 if i.severity == "error" else 1, i.code, i.node_id or ""),
+    )
+    for issue in ordered:
+        color = "red" if issue.severity == "error" else "yellow"
+        label = "✗" if issue.severity == "error" else "!"
+        loc = f" [dim](node: {issue.node_id})[/dim]" if issue.node_id else ""
+        stdout.print(
+            f"  [{color}]{label}[/{color}] [{color}]{issue.code}[/{color}]{loc}: {issue.message}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Async glue for the definition commands
 # ---------------------------------------------------------------------------
 
