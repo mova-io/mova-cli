@@ -24,10 +24,11 @@ failures / voice turns) so the dashboards light up, this module generates the
   are produced by a tiny deterministic hash-embedder (see
   :func:`_demo_embedding`) so the bundle is byte-for-byte reproducible and the
   seed stays offline / free — no provider key, no network.
-* **Tagged + purgeable.** Every record carries a ``tenant_id`` with the
-  :data:`~movate.core.demo.seeder.DEMO_TENANT_PREFIX` (``demo-``) prefix, so
-  ``mdk demo clear`` purges the agents, workflow, and graph alongside the
-  telemetry via the same ``tenant_id LIKE 'demo-%'`` predicate.
+* **Tagged + purgeable.** Every record carries the single scenario
+  ``tenant_id`` (:data:`DEMO_TENANT_ID`, the serve --dev tenant) and the
+  :data:`~movate.core.demo.seeder.DEMO_MARKER_KEY` sentinel in its metadata.
+  ``mdk demo clear`` purges the agents, workflow, and graph by that exact
+  tenant id, alongside the ``demo-%`` telemetry rows.
 * **Stdlib only.** No new deps.
 
 The embeddings are **illustrative** — a deterministic hash projection, not a
@@ -43,7 +44,7 @@ import hashlib
 import math
 from dataclasses import dataclass, field
 
-from movate.core.demo.seeder import DEMO_MARKER_KEY, DEMO_TENANT_PREFIX
+from movate.core.demo.seeder import DEMO_MARKER_KEY
 from movate.core.models import (
     AgentBundleRecord,
     Entity,
@@ -56,15 +57,41 @@ from movate.core.models import (
 #
 # The graph + sample agents are seeded under ONE canonical demo tenant +
 # agent so the graph viewer / playground have a single, predictable target
-# to point at. The tenant carries the demo prefix so `mdk demo clear` purges
-# everything; the agent name doubles as the graph viewer's "project" path
+# to point at. The agent name doubles as the graph viewer's "project" path
 # segment (GET /api/v1/projects/{agent}/graph).
+#
+# **Why the scenario tenant is the serve --dev tenant (not ``demo-acme``).**
+# ``mdk serve --dev`` mints + seeds its dev API key under tenant ``devtenant``
+# (``movate.cli.dev_key.DEV_TENANT_ID``). Every request the live browser graph
+# viewer makes is authenticated with that key, so the runtime scopes its reads
+# to ``devtenant``. If the scenario were seeded under ``demo-acme`` the viewer
+# would query the wrong tenant and render an EMPTY graph. Seeding the scenario
+# under the same ``devtenant`` is what makes the live viewer show the network.
+#
+# A ``demo-`` tenant is also *unusable as an API key prefix*: a minted key's
+# wire format is ``mvt_<env>_<tenant[:8]>_<id>_<secret>`` and the prefix segment
+# must match ``[a-zA-Z0-9]{8}`` (see ``movate.core.auth``). ``demo-acme``'s
+# first 8 chars are ``demo-acm`` — the dash breaks the regex, so a key minted
+# for it fails to parse → 401. ``devtenant`` is dash-free and ≥ 8 chars, so it
+# is a valid key prefix as well as the viewer's authenticated tenant.
+#
+# The telemetry seeder still writes its runs/evals/failures (and the analyzer
+# insights) under the ``demo-`` tenants — those feed the dashboards and are
+# never queried through an API key — and ``mdk demo clear`` purges BOTH the
+# ``demo-%`` telemetry rows and this scenario tenant's registry/graph rows.
 # ---------------------------------------------------------------------------
 
-DEMO_TENANT_ID = f"{DEMO_TENANT_PREFIX}acme"
+# NOTE: this value MUST equal ``movate.cli.dev_key.DEV_TENANT_ID``. We can't
+# import it here (that module lives in the ``cli`` layer and ``core`` must not
+# depend on ``cli`` — CLAUDE.md rule 6), so the constant is duplicated and a
+# test (``test_demo_scenario``) asserts the two stay in lockstep.
+DEMO_TENANT_ID = "devtenant"
 """The canonical demo tenant the scenario (agents + graph) is seeded under.
-Matches the first tenant slug the telemetry seeder uses (``demo-acme``) so the
-content and the telemetry share a tenant — a coherent single-tenant demo."""
+
+Aligned with ``mdk serve --dev``'s ``DEV_TENANT_ID`` so the live browser graph
+viewer — which authenticates as that tenant — queries the tenant the scenario
+was actually seeded under. Dash-free + ≥ 8 chars, so it is also a valid API
+key tenant-prefix (a ``demo-`` tenant is not). See the module note above."""
 
 DEMO_GRAPH_AGENT = "support-triage"
 """The agent whose knowledge graph is seeded. Also the first telemetry agent,
