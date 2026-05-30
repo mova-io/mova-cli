@@ -314,3 +314,51 @@ def test_no_cdn_references_in_viewer_assets() -> None:
         assert "unpkg.com" not in lowered
         assert "cdn.jsdelivr" not in lowered
         assert "cdnjs" not in lowered
+
+
+# --------------------------------------------------------------------------- #
+# analytics wiring (ADR 046) — the viewer surfaces centrality / communities /
+# shortest-path; assert the controls + the analytics fetch paths are present
+# and that the analytics endpoints fall under the proxy allowlist.
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+def test_viewer_has_analytics_controls() -> None:
+    html = (ASSETS_DIR / "index.html").read_text(encoding="utf-8")
+    # Toggles + measure select + the shortest-path + top-hubs controls.
+    for control_id in (
+        "centrality-toggle",
+        "centrality-measure",
+        "community-toggle",
+        "hubs-btn",
+        "path-from",
+        "path-to",
+        "path-btn",
+    ):
+        assert f'id="{control_id}"' in html, f"missing analytics control: {control_id}"
+
+
+@pytest.mark.unit
+def test_viewer_app_wires_analytics_endpoints() -> None:
+    app_js = (ASSETS_DIR / "app.js").read_text(encoding="utf-8")
+    # The viewer calls the three project-scoped analytics endpoints.
+    assert "/graph/analytics/" in app_js
+    for sub in ("centrality", "communities", "path"):
+        assert sub in app_js, f"app.js does not reference analytics/{sub}"
+
+
+@pytest.mark.unit
+def test_analytics_paths_are_proxied(served: tuple[str, dict[str, object]]) -> None:
+    """The analytics endpoints fall under the proxy allowlist (/api/v1/projects/).
+
+    The mocked older runtime 404s them → the proxy degrades to 501 (not a hard
+    'path not proxied' 404), proving the path IS forwarded with the bearer.
+    """
+    base, captured = served
+    captured.clear()
+    status, _body, _ctype = _get(
+        f"{base}/api/v1/projects/acme-kb/graph/analytics/centrality?measure=degree"
+    )
+    # Forwarded (allowlisted) — the older runtime 404s, translated to a 501.
+    assert status == HTTPStatus.NOT_IMPLEMENTED
+    assert captured["last_auth"] == f"Bearer {_BEARER}"
+    assert captured["last_path"] == "/api/v1/projects/acme-kb/graph/analytics/centrality"

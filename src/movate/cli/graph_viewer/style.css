@@ -133,6 +133,44 @@ html, body {
 #stats dt { color: var(--muted); }
 #stats dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
 
+/* ---- analytics (centrality / shortest-path / communities) ---- */
+.analytics { display: flex; flex-direction: column; gap: 8px; }
+.analytics-row { display: flex; gap: 6px; }
+.analytics-btn {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.analytics-btn:hover { border-color: var(--accent); }
+.analytics-btn:disabled { opacity: .5; cursor: default; }
+.analytics-btn.ghost { background: transparent; color: var(--muted); }
+.hubs-list { list-style: decimal inside; margin: 4px 0 0; padding: 0; }
+.hubs-list li {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 0; cursor: pointer; font-size: 13px;
+}
+.hubs-list li:hover { color: var(--accent); }
+.hubs-list .hub-score { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.hubs-list .empty { color: var(--muted); cursor: default; list-style: none; }
+.analytics-sep { height: 1px; background: var(--border); margin: 4px 0; }
+.path-controls { display: flex; flex-direction: column; gap: 6px; }
+.path-input {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.path-input:focus { border-color: var(--accent); outline: none; }
+.path-result { color: var(--muted); font-size: 12px; min-height: 14px; }
+.path-result.ok { color: var(--ok); }
+.path-result.miss { color: var(--warn, #d29922); }
+
 #graph-container { grid-area: graph; position: relative; background: var(--bg); }
 
 #detail-panel {
