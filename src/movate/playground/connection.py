@@ -113,7 +113,12 @@ class ConnectionMonitor:
     cache_ttl_s: float = 10.0
 
     _last_state: ConnectionState = field(default=ConnectionState.CONNECTED, init=False)
-    _last_check_at: float = field(default=0.0, init=False)
+    # ``-inf`` rather than 0.0 so the first check always probes, regardless of
+    # what value ``time.monotonic()`` happens to return on the host (on Linux
+    # it's time-since-boot, which on a fresh CI runner can be smaller than the
+    # default ``cache_ttl_s=10s`` — making 0.0 look like a still-fresh entry
+    # and short-circuiting the first probe).
+    _last_check_at: float = field(default=float("-inf"), init=False)
     _last_duration_s: float | None = field(default=None, init=False)
 
     @property

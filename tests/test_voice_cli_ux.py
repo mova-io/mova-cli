@@ -12,12 +12,14 @@ ADR 048 D5 / ADR 050 D4 / CLAUDE.md rule 5 (additive, flagged).
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from click.testing import Result
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
@@ -30,6 +32,25 @@ from movate.runtime.capabilities import (
     build_voice_capabilities,
 )
 from movate.testing import InMemoryStorage
+
+
+def _help_text(result: Result) -> str:
+    """Flatten a Rich-rendered ``--help`` output for CI-robust substring matching.
+
+    Two CI-specific gotchas:
+
+    1. **Narrow-terminal truncation/wrap**: in CI's non-TTY terminal Rich
+       renders the options panel too narrow, so flag names wrap or get
+       elided. Tests invoke the CLI with ``env={"COLUMNS": "200"}`` to
+       force a wide terminal.
+    2. **ANSI escapes inside option names**: CI runs with ``FORCE_COLOR=1``,
+       so Rich styles ``--`` and the flag name as separate spans — a raw
+       substring search misses them. Strip ANSI, then collapse whitespace
+       so wrapped/padded flag rows flatten to a single searchable string.
+    """
+    plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", result.output)
+    return " ".join(plain.split())
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -154,14 +175,23 @@ class TestVoiceCapabilitiesBlock:
             await s.init()
             return s
 
-        storage2 = asyncio.get_event_loop().run_until_complete(_make_storage())
-        with patch.dict(os.environ, {"MDK_VOICE_REALTIME": ""}, clear=False):
-            app2 = _build_app(storage2, agents_path=agents2, rate_limit_per_minute=60)
-            tenant_id = uuid4().hex
-            minted = mint_api_key(tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="rt-test")
-            asyncio.get_event_loop().run_until_complete(storage2.save_api_key(minted.record))
-            hdr = {"Authorization": f"Bearer {minted.full_key}"}
-            body = TestClient(app2).get("/api/v1/capabilities", headers=hdr).json()
+        # ``asyncio.get_event_loop()`` raises in Python 3.12+ (and on CI
+        # under pytest-asyncio strict mode) when no loop is currently
+        # running. Create a fresh loop explicitly and run the coroutines
+        # against it — pure synchronous helper invocation, no fixture
+        # needed.
+        loop = asyncio.new_event_loop()
+        try:
+            storage2 = loop.run_until_complete(_make_storage())
+            with patch.dict(os.environ, {"MDK_VOICE_REALTIME": ""}, clear=False):
+                app2 = _build_app(storage2, agents_path=agents2, rate_limit_per_minute=60)
+                tenant_id = uuid4().hex
+                minted = mint_api_key(tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="rt-test")
+                loop.run_until_complete(storage2.save_api_key(minted.record))
+                hdr = {"Authorization": f"Bearer {minted.full_key}"}
+                body = TestClient(app2).get("/api/v1/capabilities", headers=hdr).json()
+        finally:
+            loop.close()
         assert "realtime" not in body["voice"]["modes"]
 
 
@@ -342,30 +372,34 @@ class TestVoiceTryCLI:
         from movate.cli.main import app  # noqa: PLC0415
 
         runner = CliRunner()
-        result = runner.invoke(app, ["voice", "--help"])
+        result = runner.invoke(app, ["voice", "--help"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
-        assert "try" in result.output
-        assert "providers" in result.output
+        plain = _help_text(result)
+        assert "try" in plain
+        assert "providers" in plain
 
     def test_voice_try_help(self) -> None:
         from movate.cli.main import app  # noqa: PLC0415
 
         runner = CliRunner()
-        result = runner.invoke(app, ["voice", "try", "--help"])
+        result = runner.invoke(app, ["voice", "try", "--help"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
-        assert "--mode" in result.output
-        assert "--stt" in result.output
-        assert "--tts" in result.output
-        assert "--target" in result.output
-        assert "--api-key" in result.output
+        plain = _help_text(result)
+        assert "--mode" in plain
+        assert "--stt" in plain
+        assert "--tts" in plain
+        assert "--target" in plain
+        assert "--api-key" in plain
 
     def test_voice_providers_list_help(self) -> None:
         from movate.cli.main import app  # noqa: PLC0415
 
         runner = CliRunner()
-        result = runner.invoke(app, ["voice", "providers", "list", "--help"])
+        result = runner.invoke(
+            app, ["voice", "providers", "list", "--help"], env={"COLUMNS": "200"}
+        )
         assert result.exit_code == 0, result.output
-        assert "--target" in result.output
+        assert "--target" in _help_text(result)
 
     def test_voice_try_invalid_mode(self) -> None:
         """Unknown --mode exits with an error before touching the network."""
