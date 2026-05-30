@@ -35,6 +35,13 @@ Failure → :class:`SkillError` mapping:
 * JSON-RPC response can't be parsed → ``backend_error``
 * Tool returns content that isn't a JSON object → ``validation_failed``
 
+Tracing (ADR 024):
+
+When ``ctx.tracer`` is set the backend opens an ``mcp.call`` child span
+under ``ctx.parent_span`` and closes it on success/error. The span carries
+the ``entry`` command, ``tool`` name, and — on error — the bounded stderr
+ring-buffer so operators can see why a server misbehaved.
+
 Scope today (v0.6): stdio transport, single tool per skill (skill
 yaml declares ``tool:`` for the specific tool to call). HTTP/SSE
 transport and multi-tool batching land in a follow-up if real
@@ -46,7 +53,9 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
-from dataclasses import dataclass
+import time
+from collections import deque
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from movate.core.models import SkillImplementationKind
@@ -72,6 +81,12 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 # response.
 _INITIAL_ID = 1
 
+# Maximum lines retained in the per-session stderr ring buffer.
+# Enough to diagnose most server-startup failures without blowing up
+# memory on a long-running session. Kept intentionally small — the
+# goal is crash diagnostics, not a full log stream.
+_STDERR_RING_MAX = 50
+
 
 @dataclass
 class _Session:
@@ -81,6 +96,12 @@ class _Session:
     ``entry`` command. Reusing the subprocess across skill calls is
     the whole point of caching — subprocess spawn + MCP handshake
     typically takes 200-500ms; amortizing across N calls matters.
+
+    ``stderr_ring`` is a fixed-capacity ring buffer (deque with maxlen)
+    that a background reader task populates continuously. On error the
+    buffer is flushed into the span's ``mcp.stderr_log`` attribute;
+    on success it is silently discarded. Bounded at ``_STDERR_RING_MAX``
+    lines so a chatty server never causes unbounded memory growth.
     """
 
     process: asyncio.subprocess.Process
@@ -90,6 +111,10 @@ class _Session:
     # first call so a healthy skill doesn't pay the round-trip cost
     # if it never gets invoked.
     tools_known: set[str] | None = None
+    # Bounded ring buffer for continuous stderr capture.
+    stderr_ring: deque[str] = field(default_factory=lambda: deque(maxlen=_STDERR_RING_MAX))
+    # Background task that drains the server's stderr into ``stderr_ring``.
+    _stderr_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
 class MCPSkillBackend:
@@ -146,20 +171,58 @@ class MCPSkillBackend:
                 ),
             )
 
-        # Make the tools/call request. Schema validation happens one
-        # layer up in dispatch_skill, both directions; here we just
-        # produce a dict from whatever the server returned.
-        return await self._call_tool(
-            session,
-            tool=impl.tool,
-            arguments=input,
-            skill_name=skill.spec.name,
-        )
+        # ADR 024 — open an ``mcp.call`` child span under the executor's
+        # ``skill.<name>`` span (ctx.parent_span). No-op when tracer is None.
+        _span = None
+        _t0 = 0.0
+        if ctx.tracer is not None:
+            _t0 = time.monotonic()
+            _span = ctx.tracer.start_span(
+                "mcp.call",
+                {
+                    "skill": skill.spec.name,
+                    "entry": impl.entry,
+                    "tool": impl.tool,
+                },
+                parent=ctx.parent_span,
+            )
+
+        try:
+            # Make the tools/call request. Schema validation happens one
+            # layer up in dispatch_skill, both directions; here we just
+            # produce a dict from whatever the server returned.
+            result = await self._call_tool(
+                session,
+                tool=impl.tool,
+                arguments=input,
+                skill_name=skill.spec.name,
+            )
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="ok")
+            return result
+        except Exception:
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                # Flush the stderr ring buffer into the span on error so
+                # operators can see what the MCP server printed before dying.
+                stderr_log = "\n".join(session.stderr_ring)
+                if stderr_log:
+                    ctx.tracer.set_attribute(_span, "mcp.stderr_log", stderr_log)
+                ctx.tracer.end_span(_span, status="error")
+            raise
 
     async def aclose(self) -> None:
         """Terminate every cached subprocess. Safe to call multiple
         times; missing processes are silently skipped."""
         for entry, session in list(self._sessions.items()):
+            # Cancel the background stderr-drain task before terminating
+            # the process so we don't leave a dangling task behind.
+            if session._stderr_task is not None and not session._stderr_task.done():
+                session._stderr_task.cancel()
+                await asyncio.gather(session._stderr_task, return_exceptions=True)
             await _terminate_process(session.process)
             del self._sessions[entry]
 
@@ -219,6 +282,13 @@ class MCPSkillBackend:
             ) from exc
 
         session = _Session(process=process)
+
+        # Start draining stderr into the ring buffer in the background.
+        # This keeps stderr from blocking the subprocess and gives us
+        # structured context on error. The task is cancelled in aclose().
+        session._stderr_task = asyncio.create_task(
+            _drain_stderr(session), name=f"mcp-stderr-{id(session)}"
+        )
 
         # Step 1: handshake. Send initialize, expect a result.
         try:
@@ -414,6 +484,31 @@ class MCPSkillBackend:
 # ---------------------------------------------------------------------------
 
 
+async def _drain_stderr(session: _Session) -> None:
+    """Background coroutine: continuously drain the server's stderr into
+    ``session.stderr_ring``.
+
+    Runs as a task until the server process exits or the task is
+    cancelled (by ``aclose``). Each line is decoded and appended to the
+    ring buffer; the deque's ``maxlen`` keeps memory bounded regardless
+    of how chatty the server is.
+
+    Intentionally swallows all exceptions — this is a best-effort
+    diagnostic aid. A failure here (e.g. broken pipe) must never
+    propagate to the skill's result path.
+    """
+    if session.process.stderr is None:
+        return
+    try:
+        while True:
+            line = await session.process.stderr.readline()
+            if not line:
+                break
+            session.stderr_ring.append(line.decode("utf-8", errors="replace").rstrip())
+    except Exception:
+        pass
+
+
 async def _write_message(
     session: _Session,
     message: dict[str, Any],
@@ -509,17 +604,29 @@ async def _read_response(
 
 
 async def _read_stderr_tail(session: _Session) -> str:
-    """Best-effort read of whatever's pending on the server's stderr.
+    """Return a diagnostic tail of the server's stderr.
 
-    Bounded to a small read; we just want enough context to tell the
-    operator why their server died. Non-blocking — if there's nothing
-    there, returns empty string.
+    If a background drain task is running, yield to the event loop once
+    so it has a chance to populate the ring buffer before we check it.
+    Then return whatever's in the ring (no I/O needed — already decoded).
+
+    When no drain task is active (e.g. immediate spawn failure before
+    the task was created), falls back to a short blocking read of the
+    raw stderr stream instead.
+
+    Non-blocking in all paths: the fallback read uses a 0.1 s timeout.
     """
+    if session._stderr_task is not None and not session._stderr_task.done():
+        # Yield once so the drain task can read at least one iteration.
+        await asyncio.sleep(0)
+        return "\n".join(session.stderr_ring)
+
+    # No drain task (pre-task spawn failure) — try raw stream.
     if session.process.stderr is None:  # pragma: no cover
         return ""
     try:
-        # Read with a short timeout — we don't want to hang on a
-        # well-behaved server that simply has nothing on stderr.
+        # Fallback: short blocking read for cases where the drain task
+        # was never started (e.g. spawn raised before _Session was created).
         data = await asyncio.wait_for(session.process.stderr.read(2048), timeout=0.1)
     except TimeoutError:
         return ""

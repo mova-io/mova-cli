@@ -35,6 +35,7 @@ Failure → :class:`SkillError` mapping:
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 from movate.core.models import JobKind, SkillImplementationKind
@@ -108,79 +109,102 @@ class AgentSkillBackend:
                 ),
             )
 
+        # ADR 024 — open an ``agent.call`` child span under the executor's
+        # ``skill.<name>`` span (ctx.parent_span). No-op when tracer is None.
+        _span = None
+        _t0 = 0.0
+        if ctx.tracer is not None:
+            _t0 = time.monotonic()
+            _span = ctx.tracer.start_span(
+                "agent.call",
+                {"skill": skill.spec.name, "target_agent": target_agent},
+                parent=ctx.parent_span,
+            )
+
         try:
-            async with MovateClient(
-                base_url=base_url,
-                api_key=api_key,
-                timeout=float(timeout_s),
-            ) as client:
-                # Submit the job and wait for it to reach a terminal state.
-                accepted = await client.submit_job(
-                    kind=JobKind.AGENT,
-                    target=target_agent,
-                    input=input,
-                )
-                job = await asyncio.wait_for(
-                    client.wait_for_terminal(accepted.job_id),
+            try:
+                async with MovateClient(
+                    base_url=base_url,
+                    api_key=api_key,
                     timeout=float(timeout_s),
+                ) as client:
+                    # Submit the job and wait for it to reach a terminal state.
+                    accepted = await client.submit_job(
+                        kind=JobKind.AGENT,
+                        target=target_agent,
+                        input=input,
+                    )
+                    job = await asyncio.wait_for(
+                        client.wait_for_terminal(accepted.job_id),
+                        timeout=float(timeout_s),
+                    )
+            except TimeoutError as exc:
+                raise SkillError(
+                    type=SkillErrorType.TIMEOUT,
+                    message=(
+                        f"agent skill {skill.spec.name!r}: call to agent "
+                        f"{target_agent!r} timed out after {timeout_s}s"
+                    ),
+                ) from exc
+            except MovateClientError as exc:
+                raise SkillError(
+                    type=SkillErrorType.BACKEND_ERROR,
+                    message=(
+                        f"agent skill {skill.spec.name!r}: MovateClient error "
+                        f"calling agent {target_agent!r}: {exc}"
+                    ),
+                ) from exc
+
+            # Surface non-success terminal states as backend_error.
+            if job.status.value != "success":
+                err_msg = ""
+                if job.error is not None:
+                    err_msg = f": {job.error.message}"
+                raise SkillError(
+                    type=SkillErrorType.BACKEND_ERROR,
+                    message=(
+                        f"agent skill {skill.spec.name!r}: agent {target_agent!r} "
+                        f"returned status {job.status.value!r}{err_msg}"
+                    ),
                 )
-        except TimeoutError as exc:
-            raise SkillError(
-                type=SkillErrorType.TIMEOUT,
-                message=(
-                    f"agent skill {skill.spec.name!r}: call to agent "
-                    f"{target_agent!r} timed out after {timeout_s}s"
-                ),
-            ) from exc
-        except MovateClientError as exc:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"agent skill {skill.spec.name!r}: MovateClient error "
-                    f"calling agent {target_agent!r}: {exc}"
-                ),
-            ) from exc
 
-        # Surface non-success terminal states as backend_error.
-        if job.status.value != "success":
-            err_msg = ""
-            if job.error is not None:
-                err_msg = f": {job.error.message}"
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"agent skill {skill.spec.name!r}: agent {target_agent!r} "
-                    f"returned status {job.status.value!r}{err_msg}"
-                ),
-            )
+            # Retrieve the run output. job.result_run_id is set on success.
+            if not job.result_run_id:
+                raise SkillError(
+                    type=SkillErrorType.BACKEND_ERROR,
+                    message=(
+                        f"agent skill {skill.spec.name!r}: agent {target_agent!r} "
+                        "succeeded but returned no result_run_id"
+                    ),
+                )
 
-        # Retrieve the run output. job.result_run_id is set on success.
-        if not job.result_run_id:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"agent skill {skill.spec.name!r}: agent {target_agent!r} "
-                    "succeeded but returned no result_run_id"
-                ),
-            )
+            try:
+                async with MovateClient(
+                    base_url=base_url,
+                    api_key=api_key,
+                    timeout=float(timeout_s),
+                ) as client:
+                    run = await client.get_run(job.result_run_id)
+            except MovateClientError as exc:
+                raise SkillError(
+                    type=SkillErrorType.BACKEND_ERROR,
+                    message=(
+                        f"agent skill {skill.spec.name!r}: failed to fetch run "
+                        f"{job.result_run_id!r} from agent {target_agent!r}: {exc}"
+                    ),
+                ) from exc
 
-        try:
-            async with MovateClient(
-                base_url=base_url,
-                api_key=api_key,
-                timeout=float(timeout_s),
-            ) as client:
-                run = await client.get_run(job.result_run_id)
-        except MovateClientError as exc:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"agent skill {skill.spec.name!r}: failed to fetch run "
-                    f"{job.result_run_id!r} from agent {target_agent!r}: {exc}"
-                ),
-            ) from exc
-
-        return run.data
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="ok")
+            return run.data
+        except Exception:
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="error")
+            raise
 
 
 # Auto-register on import. The executor + skills_cmd import this module
