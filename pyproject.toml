@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.30.3"
+version = "2026.5.30.4"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -307,6 +307,18 @@ airflow = [
     # unrelated stub). The import package, however, is `airflow`.
     "apache-airflow>=2.7,<3",
 ]
+temporal = [
+    # ADR 054 — Temporal as a first-class OPTIONAL execution backend behind
+    # the runner Protocol. Phase 1 ships the workflow compiler skeleton +
+    # activity wrappers; this extra installs the only Python SDK for Temporal
+    # (no JSON-over-gRPC hand-rolling — see ADR 054 D7). MIT-licensed; passes
+    # the license gate; ~50 MB installed. Imported LAZILY inside
+    # movate.core.workflow.compilers.temporal (and the Track C activity
+    # wrappers / Track D worker entry), so the base install + every existing
+    # command + the native runner + the LangGraph backend are unaffected.
+    # OPT-IN only — NOT in the license gate's SHIPPED_EXTRAS.
+    "temporalio>=1.7,<2",
+]
 playground = [
     # Chainlit gives us a Python-native chat/form UI for testing
     # deployed agents from a browser. Operators run
@@ -515,6 +527,11 @@ module = [
     # keeps mypy on `src` clean whether or not the extras are installed.
     "prefect.*",
     "airflow.*",
+    # Temporal Python SDK — optional [temporal] extra (ADR 054). No type
+    # stubs shipped; imported LAZILY inside movate.core.workflow.compilers
+    # .temporal (Phase 1 compiler) and the Track C activity wrappers, so
+    # mypy on `src` stays clean whether or not the extra is installed.
+    "temporalio.*",
     # Azure Speech SDK — optional [voice] extra (T1 enterprise voice pair,
     # ADR 048/049). No type stubs shipped; imported LAZILY inside
     # movate.voice.azure_speech, so mypy on `src` stays clean whether or not
