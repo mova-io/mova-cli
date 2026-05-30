@@ -36,6 +36,16 @@
         <label class="toggle" title="Scale node size by its degree (number of connections)">
           <input type="checkbox" id="size-by-degree" checked /> size by degree
         </label>
+        <label class="toggle" title="Size + color nodes by centrality computed server-side (analytics)">
+          <input type="checkbox" id="centrality-toggle" /> centrality
+          <select id="centrality-measure" title="Which centrality measure to compute">
+            <option value="degree">degree</option>
+            <option value="betweenness">betweenness</option>
+          </select>
+        </label>
+        <label class="toggle" title="Tint nodes by detected community (connected components)">
+          <input type="checkbox" id="community-toggle" /> communities
+        </label>
         <label class="toggle live" title="Stream node/edge additions as documents are ingested">
           <input type="checkbox" id="live-toggle" /> <span class="live-dot"></span> live growth
         </label>
@@ -50,7 +60,28 @@
       <dl id="stats">
         <dt>nodes</dt><dd id="stat-nodes">0</dd>
         <dt>edges</dt><dd id="stat-edges">0</dd>
+        <dt>communities</dt><dd id="stat-communities">—</dd>
       </dl>
+
+      <div class="legend-spacer"></div>
+      <h3>Analytics</h3>
+      <div id="analytics" class="analytics">
+        <div class="analytics-row">
+          <button id="hubs-btn" class="analytics-btn" title="Rank nodes by the selected centrality measure">Top hubs</button>
+        </div>
+        <ol id="hubs-list" class="hubs-list"></ol>
+
+        <div class="analytics-sep"></div>
+        <div class="path-controls" title="Highlight the shortest path between two nodes">
+          <input id="path-from" class="path-input" type="text" placeholder="from node…" autocomplete="off" spellcheck="false" />
+          <input id="path-to" class="path-input" type="text" placeholder="to node…" autocomplete="off" spellcheck="false" />
+          <div class="analytics-row">
+            <button id="path-btn" class="analytics-btn">Shortest path</button>
+            <button id="path-clear" class="analytics-btn ghost" title="Clear the highlighted path">clear</button>
+          </div>
+          <div id="path-result" class="path-result"></div>
+        </div>
+      </div>
     </aside>
 
     <main id="graph-container"></main>

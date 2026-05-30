@@ -65,7 +65,9 @@ from movate.core.auth import (
 from movate.core.cache import build_cache
 from movate.core.canary import aggregate_side, choose_version
 from movate.core.events import EventKind, EventListView, EventView
+from movate.core.graph import analytics as graph_analytics
 from movate.core.graph import query as graph_query
+from movate.core.graph.analytics import CentralityMeasure
 from movate.core.graph.models import GraphologyDoc, NodeDetail, NodeSearchHit
 from movate.core.graph.query import GraphMode
 from movate.core.loader import AgentBundle
@@ -266,6 +268,8 @@ from movate.runtime.schemas import (
     CatalogSubmitRequest,
     CatalogSyncRequest,
     CatalogSyncResponse,
+    CentralityScoreView,
+    CommunityView,
     DescribeAgentRequest,
     DescribeAgentResponse,
     DescribeAgentTokenUsageView,
@@ -289,10 +293,13 @@ from movate.runtime.schemas import (
     FeedbackSubmission,
     FeedbackView,
     GeneratedEvalCaseView,
+    GraphCentralityView,
+    GraphCommunitiesView,
     GraphologyView,
     GraphQueryRequest,
     GraphSearchResult,
     GraphSearchView,
+    GraphShortestPathView,
     GroundedAnswerView,
     HarvestedCaseView,
     HarvestView,
@@ -1225,6 +1232,50 @@ async def _search_graph_nodes(
         )
         merged.extend(hits)
     return merged[:cap]
+
+
+# ----------------------------------------------------------------------
+# Graph analytics helpers (ADR 046). Analytics runs over the SAME windowed,
+# tenant + project-scoped, node/edge-capped graphology doc the query
+# endpoints serve — so it inherits the no-leak scoping and the
+# never-melt-the-tab cap for free, and never touches storage directly
+# (CLAUDE.md rule 6: the analytics layer is pure over the doc the query
+# layer builds). ``project_id`` (path) is the agent; ``project`` (query) is
+# the ADR 046 D1 project-scope filter.
+# ----------------------------------------------------------------------
+
+
+def _centrality_measure(raw: str | None) -> CentralityMeasure:
+    """Parse a ``measure`` query param into a :class:`CentralityMeasure`.
+
+    Unknown / missing → ``degree`` (the cheap default), so a typo degrades to
+    the fast measure rather than erroring."""
+    if raw == CentralityMeasure.BETWEENNESS.value:
+        return CentralityMeasure.BETWEENNESS
+    return CentralityMeasure.DEGREE
+
+
+async def _analytics_graph(
+    store: StorageProvider,
+    *,
+    agent: str,
+    tenant_id: str,
+    limit: int | None,
+    project_id: str | None,
+) -> GraphologyDoc:
+    """Load the windowed graph analytics computes over.
+
+    Reuses ``windowed_subgraph`` (unrooted, whole-graph-within-cap) so the
+    same tenant + project scoping + node/edge budget the GET endpoints enforce
+    applies to analytics. Knowledge mode only (the only persisted graph)."""
+    return await graph_query.windowed_subgraph(
+        store,
+        agent=agent,
+        tenant_id=tenant_id,
+        mode=GraphMode.KNOWLEDGE,
+        limit=limit,
+        project_id=project_id,
+    )
 
 
 # Graph-growth live-tail kinds — the typed projection of the ADR 035
@@ -2452,7 +2503,7 @@ def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
         prompt_hash=bundle.prompt_hash,
         input_schema=bundle.input_schema,
         output_schema=bundle.output_schema,
-        skills=list(spec.skills),
+        skills=[str(s) for s in spec.skills],
         contexts=list(spec.contexts),
         dataset=dataset_info,
         timeout_call_ms=spec.timeouts.call_ms,
@@ -4858,7 +4909,9 @@ def build_app(
                 # half-built projects.
                 if "skill.yaml" not in skill_files:
                     continue
-                persist_skill_bundle(skill_files, skills_path=skills_path)
+                # Bundled agent deploy — skill upload is intentional;
+                # use 'replace' so agents can re-deploy cleanly.
+                persist_skill_bundle(skill_files, skills_path=skills_path, on_conflict="replace")
                 _ = skill_name  # used implicitly via persist_skill_bundle
 
         result = persist_bundle(agent_files, agents_path=agents_path)
@@ -5079,7 +5132,9 @@ def build_app(
                 for skill_name, skill_files in skills_per_name.items():
                     if "skill.yaml" not in skill_files:
                         continue
-                    persist_skill_bundle(skill_files, skills_path=skills_path)
+                    persist_skill_bundle(
+                        skill_files, skills_path=skills_path, on_conflict="replace"
+                    )
                     _ = skill_name
             result = persist_bundle(agent_files, agents_path=agents_path)
             request.app.state.agents = scan_agents(agents_path)
@@ -5365,9 +5420,10 @@ def build_app(
         impl: UploadFile | None = File(default=None),
         corpus: UploadFile | None = File(default=None),
         readme: UploadFile | None = File(default=None),
+        force: bool = False,
         ctx: AuthContext = Depends(auth_dep),
     ) -> SkillCreatedView:
-        """Create or replace a skill bundle under ``<skills_path>/<name>/``.
+        """Create a skill bundle under ``<skills_path>/<name>/``.
 
         Fixes the long-standing gap where agents declaring
         ``skills: [<name>]`` 422'd on upload with "skills resolution
@@ -5384,15 +5440,19 @@ def build_app(
         * ``corpus`` (optional) — JSON corpus shipped alongside.
         * ``readme`` (optional) — human-facing notes.
 
-        PUT semantics: re-uploading the same skill name overwrites
-        atomically. Skills are referenced by name from agents, so an
-        operator who tweaked their skill and re-deploys expects the
-        runtime to follow — different conflict policy from agents
-        (which 409 on conflict because agent identity is sticky).
+        Query parameters:
+
+        * ``force=true`` — overwrite an existing skill with the same name.
+          Without this flag a 409 is returned when the skill already exists,
+          preventing silent breakage on accidental re-deploy.
+
+        CLI FLAG: ``mdk deploy --force`` / ``mdk skills upload --force``
+        passes ``?force=true`` to this endpoint for intentional overwrites.
 
         Errors:
 
         * **401** — missing / bad bearer token
+        * **409** — skill already exists (pass ``?force=true`` to overwrite)
         * **422** — bundle failed validation (parse / schema / shape)
         * **503** — runtime was built without a ``skills_path``
         """
@@ -5411,7 +5471,8 @@ def build_app(
         if readme is not None:
             files["README.md"] = await readme.read()
 
-        result = persist_skill_bundle(files, skills_path=skills_path)
+        on_conflict = "replace" if force else "reject"
+        result = persist_skill_bundle(files, skills_path=skills_path, on_conflict=on_conflict)
 
         _ = ctx.tenant_id  # future per-tenant audit log entry
 
@@ -5688,7 +5749,7 @@ def build_app(
             for skill_name, skill_files in skills_per_name.items():
                 if "skill.yaml" not in skill_files:
                     continue
-                persist_skill_bundle(skill_files, skills_path=skills_path)
+                persist_skill_bundle(skill_files, skills_path=skills_path, on_conflict="replace")
                 _ = skill_name
 
         result = persist_bundle(agent_files, agents_path=agents_path, on_conflict="replace")
@@ -6979,6 +7040,151 @@ def build_app(
             project_id=body.project_id,
         )
         return GraphologyView.model_validate(doc.model_dump())
+
+    # ------------------------------------------------------------------
+    # Graph analytics (ADR 046) — read-only centrality / shortest-path /
+    # community detection. All three run over the SAME windowed + tenant +
+    # project-scoped + node/edge-capped graphology doc the query endpoints
+    # serve (via ``_analytics_graph`` → ``windowed_subgraph``), so they
+    # inherit the no-leak scoping and the never-melt-the-tab cap. Pure
+    # ``movate.core.graph.analytics`` (no new dependency, no storage access).
+    # ``{project_id}`` is the agent; ``?project=`` is the D1 project filter.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/projects/{project_id}/graph/analytics/centrality",
+        response_model=GraphCentralityView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_centrality(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        measure: str = "degree",
+        top_n: int | None = None,
+        limit: int | None = None,
+        project: str | None = None,
+    ) -> GraphCentralityView:
+        """Top-N most central nodes — degree or betweenness centrality.
+
+        Ranks the windowed graph's nodes by importance:
+
+        * ``measure=degree`` (default) — normalized degree (how many other
+          nodes a node connects to). Cheap, O(V+E).
+        * ``measure=betweenness`` — normalized betweenness (how many shortest
+          paths route through a node — the "broker/bottleneck" measure).
+          Brandes, O(V·E); bounded by the node/edge cap.
+
+        Scores are normalized to ``[0, 1]`` so the two measures are comparable
+        and the viewer can map a score onto a size/color ramp. ``top_n`` caps
+        the returned list (default: all). ``limit`` bounds the graph window the
+        analytics runs over (default 500, max 5000 nodes/edges). ``?project=``
+        (ADR 046 D1) scopes to one project's subgraph. Tenant-scoped — a
+        cross-tenant ``project_id`` yields an empty result (no leak). Read
+        scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        doc = await _analytics_graph(
+            store,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            limit=limit,
+            project_id=project,
+        )
+        chosen = _centrality_measure(measure)
+        scores = graph_analytics.centrality(doc, measure=chosen, top_n=top_n)
+        return GraphCentralityView(
+            measure=chosen.value,
+            scores=[
+                CentralityScoreView(key=s.key, label=s.label, type=s.type, score=s.score)
+                for s in scores
+            ],
+            count=len(scores),
+        )
+
+    @v1.get(
+        "/projects/{project_id}/graph/analytics/path",
+        response_model=GraphShortestPathView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_shortest_path(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        from_: str = Query(..., alias="from"),
+        to: str = Query(...),
+        limit: int | None = None,
+        project: str | None = None,
+    ) -> GraphShortestPathView:
+        """Shortest path between two entity ids (BFS, undirected).
+
+        ``from`` / ``to`` are node ids (the ``from`` query param maps to a
+        ``from_`` handler arg — ``from`` is a Python keyword). Returns the
+        inclusive ordered id sequence ``[from, ..., to]`` the viewer
+        highlights, or ``found=false`` with an empty list when the two
+        endpoints are in different components or an id is unknown / out of
+        scope (no error — same no-leak convention as the query layer).
+
+        ``limit`` bounds the graph window the search runs over (default 500,
+        max 5000). ``?project=`` (ADR 046 D1) scopes to one project's
+        subgraph; an endpoint outside that scope simply isn't in the window, so
+        the path is "not found". Tenant-scoped. Read scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        doc = await _analytics_graph(
+            store,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            limit=limit,
+            project_id=project,
+        )
+        path = graph_analytics.shortest_path(doc, source=from_, target=to)
+        return GraphShortestPathView(found=path.found, nodes=path.nodes, hops=path.hops)
+
+    @v1.get(
+        "/projects/{project_id}/graph/analytics/communities",
+        response_model=GraphCommunitiesView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_communities(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int | None = None,
+        project: str | None = None,
+    ) -> GraphCommunitiesView:
+        """Community (cluster) assignment over the windowed graph.
+
+        Detects communities as connected components of the undirected graph —
+        each maximal set of mutually reachable nodes is one community. Fully
+        deterministic (a pure function of the edge set), so the viewer's
+        per-community colors stay stable across reloads. Communities are
+        returned largest-first, each with a small stable ``community_id`` and
+        its sorted ``members``.
+
+        ``limit`` bounds the graph window (default 500, max 5000). ``?project=``
+        (ADR 046 D1) scopes to one project's subgraph. Tenant-scoped — a
+        cross-tenant ``project_id`` yields an empty result. Read scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        doc = await _analytics_graph(
+            store,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            limit=limit,
+            project_id=project,
+        )
+        comms = graph_analytics.communities(doc)
+        return GraphCommunitiesView(
+            communities=[
+                CommunityView(community_id=c.community_id, size=c.size, members=c.members)
+                for c in comms
+            ],
+            count=len(comms),
+        )
 
     @v1.get(
         "/projects/{project_id}/graph/stream",

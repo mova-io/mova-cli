@@ -384,7 +384,9 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
 
         try:
             registry = load_skill_registry(project_root)
-            skills_resolved = list(resolve_agent_skills(spec.skills, registry))
+            skills_resolved = list(
+                resolve_agent_skills(spec.skills, registry, agent_name=spec.name)
+            )
         except SkillLoadError as exc:
             raise AgentLoadError(f"skills resolution failed: {exc}") from exc
 

@@ -1662,7 +1662,7 @@ def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
     # Check 4: skills resolve — name-by-name so a failure points at
     # WHICH skill is missing, not just "count mismatch".
     if bundle.spec.skills:
-        declared_skills = list(bundle.spec.skills)
+        declared_skills = [str(s) for s in bundle.spec.skills]
         # Each entry in `bundle.skills` is a SkillBundle whose .spec
         # has .name; cross-reference with what the agent.yaml declared.
         resolved_names = [getattr(s.spec, "name", "?") for s in bundle.skills]

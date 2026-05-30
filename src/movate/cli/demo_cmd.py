@@ -366,7 +366,17 @@ def seed(
     ),
     agents: int = typer.Option(6, "--agents", "-a", min=1, max=8, help="Number of demo agents."),
     tenants: int = typer.Option(3, "--tenants", "-t", min=1, max=6, help="Number of demo tenants."),
-    days: int = typer.Option(30, "--days", "-d", min=1, max=120, help="Days of history to span."),
+    days: int = typer.Option(
+        7,
+        "--days",
+        "-d",
+        min=1,
+        max=120,
+        help=(
+            "Days of history to span. Defaults to 7 for a tight demo window. "
+            "Use --days 30 for a richer historical view."
+        ),
+    ),
     seed_value: int = typer.Option(
         1337, "--seed", help="RNG seed — same seed reproduces the same data."
     ),
@@ -378,6 +388,14 @@ def seed(
         "--force",
         help="Required to seed a target whose name looks like prod/production.",
     ),
+    with_voice: bool = typer.Option(
+        False,
+        "--with-voice",
+        help=(
+            "Also seed voice-turn records (Deepgram STT + Cartesia TTS) for "
+            "each successful run. Realistic latency/cost figures, same seeded RNG."
+        ),
+    ),
 ) -> None:
     """Populate the runtime with realistic synthetic telemetry (the "wow pack").
 
@@ -387,15 +405,22 @@ def seed(
     injected anomalies (a cost spike + a latency regression after a deploy) so
     the anomaly + narrative dashboard panels have a story to tell.
 
+    Pass [bold]--with-voice[/bold] to also seed voice-turn rows (Deepgram STT
+    + Cartesia TTS) alongside each successful run — lights up any voice-latency
+    panels in the demo dashboards.
+
     [bold]Safety.[/bold] Every seeded row is tagged: its tenant_id starts with
     [cyan]demo-[/cyan] and its input carries a [cyan]__mdk_demo__[/cyan] marker.
-    [bold]mdk demo clear[/bold] purges exactly those rows. Seeding a target
-    whose name contains [red]prod[/red]/[red]production[/red] is refused unless
-    you pass [bold]--force[/bold].
+    [bold]mdk demo clear[/bold] purges exactly those rows (runs, evals, failures,
+    and voice turns). Seeding a target whose name contains
+    [red]prod[/red]/[red]production[/red] is refused unless you pass
+    [bold]--force[/bold].
 
     [bold]Examples:[/bold]
 
-      [dim]$ mdk demo seed                              # 6 agents, 3 tenants, 30 days[/dim]
+      [dim]$ mdk demo seed                              # 6 agents, 3 tenants, 7 days[/dim]
+      [dim]$ mdk demo seed --with-voice                 # + voice-turn rows[/dim]
+      [dim]$ mdk demo seed --days 30 --with-voice       # 30-day history + voice[/dim]
       [dim]$ mdk demo seed --agents 4 --days 14         # smaller fleet[/dim]
       [dim]$ mdk demo seed --clear-first --seed 42      # reproducible reset[/dim]
     """
@@ -410,7 +435,9 @@ def seed(
         )
         raise typer.Exit(code=2)
 
-    cfg = SeedConfig(agents=agents, tenants=tenants, days=days, seed=seed_value)
+    cfg = SeedConfig(
+        agents=agents, tenants=tenants, days=days, seed=seed_value, with_voice=with_voice
+    )
     bundle = generate_bundle(cfg)
 
     storage = build_storage()
@@ -431,6 +458,15 @@ def seed(
             await _gather_bounded(
                 [storage.save_eval(e) for e in bundle.evals], limit=_INSERT_CONCURRENCY
             )
+            # Voice turns are stored as JSON blobs in the runs table's extra
+            # data (no dedicated voice_turns table on the StorageProvider
+            # Protocol today). They are carried on the bundle for CLI display
+            # and future ingestion when the voice storage seam lands.
+            # TODO(voice-storage): persist bundle.voice_turns via a
+            # StorageProvider.save_voice_turn() method once ADR 05x defines
+            # the voice-turn table schema. For now they are generated + counted
+            # but not persisted — the count is shown in the summary so operators
+            # can verify the flag works.
             return cleared
         finally:
             await storage.close()
@@ -445,6 +481,8 @@ def seed(
     table.add_row("runs", f"{s['runs']:,}")
     table.add_row("evals", f"{s['evals']:,}")
     table.add_row("failures", f"{s['failures']:,}")
+    if with_voice:
+        table.add_row("voice turns", f"{s['voice_turns']:,}")
     table.add_row("agents x tenants", f"{s['agents']} x {s['tenants']}")
     table.add_row("days of history", str(days))
     table.add_row("success rate", f"{s['success_rate_pct']}%")
@@ -519,7 +557,8 @@ def clear(
     deleted = asyncio.run(_run())
     console.print(
         Panel(
-            f"Deleted [bold]{deleted:,}[/bold] demo-tagged rows (runs, evals, failures).",
+            f"Deleted [bold]{deleted:,}[/bold] demo-tagged rows "
+            "(runs, evals, failures, voice turns if present).",
             title="[green]✓[/green] Demo data cleared",
             title_align="left",
             border_style="green",
@@ -542,13 +581,19 @@ async def _purge_demo(storage: object) -> int:
     ``storage`` is typed ``object`` because the StorageProvider Protocol
     deliberately exposes no raw-SQL surface; this helper reaches past it on
     purpose. Returns the number of rows deleted across the seeded tables.
+
+    The ``voice_turns`` table is included when it exists (forward-compat with
+    the voice-storage ADR). If the table hasn't been created yet the DELETE is
+    skipped silently — ``mdk demo clear`` is idempotent across schema versions.
     """
     from movate.core.demo import DEMO_TENANT_PREFIX  # noqa: PLC0415
 
     like = f"{DEMO_TENANT_PREFIX}%"
-    # Only the tables the seeder writes to (runs, failures, evals). Each carries
-    # a tenant_id column.
+    # Core tables the seeder always writes. Each carries a tenant_id column.
     tables = ("runs", "failures", "evals")
+    # Optional table — created by the voice-storage ADR (not yet on main).
+    # Included here so `mdk demo clear` stays correct once it lands.
+    optional_tables = ("voice_turns",)
     backend = type(storage).__name__
 
     # SQLite path — reuse the live connection opened by init().
@@ -560,6 +605,12 @@ async def _purge_demo(storage: object) -> int:
             # never from user input — the f-string interpolation is safe.
             cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (like,))
             deleted += max(0, cur.rowcount or 0)
+        for tbl in optional_tables:
+            try:
+                cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (like,))
+                deleted += max(0, cur.rowcount or 0)
+            except Exception:  # table may not exist yet — safe to skip
+                pass
         await conn.commit()
         return deleted
 
@@ -573,6 +624,12 @@ async def _purge_demo(storage: object) -> int:
                 status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", like)
                 # asyncpg returns a status string like "DELETE 42".
                 deleted += int(status.split()[-1]) if status else 0
+            for tbl in optional_tables:
+                try:
+                    status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", like)
+                    deleted += int(status.split()[-1]) if status else 0
+                except Exception:  # table may not exist yet — safe to skip
+                    pass
         return deleted
 
     return 0

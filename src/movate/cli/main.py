@@ -240,6 +240,7 @@ from movate.cli.teams_bot import teams_bot_app  # noqa: E402
 from movate.cli.templates_cmd import app as templates_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
+from movate.cli.voice_cmd import voice_app  # noqa: E402
 from movate.cli.webhooks_cmd import webhooks_app  # noqa: E402
 from movate.cli.workflow_cmd import workflow_app  # noqa: E402
 from movate.tracing import install_log_correlation  # noqa: E402
@@ -642,6 +643,11 @@ export_app.command("state")(export_state_cmd)
 app.add_typer(export_app, name="export", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(teams_bot_app, name="teams-bot", rich_help_panel=PANEL_DEPLOY)
 app.add_typer(playground_app, name="playground", rich_help_panel=PANEL_DEPLOY)
+# ``voice`` is the terminal voice conversation + provider tooling (ADR 048/050).
+# Lives in the DEPLOY panel alongside ``playground`` since both are interactive
+# agent-invocation surfaces. Requires mdk[voice] — gates clearly if absent.
+# CLAUDE.md rule 5 — flagged: new ``voice`` CLI group, additive + opt-in.
+app.add_typer(voice_app, name="voice", rich_help_panel=PANEL_DEPLOY)
 
 # ----- Manage ---------------------------------------------------------------
 

@@ -36,8 +36,37 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Preflight — decide whether staging is wired before we spend a runner on
+  # it. GitHub doesn't allow `secrets.*` in a job-level `if:`, so we read the
+  # secret here and re-publish only its *presence* as a plain boolean output
+  # that the downstream jobs CAN gate on. When MOVATE_STAGING_URL is unset
+  # (staging not yet provisioned), the smoke job is SKIPPED — and a skipped
+  # job is green, not red — so `main` stops perpetually red-barring on a
+  # deploy target that doesn't exist yet. The moment the secret is configured
+  # the output flips to `true` and the smoke runs exactly as it does today.
+  preflight:
+    name: preflight (is staging configured?)
+    runs-on: ubuntu-latest
+    outputs:
+      has_staging: ${{ steps.check.outputs.has_staging }}
+    steps:
+      - name: Detect MOVATE_STAGING_URL
+        id: check
+        # Pass the secret in via env rather than interpolating it into the
+        # run script — same idiom as daily-changelog.yml — so actionlint
+        # doesn't flag a secret-in-`run` expression-injection warning. Only a
+        # boolean is ever emitted to the output; the secret value never is.
+        env:
+          STAGING_URL: ${{ secrets.MOVATE_STAGING_URL }}
+        run: |
+          echo "has_staging=$([ -n "${STAGING_URL}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   smoke:
     name: smoke against staging
+    needs: preflight
+    # Only burn a runner when staging is actually wired. Unset secret →
+    # this job SKIPS (green) → main stays green; secret set → runs unchanged.
+    if: needs.preflight.outputs.has_staging == 'true'
     runs-on: ubuntu-latest
     # 10-minute budget — anything longer means staging itself is the
     # problem; surfacing as a workflow timeout is the cleanest signal.
@@ -119,13 +148,27 @@ jobs:
   # as a single status check rather than each step individually.
   e2e-smoke:
     name: e2e-smoke
-    needs: smoke
+    needs: [preflight, smoke]
     runs-on: ubuntu-latest
+    # Run even when `smoke` skipped/failed so we can convert its result into
+    # a single status. We DON'T gate this on has_staging: when staging is
+    # unconfigured we still want this job to RUN and report green (a clean
+    # "nothing to smoke") rather than itself skip — that keeps the required
+    # "e2e-smoke" check present and passing on every main merge.
     if: always()
     steps:
       - name: Aggregate result
+        env:
+          HAS_STAGING: ${{ needs.preflight.outputs.has_staging }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
         run: |
-          if [ "${{ needs.smoke.result }}" != "success" ]; then
+          # Staging not wired → smoke was skipped on purpose. That's GREEN.
+          if [ "${HAS_STAGING}" != "true" ]; then
+            echo "::notice::MOVATE_STAGING_URL unset — staging smoke skipped (nothing to test)"
+            exit 0
+          fi
+          # Staging IS wired → the smoke must have actually succeeded.
+          if [ "${SMOKE_RESULT}" != "success" ]; then
             echo "::error::staging smoke failed — see the 'smoke' job above"
             exit 1
           fi

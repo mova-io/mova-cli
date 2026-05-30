@@ -1,6 +1,6 @@
 """``mdk skills`` — operator commands for the skill registry.
 
-Three subcommands:
+Six subcommands:
 
 * ``mdk skills list`` — print every skill in the project's ``skills/``
   folder. Defaults to the current directory; pass ``--project``
@@ -14,17 +14,26 @@ Three subcommands:
 * ``mdk skills run <name> '<json-input>'`` — invoke a skill directly
   without an agent. Critical for iterating on ``impl.py`` without
   paying the LLM cost of a full tool-use loop.
+* ``mdk skills search [--tag TAG] [--query TEXT] [--kind KIND]`` —
+  filter the project's skill registry by tag, freetext, and/or kind.
+* ``mdk skills info <name>`` — full detail for a skill: schema,
+  capabilities, cost, usage example.
+* ``mdk skills validate [<agent>]`` — validate declared skills are
+  compatible with the agent(s) that use them.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 
 from movate.core.skill_backend import (
@@ -323,3 +332,459 @@ def run(
     # banner stays on stderr so a redirect just captures the payload.
     err_console.print(f"[green]✓ {name}[/green]")
     print(json.dumps(output, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# `mdk skills search [--tag TAG] [--query TEXT] [--kind KIND]`
+# ---------------------------------------------------------------------------
+
+
+@skills_app.command("search")
+def search(
+    tag: str | None = typer.Option(
+        None,
+        "--tag",
+        "-t",
+        help="Filter by tag (exact match, case-insensitive).",
+    ),
+    query: str | None = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Freetext match against skill name and description (case-insensitive).",
+    ),
+    kind: str | None = typer.Option(
+        None,
+        "--kind",
+        "-k",
+        help="Filter by backend kind: python | http | mcp | agent.",
+    ),
+    project: Path = typer.Option(
+        Path("."),
+        "--project",
+        "-p",
+        help="Project root containing ``skills/<name>/``. Defaults to cwd.",
+    ),
+) -> None:
+    """Search the project's skill registry by tag, freetext, and/or kind.
+
+    Outputs a Rich table: name | kind | version | tags | description.
+
+    [bold]Examples:[/bold]
+
+      [dim]# All skills tagged 'crm'[/dim]
+      $ mdk skills search --tag crm
+
+      [dim]# Skills whose name or description contains 'lookup'[/dim]
+      $ mdk skills search --query lookup
+
+      [dim]# HTTP-backed skills only[/dim]
+      $ mdk skills search --kind http
+
+      [dim]# Combine filters[/dim]
+      $ mdk skills search --tag crm --kind http
+    """
+    _register_skill_backends()
+    try:
+        registry = load_skill_registry(project)
+    except SkillLoadError as exc:
+        err_console.print(f"[red]✗ skill registry load failed:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    if not registry:
+        console.print(f"[dim]no skills registered under {project.resolve()}/skills/[/dim]")
+        console.print("[dim]hint: `mdk skills scaffold <name>` to drop a starter skill.[/dim]")
+        return
+
+    # Normalise filter values.
+    tag_lc = tag.lower() if tag else None
+    query_lc = query.lower() if query else None
+    kind_lc = kind.lower() if kind else None
+
+    matches = []
+    for name_key in sorted(registry):
+        bundle = registry[name_key]
+        spec = bundle.spec
+
+        # Tag filter — any of the skill's tags must match.
+        if tag_lc is not None and not any(t.lower() == tag_lc for t in spec.tags):
+            continue
+
+        # Kind filter.
+        if kind_lc is not None and spec.implementation.kind.value != kind_lc:
+            continue
+
+        # Freetext — match against name OR description.
+        if query_lc is not None:
+            haystack = f"{spec.name} {spec.description}".lower()
+            if query_lc not in haystack:
+                continue
+
+        matches.append(bundle)
+
+    if not matches:
+        msg = "no skills matched"
+        parts = []
+        if tag:
+            parts.append(f"tag={tag!r}")
+        if query:
+            parts.append(f"query={query!r}")
+        if kind:
+            parts.append(f"kind={kind!r}")
+        if parts:
+            msg += " (" + ", ".join(parts) + ")"
+        console.print(f"[dim]{msg}[/dim]")
+        return
+
+    table = Table(
+        title=f"skills — {project.resolve()}/skills/",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("name")
+    table.add_column("kind", style="dim")
+    table.add_column("version", style="dim")
+    table.add_column("tags", style="dim")
+    table.add_column("description", overflow="fold")
+
+    for bundle in matches:
+        spec = bundle.spec
+        tags_str = ", ".join(spec.tags) if spec.tags else "—"
+        desc = spec.description.strip().splitlines()[0] if spec.description.strip() else "—"
+        table.add_row(
+            spec.name,
+            spec.implementation.kind.value,
+            spec.version,
+            tags_str,
+            desc,
+        )
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# `mdk skills info <name>`
+# ---------------------------------------------------------------------------
+
+
+@skills_app.command("info")
+def info(
+    name: str = typer.Argument(
+        ...,
+        help="Skill name as it appears in the project's skills/ registry.",
+    ),
+    project: Path = typer.Option(
+        Path("."),
+        "--project",
+        "-p",
+        help="Project root containing ``skills/<name>/``.",
+    ),
+) -> None:
+    """Show full detail for a skill.
+
+    Renders: name, version, kind, description, owner, tags,
+    input/output schemas (pretty-printed JSON Schema), side_effects,
+    capabilities, cost, and a usage snippet showing how to declare
+    it in agent.yaml. Also surfaces a README snippet or examples/
+    directory note when present.
+
+    [bold]Examples:[/bold]
+
+      $ mdk skills info calculator
+      $ mdk skills info warranty-lookup --project ~/work/my-project
+    """
+    _register_skill_backends()
+    try:
+        registry = load_skill_registry(project)
+    except SkillLoadError as exc:
+        err_console.print(f"[red]✗ skill registry load failed:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    if name not in registry:
+        available = sorted(registry.keys())
+        hint = str(available) if available else "(empty registry)"
+        err_console.print(f"[red]✗ skill {name!r} not found.[/red] Available: {hint}")
+        raise typer.Exit(code=2)
+
+    bundle = registry[name]
+    spec = bundle.spec
+    caps = spec.capabilities
+
+    # ── Main detail panel ──────────────────────────────────────────────
+    lines: list[str] = [
+        f"[bold]name:[/bold]        {spec.name}",
+        f"[bold]version:[/bold]     {spec.version}",
+        f"[bold]kind:[/bold]        {spec.implementation.kind.value}",
+        f"[bold]owner:[/bold]       {spec.owner or '—'}",
+        f"[bold]tags:[/bold]        {', '.join(spec.tags) if spec.tags else '—'}",
+        f"[bold]side_effects:[/bold] {spec.side_effects.value}",
+        "[bold]cost/call:[/bold]   "
+        + (f"${spec.cost.per_call_usd:.4f}" if spec.cost.per_call_usd > 0 else "free"),
+    ]
+
+    # Capabilities block (only rendered when at least one flag is set).
+    cap_parts = []
+    if caps.read_only is not None:
+        cap_parts.append(f"read_only={caps.read_only}")
+    if caps.deterministic is not None:
+        cap_parts.append(f"deterministic={caps.deterministic}")
+    if caps.network is not None:
+        cap_parts.append(f"network={caps.network}")
+    if caps.mutating is not None:
+        cap_parts.append(f"mutating={caps.mutating}")
+    if cap_parts:
+        lines.append(f"[bold]capabilities:[/bold] {', '.join(cap_parts)}")
+    else:
+        lines.append("[bold]capabilities:[/bold] [dim]not declared[/dim]")
+
+    if spec.description:
+        lines.append("")
+        lines.append("[bold]description:[/bold]")
+        for dline in spec.description.strip().splitlines():
+            lines.append(f"  {dline}")
+
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[bold]{spec.name}[/bold] [dim]v{spec.version}[/dim]",
+            title_align="left",
+            border_style="blue",
+        )
+    )
+
+    # ── Input schema ──────────────────────────────────────────────────
+    console.print("[bold]Input schema:[/bold]")
+    console.print(
+        Syntax(
+            json.dumps(bundle.input_schema, indent=2),
+            "json",
+            theme="ansi_dark",
+            word_wrap=True,
+        )
+    )
+
+    # ── Output schema ─────────────────────────────────────────────────
+    console.print("[bold]Output schema:[/bold]")
+    console.print(
+        Syntax(
+            json.dumps(bundle.output_schema, indent=2),
+            "json",
+            theme="ansi_dark",
+            word_wrap=True,
+        )
+    )
+
+    # ── Usage example (agent.yaml snippet) ───────────────────────────
+    console.print("[bold]agent.yaml usage:[/bold]")
+    usage = f"skills:\n  - {spec.name}  # declares this skill for use in the tool-use loop\n"
+    console.print(Syntax(usage, "yaml", theme="ansi_dark"))
+
+    # ── README snippet ────────────────────────────────────────────────
+    readme_path = bundle.skill_dir / "README.md"
+    if readme_path.is_file():
+        readme_text = readme_path.read_text(encoding="utf-8", errors="replace")
+        snippet_lines = readme_text.splitlines()[:20]
+        if snippet_lines:
+            console.print("[bold]README (first 20 lines):[/bold]")
+            console.print(
+                Syntax(
+                    "\n".join(snippet_lines),
+                    "markdown",
+                    theme="ansi_dark",
+                    word_wrap=True,
+                )
+            )
+
+    # ── examples/ directory note ──────────────────────────────────────
+    examples_dir = bundle.skill_dir / "examples"
+    if examples_dir.is_dir():
+        example_files = sorted(examples_dir.iterdir())
+        if example_files:
+            preview_count = 5
+            names_preview = ", ".join(f.name for f in example_files[:preview_count])
+            ellipsis_suffix = " …" if len(example_files) > preview_count else ""
+            console.print(
+                f"[dim]examples/ directory: "
+                f"{len(example_files)} file(s) — "
+                f"{names_preview}{ellipsis_suffix}[/dim]"
+            )
+
+
+# ---------------------------------------------------------------------------
+# `mdk skills validate [<agent>]`
+# ---------------------------------------------------------------------------
+
+
+@skills_app.command("validate")
+def validate_skills(
+    agent: str | None = typer.Argument(
+        None,
+        help=(
+            "Agent name (resolves under ``agents/<name>/``) or path to an agent directory. "
+            "Omit to validate every agent in the project."
+        ),
+    ),
+    project: Path = typer.Option(
+        Path("."),
+        "--project",
+        "-p",
+        help="Project root containing ``agents/`` and ``skills/``. Defaults to cwd.",
+    ),
+) -> None:
+    """Validate skill compatibility for agent(s).
+
+    For each agent x skill pair checks:
+
+    (a) each skill name resolves in the project's skill registry;
+    (b) the skill's output schema has the fields the agent's prompt
+        references via ``{{skill_name.field}}`` patterns
+        (best-effort parse);
+    (c) produces a pass/fail table per agent x skill.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Validate all agents[/dim]
+      $ mdk skills validate
+
+      [dim]# Validate one agent[/dim]
+      $ mdk skills validate rag-qa
+
+      [dim]# From a different project root[/dim]
+      $ mdk skills validate --project ~/work/my-project
+    """
+    _register_skill_backends()
+
+    project_root = project.resolve()
+
+    # Load the skill registry once.
+    try:
+        registry = load_skill_registry(project_root)
+    except SkillLoadError as exc:
+        err_console.print(f"[red]✗ skill registry load failed:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    # Discover agent directories.
+    if agent is not None:
+        # Resolve single agent: bare name → agents/<name>/, or a path.
+        candidate = project_root / "agents" / agent
+        if candidate.is_dir():
+            agent_dirs = [candidate]
+        else:
+            as_path = Path(agent).resolve()
+            if as_path.is_dir():
+                agent_dirs = [as_path]
+            else:
+                err_console.print(
+                    f"[red]✗ agent {agent!r} not found.[/red] Looked at {candidate} and {as_path}."
+                )
+                raise typer.Exit(code=2)
+    else:
+        agents_root = project_root / "agents"
+        if not agents_root.is_dir():
+            console.print(
+                f"[dim]no agents/ directory under {project_root} — nothing to validate.[/dim]"
+            )
+            return
+        agent_dirs = sorted(
+            d for d in agents_root.iterdir() if d.is_dir() and (d / "agent.yaml").is_file()
+        )
+
+    if not agent_dirs:
+        console.print("[dim]no agents found — nothing to validate.[/dim]")
+        return
+
+    # Per-agent, per-skill validation.
+    # Row: (agent_name, skill_name, status, detail)
+    rows: list[tuple[str, str, str, str]] = []
+    failed = 0
+
+    for agent_dir in agent_dirs:
+        yaml_path = agent_dir / "agent.yaml"
+        if not yaml_path.is_file():
+            continue
+
+        import yaml  # noqa: PLC0415
+
+        try:
+            raw = yaml.safe_load(yaml_path.read_text())
+        except Exception as exc:  # broad catch — YAML can raise many exception types
+            rows.append((agent_dir.name, "(parse error)", "✗", str(exc)))
+            failed += 1
+            continue
+
+        declared_skills: list[str] = raw.get("skills", []) if isinstance(raw, dict) else []
+
+        # Read the prompt for field-reference parsing.
+        prompt_text = ""
+        if isinstance(raw, dict) and "prompt" in raw:
+            prompt_file = agent_dir / raw["prompt"]
+            if prompt_file.is_file():
+                prompt_text = prompt_file.read_text(encoding="utf-8", errors="replace")
+
+        if not declared_skills:
+            # No skills declared — nothing to check.
+            rows.append((agent_dir.name, "(no skills)", "✓", "no skills declared"))
+            continue
+
+        for skill_name in declared_skills:
+            # (a) name resolves in registry.
+            if skill_name not in registry:
+                rows.append(
+                    (
+                        agent_dir.name,
+                        skill_name,
+                        "✗",
+                        "not found in skill registry",
+                    )
+                )
+                failed += 1
+                continue
+
+            bundle = registry[skill_name]
+            issues: list[str] = []
+
+            # (b) Prompt field-reference check.
+            # Pattern: {{skill_name.field}} where skill_name matches.
+            pattern = re.compile(
+                r"\{\{\s*" + re.escape(skill_name) + r"\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}"
+            )
+            referenced_fields = pattern.findall(prompt_text)
+            if referenced_fields:
+                output_props = bundle.output_schema.get("properties", {})
+                for field in referenced_fields:
+                    if output_props and field not in output_props:
+                        issues.append(
+                            f"prompt references {{{{ {skill_name}.{field} }}}} "
+                            f"but output schema has no property {field!r} "
+                            f"(available: {sorted(output_props.keys())})"
+                        )
+
+            if issues:
+                rows.append((agent_dir.name, skill_name, "✗", "; ".join(issues)))
+                failed += 1
+            else:
+                rows.append((agent_dir.name, skill_name, "✓", ""))
+
+    # ── Render results table ──────────────────────────────────────────
+    table = Table(
+        title="skills validate",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("agent")
+    table.add_column("skill")
+    table.add_column("status", no_wrap=True)
+    table.add_column("detail", overflow="fold")
+
+    for agent_name, skill_name, status, detail in rows:
+        status_cell = "[green]✓[/green]" if status == "✓" else "[red]✗[/red]"
+        table.add_row(agent_name, skill_name, status_cell, detail)
+
+    console.print(table)
+
+    if failed:
+        err_console.print(
+            f"[red]✗ {failed} issue(s) found.[/red] Fix the skill declarations and re-run."
+        )
+        raise typer.Exit(code=2)
+    else:
+        console.print(f"[green]✓[/green] all {len(rows)} agent x skill check(s) passed.")

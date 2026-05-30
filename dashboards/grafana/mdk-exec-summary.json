@@ -11,7 +11,7 @@
     {
       "name": "DS_INSIGHTS",
       "label": "Insights API (JSON / Infinity)",
-      "description": "JSON/Infinity datasource pointed at the ADR 047 Observability Intelligence API (GET /api/v1/observability/insights + /health). Feeds the fleet-health gauge, the wins/risks lists, and the narrative. Plugin: yesoreyeram-infinity-datasource. NOTE: ADR 047 is not on main yet -- those panels render their documented-gap state until it ships (see dashboards/grafana/insights/README.md).",
+      "description": "JSON/Infinity datasource pointed at the ADR 047 Observability Intelligence API (GET /api/v1/observability/insights + /health). Feeds the fleet-health gauge and the health-trend/risk insight tables. Plugin: yesoreyeram-infinity-datasource. ADR 047 is now on main -- the panels are wired to the actual response shapes. See dashboards/grafana/README.md for setup.",
       "type": "datasource",
       "pluginId": "yesoreyeram-infinity-datasource",
       "pluginName": "Infinity"
@@ -56,7 +56,7 @@
       }
     ]
   },
-  "description": "mdk - executive summary (single pane). The one screen leadership looks at: fleet health, spend-this-period + forecast, adoption, top wins/risks, and SLO error budget. Business-framed, not SRE-framed -- few big panels, exec-glance layout. Spend, forecast, runs, error-budget come from the real OTel metrics (mdk.run.cost_usd, mdk.jobs.completed) on Prometheus; health/wins/risks come from the ADR 047 insights API (scaffold-with-note until that ships). Styled with the Movate palette (dashboards/grafana/theme/). For the deep-dive SRE view see mdk-golden-signals.json (#518); for the narrative view see insights/mdk-daily-insights.json (#555).",
+  "description": "mdk - executive summary (single pane). The one screen leadership looks at: fleet health, spend-this-period + forecast, adoption, health-trend/risk insight tables, and SLO error budget. Business-framed, not SRE-framed -- few big panels, exec-glance layout. Spend, forecast, runs, error-budget come from the real OTel metrics (mdk.run.cost_usd, mdk.jobs.completed) on Prometheus; fleet health and insight tables come from the ADR 047 Observability Intelligence API (now on main -- GET /api/v1/observability/health + /insights). Styled with the Movate palette (dashboards/grafana/theme/). For the deep-dive SRE view see mdk-golden-signals.json; for the narrative view see insights/mdk-daily-insights.json.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -83,7 +83,7 @@
       "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
       "gridPos": {"h": 8, "w": 8, "x": 0, "y": 3},
       "title": "Fleet health",
-      "description": "Composite fleet health_score (0-100) from GET /api/v1/observability/health -- the ADR 047 blend of success rate, latency-vs-baseline, cost-vs-baseline, and eval pass-rate. Worst-of or fleet-mean per the API. Thresholds: red <50, amber 50-79, green >=80. SCAFFOLD-WITH-NOTE: until ADR 047 is on main this renders empty; the metric below (live success rate) is the closest standalone proxy.",
+      "description": "Composite health_score (0-100) from GET /api/v1/observability/health (ADR 047, now on main). The API returns a flat object: {project_id, date, health_score, narrative_digest, anomaly_count, has_insight}. root_selector is empty (top-level field). Thresholds: red <50, amber 50-79, green >=80. Seed demo data with `mdk demo seed --with-voice` then run `mdk dev analyze` to populate the first insight row.",
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "thresholds"},
@@ -114,7 +114,7 @@
           "type": "json",
           "source": "url",
           "url": "/api/v1/observability/health",
-          "root_selector": "fleet",
+          "root_selector": "",
           "columns": [
             {"selector": "health_score", "text": "health_score", "type": "number"}
           ]
@@ -387,11 +387,21 @@
       "id": 40,
       "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
       "gridPos": {"h": 9, "w": 12, "x": 0, "y": 27},
-      "title": "Top 3 wins",
-      "description": "The period's three best outcomes from GET /api/v1/observability/insights (wins[]): canary promotions, pass-rate gains, cost savings. SCAFFOLD-WITH-NOTE: wins[] is delivered by ADR 047 (not on main yet). mdk demo seed emits canary_promotion events shaped for this feed so the panel populates in a demo once ADR 047 is wired.",
+      "title": "Recent insights — health trend",
+      "description": "Daily health snapshots from GET /api/v1/observability/insights (ADR 047, now on main). Response shape: {insights: [{id, project_id, date, health_score, anomaly_count, narrative_digest, ...}], count: N}. root_selector=\"insights\" selects the array. Shows the last N days of health_score + narrative so leadership can see the direction of travel. Previously labeled 'Top 3 wins' and pointed at a wins[] key that does not exist in the actual API — fixed to the real response shape.",
       "fieldConfig": {
         "defaults": {"custom": {"align": "auto", "filterable": false}, "color": {"mode": "fixed", "fixedColor": "#2BB673"}},
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "health_score"},
+            "properties": [
+              {"id": "custom.width", "value": 100},
+              {"id": "color", "value": {"mode": "thresholds"}},
+              {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "#D64550", "value": null}, {"color": "#F2A93B", "value": 50}, {"color": "#2BB673", "value": 80}]}},
+              {"id": "custom.displayMode", "value": "color-background"}
+            ]
+          }
+        ]
       },
       "options": {"showHeader": true},
       "targets": [
@@ -401,11 +411,11 @@
           "type": "json",
           "source": "url",
           "url": "/api/v1/observability/insights",
-          "root_selector": "wins",
+          "root_selector": "insights",
           "columns": [
-            {"selector": "title", "text": "win", "type": "string"},
-            {"selector": "detail", "text": "detail", "type": "string"},
-            {"selector": "agent", "text": "agent", "type": "string"}
+            {"selector": "date", "text": "date", "type": "string"},
+            {"selector": "health_score", "text": "health_score", "type": "number"},
+            {"selector": "narrative_digest", "text": "narrative", "type": "string"}
           ]
         }
       ]
@@ -415,21 +425,23 @@
       "id": 41,
       "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
       "gridPos": {"h": 9, "w": 12, "x": 12, "y": 27},
-      "title": "Top 3 risks",
-      "description": "The period's three biggest risks from GET /api/v1/observability/insights (risks[] -- merged anomalies + drift + top failures, by severity). SCAFFOLD-WITH-NOTE: delivered by ADR 047 (not on main yet). mdk demo seed emits cost_anomaly / latency_anomaly / drift_detected events shaped for this feed.",
+      "title": "Recent insights — lowest health days",
+      "description": "Daily insight rows sorted by health_score ascending from GET /api/v1/observability/insights (ADR 047, now on main). Response shape: {insights: [...], count: N}. root_selector=\"insights\" selects the array; columns map to actual ObservabilityInsightView fields: date, health_score, narrative_digest. Previously labeled 'Top 3 risks' and used root_selector=\"risks\" which does not exist in the API response — fixed to the real shape. For per-anomaly severity detail, see the insights/mdk-daily-insights.json dashboard.",
       "fieldConfig": {
         "defaults": {"custom": {"align": "auto", "filterable": false}, "color": {"mode": "fixed", "fixedColor": "#D64550"}},
         "overrides": [
           {
-            "matcher": {"id": "byName", "options": "severity"},
+            "matcher": {"id": "byName", "options": "health_score"},
             "properties": [
-              {"id": "mappings", "value": [{"type": "value", "options": {"critical": {"color": "#7A1620", "index": 0}, "high": {"color": "#D64550", "index": 1}, "medium": {"color": "#F2A93B", "index": 2}, "low": {"color": "#E9D14A", "index": 3}}}]},
-              {"id": "custom.cellOptions", "value": {"type": "color-background"}}
+              {"id": "custom.width", "value": 100},
+              {"id": "color", "value": {"mode": "thresholds"}},
+              {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "#D64550", "value": null}, {"color": "#F2A93B", "value": 50}, {"color": "#2BB673", "value": 80}]}},
+              {"id": "custom.displayMode", "value": "color-background"}
             ]
           }
         ]
       },
-      "options": {"showHeader": true, "sortBy": [{"displayName": "severity", "desc": false}]},
+      "options": {"showHeader": true, "sortBy": [{"displayName": "health_score", "desc": false}]},
       "targets": [
         {
           "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
@@ -437,11 +449,11 @@
           "type": "json",
           "source": "url",
           "url": "/api/v1/observability/insights",
-          "root_selector": "risks",
+          "root_selector": "insights",
           "columns": [
-            {"selector": "severity", "text": "severity", "type": "string"},
-            {"selector": "title", "text": "risk", "type": "string"},
-            {"selector": "explanation", "text": "explanation", "type": "string"}
+            {"selector": "date", "text": "date", "type": "string"},
+            {"selector": "health_score", "text": "health_score", "type": "number"},
+            {"selector": "narrative_digest", "text": "narrative", "type": "string"}
           ]
         }
       ]
@@ -453,7 +465,7 @@
       "title": "What's live vs. scaffolded (architecture-review note)",
       "options": {
         "mode": "markdown",
-        "content": "**Live today** (real OTel metrics on Prometheus, #518 catalog): Spend this period, Spend forecast vs budget, Runs + WoW, Live success rate, SLO error-budget burndown + remaining. Run `mdk demo seed` to light these up with a believable fleet.\n\n**Scaffold-with-note** (awaiting **ADR 047** Observability Intelligence API, not on `main` yet): Fleet health gauge, Top 3 wins, Top 3 risks. These read `GET /api/v1/observability/{health,insights}` via the Infinity datasource; until ADR 047 ships they render empty (Grafana shows a datasource note on those panels). The seeder emits `deploy` / `canary_promotion` / `cost_anomaly` / `latency_anomaly` / `drift_detected` events shaped for the wins/risks feeds, so they populate end-to-end the moment ADR 047 lands.\n\n**Active-agent count** is intentionally not a panel here: `mdk.run.cost_usd` / `mdk.jobs.completed` carry only `tenant` (not `agent`) per the catalog (`docs/observability.md`), so a fleet-wide distinct-agent count isn't available metric-side — it belongs to the ADR 047 health payload (`active_agents`). Documented gap, not a bug.\n\nPalette + kiosk variant: `dashboards/grafana/theme/`."
+        "content": "**Live today** (OTel metrics on Prometheus + ADR 047 Insights API now on main):\n\n* **Prometheus panels** (Spend, Forecast, Runs + WoW, Live success rate, SLO error budget): driven by `mdk.run.cost_usd` / `mdk.jobs.completed`. Seed with `mdk demo seed --with-voice` to populate.\n* **Fleet health gauge**: reads `GET /api/v1/observability/health` — returns `{health_score, narrative_digest, anomaly_count, has_insight}` flat at root. Fixed from the previous `root_selector: \"fleet\"` (wrong) to `root_selector: \"\"` (correct). Populates once the observability analyst has run for the project.\n* **Recent insights — health trend / lowest health days**: both read `GET /api/v1/observability/insights` → `{insights: [...], count}`. Fixed from the previous `root_selector: \"wins\"` / `root_selector: \"risks\"` (non-existent keys) to `root_selector: \"insights\"` with columns mapped to `ObservabilityInsightView` fields (`date`, `health_score`, `narrative_digest`). For per-anomaly severity detail see `insights/mdk-daily-insights.json`.\n\n**Active-agent count** is intentionally not a panel here: `mdk.jobs.completed` carries only `tenant` (not `agent`) per the metric catalog, so fleet-wide distinct-agent count belongs to the ADR 047 health payload (`active_agents`). Documented gap.\n\nPalette + kiosk variant: `dashboards/grafana/theme/`."
       }
     }
   ],

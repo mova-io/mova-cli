@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.30.2"
+version = "2026.5.30.3"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -236,11 +236,20 @@ voice = [
     # scope for the strict gate either way.
     "elevenlabs>=1.50,<3",
     #
+    # ``mdk voice try`` — mic capture + TTS playback in the terminal
+    # (feat/voice-cli-ux, ADR 050 D11). sounddevice wraps PortAudio and is
+    # MIT-licensed (PyPI: "MIT License" — permissive, vetted). numpy is required
+    # by sounddevice for the audio buffer dtype. Both are imported LAZILY inside
+    # movate.cli.voice_cmd._voice_try_async, so a runtime/CLI installed WITHOUT
+    # mdk[voice] is wholly unaffected (the import only fires when a voice
+    # conversation actually starts). These stay OUT of core / SHIPPED_EXTRAS
+    # (they are NOT in scripts/check_licenses.py's SHIPPED_EXTRAS list).
+    "sounddevice>=0.4,<1",
+    "numpy>=1.24",
+    #
     # Deferred to further fast-follows (each behind this same extra,
     # permissive-only, justified in its own PR): Gemini Live realtime (a
-    # fast-follow), and any audio lib (e.g.
-    # numpy/soundfile for resampling, a VAD) only if/when edge transcoding or
-    # barge-in needs it.
+    # fast-follow), and any audio lib for edge transcoding or VAD when needed.
 ]
 langchain = [
     "langchain-core>=0.3,<1",
@@ -448,6 +457,9 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # one branch for the optional KB-seed column. Splitting would obscure the
 # single-pass rendering intent. PLR0912 is wrong for this shape.
 "src/movate/cli/eval_scorecard_cmd.py" = ["PLR0912"]
+# skills_cmd search/info/validate each have branchy filter+render pipelines;
+# extracting branches would obscure the linear operator-facing control flow.
+"src/movate/cli/skills_cmd.py" = ["PLR0912"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 
@@ -493,6 +505,11 @@ module = [
     # movate.voice.elevenlabs, so mypy on `src` stays clean whether or not the
     # extra is installed.
     "elevenlabs.*",
+    # sounddevice — optional [voice] extra (mic capture + audio playback in
+    # ``mdk voice try``). No type stubs shipped. Imported LAZILY inside
+    # movate.cli.voice_cmd._voice_try_async, so mypy on `src` is clean when
+    # the [voice] extra is absent.
+    "sounddevice.*",
     # External-orchestrator adapters (ADR 017 D3) — optional extras with no
     # type stubs. Imported LAZILY inside the adapter functions/factory; this
     # keeps mypy on `src` clean whether or not the extras are installed.

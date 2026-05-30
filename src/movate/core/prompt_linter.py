@@ -446,8 +446,12 @@ def _check_orphan_retrieval_config(bundle: AgentBundle) -> list[LintIssue]:
 
     # Any declared skill whose name starts with the canonical
     # prefix counts (handles renamed copies of the template).
+    # ``spec.skills`` is ``list[SkillRef]`` post-ADR-002; SkillRef's
+    # ``__str__`` returns the bare name, so ``str(s)`` works for both
+    # SkillRef objects AND legacy bare-string entries from older
+    # test fixtures.
     declared_skills = list(getattr(spec, "skills", []) or [])
-    if any(isinstance(s, str) and s.startswith(_RETRIEVAL_SKILL_PREFIX) for s in declared_skills):
+    if any(str(s).startswith(_RETRIEVAL_SKILL_PREFIX) for s in declared_skills):
         return []
 
     # Build a short summary of what the operator configured, so the

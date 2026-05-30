@@ -236,7 +236,7 @@ def _show_agent(path: Path) -> None:
     # the table tight for the single-shot (no-skills) common case.
     if spec.skills:
         table.add_row("", "")
-        table.add_row("skills", ", ".join(spec.skills))
+        table.add_row("skills", ", ".join(str(s) for s in spec.skills))
         for skill_bundle in bundle.skills:
             cost = skill_bundle.spec.cost.per_call_usd
             cost_str = f" [dim]${cost:.4f}/call[/dim]" if cost > 0 else ""
