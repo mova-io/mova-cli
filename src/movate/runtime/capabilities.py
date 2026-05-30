@@ -151,6 +151,17 @@ _FEATURE_PREDICATES: dict[str, Callable[[FastAPI], bool]] = {
     "oidc_auth": lambda app: _module_importable("jwt"),
     # Langfuse tracing sink (opt-in extra).
     "langfuse_tracing": lambda app: _module_importable("langfuse"),
+    # Voice transport — the WS /voice route is registered on this build (ADR
+    # 048 D4). WebSocket routes don't appear in ``_registered_paths`` (it only
+    # scans APIRoute), so detect by the route-builder's app-state factory hook
+    # (``voice_stt_factory``) set when the route is wired.
+    "voice": lambda app: getattr(app.state, "voice_stt_factory", None) is not None,
+    # Realtime (speech↔speech) voice — advertised ONLY when a realtime provider
+    # is actually configured on this runtime (ADR 048 D2b / ADR 050 D12). The
+    # route exists for every build, but realtime is opt-in: the factory is
+    # ``None`` until a deployment lights it up (MDK_VOICE_REALTIME / app.state),
+    # so this flips True exactly when ``?mode=realtime`` will work here.
+    "voice_realtime": lambda app: getattr(app.state, "voice_realtime_factory", None) is not None,
 }
 
 

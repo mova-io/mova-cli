@@ -26,7 +26,7 @@ from starlette.websockets import WebSocketDisconnect
 from movate.core.auth import ALL_SCOPES, SCOPE_READ, ApiKeyEnv, mint_api_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
-from movate.voice import FakeSTT, FakeTTS
+from movate.voice import FakeRealtime, FakeSTT, FakeTTS
 
 
 @pytest.fixture
@@ -206,3 +206,103 @@ def test_voice_ws_unknown_agent_errors_then_closes(client: TestClient, auth_setu
         msg = ws.receive_json()
         assert msg["type"] == "error"
         assert msg["code"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# Realtime mode (ADR 048 D2b / ADR 050 D12) — ?mode=realtime routes to the
+# RealtimeVoiceProvider (voice↔voice, NO text Executor). Default pipeline mode
+# is unchanged (covered by test_voice_ws_full_turn above).
+# ---------------------------------------------------------------------------
+
+
+def test_voice_ws_realtime_routes_to_realtime_provider(
+    storage, agents_path, auth_setup, app_and_fakes
+) -> None:
+    token, _tenant_id = auth_setup
+    app, _stt, _tts = app_and_fakes
+    # Light up the OPT-IN realtime path with a fake provider behind the seam.
+    rt = FakeRealtime(transcript="turn on the lights", answer="done", frames=2)
+    app.state.voice_realtime_factory = lambda: rt
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(
+        f"/api/v1/agents/voice-demo/voice?mode=realtime&token={token}"
+    ) as ws:
+        ws.send_json({"type": "config", "voice_id": "rachel"})
+        ws.send_bytes(b"\x00\x01\x02\x03")  # a mic frame
+        ws.send_json({"type": "close"})
+        frames: list[dict | bytes] = []
+        while True:
+            msg = ws.receive()
+            if "bytes" in msg and msg["bytes"] is not None:
+                frames.append(msg["bytes"])
+                continue
+            if "text" in msg and msg["text"] is not None:
+                ctrl = json.loads(msg["text"])
+                frames.append(ctrl)
+                if ctrl.get("type") == "response_done":
+                    break
+            if msg.get("type") == "websocket.close":
+                break
+
+    ctrl = [f for f in frames if isinstance(f, dict)]
+    types = [c["type"] for c in ctrl]
+    # The realtime provider's control + audio events reached the client.
+    assert "speech_started" in types
+    assert "transcript.final" in types  # the realtime transcript on the shared wire name
+    assert "tts.audio" in types  # JSON header preceding each binary audio frame
+    assert types[-1] == "response_done"
+
+    # The synthesized audio decodes back to the fake's scripted answer.
+    audio = b"".join(f for f in frames if isinstance(f, bytes))
+    assert audio.decode("utf-8") == "done"
+
+    # The provider was driven voice-native: it received the mic frame + the
+    # client's voice_id — and NO run was persisted (no Executor in this path).
+    assert rt.received == [b"\x00\x01\x02\x03"]
+    assert rt.voice_ids == ["rachel"]
+
+
+def test_voice_ws_realtime_unconfigured_is_rejected(client: TestClient, auth_setup) -> None:
+    # With no realtime factory configured (the default), ?mode=realtime must
+    # degrade with a clear error frame, not hard-fail — the pipeline mode stays
+    # available.
+    token, _ = auth_setup
+    _create_agent(client, token)
+    with client.websocket_connect(
+        f"/api/v1/agents/voice-demo/voice?mode=realtime&token={token}"
+    ) as ws:
+        msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert msg["code"] == "realtime_unavailable"
+
+
+def test_voice_ws_default_mode_unchanged_when_realtime_configured(
+    storage, agents_path, auth_setup, app_and_fakes
+) -> None:
+    # Configuring realtime must NOT change the default pipeline mode: a
+    # connection with no ?mode= still runs STT → Executor → TTS and persists a
+    # run, exactly as before.
+    token, _tenant_id = auth_setup
+    app, _stt, tts = app_and_fakes
+
+    def _make_rt() -> FakeRealtime:
+        return FakeRealtime()
+
+    app.state.voice_realtime_factory = _make_rt
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01")
+        ws.send_json({"type": "end"})
+        frames = _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    ctrl = [f for f in frames if isinstance(f, dict)]
+    types = [c["type"] for c in ctrl]
+    assert "agent.token" in types  # the pipeline Executor stage ran
+    assert types[-1] == "done"
+    assert tts.spoken  # pipeline TTS was driven

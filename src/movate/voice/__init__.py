@@ -23,14 +23,24 @@ Phase 1 scope (pipeline mode only):
 * the pipeline driver (:func:`run_voice_pipeline`) in
   :mod:`movate.voice.pipeline`, which the runtime's WS ``/voice`` route wraps.
 
-Deferred (out of scope here): the full-duplex :class:`RealtimeVoiceProvider`
-seam + speech-to-speech mode (ADR 048 D2b / Phase 2), telephony (Phase 3), and
-the agility layer (router / bench / drift — ADR 049).
+Phase 2 (realtime / speech↔speech) adds the optional full-duplex
+:class:`RealtimeVoiceProvider` seam + its chunk/event types
+(:class:`RealtimeChunk` / :class:`RealtimeEventKind`) in
+:mod:`movate.voice.base`, with two first impls — :class:`OpenAIRealtime`
+(:mod:`movate.voice.realtime_openai`) and the sovereignty-preserving
+:class:`AzureOpenAIRealtime` (:mod:`movate.voice.realtime_azure`, against the
+customer's own Azure OpenAI resource) — plus the :class:`FakeRealtime` double.
+Realtime is **voice-native**: it does NOT reuse the text Executor (ADR 048
+D2b / Boundaries); it is routed by the transport's ``?mode=realtime`` mode
+(ADR 050 D12), separate from the pipeline path.
+
+Deferred (out of scope here): telephony (Phase 3) and the agility layer
+(router / bench / drift — ADR 049).
 
 The Protocols + chunk types + doubles + pipeline are import-cheap (no optional
-deps). The OpenAI / Deepgram / Cartesia / Azure Speech adapters import their
-provider SDK lazily; importing them by name here does **not** trigger that
-import until the class is constructed.
+deps). The OpenAI / Deepgram / Cartesia / Azure Speech / realtime adapters
+import their provider SDK lazily; importing them by name here does **not**
+trigger that import until the class is constructed.
 """
 
 from __future__ import annotations
@@ -39,27 +49,38 @@ from movate.voice.azure_speech import AzureNeuralTTS, AzureSpeechSTT
 from movate.voice.base import (
     AudioChunk,
     AudioCodec,
+    RealtimeChunk,
+    RealtimeEventKind,
+    RealtimeVoiceProvider,
     SpeechToTextProvider,
     TextToSpeechProvider,
     TranscriptChunk,
 )
 from movate.voice.cartesia import CartesiaTTS
 from movate.voice.deepgram import DeepgramSTT
-from movate.voice.doubles import FakeSTT, FakeTTS
+from movate.voice.doubles import FakeRealtime, FakeSTT, FakeTTS
 from movate.voice.openai_speech import OpenAITTS, OpenAIWhisperSTT
 from movate.voice.pipeline import VoicePipelineResult, run_voice_pipeline
+from movate.voice.realtime_azure import AzureOpenAIRealtime
+from movate.voice.realtime_openai import OpenAIRealtime
 
 __all__ = [
     "AudioChunk",
     "AudioCodec",
     "AzureNeuralTTS",
+    "AzureOpenAIRealtime",
     "AzureSpeechSTT",
     "CartesiaTTS",
     "DeepgramSTT",
+    "FakeRealtime",
     "FakeSTT",
     "FakeTTS",
+    "OpenAIRealtime",
     "OpenAITTS",
     "OpenAIWhisperSTT",
+    "RealtimeChunk",
+    "RealtimeEventKind",
+    "RealtimeVoiceProvider",
     "SpeechToTextProvider",
     "TextToSpeechProvider",
     "TranscriptChunk",
