@@ -24,6 +24,13 @@ prefix, so seeded data never co-mingles with real telemetry.
 
 from __future__ import annotations
 
+from movate.core.demo.scenario import (
+    DEMO_GRAPH_AGENT,
+    DEMO_PROJECT_ID,
+    DEMO_TENANT_ID,
+    ScenarioBundle,
+    generate_scenario,
+)
 from movate.core.demo.seeder import (
     DEMO_MARKER_KEY,
     DEMO_TENANT_PREFIX,
@@ -35,11 +42,16 @@ from movate.core.demo.seeder import (
 )
 
 __all__ = [
+    "DEMO_GRAPH_AGENT",
     "DEMO_MARKER_KEY",
+    "DEMO_PROJECT_ID",
+    "DEMO_TENANT_ID",
     "DEMO_TENANT_PREFIX",
     "DemoBundle",
+    "ScenarioBundle",
     "SeedConfig",
     "VoiceTurnRecord",
     "generate_bundle",
+    "generate_scenario",
     "is_demo_tenant",
 ]
