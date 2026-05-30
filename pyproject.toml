@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.29.20"
+version = "2026.5.29.21"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -215,10 +215,22 @@ voice = [
     # sign-off (the gate would correctly reject it there).
     "azure-cognitiveservices-speech>=1.40,<2",
     #
+    # Realtime / speech↔speech (ADR 048 D2b / Phase 2): OpenAI Realtime + Azure
+    # OpenAI Realtime. BOTH are served by the official `openai` SDK already
+    # declared above (Apache-2.0 — permissive, vetted for the [openai] extra):
+    # the public adapter uses `AsyncOpenAI(...).beta.realtime.connect(...)` and
+    # the sovereignty-preserving Azure adapter uses `AsyncAzureOpenAI(...)` with
+    # the SAME wire protocol. So realtime adds NO new shipped dependency — it
+    # reuses the `openai` SDK and the existing OPENAI_API_KEY /
+    # AZURE_OPENAI_API_KEY credentials (already in the autoload whitelist), and
+    # is imported LAZILY by movate.voice.realtime_openai / .realtime_azure (a
+    # default install is unaffected, ADR 048 D9).
+    #
     # Deferred to further fast-follows (each behind this same extra,
-    # permissive-only, justified in its own PR): ElevenLabs (premium voice) and
-    # any audio lib (e.g. numpy/soundfile for resampling, a VAD) only if/when
-    # edge transcoding or barge-in needs it.
+    # permissive-only, justified in its own PR): Gemini Live realtime (a
+    # fast-follow), ElevenLabs (premium voice), and any audio lib (e.g.
+    # numpy/soundfile for resampling, a VAD) only if/when edge transcoding or
+    # barge-in needs it.
 ]
 langchain = [
     "langchain-core>=0.3,<1",
