@@ -19,6 +19,102 @@ SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 # ---------------------------------------------------------------------------
+# SkillRef — agent.yaml ``skills:`` list element (additive, backward-compat)
+# ---------------------------------------------------------------------------
+
+
+class SkillRef(BaseModel):
+    """A skill reference in an agent's ``skills:`` list.
+
+    Accepts two forms in ``agent.yaml`` (both backward-compatible):
+
+    * **Bare string** (original)::
+
+        skills:
+          - kb-lookup
+          - web-search
+
+    * **Inline object with optional semver constraint** (new)::
+
+        skills:
+          - name: kb-lookup
+            version: "^1.2"
+          - name: web-search
+            version: ">=1.0,<2.0"
+
+    Bare strings are treated as ``version: "*"`` (any version accepted).
+    When a ``version`` constraint is declared, :func:`resolve_agent_skills`
+    checks the installed skill's version against it at agent-load time and
+    raises :class:`movate.core.loader.AgentLoadError` on a mismatch — fail
+    at load time, not silently at the first run.
+
+    ``SkillRef`` implements ``__str__`` (returns ``name``) and cross-type
+    ``__eq__`` / ``__hash__`` so existing code that does
+    ``"kb-vector-lookup" in spec.skills`` or iterates ``for s in spec.skills``
+    treating each entry as a plain name string continues to work unchanged.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(
+        ..., min_length=1, description="Skill name matching skills/<name>/skill.yaml."
+    )
+    version: str = Field(
+        default="*",
+        description=(
+            "Semver constraint the installed skill's version must satisfy. "
+            "``'*'`` (the default, used for bare-string entries) accepts any "
+            "installed version. Constraint syntax: ``'^1.2'`` (compatible), "
+            "``'>=1.0,<2.0'`` (range), ``'1.2.3'`` (exact). Uses "
+            "``packaging.version`` under the hood — same library that pip uses."
+        ),
+    )
+
+    # Cross-type equality so ``"kb-vector-lookup" in spec.skills`` works
+    # identically to the pre-SkillRef ``list[str]`` behavior.
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.name == other
+        if isinstance(other, SkillRef):
+            return self.name == other.name and self.version == other.version
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        # Hash on name only — mirrors the equality contract with strings so
+        # set-membership tests (``"name" in {ref}`` etc.) remain intuitive.
+        return hash(self.name)
+
+    def __str__(self) -> str:
+        return self.name
+
+    def __repr__(self) -> str:
+        if self.version == "*":
+            return f"SkillRef({self.name!r})"
+        return f"SkillRef({self.name!r}, version={self.version!r})"
+
+    @classmethod
+    def _from_raw(cls, v: object) -> SkillRef:
+        """Coerce a raw YAML value into a :class:`SkillRef`.
+
+        Called by the ``AgentSpec.skills`` field validator so both the
+        bare-string form and the inline-object form parse correctly.
+        """
+        if isinstance(v, str):
+            return cls(name=v)
+        if isinstance(v, dict):
+            name = v.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"skill ref dict must have a non-empty 'name' key; got {v!r}")
+            version = v.get("version", "*")
+            if not isinstance(version, str):
+                version = str(version)
+            return cls(name=name, version=version)
+        raise ValueError(
+            f"each skills: entry must be a string or {{name, version}} dict; got {type(v).__name__}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Agent specification (mirrors agent.yaml)
 # ---------------------------------------------------------------------------
 
@@ -1227,16 +1323,37 @@ class AgentSpec(BaseModel):
     # executor enters a tool-use loop on requests that have skills wired.
     # An agent with `skills: []` (the default) keeps the v0.5 single-shot
     # behavior. See docs/adr/002-skills-and-contexts.md.
+    #
+    # SCHEMA FLAG (additive, backward-compatible): each entry may now be
+    # EITHER a bare string (original form) OR an inline {name, version}
+    # object with a semver constraint.  Bare strings remain valid and are
+    # treated as version: "*" (any version).  Callers that iterate or
+    # test membership with plain strings continue to work because SkillRef
+    # implements cross-type __eq__ / __hash__ / __str__.
 
-    skills: list[str] = Field(
+    skills: list[SkillRef] = Field(
         default_factory=list,
         description=(
-            "Names of skills (from the project's skills/ registry) this "
-            "agent may invoke during a tool-use loop. Each name must resolve "
-            "to a `skills/<name>/skill.yaml` at load time. Empty list keeps "
-            "the agent in single-shot mode (no tool-use loop)."
+            "Skills (from the project's skills/ registry) this agent may "
+            "invoke during a tool-use loop.  Each entry is EITHER a bare "
+            "skill name string (original form, treated as version='*') OR an "
+            "inline object ``{name: str, version: str}`` with a semver "
+            "constraint.  Unknown names or unsatisfied constraints raise "
+            "AgentLoadError at agent-load time.  Empty list keeps the agent "
+            "in single-shot mode (no tool-use loop)."
         ),
     )
+
+    @field_validator("skills", mode="before")
+    @classmethod
+    def _coerce_skill_refs(cls, v: object) -> list[object]:
+        """Accept bare strings and inline dicts; coerce both to SkillRef."""
+        if not isinstance(v, list):
+            raise ValueError(f"skills must be a list; got {type(v).__name__}")
+        result: list[object] = []
+        for item in v:
+            result.append(SkillRef._from_raw(item))
+        return result
 
     # ---- v0.6 shared contexts (ADR 002) ----
     # Names referencing `contexts/<name>.md` files in the project's

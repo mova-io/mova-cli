@@ -16,9 +16,12 @@ See ``docs/adr/002-skills-and-contexts.md`` for the full design.
 
 from __future__ import annotations
 
+import logging
+import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from jsonschema import Draft202012Validator
@@ -26,6 +29,11 @@ from pydantic import ValidationError
 
 from movate.core.loader import AgentLoadError, _resolve_schema
 from movate.core.models import SkillSpec
+
+if TYPE_CHECKING:
+    from movate.core.models import SkillRef
+
+_log = logging.getLogger(__name__)
 
 
 class SkillLoadError(Exception):
@@ -142,18 +150,120 @@ def load_skill_registry(project_root: str | Path) -> dict[str, SkillBundle]:
     return registry
 
 
+def _check_version_constraint(
+    skill_name: str,
+    installed_version: str,
+    constraint: str,
+    agent_name: str,
+) -> None:
+    """Check that ``installed_version`` satisfies ``constraint``.
+
+    ``constraint`` is a pip-style specifier string (``"^1.2"``,
+    ``">=1.0,<2.0"``, ``"1.2.3"``) or ``"*"`` (any version accepted).
+    ``"^1.2"`` is a caret-range shorthand: ``>=1.2,<2.0``.
+
+    Raises :class:`AgentLoadError` with a descriptive message when the
+    constraint is not met. Emits a :mod:`warnings` warning when the
+    installed skill has no version field (treated as ``"0.0.0"``).
+    """
+    if constraint == "*":
+        return  # bare-string shorthand — any version accepted
+
+    # Normalize caret ranges + bare version strings before handing to
+    # packaging.specifiers (which only understands pip-style specifiers).
+    normalized = _normalize_constraint(constraint)
+
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet  # noqa: PLC0415
+    from packaging.version import Version  # noqa: PLC0415
+
+    try:
+        spec_set = SpecifierSet(normalized)
+    except InvalidSpecifier as exc:
+        raise AgentLoadError(
+            f"skill {skill_name!r}: invalid version constraint {constraint!r} — {exc}"
+        ) from exc
+
+    # Treat bare skill.yaml "version: 0.0.0" from no-version field as unknown.
+    installed = installed_version.strip()
+    is_fallback_version = installed == "0.0.0"
+    if is_fallback_version:
+        warnings.warn(
+            f"skill {skill_name!r} has no version field (defaulting to '0.0.0'); "
+            f"agent {agent_name!r} requires {constraint!r}. Pin a version in "
+            f"skills/{skill_name}/skill.yaml to silence this warning.",
+            UserWarning,
+            stacklevel=4,
+        )
+
+    try:
+        parsed = Version(installed)
+    except Exception as exc:
+        raise AgentLoadError(
+            f"skill {skill_name!r}: installed version {installed!r} is not valid semver: {exc}"
+        ) from exc
+
+    if parsed not in spec_set:
+        raise AgentLoadError(
+            f"skill {skill_name!r} version {installed!r} does not satisfy "
+            f"constraint {constraint!r} required by agent {agent_name!r}"
+        )
+
+
+_BARE_VERSION_RE = re.compile(r"^\d+\.\d+(\.\d+)?$")
+
+
+def _normalize_constraint(constraint: str) -> str:
+    """Normalize a constraint string to a form ``packaging.specifiers`` understands.
+
+    Two normalizations:
+
+    * ``^MAJOR.MINOR[.PATCH]`` (caret range, e.g. ``^1.2``) → ``>=1.2,<2.0.0``
+    * Bare version string (e.g. ``1.2.3``) → ``==1.2.3`` (exact match)
+
+    All other specifiers (``>=1.0,<2.0``, ``~=1.2``, etc.) pass through
+    unchanged — ``packaging.specifiers.SpecifierSet`` handles them natively.
+    """
+    stripped = constraint.strip()
+
+    # Bare version → exact equality specifier.
+    if _BARE_VERSION_RE.match(stripped):
+        return f"=={stripped}"
+
+    # Caret range → >=lo,<(major+1).0.0
+    def _replace(m: re.Match[str]) -> str:
+        parts = m.group(1).split(".")
+        major = int(parts[0])
+        lo = m.group(1)
+        # Next-breaking: bump MAJOR; minor+patch become 0.
+        hi = f"{major + 1}.0.0"
+        return f">={lo},<{hi}"
+
+    return re.sub(r"\^(\d+(?:\.\d+)*)", _replace, stripped)
+
+
 def resolve_agent_skills(
-    skill_names: list[str],
+    skill_refs: list[SkillRef] | list[str],
     registry: dict[str, SkillBundle],
+    *,
+    agent_name: str = "<unknown>",
 ) -> list[SkillBundle]:
     """Resolve an agent's ``skills: [...]`` list against the project registry.
 
-    Returns the matching :class:`SkillBundle` list in declaration
-    order. Unknown names raise :class:`SkillLoadError` with the
-    available names listed so operators can spot a typo immediately.
+    Accepts both the legacy ``list[str]`` form and the new
+    ``list[SkillRef]`` form (see :class:`movate.core.models.SkillRef`).
+
+    Returns the matching :class:`SkillBundle` list in declaration order.
+
+    Raises:
+        :class:`SkillLoadError` — unknown skill name (typo / missing registration).
+        :class:`AgentLoadError` — version constraint not satisfied.
     """
     resolved: list[SkillBundle] = []
-    for name in skill_names:
+    for ref in skill_refs:
+        # Accept both bare strings (legacy callers) and SkillRef objects.
+        name: str = ref if isinstance(ref, str) else ref.name
+        constraint: str = "*" if isinstance(ref, str) else ref.version
+
         if name not in registry:
             available = sorted(registry.keys())
             hint = str(available) if available else "(empty registry; add skills/<name>/skill.yaml)"
@@ -161,5 +271,10 @@ def resolve_agent_skills(
                 f"agent references skill {name!r} but no such skill is "
                 f"registered. Available: {hint}"
             )
-        resolved.append(registry[name])
+
+        bundle = registry[name]
+        installed_version = bundle.spec.version if bundle.spec.version else "0.0.0"
+        _check_version_constraint(name, installed_version, constraint, agent_name)
+
+        resolved.append(bundle)
     return resolved

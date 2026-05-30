@@ -2452,7 +2452,7 @@ def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
         prompt_hash=bundle.prompt_hash,
         input_schema=bundle.input_schema,
         output_schema=bundle.output_schema,
-        skills=list(spec.skills),
+        skills=[str(s) for s in spec.skills],
         contexts=list(spec.contexts),
         dataset=dataset_info,
         timeout_call_ms=spec.timeouts.call_ms,
@@ -4858,7 +4858,9 @@ def build_app(
                 # half-built projects.
                 if "skill.yaml" not in skill_files:
                     continue
-                persist_skill_bundle(skill_files, skills_path=skills_path)
+                # Bundled agent deploy — skill upload is intentional;
+                # use 'replace' so agents can re-deploy cleanly.
+                persist_skill_bundle(skill_files, skills_path=skills_path, on_conflict="replace")
                 _ = skill_name  # used implicitly via persist_skill_bundle
 
         result = persist_bundle(agent_files, agents_path=agents_path)
@@ -5079,7 +5081,9 @@ def build_app(
                 for skill_name, skill_files in skills_per_name.items():
                     if "skill.yaml" not in skill_files:
                         continue
-                    persist_skill_bundle(skill_files, skills_path=skills_path)
+                    persist_skill_bundle(
+                        skill_files, skills_path=skills_path, on_conflict="replace"
+                    )
                     _ = skill_name
             result = persist_bundle(agent_files, agents_path=agents_path)
             request.app.state.agents = scan_agents(agents_path)
@@ -5365,9 +5369,10 @@ def build_app(
         impl: UploadFile | None = File(default=None),
         corpus: UploadFile | None = File(default=None),
         readme: UploadFile | None = File(default=None),
+        force: bool = False,
         ctx: AuthContext = Depends(auth_dep),
     ) -> SkillCreatedView:
-        """Create or replace a skill bundle under ``<skills_path>/<name>/``.
+        """Create a skill bundle under ``<skills_path>/<name>/``.
 
         Fixes the long-standing gap where agents declaring
         ``skills: [<name>]`` 422'd on upload with "skills resolution
@@ -5384,15 +5389,19 @@ def build_app(
         * ``corpus`` (optional) — JSON corpus shipped alongside.
         * ``readme`` (optional) — human-facing notes.
 
-        PUT semantics: re-uploading the same skill name overwrites
-        atomically. Skills are referenced by name from agents, so an
-        operator who tweaked their skill and re-deploys expects the
-        runtime to follow — different conflict policy from agents
-        (which 409 on conflict because agent identity is sticky).
+        Query parameters:
+
+        * ``force=true`` — overwrite an existing skill with the same name.
+          Without this flag a 409 is returned when the skill already exists,
+          preventing silent breakage on accidental re-deploy.
+
+        CLI FLAG: ``mdk deploy --force`` / ``mdk skills upload --force``
+        passes ``?force=true`` to this endpoint for intentional overwrites.
 
         Errors:
 
         * **401** — missing / bad bearer token
+        * **409** — skill already exists (pass ``?force=true`` to overwrite)
         * **422** — bundle failed validation (parse / schema / shape)
         * **503** — runtime was built without a ``skills_path``
         """
@@ -5411,7 +5420,8 @@ def build_app(
         if readme is not None:
             files["README.md"] = await readme.read()
 
-        result = persist_skill_bundle(files, skills_path=skills_path)
+        on_conflict = "replace" if force else "reject"
+        result = persist_skill_bundle(files, skills_path=skills_path, on_conflict=on_conflict)
 
         _ = ctx.tenant_id  # future per-tenant audit log entry
 
@@ -5688,7 +5698,7 @@ def build_app(
             for skill_name, skill_files in skills_per_name.items():
                 if "skill.yaml" not in skill_files:
                     continue
-                persist_skill_bundle(skill_files, skills_path=skills_path)
+                persist_skill_bundle(skill_files, skills_path=skills_path, on_conflict="replace")
                 _ = skill_name
 
         result = persist_bundle(agent_files, agents_path=agents_path, on_conflict="replace")
