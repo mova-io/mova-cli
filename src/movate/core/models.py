@@ -1179,6 +1179,76 @@ class RetrievalConfig(BaseModel):
         )
 
 
+class VoiceConfig(BaseModel):
+    """Per-agent voice configuration block (ADR 048 D5 / ADR 050 D4).
+
+    **ADDITIVE, OPTIONAL** field on :class:`AgentSpec` — every existing
+    ``agent.yaml`` that omits this block is valid and unchanged.  Absence
+    means "no per-agent voice override; tenant defaults apply when this agent
+    is invoked on the voice endpoint."
+
+    CLAUDE.md rule 5 — flagged: this is the single additive schema change
+    for voice.  All fields default to ``None`` / ``False`` so omitting the
+    block serializes identically to today.  The voice WS handler in
+    ``runtime/app.py`` reads this block to override the runtime defaults for
+    the per-connection turn config.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Opt this agent in to voice.  When ``False`` (the default, and the "
+            "value when the block is absent), the runtime still accepts voice "
+            "connections for this agent using tenant defaults — this flag is a "
+            "*per-agent explicit enablement*, not a gate. "
+            "Future: set to ``True`` to opt into per-agent reporting/metering."
+        ),
+    )
+    mode: Literal["pipeline", "realtime"] = Field(
+        default="pipeline",
+        description=(
+            "Voice pipeline mode for this agent.  ``pipeline`` (the default) "
+            "routes through STT → unchanged text Executor → TTS (ADR 048 D2a); "
+            "``realtime`` selects the full-duplex ``RealtimeVoiceProvider`` "
+            "path (ADR 048 D2b, Phase 2) when configured on the runtime."
+        ),
+    )
+    stt: str | None = Field(
+        default=None,
+        description=(
+            "STT provider override for this agent "
+            "(e.g. ``'deepgram'``, ``'openai'``, ``'azure'``).  "
+            "``None`` → use the runtime/tenant default."
+        ),
+    )
+    tts: str | None = Field(
+        default=None,
+        description=(
+            "TTS provider override for this agent "
+            "(e.g. ``'cartesia'``, ``'openai'``, ``'elevenlabs'``, ``'azure'``).  "
+            "``None`` → use the runtime/tenant default."
+        ),
+    )
+    voice_id: str = Field(
+        default="",
+        description=(
+            "Provider-specific synthesized-voice id for this agent.  "
+            "Empty string → provider default.  "
+            "Example: ``'rachel'`` (ElevenLabs) or a Cartesia voice UUID."
+        ),
+    )
+    language: str | None = Field(
+        default=None,
+        description=(
+            "BCP-47 language hint for STT/TTS "
+            "(e.g. ``'en-US'``, ``'fr-FR'``).  "
+            "``None`` → auto-detect / provider default."
+        ),
+    )
+
+
 class AgentSpec(BaseModel):
     """Parsed ``agent.yaml`` contents (api_version: movate/v1, kind: Agent)."""
 
@@ -1428,6 +1498,25 @@ class AgentSpec(BaseModel):
             "Only meaningful for agents that use a `kb-vector-lookup` "
             "skill or otherwise produce a `grounded` / `citations` output "
             "field. Non-RAG agents should leave this ``off``."
+        ),
+    )
+
+    # ---- ADR 048 D5 / ADR 050 — per-agent voice override (ADDITIVE, OPTIONAL) ----
+    # Every existing agent.yaml validates unchanged — this field is absent →
+    # None, which means "no per-agent voice override; tenant defaults apply when
+    # invoked on the WS /api/v1/agents/{name}/voice endpoint."
+    # CLAUDE.md rule 5 — flagged: the single additive schema change for voice.
+    voice: VoiceConfig | None = Field(
+        default=None,
+        description=(
+            "Optional per-agent voice configuration (ADR 048 D5).  "
+            "When absent (the default on EVERY existing agent.yaml), the runtime "
+            "applies tenant defaults when this agent is invoked on the voice "
+            "endpoint — the agent is voice-capable with ZERO changes.  "
+            "Add this block only to override the tenant-default STT/TTS provider, "
+            "voice id, language, or pipeline mode for THIS agent specifically.\n\n"
+            "CLAUDE.md rule 5: additive-only; omitting the block serializes "
+            "identically to today.  No existing field is changed or removed."
         ),
     )
 

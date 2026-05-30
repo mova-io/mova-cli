@@ -459,6 +459,50 @@ class ReadyView(BaseModel):
     wipes the ApiKeyRecord table → operators lose their saved keys."""
 
 
+class CapabilityVoiceView(BaseModel):
+    """The ``voice`` block of :class:`CapabilitiesView` (ADR 048/050 D4).
+
+    Advertises this runtime's voice capability: which pipeline modes are
+    available, which STT/TTS providers are configured (key present in env),
+    and whether voice is effectively enabled at all.
+
+    ``enabled`` is ``True`` when at least one STT + one TTS provider has its
+    credential env var set.  When ``False`` the other fields are still
+    populated (modes / provider lists) so a client knows *what would work* if
+    keys were provided — this lets ``mdk voice providers list`` give useful
+    guidance even on an unconfigured runtime.
+
+    Added as an **additive, optional** field on :class:`CapabilitiesView`
+    (``None`` on the minimal / unauthenticated view).  Absence means the
+    runtime predates this field — callers should fall back to the flat
+    ``features["voice"]`` / ``features["voice_realtime"]`` booleans.
+
+    CLAUDE.md rule 5 — flagged: new additive field on an existing endpoint.
+    No existing field is changed or removed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    """``True`` when at least one STT + one TTS provider is keyed and the
+    voice WS route is registered on this runtime.  ``False`` means voice
+    is not ready (no keys, or the route is absent / mdk[voice] not installed).
+    """
+    modes: list[str]
+    """Voice pipeline modes available on this runtime — a subset of
+    ``["pipeline", "realtime"]``.  ``pipeline`` is always present when
+    ``enabled`` is ``True``; ``realtime`` is only present when a
+    ``RealtimeVoiceProvider`` factory is configured (ADR 048 D2b)."""
+    stt_providers: list[str]
+    """STT provider names whose credential env var is set on this runtime
+    (e.g. ``["deepgram", "openai", "azure"]``).  Sorted.  Empty when no STT
+    key is configured."""
+    tts_providers: list[str]
+    """TTS provider names whose credential env var is set on this runtime
+    (e.g. ``["cartesia", "openai", "elevenlabs", "azure"]``).  Sorted.
+    Empty when no TTS key is configured."""
+
+
 class CapabilityModelsView(BaseModel):
     """The ``models`` block of :class:`CapabilitiesView`.
 
@@ -548,6 +592,13 @@ class CapabilitiesView(BaseModel):
     extras_installed: list[str] | None = None
     """Optional ``pyproject`` extras importable in this image (marker-module
     probe). ``None`` in the minimal view."""
+    voice: CapabilityVoiceView | None = None
+    """Voice capability block (ADR 048/050 D4): modes, STT/TTS providers,
+    and whether voice is effectively enabled. ``None`` in the minimal
+    (unauthenticated) view. Additive — absent on runtimes that predate this
+    field; callers fall back to ``features["voice"]``/``features["voice_realtime"]``.
+
+    CLAUDE.md rule 5 — flagged: new additive field on an existing endpoint."""
 
 
 class AgentView(BaseModel):
