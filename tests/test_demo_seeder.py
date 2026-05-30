@@ -244,3 +244,91 @@ def test_clear_leaves_non_demo_rows_intact(tmp_path, monkeypatch) -> None:
 
     deleted = asyncio.run(_scenario())
     assert deleted >= 1
+
+
+# ---------------------------------------------------------------------------
+# Voice-turn generation (--with-voice)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_no_voice_turns_by_default() -> None:
+    """Default seed produces zero voice-turn records."""
+    bundle = generate_bundle(_cfg())
+    assert bundle.voice_turns == []
+    assert bundle.stats["voice_turns"] == 0
+
+
+@pytest.mark.unit
+def test_with_voice_produces_turns_for_success_runs() -> None:
+    """with_voice=True yields one VoiceTurnRecord per successful run."""
+    from movate.core.demo import VoiceTurnRecord  # noqa: PLC0415
+
+    bundle = generate_bundle(_cfg(with_voice=True))
+    n_success = sum(1 for r in bundle.runs if r.status == JobStatus.SUCCESS)
+    assert len(bundle.voice_turns) == n_success
+    assert bundle.stats["voice_turns"] == n_success
+    # Every voice turn references a real run id in the bundle.
+    run_ids = {r.run_id for r in bundle.runs}
+    for vt in bundle.voice_turns:
+        assert isinstance(vt, VoiceTurnRecord)
+        assert vt.run_id in run_ids
+        # Provider names must match the documented seeder values.
+        assert vt.stt_provider == "deepgram"
+        assert vt.tts_provider == "cartesia"
+        # All turns are non-realtime in the demo (future flag).
+        assert vt.realtime_mode is False
+
+
+@pytest.mark.unit
+def test_voice_turn_values_are_realistic() -> None:
+    """Latency + cost values must be within their documented bands."""
+    bundle = generate_bundle(_cfg(with_voice=True))
+    assert bundle.voice_turns, "need at least one success run"
+    for vt in bundle.voice_turns:
+        # STT: 90-340 ms (Deepgram Nova-2 documented band).
+        assert 90 <= vt.stt_latency_ms <= 340, vt.stt_latency_ms
+        # TTS: 65-185 ms (Cartesia Sonic documented band).
+        assert 65 <= vt.tts_latency_ms <= 185, vt.tts_latency_ms
+        # Audio: 3-28 s conversational utterances.
+        assert 3.0 <= vt.audio_duration_s <= 28.0, vt.audio_duration_s
+        # Cost: realistic blended STT+TTS per-turn range.
+        assert 0.0007 <= vt.turn_cost_usd <= 0.0030, vt.turn_cost_usd
+
+
+@pytest.mark.unit
+def test_voice_turn_bundle_is_deterministic() -> None:
+    """with_voice bundles reproduce byte-for-byte for the same (seed, now)."""
+    a = generate_bundle(_cfg(with_voice=True))
+    b = generate_bundle(_cfg(with_voice=True))
+    assert [vt.run_id for vt in a.voice_turns] == [vt.run_id for vt in b.voice_turns]
+    assert [vt.stt_latency_ms for vt in a.voice_turns] == [
+        vt.stt_latency_ms for vt in b.voice_turns
+    ]
+
+
+@pytest.mark.unit
+def test_voice_turns_do_not_alter_run_data() -> None:
+    """Enabling with_voice must not change run records (RNG is consumed after runs)."""
+    bundle_plain = generate_bundle(_cfg())
+    bundle_voice = generate_bundle(_cfg(with_voice=True))
+    # Run ids and metrics must be identical.
+    assert [r.run_id for r in bundle_plain.runs] == [r.run_id for r in bundle_voice.runs]
+    assert [r.metrics.cost_usd for r in bundle_plain.runs] == [
+        r.metrics.cost_usd for r in bundle_voice.runs
+    ]
+
+
+@pytest.mark.unit
+def test_voice_turns_tagged_with_demo_tenant() -> None:
+    """Every voice-turn record inherits its run's demo-tagged tenant_id."""
+    bundle = generate_bundle(_cfg(with_voice=True))
+    for vt in bundle.voice_turns:
+        assert vt.tenant_id.startswith(DEMO_TENANT_PREFIX), vt.tenant_id
+
+
+@pytest.mark.unit
+def test_days_default_is_7() -> None:
+    """SeedConfig.days defaults to 7 (tighter demo window per task spec)."""
+    cfg = SeedConfig(seed=1, now=_NOW)
+    assert cfg.days == 7

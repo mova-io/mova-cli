@@ -29,6 +29,7 @@ from movate.core.demo.seeder import (
     DEMO_TENANT_PREFIX,
     DemoBundle,
     SeedConfig,
+    VoiceTurnRecord,
     generate_bundle,
     is_demo_tenant,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "DEMO_TENANT_PREFIX",
     "DemoBundle",
     "SeedConfig",
+    "VoiceTurnRecord",
     "generate_bundle",
     "is_demo_tenant",
 ]
