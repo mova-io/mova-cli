@@ -55,9 +55,10 @@ OBSERVABILITY_KEY_ENV_VARS: tuple[str, ...] = (
 )
 
 # Voice-provider env vars (ADR 048/049, the ``[voice]`` extra). Set via
-# ``mdk auth login deepgram`` / ``cartesia`` / ``azure-speech`` (or by hand)
-# and consumed by the speech adapters in ``movate.voice`` (Deepgram STT /
-# Cartesia TTS, plus the Azure Speech STT/TTS pair which reads key+region).
+# ``mdk auth login deepgram`` / ``cartesia`` / ``elevenlabs`` / ``azure-speech``
+# (or by hand) and consumed by the speech adapters in ``movate.voice`` (Deepgram
+# STT / Cartesia TTS / ElevenLabs TTS, plus the Azure Speech STT/TTS pair which
+# reads key+region).
 # Kept SEPARATE from PROVIDER_KEY_ENV_VARS on purpose: those are LLM-chat
 # provider keys that gate ``_has_any_provider_key`` ("can this machine run a
 # text agent?") and are live-verified against an LLM metadata endpoint by the
@@ -74,6 +75,7 @@ OBSERVABILITY_KEY_ENV_VARS: tuple[str, ...] = (
 VOICE_KEY_ENV_VARS: tuple[str, ...] = (
     "DEEPGRAM_API_KEY",
     "CARTESIA_API_KEY",
+    "ELEVENLABS_API_KEY",
     "AZURE_SPEECH_KEY",
     "AZURE_SPEECH_REGION",
 )

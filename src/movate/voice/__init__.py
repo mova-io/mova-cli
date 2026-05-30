@@ -13,7 +13,8 @@ Phase 1 scope (pipeline mode only):
 * OpenAI reference adapters (:class:`OpenAIWhisperSTT` / :class:`OpenAITTS`)
   in :mod:`movate.voice.openai_speech` (the T2 low-friction default), plus the
   T1 low-latency pair (:class:`DeepgramSTT` in :mod:`movate.voice.deepgram` /
-  :class:`CartesiaTTS` in :mod:`movate.voice.cartesia`) and the T1
+  :class:`CartesiaTTS` in :mod:`movate.voice.cartesia`), the T2 premium-voice
+  TTS (:class:`ElevenLabsTTS` in :mod:`movate.voice.elevenlabs`), and the T1
   enterprise/sovereignty Azure Speech pair (:class:`AzureSpeechSTT` /
   :class:`AzureNeuralTTS` in :mod:`movate.voice.azure_speech`, against the
   customer's own Azure subscription), each with its provider SDK imported
@@ -38,8 +39,8 @@ Deferred (out of scope here): telephony (Phase 3) and the agility layer
 (router / bench / drift — ADR 049).
 
 The Protocols + chunk types + doubles + pipeline are import-cheap (no optional
-deps). The OpenAI / Deepgram / Cartesia / Azure Speech / realtime adapters
-import their provider SDK lazily; importing them by name here does **not**
+deps). The OpenAI / Deepgram / Cartesia / ElevenLabs / Azure Speech / realtime
+adapters import their provider SDK lazily; importing them by name here does **not**
 trigger that import until the class is constructed.
 """
 
@@ -59,6 +60,7 @@ from movate.voice.base import (
 from movate.voice.cartesia import CartesiaTTS
 from movate.voice.deepgram import DeepgramSTT
 from movate.voice.doubles import FakeRealtime, FakeSTT, FakeTTS
+from movate.voice.elevenlabs import ElevenLabsTTS
 from movate.voice.openai_speech import OpenAITTS, OpenAIWhisperSTT
 from movate.voice.pipeline import VoicePipelineResult, run_voice_pipeline
 from movate.voice.realtime_azure import AzureOpenAIRealtime
@@ -72,6 +74,7 @@ __all__ = [
     "AzureSpeechSTT",
     "CartesiaTTS",
     "DeepgramSTT",
+    "ElevenLabsTTS",
     "FakeRealtime",
     "FakeSTT",
     "FakeTTS",
