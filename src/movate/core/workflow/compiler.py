@@ -234,6 +234,10 @@ def compile_workflow(
         nodes=nodes,
         edges=edges,
         workflow_dir=workflow_dir,
+        # ADR 055 D1 — surface the declared backend read-only on the IR so the
+        # dispatch fork + `mdk show` see it without re-parsing workflow.yaml.
+        # Default "native" preserves every existing workflow's behavior.
+        runtime=spec.runtime,
     )
 
     # 5. Cycle detection — fail fast at compile time, UNLESS the caller opted

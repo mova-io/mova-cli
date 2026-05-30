@@ -115,6 +115,17 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
         "--poll-interval",
         help="Seconds between filesystem polls in the live loop.",
     ),
+    runtime: str = typer.Option(
+        None,
+        "--runtime",
+        help=(
+            "Override the workflow execution backend (ADR 055 D3): native (default), "
+            "temporal, or langgraph. Precedence: this flag > workflow.yaml 'runtime:' "
+            "field > native. Read-only — never mutates the spec. Applies to workflow "
+            "targets only; agent dev ignores it. (The dev loop validates + evals; use "
+            "[bold]mdk run --runtime temporal <wf>[/bold] to execute on the backend.)"
+        ),
+    ),
 ) -> None:
     """Guided agent authoring: scaffold → edit → live-test → deploy.
 
@@ -146,8 +157,14 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
             agent_dir,
             mock=mock,
             poll_interval=poll_interval,
+            runtime_override=runtime,
         )
         return
+    if runtime is not None:
+        # --runtime selects a workflow execution backend; an agent dev session
+        # has no workflow to route. Fail loud rather than silently ignoring it.
+        _console.error("--runtime applies to workflow targets only; this is an agent.")
+        raise typer.Exit(code=2)
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if not interactive:
@@ -1132,6 +1149,7 @@ def _run_workflow_dev_loop(
     *,
     mock: bool,
     poll_interval: float,
+    runtime_override: str | None = None,
 ) -> None:
     """Live-reload loop for a workflow target.
 
@@ -1139,8 +1157,36 @@ def _run_workflow_dev_loop(
     ``agent.yaml`` + ``prompt.md`` + schemas, and the workflow eval
     dataset. On any change, re-validates the spec + re-runs the eval
     dataset (under ``--mock`` by default). Ctrl-C exits.
+
+    ``runtime_override`` (ADR 055 D3) is validated + surfaced for parity with
+    ``mdk run`` — the dev loop validates and evals (it does not *execute* the
+    workflow on the backend), so the override is informational here; it fails
+    loud on an invalid value rather than silently accepting a typo.
     """
     import time  # noqa: PLC0415
+
+    if runtime_override is not None:
+        from movate.runtime.workflow_backend import (  # noqa: PLC0415
+            VALID_RUNTIMES,
+            WorkflowBackendError,
+            require_backend_available,
+        )
+
+        if runtime_override not in VALID_RUNTIMES:
+            _console.error(
+                f"--runtime {runtime_override!r} invalid; expected one of "
+                f"{', '.join(VALID_RUNTIMES)}."
+            )
+            raise typer.Exit(code=2)
+        # Surface availability up front so the operator learns NOW (not at
+        # `mdk run` time) that the backend isn't installed/configured.
+        try:
+            require_backend_available(runtime_override)
+            stdout.print(f"[dim]runtime override (for `mdk run`): {runtime_override}[/dim]")
+        except WorkflowBackendError as exc:
+            err.print(
+                f"[yellow]⚠[/yellow] runtime {runtime_override!r} not ready: [dim]{exc}[/dim]"
+            )
 
     stdout.print(f"\n[bold]mdk dev[/bold] (workflow) · [bold]{workflow_dir.name}[/bold]")
     stdout.print(f"[dim]workflow: {workflow_dir / 'workflow.yaml'}[/dim]")
