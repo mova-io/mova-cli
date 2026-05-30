@@ -135,7 +135,16 @@ def create_project(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """Create a new project in the active tenant."""
+    """Create a new project in the active tenant.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Create a project (caller becomes owner)[/dim]
+      $ mdk project create "Returns Pipeline" -d "RMA triage agents"
+
+      [dim]# Create against a named deploy target[/dim]
+      $ mdk project create acme-support -t prod
+    """
     client = _build_client(target, suppress=output_format == TableJson.JSON)
     asyncio.run(_create(client, name=name, description=description, owner=owner, fmt=output_format))
 
@@ -150,7 +159,16 @@ def list_projects(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """List this tenant's projects, newest-first."""
+    """List this tenant's projects, newest-first.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Active projects as a table[/dim]
+      $ mdk project list
+
+      [dim]# Include archived, machine-readable[/dim]
+      $ mdk project list --include-archived -o json
+    """
     client = _build_client(target, suppress=output_format == TableJson.JSON)
     asyncio.run(_list(client, include_archived=include_archived, fmt=output_format))
 
@@ -163,7 +181,13 @@ def show_project(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """Show one project's detail."""
+    """Show one project's detail.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Inspect one project by id[/dim]
+      $ mdk project show prj_01H...
+    """
     client = _build_client(target, suppress=output_format == TableJson.JSON)
     asyncio.run(_show(client, project_id=project_id, fmt=output_format))
 
@@ -178,7 +202,16 @@ def update_project(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """Rename / re-describe a project."""
+    """Rename / re-describe a project.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Rename a project[/dim]
+      $ mdk project update prj_01H... --name "Returns v2"
+
+      [dim]# Update just the description[/dim]
+      $ mdk project update prj_01H... -d "now covers EU returns"
+    """
     if name is None and description is None:
         error("nothing to update — pass --name and/or --description")
         raise typer.Exit(code=2)
@@ -203,7 +236,16 @@ def archive_project(
     """Soft-delete (archive) a project.
 
     The per-tenant ``default`` project cannot be archived (the runtime
-    returns 422)."""
+    returns 422).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Archive with a confirm prompt[/dim]
+      $ mdk project archive prj_01H...
+
+      [dim]# Archive non-interactively (CI)[/dim]
+      $ mdk project archive prj_01H... --yes
+    """
     confirm_destructive(
         f"Archive project {project_id}? Soft-delete only — re-list with --include-archived.",
         yes=yes,
@@ -225,7 +267,13 @@ def list_members(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """List a project's members (creation order)."""
+    """List a project's members (creation order).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Who can access this project?[/dim]
+      $ mdk project members list prj_01H...
+    """
     client = _build_client(target, suppress=output_format == TableJson.JSON)
     asyncio.run(_list_members(client, project_id=project_id, fmt=output_format))
 
@@ -244,7 +292,13 @@ def add_member(
     ),
     target: str = typer.Option(None, "--target", "-t"),
 ) -> None:
-    """Invite a principal to the project with a role."""
+    """Invite a principal to the project with a role.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Add an editor by principal id[/dim]
+      $ mdk project members add prj_01H... --principal api_key:KEYID --role editor
+    """
     client = _build_client(target)
     asyncio.run(_add_member(client, project_id=project_id, principal=principal, role=role))
 
@@ -259,7 +313,13 @@ def remove_member(
     """Remove a member from the project.
 
     The runtime rejects removing the last ``owner`` (422 — promote
-    someone else first)."""
+    someone else first).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Remove a member (with confirm)[/dim]
+      $ mdk project members remove prj_01H... --principal api_key:KEYID
+    """
     confirm_destructive(
         f"Remove {principal} from project {project_id}?",
         yes=yes,

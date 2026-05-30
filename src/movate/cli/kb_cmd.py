@@ -1642,6 +1642,20 @@ def ingest(
     stale chunks before writing new ones.
 
     Use ``--ocr-lang`` / ``--ocr-backend`` for non-English or noisy scans.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Ingest an agent's kb/ directory locally[/dim]
+      $ mdk kb ingest faq-agent agents/faq-agent/kb/
+
+      [dim]# Preview chunking without spending embedding budget[/dim]
+      $ mdk kb ingest faq-agent ./docs --dry-run
+
+      [dim]# Ingest a single web page[/dim]
+      $ mdk kb ingest faq-agent https://example.com/handbook
+
+      [dim]# Upload to a deployed runtime's KB[/dim]
+      $ mdk kb ingest faq-agent ./docs --target prod
     """
     import os  # noqa: PLC0415
 
@@ -2367,6 +2381,17 @@ def search(
     Pass ``--target`` to search a deployed agent's KB instead of the
     local store — the runtime embeds the query server-side, so no local
     embedding key is needed.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Sanity-check retrieval before running the agent[/dim]
+      $ mdk kb search faq-agent "what is the refund window?"
+
+      [dim]# Hybrid (vector + BM25) for rare-term queries, top 10[/dim]
+      $ mdk kb search faq-agent "error E1042" --hybrid -k 10
+
+      [dim]# Search a deployed agent's KB[/dim]
+      $ mdk kb search faq-agent "refund window?" --target prod
     """
     import os  # noqa: PLC0415
 
@@ -2542,6 +2567,14 @@ def list_chunks(
 
     Omit ``agent`` for an interactive picker. Pass ``--target`` to list a
     deployed agent's KB instead of the local store.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Confirm a doc's chunks landed[/dim]
+      $ mdk kb list faq-agent
+
+      [dim]# Filter to one source file on a deployed agent[/dim]
+      $ mdk kb list faq-agent --source handbook.md --target prod
     """
     # ── Interactive guided helper ──────────────────────────────────────────
     if agent is None:
@@ -2651,6 +2684,14 @@ def stats(
 
     Omit ``agent`` for an interactive picker. Pass ``--target`` to
     summarize a deployed agent's KB instead of the local store.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Sanity-check a corpus after ingest[/dim]
+      $ mdk kb stats faq-agent
+
+      [dim]# Is one document dominating the KB?[/dim]
+      $ mdk kb stats faq-agent --by-source
     """
     # ── Interactive guided helper ──────────────────────────────────────────
     if agent is None:
@@ -3261,6 +3302,14 @@ def clear(
 
     Omit ``agent`` for an interactive picker. Pass ``--target`` to clear
     a deployed agent's KB instead of the local store.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Drop just one stale document[/dim]
+      $ mdk kb clear faq-agent --source handbook.md
+
+      [dim]# Full wipe, no prompt (CI)[/dim]
+      $ mdk kb clear faq-agent --yes
     """
     # ── Interactive guided helper ──────────────────────────────────────────
     if agent is None:
@@ -3370,6 +3419,14 @@ def reindex(
 
     Omit ``agent`` for an interactive picker. Pass ``--target`` to
     reindex a deployed agent's KB instead of the local store.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Rebuild the index from existing vectors (free)[/dim]
+      $ mdk kb reindex faq-agent
+
+      [dim]# Re-embed everything after an embedding-model change[/dim]
+      $ mdk kb reindex faq-agent --reembed --yes
     """
     import os  # noqa: PLC0415
 
