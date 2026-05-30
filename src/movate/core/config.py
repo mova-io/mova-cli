@@ -710,6 +710,19 @@ class ProjectConfig(BaseModel):
             "absent = use the default 10 categories. See ScorecardConfig."
         ),
     )
+    mdk_version_min: str | None = Field(
+        default=None,
+        description=(
+            "Minimum mdk CalVer (``YYYY.M.D.N``) this project expects to "
+            "run against. When set, ``mdk doctor`` flags an installed "
+            "binary that's older than this value with the reinstall "
+            "command — converts the silent 'works-on-my-machine' class "
+            "of bug into an explicit, actionable warning at the start of "
+            "the session. Operators can also set the ``MDK_VERSION_MIN`` "
+            "env var as an override. Empty/absent = no check (the doctor "
+            "row is silently skipped)."
+        ),
+    )
 
 
 class ScorecardConfig(BaseModel):
