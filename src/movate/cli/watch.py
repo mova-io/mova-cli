@@ -37,7 +37,7 @@ import difflib
 import json
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -402,7 +402,14 @@ def dispatch_run_once(agent_dir: Path, test_input: str, *, mock: bool) -> tuple[
 # ---------------------------------------------------------------------------
 
 
-def run_loop(agent_dir: Path, test_input: str, *, mock: bool, poll_interval: float) -> None:
+def run_loop(
+    agent_dir: Path,
+    test_input: str,
+    *,
+    mock: bool,
+    poll_interval: float,
+    on_iteration: Callable[[int], None] | None = None,
+) -> None:
     """Re-run the agent on every change to its files until ``KeyboardInterrupt``.
 
     The single home for the live-reload test loop (ADR 027 D1): polls
@@ -410,6 +417,15 @@ def run_loop(agent_dir: Path, test_input: str, *, mock: bool, poll_interval: flo
     *run* (:func:`dispatch_run_once`) instead of a validate, then prints a
     diff vs. the previous run (:func:`_print_output_diff`). ``mdk dev`` drives
     this as a phase; ``mdk watch --run`` drives it directly.
+
+    ``on_iteration`` is an optional post-dispatch hook fired with the run's exit
+    code after the initial dispatch and after every change-triggered dispatch.
+    It's the seam ``mdk dev`` uses for eval-in-the-loop (score a few cases +
+    show the delta) without coupling the shared loop to the eval engine. The
+    default (``None``) leaves the loop byte-for-byte unchanged — ``mdk watch
+    --run`` never passes it. The hook must not raise (the caller wraps its own
+    failures); for safety it's still called inside a guard so a buggy hook can't
+    kill the loop.
 
     D4 concurrency model — the one real risk — is enforced here: this is a
     **single foreground loop**. Each dispatch runs via ``asyncio.run`` (inside
@@ -422,6 +438,17 @@ def run_loop(agent_dir: Path, test_input: str, *, mock: bool, poll_interval: flo
     caller can stop the loop (``mdk dev`` opens its actions menu; ``mdk watch``
     exits).
     """
+
+    def _fire_iteration(exit_code: int) -> None:
+        if on_iteration is None:
+            return
+        try:
+            on_iteration(exit_code)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # a buggy hook must not sink the loop
+            warn(f"dev iteration hook failed: {exc}")
+
     try:
         paths = _compute_watched_paths(agent_dir).paths
     except AgentLoadError as exc:
@@ -432,7 +459,8 @@ def run_loop(agent_dir: Path, test_input: str, *, mock: bool, poll_interval: flo
         "[dim]  edit prompt.md, agent.yaml, a schema, or a context — re-runs on save."
         " Ctrl-C to stop.[/dim]"
     )
-    _, previous = dispatch_run_once(agent_dir, test_input, mock=mock)
+    rc, previous = dispatch_run_once(agent_dir, test_input, mock=mock)
+    _fire_iteration(rc)
 
     snapshot = _snapshot_mtimes(paths)
     while True:
@@ -445,8 +473,9 @@ def run_loop(agent_dir: Path, test_input: str, *, mock: bool, poll_interval: flo
             with contextlib.suppress(AgentLoadError):
                 paths = _compute_watched_paths(agent_dir).paths
             snapshot = _snapshot_mtimes(paths)
-            _, current = dispatch_run_once(agent_dir, test_input, mock=mock)
+            rc, current = dispatch_run_once(agent_dir, test_input, mock=mock)
             _print_output_diff(previous, current)
+            _fire_iteration(rc)
             # Keep the last GOOD output as the baseline so a failed run
             # (current is None) doesn't reset the diff reference.
             if current is not None:
