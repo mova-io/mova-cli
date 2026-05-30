@@ -877,21 +877,88 @@ class WorkerDispatch:
                 f"workflow {job.target!r} not registered on this worker",
                 retryable=False,
             )
-        # Same tenant-scoping fix as the agent path: workers run jobs from
-        # many tenants through one Executor; the workflow runner must stamp
-        # the job's tenant on every node's RunRecord, not the executor's
-        # construction-time default.
-        runner = WorkflowRunner(
-            executor=self._executor,
-            storage=self._storage,
-            tenant_id=job.tenant_id,
+
+        # ADR 055 D2/D3 — the dispatch fork. Route on the workflow's DECLARED
+        # runtime (workflow.yaml 'runtime:' surfaced on the IR). native stays
+        # today's WorkflowRunner unchanged; temporal/langgraph route through the
+        # backend seam, which fails loud (D6) if unavailable — never a silent
+        # downgrade to native.
+        from movate.runtime.workflow_backend import (  # noqa: PLC0415
+            WorkflowBackendError,
+            require_backend_available,
+            resolve_effective_runtime,
         )
+
         try:
-            result = await runner.run(graph, initial_state=job.input)
+            effective = resolve_effective_runtime(graph, None)
+            require_backend_available(effective)
+        except WorkflowBackendError as exc:
+            # A workflow declaring temporal/langgraph that this worker can't
+            # serve is a non-retryable config error (retrying won't install the
+            # extra or configure the connection) — surface the actionable hint.
+            return _error("runtime_unavailable", str(exc), retryable=False)
+
+        if effective == "native":
+            # Same tenant-scoping fix as the agent path: workers run jobs from
+            # many tenants through one Executor; the workflow runner must stamp
+            # the job's tenant on every node's RunRecord, not the executor's
+            # construction-time default.
+            runner = WorkflowRunner(
+                executor=self._executor,
+                storage=self._storage,
+                tenant_id=job.tenant_id,
+            )
+            try:
+                result = await runner.run(graph, initial_state=job.input)
+            except Exception as exc:
+                logger.exception("workflow_execute_unhandled job_id=%s", job.job_id)
+                return _error("internal", str(exc), retryable=True)
+            return self._workflow_result_to_outcome(result)
+
+        # temporal — compile (Track B) + execute on Temporal via Track C
+        # activities, reusing this worker's Executor collaborators (ADR 054 D3).
+        # langgraph never reaches here (require_backend_available failed loud).
+        try:
+            result = await self._run_workflow_on_backend(job, graph)
+        except WorkflowBackendError as exc:
+            return _error("runtime_unavailable", str(exc), retryable=False)
         except Exception as exc:
-            logger.exception("workflow_execute_unhandled job_id=%s", job.job_id)
+            logger.exception("workflow_backend_execute_unhandled job_id=%s", job.job_id)
             return _error("internal", str(exc), retryable=True)
         return self._workflow_result_to_outcome(result)
+
+    async def _run_workflow_on_backend(self, job: JobRecord, graph: Any) -> Any:
+        """Execute a non-native workflow via the backend seam (ADR 055 D2).
+
+        The Temporal activities run the SAME execution model the native runner
+        does (ADR 054 D3): one Executor, built here from the same provider
+        policy the eval/bench paths use (MockProvider under a ``mock`` job,
+        LiteLLM otherwise) plus this worker's storage + tracer. The job's tenant
+        is stamped so every node's RunRecord is scoped correctly (mirrors the
+        native path)."""
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.runtime.workflow_backend import run_temporal_workflow  # noqa: PLC0415
+
+        use_mock = self._use_mock_for_eval or bool(job.input.get("mock"))
+        if use_mock:
+            from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+            provider: Any = MockProvider()
+        else:
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+            provider = LiteLLMProvider()
+
+        return await run_temporal_workflow(
+            graph,
+            job.input,
+            storage=self._storage,
+            pricing=load_pricing(),
+            tracer=self._executor.tracer,
+            provider=provider,
+            tenant_id=job.tenant_id,
+            mock=use_mock,
+        )
 
     @staticmethod
     def _workflow_result_to_outcome(result: Any) -> DispatchOutcome:
