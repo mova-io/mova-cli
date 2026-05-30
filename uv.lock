@@ -3490,7 +3490,7 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "2026.5.29.19"
+version = "2026.5.29.20"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -3564,6 +3564,7 @@ playground = [
     { name = "greenlet" },
     { name = "httpx" },
     { name = "sqlalchemy", version = "2.0.50", source = { registry = "https://pypi.org/simple" } },
+    { name = "websockets", version = "16.0", source = { registry = "https://pypi.org/simple" } },
 ]
 prefect = [
     { name = "prefect", version = "2.20.25", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-10-movate-cli-airflow'" },
@@ -3663,6 +3664,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'runtime'", specifier = ">=0.29" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'teams'", specifier = ">=0.29" },
+    { name = "websockets", marker = "extra == 'playground'", specifier = ">=12.0" },
 ]
 provides-extras = ["runtime", "langfuse", "keychain", "cross-encoder", "ocr", "easyocr", "otel", "dev", "anthropic", "openai", "voice", "langchain", "teams", "github", "prefect", "airflow", "playground"]
 
