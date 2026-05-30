@@ -20,10 +20,12 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from movate.core.auth import ALL_SCOPES, SCOPE_READ, ApiKeyEnv, mint_api_key
+from movate.core.provider_keys import ENV_PROVIDER_KEY_SECRET, mint_tenant_provider_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 from movate.voice import FakeRealtime, FakeSTT, FakeTTS
@@ -306,3 +308,159 @@ def test_voice_ws_default_mode_unchanged_when_realtime_configured(
     assert "agent.token" in types  # the pipeline Executor stage ran
     assert types[-1] == "done"
     assert tts.spoken  # pipeline TTS was driven
+
+
+# ---------------------------------------------------------------------------
+# Per-tenant BYOK key resolution for voice (ADR 048 D6 / ADR 018).
+#
+# The transport edge resolves the calling tenant's OWN STT/TTS/realtime key via
+# the ADR 018 ProviderKeyResolver and threads it into the adapters (`api_key=`).
+# No tenant key → `None` → the adapter's env-default credential, byte-for-byte
+# today's behavior (the back-compat guard). Resolution is wired in the handler,
+# never inside the adapter (CLAUDE.md rule 6) — proven here by asserting the
+# fakes received exactly the resolved key (or `None`).
+# ---------------------------------------------------------------------------
+
+_FERNET_KEY = Fernet.generate_key()
+
+
+def _named_stt(name: str, transcript: str = "lights on") -> FakeSTT:
+    stt = FakeSTT(transcript)
+    stt.name = name  # the adapter name the resolver maps to a BYOK family
+    return stt
+
+
+def _named_tts(name: str) -> FakeTTS:
+    tts = FakeTTS()
+    tts.name = name
+    return tts
+
+
+async def _store_key(storage: InMemoryStorage, *, tenant_id: str, provider: str, key: str) -> None:
+    """Persist a tenant BYOK key encrypted under the test Fernet secret."""
+    rec = mint_tenant_provider_key(
+        tenant_id=tenant_id,
+        provider=provider,
+        plaintext=key,
+        fernet=Fernet(_FERNET_KEY),
+    )
+    await storage.save_tenant_provider_key(rec)
+
+
+@pytest.fixture
+def byok_app(storage: InMemoryStorage, agents_path: Path, monkeypatch):
+    # The handler builds its own ProviderKeyResolver(storage), which decrypts
+    # with the env secret — so the test minting must use the same secret.
+    monkeypatch.setenv(ENV_PROVIDER_KEY_SECRET, _FERNET_KEY.decode())
+    app = build_app(storage, agents_path=agents_path)
+    stt = _named_stt("deepgram", "lights on")  # `deepgram` is its own BYOK family
+    tts = _named_tts("elevenlabs")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = lambda: tts
+    return app, stt, tts
+
+
+async def test_voice_ws_pipeline_uses_tenant_byok_keys(storage, auth_setup, byok_app) -> None:
+    """With tenant STT + TTS keys stored, both are threaded into the adapters."""
+    token, tenant_id = auth_setup
+    app, stt, tts = byok_app
+    await _store_key(storage, tenant_id=tenant_id, provider="deepgram", key="dg-tenant")
+    await _store_key(storage, tenant_id=tenant_id, provider="elevenlabs", key="el-tenant")
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01")
+        ws.send_json({"type": "end"})
+        _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    # The resolved tenant keys reached the adapters via `api_key=` (proof the
+    # edge resolved + threaded them, not the SDK env default).
+    assert stt.api_keys == ["dg-tenant"]
+    assert tts.api_keys == ["el-tenant"]
+
+
+async def test_voice_ws_pipeline_falls_back_to_env_when_no_tenant_key(
+    storage, auth_setup, byok_app
+) -> None:
+    """No tenant key → adapters receive `api_key=None` → SDK env default.
+
+    This is the back-compat guard: a keyless tenant must behave byte-for-byte
+    as before BYOK (the adapter reads its own env credential)."""
+    token, _tenant_id = auth_setup
+    app, stt, tts = byok_app
+    # Deliberately store NO tenant key.
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01")
+        ws.send_json({"type": "end"})
+        _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    assert stt.api_keys == [None]
+    assert tts.api_keys == [None]
+
+
+async def test_voice_ws_pipeline_maps_adapter_name_to_provider_family(
+    storage, auth_setup, agents_path, monkeypatch
+) -> None:
+    """A multi-service vendor adapter (`openai_whisper`) resolves the tenant's
+    `openai` key — the edge collapses the capability name to its BYOK family."""
+    monkeypatch.setenv(ENV_PROVIDER_KEY_SECRET, _FERNET_KEY.decode())
+    token, tenant_id = auth_setup
+    app = build_app(storage, agents_path=agents_path)
+    stt = _named_stt("openai_whisper", "hello")
+    tts = _named_tts("openai_tts")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = lambda: tts
+    # One `openai` key covers both the Whisper STT and the OpenAI TTS adapter.
+    await _store_key(storage, tenant_id=tenant_id, provider="openai", key="sk-openai")
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01")
+        ws.send_json({"type": "end"})
+        _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    assert stt.api_keys == ["sk-openai"]
+    assert tts.api_keys == ["sk-openai"]
+
+
+async def test_voice_ws_realtime_uses_tenant_byok_key(
+    storage, agents_path, auth_setup, monkeypatch
+) -> None:
+    """The realtime (?mode=realtime) path threads the tenant key into session()."""
+    monkeypatch.setenv(ENV_PROVIDER_KEY_SECRET, _FERNET_KEY.decode())
+    token, tenant_id = auth_setup
+    app = build_app(storage, agents_path=agents_path)
+    rt = FakeRealtime(transcript="hi", answer="done")
+    rt.name = "openai_realtime"  # maps to the `openai` BYOK family
+    app.state.voice_realtime_factory = lambda: rt
+    await _store_key(storage, tenant_id=tenant_id, provider="openai", key="sk-rt")
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(
+        f"/api/v1/agents/voice-demo/voice?mode=realtime&token={token}"
+    ) as ws:
+        ws.send_bytes(b"\x00\x01")
+        ws.send_json({"type": "close"})
+        while True:
+            msg = ws.receive()
+            if (
+                msg.get("text") is not None
+                and json.loads(msg["text"]).get("type") == "response_done"
+            ):
+                break
+            if msg.get("type") == "websocket.close":
+                break
+
+    assert rt.api_keys == ["sk-rt"]
