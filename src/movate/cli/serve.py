@@ -182,6 +182,12 @@ async def _run_serve(
     # optional [runtime] deps (uvicorn, fastapi). Deferring to here
     # means ``mdk kb ingest``, ``mdk eval``, and other non-serve
     # commands don't crash when the [runtime] extra isn't installed.
+    # Probe up-front and print a friendly install hint instead of a
+    # raw ``ModuleNotFoundError`` traceback when the extra is missing.
+    from movate.cli._runtime_extras import ensure_runtime_extras  # noqa: PLC0415
+
+    ensure_runtime_extras()
+
     import uvicorn  # noqa: PLC0415
 
     from movate.cli._runtime import register_pool_observability  # noqa: PLC0415
