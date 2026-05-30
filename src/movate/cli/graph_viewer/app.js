@@ -115,6 +115,7 @@
     opts = opts || {};
     var hadPositions = true;
     var addedNodes = [];
+    var addedEdges = [];
 
     function ingestNode(n) {
       var key = n.key != null ? n.key : n.id;
@@ -149,8 +150,15 @@
     function ingestEdge(e) {
       var s = e.source, t = e.target;
       if (s == null || t == null || !graph.hasNode(s) || !graph.hasNode(t)) return;
-      try { graph.addEdge(s, t, Object.assign({ size: 1, color: "#30363d" }, e.attributes || {})); }
-      catch (_) { /* parallel/dup edge in a non-multi context — ignore */ }
+      // Prefer the server-supplied edge key (stable across re-imports / lets
+      // the live highlight target it); fall back to graphology's generated
+      // key when none is given.
+      try {
+        var key = (e.key != null && !graph.hasEdge(e.key))
+          ? graph.addEdgeWithKey(e.key, s, t, Object.assign({ size: 1, color: "#30363d" }, e.attributes || {}))
+          : graph.addEdge(s, t, Object.assign({ size: 1, color: "#30363d" }, e.attributes || {}));
+        addedEdges.push(key);
+      } catch (_) { /* parallel/dup edge in a non-multi context — ignore */ }
     }
 
     (data.nodes || []).forEach(ingestNode);
@@ -160,7 +168,7 @@
     rebuildTypeFilters();
     updateStats();
 
-    return { hadPositions: hadPositions, addedNodes: addedNodes };
+    return { hadPositions: hadPositions, addedNodes: addedNodes, addedEdges: addedEdges };
   }
 
   // ---- ForceAtlas2 layout (web worker) ------------------------------------
@@ -216,6 +224,14 @@
           res.zIndex = 0;
         }
       }
+      // Live-growth halo: a freshly-arrived node briefly glows + grows so the
+      // eye catches the graph growing. Cleared by highlightNew() after a beat.
+      if (graph.getNodeAttribute(node, "_new")) {
+        res.color = "#7ee787";
+        res.highlighted = true;
+        res.size = (res.size || 4) * 1.6;
+        res.zIndex = 3;
+      }
       return res;
     });
 
@@ -231,6 +247,10 @@
         if (s === selectedNode || t === selectedNode) {
           res.color = "#58a6ff"; res.zIndex = 1;
         } else { res.hidden = true; }
+      }
+      // Live-growth halo on a freshly-arrived edge (mirrors the node glow).
+      if (graph.getEdgeAttribute(edge, "_new")) {
+        res.color = "#7ee787"; res.size = (res.size || 1) + 1.5; res.zIndex = 3;
       }
       return res;
     });
@@ -501,18 +521,33 @@
   }
 
   // ---- live growth (Server-Sent Events) -----------------------------------
+  // Subscribes to the runtime's graph-growth SSE stream with ?live=true so
+  // the server, after replaying the current graph, KEEPS THE CONNECTION OPEN
+  // and pushes node.added / edge.added frames as KB ingest persists new
+  // nodes/edges (ADR 046 D6). Each new element gets a brief highlight halo so
+  // the eye catches the graph growing. The static viewer is independent of
+  // this: the initial snapshot loads in boot(); if the stream is unavailable
+  // (older runtime, network) the graph still renders and stays interactive.
+  var HIGHLIGHT_MS = 2600;          // how long a freshly-added element glows
+
   function setLive(on) {
     el("live-toggle").parentElement.classList.toggle("on", on);
     if (on) {
       if (liveSource) return;
-      var url = "/api/v1/projects/" + encodeURIComponent(CFG.project) + "/graph/stream";
+      // ?live=true engages the live-tail (without it the stream is a one-shot
+      // snapshot). The {project} path param is the agent the snapshot used, so
+      // the live-tail is scoped to the SAME graph the viewer is showing.
+      var url = "/api/v1/projects/" + encodeURIComponent(CFG.project) + "/graph/stream?live=true";
       liveSource = new EventSource(url, { withCredentials: true });
       liveSource.addEventListener("node.added", function (ev) { onLiveNode(ev); });
       liveSource.addEventListener("edge.added", function (ev) { onLiveEdge(ev); });
       // Generic message fallback for runtimes that don't set an event name.
       liveSource.onmessage = function (ev) { onLiveGeneric(ev); };
-      liveSource.onerror = function () { status("live stream error — retrying…"); };
-      status("live growth ON — watching for ingest events");
+      // Graceful degrade: a stream error never touches the already-rendered
+      // static graph — we just note it. EventSource auto-reconnects; on
+      // reconnect the server re-replays the snapshot to reconcile.
+      liveSource.onerror = function () { status("live stream interrupted — retrying… (graph still interactive)"); };
+      status("live growth ON — watching ingest for new nodes/edges");
     } else if (liveSource) {
       liveSource.close(); liveSource = null;
       status("live growth OFF");
@@ -524,18 +559,55 @@
   function onLiveNode(ev) {
     var n = parseEvent(ev); if (!n) return;
     var before = graph.order;
-    importGraph({ nodes: [n], edges: [] });
-    if (graph.order > before) { nudgeLayout(); status("+ node " + (n.attributes && n.attributes.label || n.key || n.id)); }
+    var res = importGraph({ nodes: [n], edges: [] });
+    if (graph.order > before) {
+      highlightNew(res.addedNodes, []);
+      nudgeLayout();
+      status("+ node " + (n.attributes && n.attributes.label || n.key || n.id));
+    }
   }
   function onLiveEdge(ev) {
     var e = parseEvent(ev); if (!e) return;
     var before = graph.size;
-    importGraph({ nodes: [], edges: [e] });
-    if (graph.size > before) { nudgeLayout(); status("+ edge"); }
+    var res = importGraph({ nodes: [], edges: [e] });
+    if (graph.size > before) {
+      highlightNew([], res.addedEdges);
+      nudgeLayout();
+      status("+ edge");
+    }
   }
   function onLiveGeneric(ev) {
     var payload = parseEvent(ev); if (!payload) return;
-    if (payload.nodes || payload.edges) { importGraph(payload); nudgeLayout(); }
+    if (payload.nodes || payload.edges) {
+      var res = importGraph(payload);
+      highlightNew(res.addedNodes, res.addedEdges);
+      nudgeLayout();
+    }
+  }
+
+  // Briefly flag freshly-arrived elements so the node/edge reducers render
+  // them with a glow halo, then clear the flag so they settle into the graph.
+  // Purely cosmetic + transient — the `_new` attribute is never persisted or
+  // serialized, and clearing it can't fail the live loop.
+  function highlightNew(nodes, edges) {
+    (nodes || []).forEach(function (key) {
+      if (graph.hasNode(key)) graph.setNodeAttribute(key, "_new", true);
+    });
+    (edges || []).forEach(function (key) {
+      if (graph.hasEdge(key)) graph.setEdgeAttribute(key, "_new", true);
+    });
+    if ((nodes && nodes.length) || (edges && edges.length)) {
+      if (renderer) renderer.refresh();
+      setTimeout(function () {
+        (nodes || []).forEach(function (key) {
+          if (graph.hasNode(key)) graph.removeNodeAttribute(key, "_new");
+        });
+        (edges || []).forEach(function (key) {
+          if (graph.hasEdge(key)) graph.removeEdgeAttribute(key, "_new");
+        });
+        if (renderer) renderer.refresh();
+      }, HIGHLIGHT_MS);
+    }
   }
 
   // ---- helpers ------------------------------------------------------------

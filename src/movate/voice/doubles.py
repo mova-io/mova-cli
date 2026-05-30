@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from movate.voice.base import AudioChunk, AudioCodec, TranscriptChunk
+from movate.voice.base import AudioChunk, AudioCodec, RealtimeChunk, TranscriptChunk
 
 
 class FakeSTT:
@@ -99,3 +99,67 @@ class FakeTTS:
         step = max(1, len(data) // self._frames)
         for start in range(0, len(data), step):
             yield AudioChunk(data=data[start : start + step], codec=codec, sample_rate=24_000)
+
+
+class FakeRealtime:
+    """Scripted :class:`~movate.voice.base.RealtimeVoiceProvider` (Phase 2).
+
+    Drains the inbound audio (recording every chunk's bytes in
+    :attr:`received` + the call kwargs for assertion) and replays a fixed,
+    realistic event sequence: a ``speech_started`` cue, an input
+    ``transcript`` slice, one or more synthesized ``audio`` chunks carrying
+    ``answer`` (so a test can decode the audio back to text and assert the
+    voice↔voice round-trip), then ``response_done``. No network, no SDK, no
+    audio libs — usable from a default install with no ``mdk[voice]`` extra.
+
+    Set ``frames`` to split the answer audio into that many chunks to exercise
+    the transport's multi-frame audio-out path.
+    """
+
+    name = "fake_realtime"
+    version = "0.0.1"
+
+    def __init__(
+        self,
+        *,
+        transcript: str = "hello",
+        answer: str = "hi there",
+        frames: int = 1,
+    ) -> None:
+        self._transcript = transcript
+        self._answer = answer
+        self._frames = max(1, frames)
+        self.received: list[bytes] = []
+        self.voice_ids: list[str] = []
+        self.instructions: list[str] = []
+        self.languages: list[str | None] = []
+        self.api_keys: list[str | None] = []
+
+    async def session(
+        self,
+        audio_in: AsyncIterator[AudioChunk],
+        *,
+        voice_id: str = "",
+        instructions: str = "",
+        language: str | None = None,
+        codec: AudioCodec = "pcm16",
+        api_key: str | None = None,
+    ) -> AsyncIterator[RealtimeChunk]:
+        self.voice_ids.append(voice_id)
+        self.instructions.append(instructions)
+        self.languages.append(language)
+        self.api_keys.append(api_key)
+        async for chunk in audio_in:
+            self.received.append(chunk.data)
+
+        yield RealtimeChunk(kind="speech_started")
+        yield RealtimeChunk(kind="transcript", text=self._transcript, is_final=True)
+        data = self._answer.encode("utf-8")
+        if data:
+            step = max(1, len(data) // self._frames)
+            for start in range(0, len(data), step):
+                yield RealtimeChunk(
+                    kind="audio",
+                    audio=AudioChunk(data=data[start : start + step], codec=codec),
+                )
+        yield RealtimeChunk(kind="response_done")

@@ -855,6 +855,7 @@ _PROVIDERS_PROMPT_NAME = {
     # because operators expect "set up the integration once" to look the same.
     "deepgram": "Deepgram (voice STT)",
     "cartesia": "Cartesia (voice TTS)",
+    "elevenlabs": "ElevenLabs (voice TTS)",
     # Telegram is the deploy-notification channel, not an LLM provider.
     # Same UX surface as the LLM providers because operators expect
     # "set up the integration once" to look the same regardless.
@@ -874,6 +875,7 @@ _PROVIDER_TO_ENV_VAR = {
     "lyzr": "LYZR_API_KEY",
     "deepgram": "DEEPGRAM_API_KEY",
     "cartesia": "CARTESIA_API_KEY",
+    "elevenlabs": "ELEVENLABS_API_KEY",
 }
 
 # Telegram needs TWO values (bot token + chat ID), not one — handled
@@ -898,6 +900,7 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "[bold]openai[/bold], [bold]anthropic[/bold], "
             "[bold]azure[/bold], [bold]gemini[/bold], [bold]lyzr[/bold], "
             "[bold]deepgram[/bold], [bold]cartesia[/bold], "
+            "[bold]elevenlabs[/bold], "
             "[bold]azure-speech[/bold] (voice), or [bold]telegram[/bold]. "
             "Omit to pick interactively."
         ),
@@ -2471,6 +2474,7 @@ def _prompt_for_provider() -> str:
         ("lyzr", _PROVIDERS_PROMPT_NAME["lyzr"]),
         ("deepgram", _PROVIDERS_PROMPT_NAME["deepgram"]),
         ("cartesia", _PROVIDERS_PROMPT_NAME["cartesia"]),
+        ("elevenlabs", _PROVIDERS_PROMPT_NAME["elevenlabs"]),
         ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
         ("azure-speech", _PROVIDERS_PROMPT_NAME["azure-speech"]),
     ]

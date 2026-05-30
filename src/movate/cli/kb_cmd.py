@@ -861,6 +861,7 @@ def _ingest_url(
                 embedding_model=model,
                 api_key=api_key,
                 build_graph=build_graph,
+                emit_growth_events=build_graph,
             )
         finally:
             await storage.close()  # type: ignore[attr-defined]
@@ -1141,6 +1142,7 @@ def _ingest_crawl(
                         embedding_model=model,
                         api_key=api_key,
                         build_graph=build_graph,
+                        emit_growth_events=build_graph,
                     )
                 except Exception as exc:
                     # Per-page failure isolation extends to the
@@ -1862,6 +1864,7 @@ def ingest(
                             api_key=api_key,
                             clean_source=clean_source,
                             build_graph=build_graph,
+                            emit_growth_events=build_graph,
                         )
                         summaries.extend(file_summaries)
                         for fname, reason in file_failed:
@@ -1887,6 +1890,7 @@ def ingest(
                         clean_source=clean_source,
                         build_graph=build_graph,
                         on_file_start=_on_file,
+                        emit_growth_events=build_graph,
                     )
                     summaries.extend(file_summaries)
                     for fname, reason in file_failed:

@@ -90,6 +90,21 @@ class EventKind(StrEnum):
     automated rollback on drift regression (ADR 016 D5). ``subject``
     = agent name; ``data.reason`` records the cause."""
 
+    GRAPH_NODE_ADDED = "graph.node.added"
+    """A knowledge-graph node was upserted during KB ingest (ADR 046 D6
+    growth stream — a typed projection of this ADR 035 outbox). ``subject``
+    = agent name; ``data`` carries a one-node graphology fragment plus the
+    optional ``project_id`` so the SSE growth stream can replay/live-tail
+    it project-scoped. A re-ingest that touches an existing node emits the
+    same kind (the viewer merges it idempotently)."""
+
+    GRAPH_EDGE_ADDED = "graph.edge.added"
+    """A knowledge-graph edge (relation) was upserted during KB ingest
+    (ADR 046 D6). ``subject`` = agent name; ``data`` carries a one-edge
+    graphology fragment plus the optional ``project_id``. Same outbox,
+    same scoping, same at-least-once + dedupe-on-id semantics as every
+    other ADR 035 event."""
+
 
 class Event(BaseModel):
     """One persisted lifecycle event.

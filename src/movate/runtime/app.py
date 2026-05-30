@@ -611,6 +611,192 @@ async def _send_voice_event(websocket: WebSocket, event: Any) -> None:
         await websocket.send_json(_voice_ctrl(event.kind, text=event.text))
 
 
+async def _send_realtime_chunk(websocket: WebSocket, chunk: Any) -> None:
+    """Serialize one :class:`movate.voice.base.RealtimeChunk` onto the socket
+    (ADR 048 D2b / Phase 2 — the ``?mode=realtime`` voice↔voice path).
+
+    Mirrors :func:`_send_voice_event`'s framing so a client speaks one protocol
+    regardless of mode: synthesized audio goes out as a small JSON header
+    (``tts.audio``: codec / sample rate / byte count) followed by the raw binary
+    frame (no base64); control events go out as one JSON control frame each.
+    ``speech_started`` is the client's barge-in cue (stop local playback);
+    ``response_done`` ends the assistant's turn.
+    """
+    if chunk.kind == "audio" and chunk.audio is not None:
+        await websocket.send_json(
+            _voice_ctrl(
+                "tts.audio",
+                codec=chunk.audio.codec,
+                sample_rate=chunk.audio.sample_rate,
+                bytes=len(chunk.audio.data),
+            )
+        )
+        await websocket.send_bytes(chunk.audio.data)
+    elif chunk.kind == "transcript":
+        # Surface realtime transcripts on the SAME wire names the pipeline uses
+        # so a client renders captions identically in either mode.
+        kind = "transcript.final" if chunk.is_final else "transcript.partial"
+        await websocket.send_json(_voice_ctrl(kind, text=chunk.text))
+    elif chunk.kind == "error":
+        await websocket.send_json(
+            _voice_ctrl("error", message=chunk.message, code=chunk.code, stage="realtime")
+        )
+    else:
+        # speech_started / speech_stopped / response_done — bare control frames.
+        await websocket.send_json(_voice_ctrl(chunk.kind))
+
+
+def _realtime_instructions(bundle: Any) -> str:
+    """Best-effort system instructions for a realtime (voice-native) session.
+
+    Realtime has NO text Executor (ADR 048 D2b) — the voice-native model needs
+    its persona supplied directly, so we hand it the agent's ``prompt.md``. A
+    voice-native agent's prompt is plain persona prose; a text agent's prompt
+    may carry ``{{ input.* }}`` placeholders (there's no per-turn text input
+    here), so we render with an empty input namespace and fall back to the raw
+    template if rendering raises. This never touches the Executor.
+    """
+    try:
+        return str(bundle.render_prompt({}))
+    except Exception:
+        return str(getattr(bundle, "prompt_template", "") or "")
+
+
+def _apply_realtime_config(config: _VoiceTurnConfig, ctrl: dict[str, Any]) -> None:
+    """Apply a realtime ``config`` control frame onto ``config`` in place."""
+    config.voice_id = str(ctrl.get("voice_id") or config.voice_id)
+    config.language = ctrl.get("language") or config.language
+
+
+async def _read_realtime_leading_config(
+    websocket: WebSocket, config: _VoiceTurnConfig, mic: asyncio.Queue[bytes | None]
+) -> bool:
+    """Consume ONE optional leading frame so the session opens with the client's
+    voice/language before any audio.
+
+    A leading binary frame is forwarded onto ``mic`` (not dropped); a leading
+    ``config`` frame is applied to ``config``; a leading ``close``/hangup means
+    end the session. Returns ``True`` if the session should stop immediately.
+    """
+    try:
+        first = await websocket.receive()
+    except WebSocketDisconnect:
+        return True
+    if first.get("type") == "websocket.disconnect":
+        return True
+    if (data := first.get("bytes")) is not None:
+        await mic.put(data)
+        return False
+    text = first.get("text")
+    if text is None:
+        return False
+    try:
+        ctrl = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if ctrl.get("type") == "config":
+        _apply_realtime_config(config, ctrl)
+        return False
+    return bool(ctrl.get("type") == "close")
+
+
+async def _run_voice_realtime(websocket: WebSocket, bundle: Any) -> None:
+    """Drive a ``?mode=realtime`` voice↔voice session (ADR 048 D2b / Phase 2).
+
+    Voice-NATIVE: the inbound mic frames go straight to a
+    :class:`~movate.voice.base.RealtimeVoiceProvider` and its audio + control
+    output streams straight back — there is **no** STT / Executor / TTS
+    pipeline here (that's the default mode). Opt-in: a runtime with no
+    ``voice_realtime_factory`` configured rejects the connection with a clear
+    ``error`` frame (the pipeline mode is always available; realtime is the
+    premium add-on).
+
+    The client streams binary mic frames continuously; a JSON ``config`` frame
+    (optional, first) can set ``voice_id`` / ``language``; a ``{"type":"close"}``
+    frame (or a hangup) ends the session. The provider's own server-side VAD
+    decides turns, so the transport never endpoints — it forwards frames and
+    relays the provider's events.
+    """
+    factory = getattr(websocket.app.state, "voice_realtime_factory", None)
+    if factory is None:
+        await websocket.send_json(
+            _voice_ctrl(
+                "error",
+                message=(
+                    "realtime voice is not configured on this runtime; "
+                    "use the default pipeline mode or set MDK_VOICE_REALTIME"
+                ),
+                code="realtime_unavailable",
+                stage="realtime",
+            )
+        )
+        await websocket.close(code=_WS_POLICY_VIOLATION, reason="realtime not configured")
+        return
+
+    from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
+
+    provider = factory()
+    instructions = _realtime_instructions(bundle)
+    config = _VoiceTurnConfig()
+
+    # A queue bridges inbound binary WS frames (filled by a reader task) to the
+    # provider's ``audio_in`` async iterator. ``None`` closes the mic stream.
+    mic: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    if await _read_realtime_leading_config(websocket, config, mic):
+        return
+
+    async def _reader() -> None:
+        """Pump inbound WS frames into the mic queue until close/hangup."""
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                if (data := message.get("bytes")) is not None:
+                    await mic.put(data)
+                    continue
+                text = message.get("text")
+                if text is None:
+                    continue
+                try:
+                    ctrl = json.loads(text)
+                except (ValueError, TypeError):
+                    continue
+                if ctrl.get("type") == "config":
+                    _apply_realtime_config(config, ctrl)
+                elif ctrl.get("type") == "close":
+                    break
+        finally:
+            await mic.put(None)
+
+    async def _audio_in() -> AsyncIterator[Any]:
+        while True:
+            data = await mic.get()
+            if data is None:
+                return
+            yield _AudioChunk(data=data)
+
+    reader_task = asyncio.create_task(_reader())
+    try:
+        async for chunk in provider.session(
+            _audio_in(),
+            voice_id=config.voice_id,
+            instructions=instructions,
+            language=config.language,
+        ):
+            await _send_realtime_chunk(websocket, chunk)
+            if chunk.kind == "error":
+                break
+    except WebSocketDisconnect:
+        return
+    finally:
+        if not reader_task.done():
+            reader_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await reader_task
+
+
 # ---------------------------------------------------------------------------
 # ADR 035 D3 — SSE event-stream tuning.
 #
@@ -1041,6 +1227,33 @@ async def _search_graph_nodes(
     return merged[:cap]
 
 
+# Graph-growth live-tail kinds — the typed projection of the ADR 035
+# outbox that the growth stream tails (ADR 046 D6). The publisher
+# (``kb.graph_events.make_outbox_publisher``) records exactly these on
+# every node/edge upsert during a build-graph ingest.
+_GRAPH_GROWTH_KINDS: tuple[str, str] = (
+    EventKind.GRAPH_NODE_ADDED.value,
+    EventKind.GRAPH_EDGE_ADDED.value,
+)
+
+
+def _graph_growth_frame_for_event(ev: EventView, *, project_id: str | None) -> str | None:
+    """Translate one outbox event into a growth SSE frame, or ``None`` to skip.
+
+    The event ``data`` is ``{<graphology fragment>, "project_id": ...}``
+    written by :func:`movate.kb.graph_events.make_outbox_publisher`.
+    When the caller scoped the stream with ``?project=`` we drop any event
+    whose ``project_id`` doesn't match (no cross-project leak into the
+    live view). The fragment is re-emitted verbatim — it is already the
+    same zero-transform graphology doc the snapshot frames carry."""
+    data = dict(ev.data)
+    event_project = data.pop("project_id", None)
+    if project_id is not None and event_project != project_id:
+        return None
+    sse_event = "node.added" if ev.kind == EventKind.GRAPH_NODE_ADDED.value else "edge.added"
+    return _sse_frame(sse_event, data)
+
+
 async def _sse_graph_growth_stream(
     *,
     store: StorageProvider,
@@ -1049,20 +1262,44 @@ async def _sse_graph_growth_stream(
     mode: GraphMode,
     cap: int,
     project_id: str | None = None,
-) -> Any:
-    """SSE growth generator: replay the current graph as add events.
+    live: bool = False,
+    is_disconnected: Callable[[], Awaitable[bool]] | None = None,
+    poll_interval_s: float = _EVENTS_SSE_POLL_INTERVAL_S,
+    heartbeat_interval_s: float = _EVENTS_SSE_HEARTBEAT_INTERVAL_S,
+) -> AsyncIterator[str]:
+    """SSE growth generator: replay the current graph, then optionally
+    **live-tail** new nodes/edges as KB ingest persists them (ADR 046 D6).
 
-    Loads a capped window (the same windowing the GET endpoint uses) and
-    emits one ``node.added`` frame per node, then one ``edge.added`` frame
-    per edge, each carrying a single-element graphology document so the
-    client merges every frame with the same zero-transform
-    ``graph.import(...)``. Closes with a ``done`` frame carrying the
-    totals. ``project_id`` (additive) scopes the replayed window to one
-    project's subgraph.
+    Phase 1 (always) — **snapshot replay**: load a capped window (the same
+    windowing the GET endpoint uses) and emit one ``node.added`` frame per
+    node, then one ``edge.added`` frame per edge, each carrying a
+    single-element graphology document so the client merges every frame
+    with the same zero-transform ``graph.import(...)``. ``project_id``
+    (additive) scopes the replayed window to one project's subgraph.
 
-    Snapshot-as-stream today (ADR 046 D3): a live-tail that pushes future
-    ingest writes is the additive follow-on; the frame contract here is
-    forward-compatible with it."""
+    Phase 2 — **live-tail** (only when ``live=True``): anchor a UTC-now
+    cursor and poll the ADR 035 events outbox (the same machinery
+    ``GET /api/v1/events/stream`` uses) for ``graph.node.added`` /
+    ``graph.edge.added`` events with ``subject=agent``, re-emitting each as
+    a growth frame so the sigma viewer animates the graph growing in real
+    time while a crawl/ingest runs. Events are deduped against the snapshot
+    by key, project-filtered, and the loop heartbeats + watches the
+    disconnect predicate so a closed EventSource unwinds cleanly. The
+    stream stays open until disconnect — there is **no** ``done`` frame in
+    live mode.
+
+    Phase 2 (skipped) — when ``live=False`` (the default), the snapshot is
+    followed by a ``done`` frame carrying the totals and the stream closes.
+    This preserves the original snapshot-as-stream contract byte-for-byte,
+    so existing clients (and ``TestClient.get(...).text``) are unaffected.
+
+    The growth stream is **additive eye-candy over the durable store** (ADR
+    046 failure modes): on reconnect the client re-runs the snapshot to
+    reconcile, so no live event is load-bearing for correctness."""
+    seen_nodes: set[str] = set()
+    seen_edges: set[str] = set()
+
+    # ---- Phase 1: snapshot replay ----
     doc: GraphologyDoc = await graph_query.windowed_subgraph(
         store,
         agent=agent,
@@ -1072,12 +1309,89 @@ async def _sse_graph_growth_stream(
         project_id=project_id,
     )
     for node in doc.nodes:
+        seen_nodes.add(node.key)
         frame_doc = GraphologyDoc(nodes=[node], edges=[])
         yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
     for edge in doc.edges:
+        seen_edges.add(edge.key)
         frame_doc = GraphologyDoc(nodes=[], edges=[edge])
         yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
-    yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
+
+    if not live:
+        yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
+        return
+
+    # ---- Phase 2: live-tail the graph-mutation outbox ----
+    # Anchor at now: only events recorded AFTER the snapshot are streamed
+    # live (the snapshot already covered everything before). The id cursor
+    # advances per emitted event so we never re-send one.
+    live_since = datetime.now(UTC)
+    after_id: str | None = None
+    last_heartbeat = asyncio.get_event_loop().time()
+    try:
+        while True:
+            if is_disconnected is not None and await is_disconnected():
+                return
+
+            now = asyncio.get_event_loop().time()
+            if now - last_heartbeat >= heartbeat_interval_s:
+                yield ":keepalive\n\n"
+                last_heartbeat = now
+
+            # One outbox poll covers BOTH graph kinds — list_events filters
+            # by a single kind, so we union the two kind-scoped pages and
+            # re-order by id (the cursor is monotonic per the uuid-keyed
+            # insert order the storage layer guarantees).
+            batch: list[EventView] = []
+            for kind in _GRAPH_GROWTH_KINDS:
+                rows = await store.list_events(
+                    tenant_id,
+                    since=None if after_id is not None else live_since,
+                    kind=kind,
+                    subject=agent,
+                    limit=_EVENTS_SSE_PAGE_SIZE,
+                    after_id=after_id,
+                )
+                batch.extend(EventView.from_record(r) for r in rows)
+            # Stable oldest-first by created_at then id (each kind-page is
+            # already oldest-first; the merge keeps a deterministic order).
+            batch.sort(key=lambda e: (e.created_at, e.id))
+
+            for ev in batch:
+                # Dedupe against the snapshot + earlier live frames by key,
+                # so a node already painted isn't re-animated.
+                key = _graph_event_key(ev)
+                if key is not None:
+                    is_node = ev.kind == EventKind.GRAPH_NODE_ADDED.value
+                    bucket = seen_nodes if is_node else seen_edges
+                    if key in bucket:
+                        after_id = ev.id
+                        continue
+                    bucket.add(key)
+                frame = _graph_growth_frame_for_event(ev, project_id=project_id)
+                if frame is not None:
+                    yield frame
+                after_id = ev.id
+
+            await asyncio.sleep(poll_interval_s)
+    except asyncio.CancelledError:
+        # Client disconnect / server shutdown — unwind cleanly, honoring
+        # the ASGI cancellation contract.
+        raise
+
+
+def _graph_event_key(ev: EventView) -> str | None:
+    """Extract the node/edge ``key`` from a graph-growth outbox event.
+
+    The fragment in ``ev.data`` has exactly one node (for ``node.added``)
+    or one edge (for ``edge.added``); its ``key`` is the dedupe id. Returns
+    ``None`` if the payload is malformed (defensive — a bad event is
+    skipped, never crashes the stream)."""
+    items = ev.data.get("nodes") or ev.data.get("edges") or []
+    if items and isinstance(items[0], dict):
+        key = items[0].get("key")
+        return str(key) if key is not None else None
+    return None
 
 
 def _default_sibling_path(
@@ -3821,6 +4135,46 @@ def build_app(
 
     app.state.voice_stt_factory = _default_voice_stt
     app.state.voice_tts_factory = _default_voice_tts
+
+    # Voice realtime (ADR 048 D2b / Phase 2, ADR 050 D12) — the factory the
+    # WS /voice route calls when a client opens the socket with ``?mode=realtime``.
+    # Realtime is the OPT-IN, voice-NATIVE premium path (full-duplex voice↔voice,
+    # NO text Executor), so unlike STT/TTS it has NO default adapter: the public
+    # OpenAI Realtime endpoint or the customer's Azure OpenAI Realtime deployment
+    # is a deliberate deployment choice (Azure needs a deployment name; both want
+    # a realtime-grade key). A deployment opts in by setting this factory (or the
+    # MDK_VOICE_REALTIME env hint below) to a callable returning a fresh
+    # RealtimeVoiceProvider per connection; tests inject a FakeRealtime. ``None``
+    # (the default) means "realtime not configured on this runtime" — the route
+    # then rejects a ?mode=realtime connection with a clear error frame, and the
+    # capabilities endpoint reports ``voice_realtime: false``.
+    def _env_voice_realtime() -> Any | None:
+        # Opt-in via env so an operator can light up realtime without code:
+        #   MDK_VOICE_REALTIME=openai   → public OpenAI Realtime (OPENAI_API_KEY)
+        #   MDK_VOICE_REALTIME=azure    → Azure OpenAI Realtime (AZURE_OPENAI_API_KEY
+        #                                 + AZURE_OPENAI_ENDPOINT + a deployment via
+        #                                 AZURE_OPENAI_REALTIME_DEPLOYMENT)
+        # Both reuse creds already in the autoload whitelist — no new var.
+        choice = (os.environ.get("MDK_VOICE_REALTIME") or "").strip().lower()
+        if choice == "openai":
+
+            def _make_openai() -> Any:
+                from movate.voice import OpenAIRealtime  # noqa: PLC0415
+
+                return OpenAIRealtime()
+
+            return _make_openai
+        if choice in ("azure", "azure_openai", "azure-openai"):
+
+            def _make_azure() -> Any:
+                from movate.voice import AzureOpenAIRealtime  # noqa: PLC0415
+
+                return AzureOpenAIRealtime()
+
+            return _make_azure
+        return None
+
+    app.state.voice_realtime_factory = _env_voice_realtime()
 
     # ADR 035 D3 — per-tenant SSE subscriber accounting. A simple
     # ``{tenant_id: count}`` dict, lock-guarded for the increment/cap
@@ -6640,38 +6994,54 @@ def build_app(
         mode: str = "knowledge",
         limit: int | None = None,
         project: str | None = None,
+        live: bool = False,
     ) -> StreamingResponse:
         """Growth stream for ``project_id``'s graph over **SSE**.
 
-        Reuses the ADR 035 SSE infrastructure (:func:`_sse_frame`). Emits
-        the current graph as a sequence of growth events the client
-        applies incrementally:
+        Reuses the ADR 035 SSE infrastructure (:func:`_sse_frame` + the
+        events outbox). Emits the current graph as a sequence of growth
+        events the client applies incrementally:
 
         * ``event: node.added`` / ``data: <graphology doc with one node>``
         * ``event: edge.added`` / ``data: <graphology doc with one edge>``
-        * ``event: done`` / ``data: {"nodes": N, "edges": M}``
+        * ``event: done`` / ``data: {"nodes": N, "edges": M}`` — snapshot
+          mode only (terminal frame; omitted in ``?live=true``).
 
         Each ``node.added`` / ``edge.added`` payload is itself a
         graphology-importable document (a single-element ``nodes`` or
         ``edges`` list), so the client merges every frame with the same
         zero-transform ``graph.import(...)`` it uses for the windowed
-        endpoints — no special-case parsing. (``node.updated`` shares the
-        ``node.added`` shape; emitted when a re-ingest changes an existing
-        node.)
+        endpoints — no special-case parsing.
+
+        Two modes (``?live``, default **false** — backward-compatible):
+
+        * **Snapshot** (``?live=false``) — replay the current graph, then a
+          terminal ``done`` and close. The original ADR 046 D3 contract,
+          byte-for-byte.
+        * **Live-tail** (``?live=true``, ADR 046 D6) — replay the snapshot,
+          then keep the connection open and push ``node.added`` /
+          ``edge.added`` frames as KB ingest extracts + persists new
+          nodes/edges, so the sigma viewer **animates the graph growing in
+          real time**. This is a *typed projection of the ADR 035 outbox*:
+          the same SSE machinery, filtered to ``graph.*.added`` events
+          scoped to this agent. No ``done`` frame — the client closes the
+          EventSource (the live-growth toggle) or disconnects. The growth
+          events are additive over the durable store: on reconnect the
+          client re-runs the snapshot to reconcile (no event is
+          load-bearing for correctness).
 
         Bounded by ``limit`` (node/edge cap). ``?project=`` (ADR 046 D1,
-        additive) scopes the replayed window to one project's subgraph.
-        Tenant-scoped. Read scope.
-
-        This is a SNAPSHOT-as-stream today (it replays the current graph
-        then closes with ``done``); the live-tail seam — pushing future
-        ``node.added`` events as ingest writes them — is additive and
-        documented in ADR 046 D3.
+        additive) scopes both the replayed window AND the live-tail to one
+        project's subgraph (a cross-project event never reaches the
+        stream). Tenant-scoped. Read scope.
         """
         store: StorageProvider = request.app.state.storage
         tenant_id = ctx.tenant_id
         cap = graph_query.clamp_cap(limit)
         graph_mode = _graph_mode(mode)
+
+        async def _is_disconnected() -> bool:
+            return await request.is_disconnected()
 
         generator = _sse_graph_growth_stream(
             store=store,
@@ -6680,6 +7050,8 @@ def build_app(
             mode=graph_mode,
             cap=cap,
             project_id=project,
+            live=live,
+            is_disconnected=_is_disconnected if live else None,
         )
         return StreamingResponse(
             generator,
@@ -13738,20 +14110,29 @@ def build_app(
     # ------------------------------------------------------------------
     @v1.websocket("/agents/{name}/voice")
     async def v1_agent_voice(websocket: WebSocket, name: str) -> None:
-        """Speak to ``{name}`` over a full-duplex WebSocket (pipeline mode).
+        """Speak to ``{name}`` over a full-duplex WebSocket.
 
-        See the "Voice WS message protocol" block at the top of this module
-        for the framed envelope set. One connection serves one or more turns:
-        the client streams binary audio frames then a ``{"type":"end"}``
-        control frame to run a turn; the server replies with
-        ``transcript.*`` / ``agent.token`` / binary ``tts.audio`` (each
-        preceded by a small JSON header) / ``done`` (or ``error``) and then
-        listens for the next turn until the socket closes.
+        Two modes share this one URL (ADR 050 D12), selected by the
+        ``?mode=`` query param:
 
-        The agent stage is the **unchanged Executor** — this route never
-        edits ``core/executor.py``; it calls ``run_voice_pipeline`` which in
-        turn calls ``executor.execute(..., on_token=...)``, exactly like the
-        SSE run-stream route (ADR 048 R2 — zero change to existing agents).
+        * **pipeline (default)** — audio → STT → the UNCHANGED text Executor →
+          TTS → audio. One connection serves one or more turns: the client
+          streams binary audio frames then a ``{"type":"end"}`` control frame
+          to run a turn; the server replies with ``transcript.*`` /
+          ``agent.token`` / binary ``tts.audio`` (each preceded by a small JSON
+          header) / ``done`` (or ``error``). The agent stage is the unchanged
+          Executor — this route never edits ``core/executor.py``; it calls
+          ``run_voice_pipeline`` → ``executor.execute(..., on_token=...)``,
+          exactly like the SSE run-stream route (ADR 048 R2 — zero change to
+          existing agents).
+        * **realtime** (``?mode=realtime``, ADR 048 D2b / Phase 2) — full-duplex
+          voice↔voice through a :class:`RealtimeVoiceProvider`, voice-NATIVE
+          (NO text Executor). The client streams binary mic frames continuously;
+          the provider's own server-side VAD decides turns and the server
+          streams back binary audio + ``speech_started`` / ``speech_stopped`` /
+          ``transcript.*`` / ``response_done`` control frames. Realtime is
+          opt-in: a runtime with no realtime factory configured rejects the
+          mode with an ``error`` frame. The pipeline path is unchanged.
         """
         store: StorageProvider = websocket.app.state.storage
 
@@ -13795,6 +14176,15 @@ def build_app(
             return
 
         await websocket.accept()
+
+        # ── Mode select (ADR 050 D12): realtime vs the default pipeline ──
+        # Same URL; ``?mode=realtime`` routes voice↔voice to a
+        # RealtimeVoiceProvider (NO text Executor). Any other value (incl.
+        # absent / "pipeline") is the unchanged pipeline path below.
+        mode = (websocket.query_params.get("mode") or "pipeline").strip().lower()
+        if mode == "realtime":
+            await _run_voice_realtime(websocket, bundle)
+            return
 
         # ── Wire the UNCHANGED Executor + the speech adapters ──
         from movate.core.executor import Executor  # noqa: PLC0415
