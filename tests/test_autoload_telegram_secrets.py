@@ -76,6 +76,10 @@ class TestAutoloadedRegistry:
         assert "DEEPGRAM_API_KEY" in VOICE_KEY_ENV_VARS
         assert "CARTESIA_API_KEY" in VOICE_KEY_ENV_VARS
 
+    def test_voice_env_vars_include_elevenlabs(self) -> None:
+        # T2 premium-voice TTS (ADR 048/049) autoloads the same way.
+        assert "ELEVENLABS_API_KEY" in VOICE_KEY_ENV_VARS
+
 
 # ---------------------------------------------------------------------------
 # Autoload: Telegram secrets get picked up from the credentials file
@@ -123,9 +127,9 @@ class TestAutoloadTelegram:
 
 @pytest.mark.unit
 class TestAutoloadVoiceKeys:
-    """Deepgram/Cartesia keys autoload from the credentials file the same
-    way the LLM provider keys do (so operators set them once via
-    `mdk auth login deepgram`/`cartesia` and never re-export)."""
+    """Deepgram/Cartesia/ElevenLabs keys autoload from the credentials file
+    the same way the LLM provider keys do (so operators set them once via
+    `mdk auth login deepgram`/`cartesia`/`elevenlabs` and never re-export)."""
 
     def test_deepgram_key_autoloads(self, isolated_env: Path) -> None:
         CredentialsStore().set("DEEPGRAM_API_KEY", "dg-test")
@@ -138,6 +142,12 @@ class TestAutoloadVoiceKeys:
         autoload_credentials()
         assert os.environ["CARTESIA_API_KEY"] == "ct-test"
 
+    def test_elevenlabs_key_autoloads(self, isolated_env: Path) -> None:
+        CredentialsStore().set("ELEVENLABS_API_KEY", "el-test")
+        assert os.environ.get("ELEVENLABS_API_KEY") is None
+        autoload_credentials()
+        assert os.environ["ELEVENLABS_API_KEY"] == "el-test"
+
     def test_shell_env_still_wins_over_file(
         self, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -149,19 +159,23 @@ class TestAutoloadVoiceKeys:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: `mdk auth login deepgram`/`cartesia` are recognized
+# End-to-end: `mdk auth login deepgram`/`cartesia`/`elevenlabs` are recognized
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("provider", "env_var"),
-    [("deepgram", "DEEPGRAM_API_KEY"), ("cartesia", "CARTESIA_API_KEY")],
+    [
+        ("deepgram", "DEEPGRAM_API_KEY"),
+        ("cartesia", "CARTESIA_API_KEY"),
+        ("elevenlabs", "ELEVENLABS_API_KEY"),
+    ],
 )
 def test_auth_login_voice_provider_recognized(
     isolated_env: Path, provider: str, env_var: str
 ) -> None:
-    """`mdk auth login deepgram`/`cartesia` is a recognized provider and
+    """`mdk auth login deepgram`/`cartesia`/`elevenlabs` is a recognized provider and
     writes its key to the credentials file (not an 'unknown provider' error).
     --no-verify because voice providers have no live-verify probe wired."""
     result = runner.invoke(
