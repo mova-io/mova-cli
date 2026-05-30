@@ -45,6 +45,7 @@ from movate.runtime.schemas import (
     CapabilitiesView,
     CapabilityLimitsView,
     CapabilityModelsView,
+    CapabilityVoiceView,
 )
 
 if TYPE_CHECKING:
@@ -199,6 +200,9 @@ _EXTRA_MARKERS: dict[str, str] = {
     "openai": "openai",
     "langchain": "langchain_core",
     "playground": "chainlit",
+    # ADR 048 D9: the voice extra marker is the pipeline module — present only
+    # when mdk[voice] is installed (lazy import confirmed importable).
+    "voice": "movate.voice.pipeline",
 }
 
 
@@ -234,6 +238,79 @@ def _catalog_model_ids() -> list[str]:
     from movate.providers.model_catalog import model_catalog  # noqa: PLC0415
 
     return [info.model_id for info in model_catalog()]
+
+
+# ----------------------------------------------------------------------
+# Voice capability detection (ADR 048/050 D4)
+# ----------------------------------------------------------------------
+
+# Mapping: provider name → the env var whose presence means the provider is
+# keyed on this runtime. Separate lists for STT and TTS because a provider
+# may cover only one role (e.g. Deepgram is STT-only, Cartesia TTS-only) or
+# both (Azure Speech, OpenAI).
+_STT_PROVIDER_KEYS: dict[str, str] = {
+    "deepgram": "DEEPGRAM_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "azure": "AZURE_SPEECH_KEY",
+}
+
+_TTS_PROVIDER_KEYS: dict[str, str] = {
+    "cartesia": "CARTESIA_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "elevenlabs": "ELEVENLABS_API_KEY",
+    "azure": "AZURE_SPEECH_KEY",
+}
+
+
+def _configured_stt_providers() -> list[str]:
+    """STT provider names whose credential env var is set, sorted."""
+    return sorted(
+        name for name, var in _STT_PROVIDER_KEYS.items() if os.environ.get(var, "").strip()
+    )
+
+
+def _configured_tts_providers() -> list[str]:
+    """TTS provider names whose credential env var is set, sorted."""
+    return sorted(
+        name for name, var in _TTS_PROVIDER_KEYS.items() if os.environ.get(var, "").strip()
+    )
+
+
+def build_voice_capabilities(app: FastAPI) -> CapabilityVoiceView:
+    """Build the voice capability block for ``GET /api/v1/capabilities``.
+
+    ``enabled`` is ``True`` when the voice WS route is registered (the
+    ``voice_stt_factory`` app-state hook is set) AND at least one STT + one
+    TTS provider has its key in the environment. Either condition alone is
+    insufficient: a keyed but unregistered route (mdk[voice] not installed)
+    and a registered but keyless runtime both return ``enabled=False`` cleanly.
+
+    Modes: ``pipeline`` is always included when the route is registered;
+    ``realtime`` is added only when a ``voice_realtime_factory`` is set (the
+    opt-in premium path, ADR 048 D2b / ADR 050 D12).
+
+    ADR 050 D4 — additive; no existing field is changed.
+    """
+    route_registered = getattr(app.state, "voice_stt_factory", None) is not None
+    realtime_registered = getattr(app.state, "voice_realtime_factory", None) is not None
+
+    stt_providers = _configured_stt_providers()
+    tts_providers = _configured_tts_providers()
+
+    enabled = route_registered and bool(stt_providers) and bool(tts_providers)
+
+    modes: list[str] = []
+    if route_registered:
+        modes.append("pipeline")
+    if realtime_registered:
+        modes.append("realtime")
+
+    return CapabilityVoiceView(
+        enabled=enabled,
+        modes=modes,
+        stt_providers=stt_providers,
+        tts_providers=tts_providers,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -356,6 +433,7 @@ async def build_capabilities(app: FastAPI, ctx: AuthContext) -> CapabilitiesView
         scopes_supported=list(snapshot.scopes_supported),
         limits=_limits(app),
         extras_installed=list(snapshot.extras_installed),
+        voice=build_voice_capabilities(app),
     )
 
 
@@ -386,6 +464,7 @@ async def _byok_providers(app: FastAPI, *, tenant_id: str) -> list[str]:
 __all__ = [
     "API_VERSION",
     "build_capabilities",
+    "build_voice_capabilities",
     "detect_extras",
     "detect_features",
     "minimal_capabilities",
