@@ -3855,6 +3855,89 @@ class GraphQueryRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Graph analytics (ADR 046) — read-only centrality / shortest-path / community
+# detection over the windowed graph the query layer builds. Additive: these
+# views sit beside the graph query views and never change an existing shape.
+# Computed by ``movate.core.graph.analytics`` (pure Python, no new dependency)
+# over the SAME windowed + tenant/project-scoped graphology doc the query
+# endpoints serve — so analytics inherits the node/edge cap and the no-leak
+# scoping for free.
+# ---------------------------------------------------------------------------
+
+
+class CentralityScoreView(BaseModel):
+    """One node's centrality score in a ``GET .../analytics/centrality`` response.
+
+    ``score`` is normalized to ``[0, 1]`` (degree and betweenness are both
+    normalized so they're comparable + map onto a size/color ramp in the
+    viewer). ``key`` is the node id; ``label`` / ``type`` decorate it so the
+    client can render a ranked list without a second fetch.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    label: str
+    type: str
+    score: float
+
+
+class GraphCentralityView(BaseModel):
+    """``GET /api/v1/graph/analytics/centrality`` response — top-N hubs.
+
+    ``measure`` echoes which centrality was computed (``degree`` |
+    ``betweenness``); ``scores`` is highest-first, capped at the requested
+    ``top_n``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    measure: str
+    scores: list[CentralityScoreView] = Field(default_factory=list)
+    count: int = 0
+
+
+class GraphShortestPathView(BaseModel):
+    """``GET /api/v1/graph/analytics/path`` response — a shortest path.
+
+    ``found`` is ``False`` (and ``nodes`` empty) when the two endpoints are in
+    different components or an endpoint is unknown / out of scope.  ``hops`` is
+    ``len(nodes) - 1`` (0 for a single-node path). ``nodes`` is the inclusive
+    ordered id sequence ``[from, ..., to]`` the viewer highlights.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    found: bool
+    nodes: list[str] = Field(default_factory=list)
+    hops: int = 0
+
+
+class CommunityView(BaseModel):
+    """One detected community in a ``GET .../analytics/communities`` response.
+
+    ``community_id`` is a small stable integer (largest community first);
+    ``members`` is the sorted node-id list; ``size`` is ``len(members)``. The
+    viewer tints each member by ``community_id``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    community_id: int
+    size: int
+    members: list[str] = Field(default_factory=list)
+
+
+class GraphCommunitiesView(BaseModel):
+    """``GET /api/v1/graph/analytics/communities`` response — cluster assignment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    communities: list[CommunityView] = Field(default_factory=list)
+    count: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Observability Intelligence layer (ADR 047) — wire types for the
 # /api/v1/observability/* endpoints. Kept here (not in core/observability) so
 # the HTTP surface evolves independently of the persisted insight model.
