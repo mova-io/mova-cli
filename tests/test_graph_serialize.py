@@ -156,6 +156,41 @@ def test_community_and_layout_from_metadata() -> None:
     assert attrs["y"] == -2.0
 
 
+def test_confidence_from_metadata_surfaces_on_node() -> None:
+    """Stored ``metadata["confidence"]`` surfaces as the node's ``confidence``
+    attribute (ADR 046 D2's ``properties.confidence``) so the viewer can dim
+    low-confidence nodes."""
+    e = _entity("n1", "Shaky Entity", "T", metadata={"confidence": 0.42})
+    doc = to_graphology([e], [])
+    assert doc.nodes[0].attributes["confidence"] == pytest.approx(0.42)
+
+
+def test_confidence_omitted_when_unrecorded() -> None:
+    """A node with no recorded confidence omits the attribute entirely — the
+    wire shape for a confidence-less graph is byte-for-byte unchanged (the
+    viewer treats absence as full confidence)."""
+    e = _entity("n1", "A", "T")  # no metadata at all
+    e_meta = _entity("n2", "B", "T", metadata={"salience": 0.9})  # other meta only
+    doc = to_graphology([e, e_meta], [])
+    for node in doc.nodes:
+        assert "confidence" not in node.attributes
+
+
+def test_confidence_clamped_and_non_numeric_ignored() -> None:
+    """Out-of-range confidence is clamped to [0, 1]; a non-numeric (or bool)
+    value is treated as unrecorded (omitted), never crashing the serializer."""
+    over = _entity("n1", "A", "T", metadata={"confidence": 1.7})
+    under = _entity("n2", "B", "T", metadata={"confidence": -0.3})
+    boolish = _entity("n3", "C", "T", metadata={"confidence": True})
+    stringy = _entity("n4", "D", "T", metadata={"confidence": "high"})
+    doc = to_graphology([over, under, boolish, stringy], [])
+    by_key = {n.key: n for n in doc.nodes}
+    assert by_key["n1"].attributes["confidence"] == pytest.approx(1.0)
+    assert by_key["n2"].attributes["confidence"] == pytest.approx(0.0)
+    assert "confidence" not in by_key["n3"].attributes
+    assert "confidence" not in by_key["n4"].attributes
+
+
 def test_empty_graph_serializes_to_empty_doc() -> None:
     doc = to_graphology([], [])
     assert isinstance(doc, GraphologyDoc)

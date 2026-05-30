@@ -1488,6 +1488,12 @@ _GRAPH_GROWTH_KINDS: tuple[str, str] = (
     EventKind.GRAPH_EDGE_ADDED.value,
 )
 
+# Upper bound (seconds) on the per-frame ``?pace=`` delay for the snapshot
+# replay. The demo "watch it assemble" effect uses small fractions of a
+# second; this ceiling stops a stray/abusive ``?pace=`` from pinning a
+# streaming connection open frame-by-frame for an unreasonable time.
+_GRAPH_REPLAY_PACE_MAX_S = 2.0
+
 
 def _graph_growth_frame_for_event(ev: EventView, *, project_id: str | None) -> str | None:
     """Translate one outbox event into a growth SSE frame, or ``None`` to skip.
@@ -1506,6 +1512,43 @@ def _graph_growth_frame_for_event(ev: EventView, *, project_id: str | None) -> s
     return _sse_frame(sse_event, data)
 
 
+async def _replay_snapshot_frames(
+    doc: GraphologyDoc,
+    *,
+    seen_nodes: set[str],
+    seen_edges: set[str],
+    replay_pace_s: float,
+    is_disconnected: Callable[[], Awaitable[bool]] | None,
+) -> AsyncIterator[str]:
+    """Yield one ``node.added`` frame per node then one ``edge.added`` per edge.
+
+    Each frame is a single-element graphology document so the client merges it
+    with the same zero-transform ``graph.import(...)``. ``seen_nodes`` /
+    ``seen_edges`` are populated as we go (the caller dedupes the live-tail
+    against them). When ``replay_pace_s > 0`` we sleep that long *between*
+    frames so the viewer paints the graph node-by-node (the demo "watch it
+    grow" effect) and check the disconnect predicate before each frame so a
+    paced replay unwinds promptly when the EventSource closes. At ``0.0`` it
+    emits as fast as the client drains — the original snapshot contract."""
+    paced = replay_pace_s > 0.0
+    for node in doc.nodes:
+        if paced and is_disconnected is not None and await is_disconnected():
+            return
+        seen_nodes.add(node.key)
+        frame_doc = GraphologyDoc(nodes=[node], edges=[])
+        yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
+        if paced:
+            await asyncio.sleep(replay_pace_s)
+    for edge in doc.edges:
+        if paced and is_disconnected is not None and await is_disconnected():
+            return
+        seen_edges.add(edge.key)
+        frame_doc = GraphologyDoc(nodes=[], edges=[edge])
+        yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
+        if paced:
+            await asyncio.sleep(replay_pace_s)
+
+
 async def _sse_graph_growth_stream(
     *,
     store: StorageProvider,
@@ -1514,7 +1557,9 @@ async def _sse_graph_growth_stream(
     mode: GraphMode,
     cap: int,
     project_id: str | None = None,
+    min_confidence: float = 0.0,
     live: bool = False,
+    replay_pace_s: float = 0.0,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     poll_interval_s: float = _EVENTS_SSE_POLL_INTERVAL_S,
     heartbeat_interval_s: float = _EVENTS_SSE_HEARTBEAT_INTERVAL_S,
@@ -1527,7 +1572,18 @@ async def _sse_graph_growth_stream(
     node, then one ``edge.added`` frame per edge, each carrying a
     single-element graphology document so the client merges every frame
     with the same zero-transform ``graph.import(...)``. ``project_id``
-    (additive) scopes the replayed window to one project's subgraph.
+    (additive) scopes the replayed window to one project's subgraph;
+    ``min_confidence`` (additive) applies the same confidence floor the GET
+    endpoint does so a filtered stream and a filtered snapshot agree.
+
+    ``replay_pace_s`` (additive, default ``0.0`` = no delay) sleeps that many
+    seconds **between** snapshot frames so the viewer animates the graph
+    *assembling node-by-node* — the demo's "watch it grow" moment even when
+    the graph was built atomically (e.g. a one-shot ``mdk kb ingest
+    --build-graph`` that finished before the viewer opened). At ``0.0`` the
+    replay is emitted as fast as the client drains it, byte-for-byte the
+    original contract. Disconnect is honored between frames so a paced
+    replay unwinds promptly when the EventSource closes.
 
     Phase 2 — **live-tail** (only when ``live=True``): anchor a UTC-now
     cursor and poll the ADR 035 events outbox (the same machinery
@@ -1559,15 +1615,18 @@ async def _sse_graph_growth_stream(
         mode=mode,
         limit=cap,
         project_id=project_id,
+        min_confidence=min_confidence,
     )
-    for node in doc.nodes:
-        seen_nodes.add(node.key)
-        frame_doc = GraphologyDoc(nodes=[node], edges=[])
-        yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
-    for edge in doc.edges:
-        seen_edges.add(edge.key)
-        frame_doc = GraphologyDoc(nodes=[], edges=[edge])
-        yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
+    async for snapshot_frame in _replay_snapshot_frames(
+        doc,
+        seen_nodes=seen_nodes,
+        seen_edges=seen_edges,
+        replay_pace_s=replay_pace_s,
+        is_disconnected=is_disconnected,
+    ):
+        yield snapshot_frame
+    # A paced replay that aborted on disconnect leaves seen_* short of the doc;
+    # the loop simply stopped yielding, which is the correct unwind.
 
     if not live:
         yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
@@ -7052,6 +7111,7 @@ def build_app(
         depth: int | None = None,
         limit: int | None = None,
         project: str | None = None,
+        min_confidence: float = 0.0,
     ) -> GraphologyView:
         """A windowed subgraph for ``project_id`` as **graphology JSON**.
 
@@ -7059,8 +7119,9 @@ def build_app(
         response is a graphology import document (``{attributes, nodes,
         edges}``) a sigma.js client feeds to ``graph.import(...)`` with
         zero transform: each node carries ``label`` / ``type`` /
-        degree-derived ``size`` / ``color`` (+ ``community`` when stored);
-        layout ``x`` / ``y`` are omitted (the client runs ForceAtlas2).
+        degree-derived ``size`` / ``color`` (+ ``community`` /
+        ``confidence`` when stored); layout ``x`` / ``y`` are omitted (the
+        client runs ForceAtlas2).
 
         Query params:
 
@@ -7075,6 +7136,11 @@ def build_app(
           nodes/edges tagged with this ``project_id`` are returned (a
           project's subgraph across the agent's KBs). Omit (default) for
           the full per-agent graph — backward-compatible.
+        * ``min_confidence`` — **ADR 046 D2** confidence floor in ``[0, 1]``.
+          Drops nodes whose stored extraction confidence is below it (and
+          their now-dangling edges). Default ``0.0`` shows every node — an
+          opt-in, backward-compatible filter. A node with no recorded
+          confidence is treated as full-confidence (never dropped).
 
         Tenant-scoped: a cross-tenant ``project_id`` / ``root`` yields an
         empty document (no leak). Read scope.
@@ -7090,6 +7156,7 @@ def build_app(
             depth=depth,
             limit=limit,
             project_id=project,
+            min_confidence=min_confidence,
         )
         return GraphologyView.model_validate(doc.model_dump())
 
@@ -7410,6 +7477,8 @@ def build_app(
         limit: int | None = None,
         project: str | None = None,
         live: bool = False,
+        min_confidence: float = 0.0,
+        pace: float = 0.0,
     ) -> StreamingResponse:
         """Growth stream for ``project_id``'s graph over **SSE**.
 
@@ -7448,16 +7517,30 @@ def build_app(
         Bounded by ``limit`` (node/edge cap). ``?project=`` (ADR 046 D1,
         additive) scopes both the replayed window AND the live-tail to one
         project's subgraph (a cross-project event never reaches the
-        stream). Tenant-scoped. Read scope.
+        stream). ``?min_confidence=`` (ADR 046 D2, additive) applies a
+        confidence floor to the replayed window (and, in live mode, leaves
+        low-confidence live frames to the viewer's dimming) — default
+        ``0.0`` shows everything. ``?pace=`` (additive, default ``0.0``)
+        sleeps that many seconds between snapshot frames so the viewer
+        animates the graph **assembling node-by-node** — the demo "watch it
+        grow" effect even for a graph that was built atomically. A paced
+        replay honors client disconnect between frames. Tenant-scoped. Read
+        scope.
         """
         store: StorageProvider = request.app.state.storage
         tenant_id = ctx.tenant_id
         cap = graph_query.clamp_cap(limit)
         graph_mode = _graph_mode(mode)
+        # Bound the per-frame pacing so a stray ?pace= can't pin a connection
+        # open for an absurd time; the demo uses fractions of a second.
+        replay_pace_s = min(max(pace, 0.0), _GRAPH_REPLAY_PACE_MAX_S)
 
         async def _is_disconnected() -> bool:
             return await request.is_disconnected()
 
+        # A paced replay also needs the disconnect predicate so it can unwind
+        # between frames even in snapshot (non-live) mode.
+        needs_disconnect = live or replay_pace_s > 0.0
         generator = _sse_graph_growth_stream(
             store=store,
             agent=project_id,
@@ -7465,8 +7548,10 @@ def build_app(
             mode=graph_mode,
             cap=cap,
             project_id=project,
+            min_confidence=min_confidence,
             live=live,
-            is_disconnected=_is_disconnected if live else None,
+            replay_pace_s=replay_pace_s,
+            is_disconnected=_is_disconnected if needs_disconnect else None,
         )
         return StreamingResponse(
             generator,

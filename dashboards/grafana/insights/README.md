@@ -12,9 +12,34 @@ They **complement, not replace** #518: the narrative/health/Top-3 rows read the
 
 | File | Surface | Reads from |
 | --- | --- | --- |
+| `mdk-mission-control.json` | Grafana dashboard | **Single-pane operator wall** — Insights API (health gauge + plain-English anomalies + open-anomaly count) + Prometheus (live spend / throughput / error-rate / p95 latency / in-flight). Wired to the **real** response shapes; lights up against `mdk demo seed`. |
 | `mdk-daily-insights.json` | Grafana dashboard | Insights API (narrative, health, Top 3, anomaly annotations) + Prometheus (golden-signal charts) |
 | `mdk-project-health.json` | Grafana dashboard | Insights API (score history, trends, failure clusters) + Prometheus (ground-truth panel) |
 | `../../infra/azure-monitor/workbooks/insights.workbook.json` | Azure Monitor workbook | Insights API (custom-endpoint / pasted digest) + `AppMetrics`/`AppDependencies` (raw) |
+
+> ## ADR 047 is now on `main` — `mdk-mission-control.json` is wired to the real shapes
+>
+> The legacy gap banner below was written when the `/observability` endpoints
+> were still unmerged; the older dashboards in this pack carry per-panel
+> "documented-gap" notes from that era. **`mdk-mission-control.json` is wired to
+> the *actual* response shapes** of the now-shipped API and verified against
+> `movate.runtime.schemas` + `movate.core.observability.analyst`:
+>
+> - `GET /api/v1/observability/health` returns a **flat** object
+>   `{project_id, date, health_score, narrative_digest, anomaly_count,
+>   has_insight}` → the health gauge + open-anomaly tile use `root_selector: ""`.
+> - `GET /api/v1/observability/insights` returns
+>   `{insights: [{date, health_score, anomalies: [{metric, severity, value,
+>   baseline, z, note}], top_failures, usage_rollup, trends, narrative_digest}],
+>   count}` → the **plain-English anomaly table** uses
+>   `root_selector: "insights.anomalies"` and surfaces the analyst's
+>   human-readable `note` (e.g. *"cost is 12.9 sigma above the 3-day baseline"*),
+>   which is computed **pure (no LLM)**, so it populates **offline + free** right
+>   after `mdk demo seed` (the seed runs the analyst under project `default`).
+>
+> Honest caveat: the **in-flight** tile (`mdk.jobs.in_flight`) is a *live*
+> gauge — on a static/replayed demo it reads 0; it animates only while the
+> runtime is actively draining work.
 
 > ## Dependency: ADR 047 is not on `main` yet
 >

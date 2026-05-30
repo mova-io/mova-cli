@@ -1,0 +1,511 @@
+{
+  "$comment": "mdk - mission control (single pane). The Monday-demo operator wall: ONE screen that fuses the live OTel golden signals (spend, throughput, error rate, p95 latency, in-flight) from Prometheus with the overnight analyst's structured output (health gauge + plain-English anomalies) from the ADR 047 Observability Intelligence API (now on main). Movate-themed (dashboards/grafana/theme/palette.json). Designed to render with non-empty panels against a freshly `mdk demo seed`-ed tenant+project: the seed runs the analyst (PR #613) under project_id='default', so the health gauge + anomaly table light up, and the Prometheus panels populate from the seeded run/cost/latency telemetry once it is scraped. CONSUMES existing endpoints only -- no new /api/v1 routes. Response shapes are the REAL ones (verified against movate.runtime.schemas.ObservabilityInsightView / ObservabilityHealthView and movate.core.observability.analyst): GET /api/v1/observability/health -> {project_id, date, health_score, narrative_digest, anomaly_count, has_insight} (flat, root_selector=''); GET /api/v1/observability/insights -> {insights:[{date, health_score, anomalies:[{metric, severity, value, baseline, z, note}], top_failures:[{signature, count, sample_message, agent}], usage_rollup:{...}, trends:{...}, narrative_digest}], count} (root_selector='insights', and the plain-English anomaly feed flattens insights.anomalies via root_selector='insights.anomalies').",
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics (same source as the #518 golden-signal dashboards). Feeds the live spend / throughput / error-rate / p95-latency / in-flight panels.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_INSIGHTS",
+      "label": "Insights API (JSON / Infinity)",
+      "description": "JSON/Infinity datasource pointed at the ADR 047 Observability Intelligence API (now on main): GET /api/v1/observability/health + /insights. Feeds the health gauge and the plain-English overnight-anomaly table. Plugin: yesoreyeram-infinity-datasource. See dashboards/grafana/insights/README.md for datasource setup.",
+      "type": "datasource",
+      "pluginId": "yesoreyeram-infinity-datasource",
+      "pluginName": "Infinity"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"},
+    {"type": "datasource", "id": "yesoreyeram-infinity-datasource", "name": "Infinity", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "mdk - mission control (single pane). The one operator screen for the demo: a fleet HEALTH gauge + live SPEND / THROUGHPUT / ERROR-RATE, P95 LATENCY + IN-FLIGHT, and the overnight analyst's TOP ANOMALIES IN PLAIN ENGLISH -- all on one wall. Live golden signals come from the real OTel metrics on Prometheus (mdk.run.cost_usd, mdk.jobs.completed, mdk.job.duration_ms, mdk.jobs.in_flight); the health gauge + anomaly narrative come from the ADR 047 Observability Intelligence API (GET /api/v1/observability/health + /insights, now on main). Movate-themed. Lights up against `mdk demo seed` (the seed runs the analyst under project_id='default'). For the deep-dive SRE view see mdk-golden-signals.json; for the full daily narrative see insights/mdk-daily-insights.json; for the leadership view see mdk-exec-summary.json.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [
+    {"title": "Exec summary (leadership)", "type": "link", "url": "/d/mdk-exec-summary", "targetBlank": true, "icon": "external link"},
+    {"title": "Daily insights (narrative)", "type": "link", "url": "/d/mdk-daily-insights", "targetBlank": true, "icon": "external link"},
+    {"title": "Deep-dive: golden signals (#518)", "type": "link", "url": "/d/mdk-golden-signals", "targetBlank": true, "icon": "external link"}
+  ],
+  "liveNow": true,
+  "panels": [
+    {
+      "type": "text",
+      "id": 1,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 0},
+      "title": "",
+      "options": {
+        "mode": "markdown",
+        "content": "# Movate MDK — Mission Control\n\n**The one operator screen.** Fleet **health** (overnight analyst) · live **spend / throughput / error rate** · **p95 latency + in-flight** · the analyst's **top anomalies in plain English**. Golden signals are live from the OTel metrics on Prometheus; the health gauge and the anomaly narrative come from the **ADR 047 Observability Intelligence API** (`GET /api/v1/observability/health` + `/insights`, now on main). Seed a live story with `mdk demo seed` — the seed runs the analyst under project `default`, so the health gauge and the anomaly table light up immediately. Deep-dive + narrative + leadership views: top-right links."
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 3},
+      "id": 99,
+      "panels": [],
+      "title": "Fleet health & live golden signals",
+      "type": "row"
+    },
+    {
+      "type": "gauge",
+      "id": 10,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 9, "w": 6, "x": 0, "y": 4},
+      "title": "Fleet health",
+      "description": "Composite health_score (0-100) for $insight_project from GET /api/v1/observability/health (ADR 047). The API returns a FLAT object: {project_id, date, health_score, narrative_digest, anomaly_count, has_insight} -- so root_selector is '' (top-level field). The score blends success rate, latency-vs-baseline, cost-vs-baseline, drift and eval pass-rate (movate.core.observability.analyst.compute_health_score). Thresholds (Movate palette): red <50, amber 50-79, green >=80. Lights up after `mdk demo seed` runs the analyst for project='default'.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#D64550", "value": null},
+              {"color": "#F2A93B", "value": 50},
+              {"color": "#2BB673", "value": 80}
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^health_score$/", "values": false},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/health?project_id=$insight_project",
+          "root_selector": "",
+          "columns": [
+            {"selector": "health_score", "text": "health_score", "type": "number"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 11,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 9, "w": 6, "x": 6, "y": 4},
+      "title": "Spend this period",
+      "description": "Total LLM spend over the dashboard window from mdk.run.cost_usd (the #518 catalog instrument). The headline cost number for the demo wall. Pairs with the error-rate and throughput tiles to the right.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed", "fixedColor": "#2D6CDF"},
+          "unit": "currencyUSD",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_run_cost_usd_total{tenant=~\"$tenant\"}[$__range]))",
+          "legendFormat": "spend (period)",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 12,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 9, "w": 6, "x": 12, "y": 4},
+      "title": "Throughput (runs)",
+      "description": "Total runs over the window from mdk.jobs.completed -- the demo's adoption/throughput headline, with an area sparkline of the rate. Same instrument as the #518 golden-signals throughput panel.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed", "fixedColor": "#5BC0EB"},
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_jobs_completed_total{tenant=~\"$tenant\"}[$__range]))",
+          "legendFormat": "runs (period)",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 13,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 9, "w": 6, "x": 18, "y": 4},
+      "title": "Error rate",
+      "description": "Fleet error rate (all non-success) over the window from mdk.jobs.completed: non-success / all. Thresholds match the #518 error SLO -- green <=10% error, amber to red above. The seeded fleet carries a believable 0.5-4% smear of error/safety/dead-letter so this tile is non-zero but healthy.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#2BB673", "value": null},
+              {"color": "#F2A93B", "value": 0.05},
+              {"color": "#D64550", "value": 0.1}
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_jobs_completed_total{status!=\"success\",tenant=~\"$tenant\"}[$__range])) / clamp_min(sum(increase(mdk_jobs_completed_total{tenant=~\"$tenant\"}[$__range])), 1)",
+          "legendFormat": "error rate",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 13},
+      "id": 98,
+      "panels": [],
+      "title": "Latency & saturation (p95 + in-flight)",
+      "type": "row"
+    },
+    {
+      "type": "timeseries",
+      "id": 20,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 9, "w": 16, "x": 0, "y": 14},
+      "title": "Job latency p95 / p99",
+      "description": "Job latency p95 + p99 over time from the mdk.job.duration_ms histogram (the #518 catalog instrument). The red line is the 30s high-latency SLO. The seeded fleet injects a latency regression on one agent after a deploy, so p95 shows a believable step change in the window.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 12, "lineWidth": 2, "showPoints": "never", "thresholdsStyle": {"mode": "line"}},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "#2BB673", "value": null}, {"color": "#D64550", "value": 30000}]},
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "p99"},
+            "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "#F2A93B"}}]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "p95"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mdk_job_duration_ms_milliseconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "p99"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 21,
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 14},
+      "title": "In-flight now",
+      "description": "Jobs currently executing from the mdk.jobs.in_flight up/down counter (the #518 saturation signal) -- the live 'work in the pipe right now' number, with a sparkline of recent depth. NOTE: this is a real-time gauge; on a paused/historical demo (replaying a seeded window) it reads 0 because no jobs are executing live. It animates when the runtime is actively draining work (e.g. `mdk dev` / a load run). Documented so an empty value on a static demo is understood, not mistaken for a misconfiguration.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#2BB673", "value": null},
+              {"color": "#5BC0EB", "value": 1},
+              {"color": "#F2A93B", "value": 50}
+            ]
+          },
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(mdk_jobs_in_flight{tenant=~\"$tenant\"})",
+          "legendFormat": "in-flight",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23},
+      "id": 97,
+      "panels": [],
+      "title": "Overnight analyst — top anomalies in plain English (from the seeded insights)",
+      "type": "row"
+    },
+    {
+      "type": "table",
+      "id": 30,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 11, "w": 18, "x": 0, "y": 24},
+      "title": "Top anomalies (plain English)",
+      "description": "The overnight analyst's anomalies, flattened across the insight history for $insight_project, worst-z-first. Source: GET /api/v1/observability/insights -> {insights:[{date, anomalies:[{metric, severity, value, baseline, z, note}], ...}], count}. root_selector='insights.anomalies' flattens the nested per-day anomaly arrays into rows; the human-readable `note` (e.g. 'cost is 12.9 sigma above the 3-day baseline') is the plain-English column. These are produced PURE (z-score, no LLM) by movate.core.observability.analyst.detect_anomalies, so they populate $0/offline right after `mdk demo seed` (the seed injects a cost spike + a latency regression, so the table is non-empty). Severity color map: critical dark-red, warning amber, info blue (Movate palette).",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto", "filterable": true},
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "severity"},
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {"type": "value", "options": {"critical": {"color": "#7A1620", "index": 0}, "warning": {"color": "#F2A93B", "index": 1}, "info": {"color": "#2D6CDF", "index": 2}}}
+                ]
+              },
+              {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+              {"id": "custom.width", "value": 110}
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "metric"},
+            "properties": [{"id": "custom.width", "value": 110}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "z"},
+            "properties": [{"id": "decimals", "value": 1}, {"id": "custom.width", "value": 80}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "what happened (plain English)"},
+            "properties": [{"id": "custom.cellOptions", "value": {"type": "auto", "wrapText": true}}]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{"displayName": "z", "desc": true}]
+      },
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/insights?project_id=$insight_project",
+          "root_selector": "insights.anomalies",
+          "columns": [
+            {"selector": "severity", "text": "severity", "type": "string"},
+            {"selector": "metric", "text": "metric", "type": "string"},
+            {"selector": "note", "text": "what happened (plain English)", "type": "string"},
+            {"selector": "z", "text": "z", "type": "number"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 31,
+      "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+      "gridPos": {"h": 11, "w": 6, "x": 18, "y": 24},
+      "title": "Open anomalies (latest insight)",
+      "description": "anomaly_count from the latest insight for $insight_project, via GET /api/v1/observability/health -> {..., anomaly_count, ...} (flat; root_selector=''). The single 'how many fires right now' number paired with the table to the left. 0 (green) on a quiet day; turns amber/red as the analyst flags more.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#2BB673", "value": null},
+              {"color": "#F2A93B", "value": 1},
+              {"color": "#D64550", "value": 4}
+            ]
+          },
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^anomaly_count$/", "values": false},
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "yesoreyeram-infinity-datasource", "uid": "${DS_INSIGHTS}"},
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "url": "/api/v1/observability/health?project_id=$insight_project",
+          "root_selector": "",
+          "columns": [
+            {"selector": "anomaly_count", "text": "anomaly_count", "type": "number"}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": 40,
+      "gridPos": {"h": 5, "w": 24, "x": 0, "y": 35},
+      "title": "How to read mission control (+ what lights up on a seed)",
+      "options": {
+        "mode": "markdown",
+        "content": "**One screen, two data planes.**\n\n* **Live golden signals** (Spend, Throughput, Error rate, p95/p99 latency, In-flight) read the real OTel metrics on Prometheus (`mdk.run.cost_usd`, `mdk.jobs.completed`, `mdk.job.duration_ms`, `mdk.jobs.in_flight`) — the #518 catalog. Scope with the `$tenant` variable.\n* **Fleet health** + **Top anomalies (plain English)** + **Open anomalies** read the ADR 047 Observability Intelligence API (`GET /api/v1/observability/health` + `/insights`) for `$insight_project`. The anomaly `note` (e.g. _“cost is 12.9 sigma above the 3-day baseline”_) is computed **pure (no LLM)** by the analyst, so it populates **offline and free**.\n\n**Lights up on `mdk demo seed`.** The seed persists a believable fleet **and runs the analyst** under project `default` (PR #613), injecting a **cost spike** + a **latency regression after a deploy**. So right after a seed: the health gauge shows a real composite score, the anomaly table is non-empty (cost / volume / latency rows with plain-English notes), and — once the seeded run/cost/latency telemetry is scraped into Prometheus — the spend / throughput / error-rate / p95 tiles populate too.\n\n**Honest gap.** **In-flight** is a *live* gauge (`mdk.jobs.in_flight`): on a static/replayed demo it reads **0** because nothing is executing at that instant — it animates only while the runtime is actively draining work. The **narrative digest** prose is the analyst's one optional LLM call; on the offline seed path it runs against the MockProvider, so the *plain-English signal you should demo is the anomaly `note` column*, not the digest. See `dashboards/grafana/insights/README.md`."
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "mission-control", "single-pane", "observability-intelligence", "wow-pack"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Prometheus",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Insights API",
+        "multi": false,
+        "name": "DS_INSIGHTS",
+        "options": [],
+        "query": "yesoreyeram-infinity-datasource",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": ".*"},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(mdk_run_cost_usd_total, tenant)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "tenant",
+        "multi": true,
+        "name": "tenant",
+        "options": [],
+        "query": {"query": "label_values(mdk_run_cost_usd_total, tenant)", "refId": "StandardVariableQuery"},
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      },
+      {
+        "current": {"selected": true, "text": "default", "value": "default"},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Insight project",
+        "name": "insight_project",
+        "options": [
+          {"selected": true, "text": "default", "value": "default"}
+        ],
+        "query": "default",
+        "description": "The ADR 047 project the analyst writes insights under. `mdk demo seed` analyzes under 'default' (movate.cli.demo_cmd._DEMO_INSIGHT_PROJECT), so the health gauge + anomaly table light up for that value out of the box.",
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {"from": "now-7d", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - mission control (single pane)",
+  "uid": "mdk-mission-control",
+  "version": 1,
+  "weekStart": ""
+}
