@@ -39,6 +39,7 @@ from movate.playground.voice import (
     collect_audio,
     config_frame,
     end_frame,
+    interrupt_frame,
     parse_control_frame,
     runtime_advertises_voice,
 )
@@ -128,6 +129,30 @@ def test_config_frame_only_sends_overrides() -> None:
 def test_end_and_close_frames() -> None:
     assert json.loads(end_frame()) == {"type": "end"}
     assert json.loads(close_frame()) == {"type": "close"}
+
+
+def test_interrupt_frame() -> None:
+    """The barge-in control frame the client sends to cancel an in-flight answer."""
+    assert json.loads(interrupt_frame()) == {"type": "interrupt"}
+
+
+def test_latency_frame_exposes_badge() -> None:
+    """A ``latency`` frame is recognized and surfaces its ready-to-render badge."""
+    f = parse_control_frame(
+        json.dumps({"type": "latency", "badge": "⚡ responded in 480ms", "responded_in_ms": 480.0})
+    )
+    assert f is not None
+    assert f.is_latency
+    assert f.latency_badge == "⚡ responded in 480ms"
+    # A frame without a badge yields an empty string (never raises).
+    assert VoiceFrame(type="latency", data={"type": "latency"}).latency_badge == ""
+
+
+def test_speech_started_is_barge_in_cue() -> None:
+    """The realtime ``speech_started`` control frame is flagged as the barge-in cue."""
+    f = parse_control_frame(json.dumps({"type": "speech_started"}))
+    assert f is not None
+    assert f.is_speech_started
 
 
 def test_parse_control_frame_typed() -> None:

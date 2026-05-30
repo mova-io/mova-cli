@@ -509,12 +509,18 @@ def _sse_frame(event: str, data: dict[str, Any]) -> str:
 #                                    voice_id / codec for THIS turn
 #     <binary frame>               an inbound audio chunk (pcm16 by default)
 #     {"type": "end"}              the caller finished the utterance → run the turn
+#     {"type": "interrupt"}        BARGE-IN: the user started speaking while the
+#                                    agent is talking → cancel the in-flight TTS
+#                                    (a binary frame arriving mid-answer is also
+#                                    treated as a barge-in)
 #
 #   server → client
 #     {"type": "transcript.partial", "text": ...}   streaming partial (STT)
 #     {"type": "transcript.final",   "text": ...}   endpointed utterance
 #     {"type": "agent.token",        "text": ...}   streamed agent token (D11)
 #     <binary frame>                                synthesized audio (tts.audio)
+#     {"type": "latency", "responded_in_ms", ...}   per-stage turn latency (the
+#                                                    demo badge; additive)
 #     {"type": "usage", ...}                        end-of-turn meter (ADR 036)
 #     {"type": "error", "message","code","stage"}   a stage failure + degrade
 #     {"type": "done", "run_id","status"}           terminal for the turn
@@ -671,6 +677,140 @@ async def _send_voice_event(websocket: WebSocket, event: Any) -> None:
     else:
         # transcript.partial / transcript.final / agent.token
         await websocket.send_json(_voice_ctrl(event.kind, text=event.text))
+
+
+async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
+    """Emit one ``latency`` control frame for a finished pipeline turn.
+
+    Derives per-stage latencies from the ``at_ms`` offsets stamped on the
+    turn's :class:`~movate.voice.pipeline.VoiceEvent` stream (STT-final →
+    agent-first-token → TTS-first-audio) and sends a small JSON frame the demo
+    UI renders as the "responded in {X}ms" badge. Additive (a client that
+    doesn't know the frame ignores it); silent when there's nothing to report
+    (e.g. an STT-stage error produced no milestones).
+    """
+    from movate.voice.pipeline import (  # noqa: PLC0415 - lazy, voice-only path
+        compute_turn_latency,
+        format_latency_badge,
+    )
+
+    latency = compute_turn_latency(events)
+    badge = format_latency_badge(latency)
+    if not badge:
+        return
+    await websocket.send_json(
+        _voice_ctrl(
+            "latency",
+            badge=badge,
+            responded_in_ms=latency.responded_in_ms,
+            stt_final_ms=latency.stt_final_ms,
+            agent_first_token_ms=latency.agent_first_token_ms,
+            tts_first_audio_ms=latency.tts_first_audio_ms,
+        )
+    )
+
+
+async def _watch_voice_barge_in(
+    websocket: WebSocket, cancel: asyncio.Event, buffered: list[dict[str, Any]]
+) -> None:
+    """Watch the socket during a turn for the user barging in (ADR 048 D2b cue).
+
+    Sets ``cancel`` the moment the user cuts in while the agent is talking —
+    either an explicit ``{"type":"interrupt"}`` control frame or a fresh binary
+    mic frame arriving mid-answer (the user started their next utterance). That
+    is the signal ``run_voice_pipeline`` honors to stop the in-flight TTS.
+
+    Frames that aren't barge-in signals but matter to the session (a ``close``)
+    are appended to ``buffered`` so the run loop can act on them after the turn.
+    The task is cancelled by the run loop when the turn ends; a hangup just ends
+    the watch (the run loop's ``WebSocketDisconnect`` handler takes over).
+    """
+    with contextlib.suppress(WebSocketDisconnect):
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+            if message.get("bytes") is not None:
+                # A mic frame arriving mid-answer = the user started talking.
+                cancel.set()
+                continue
+            text = message.get("text")
+            if text is None:
+                continue
+            try:
+                ctrl = json.loads(text)
+            except (ValueError, TypeError):
+                continue
+            ctrl_type = ctrl.get("type")
+            if ctrl_type == "interrupt":
+                cancel.set()
+            elif ctrl_type in ("close", "config", "end"):
+                buffered.append(ctrl)
+
+
+async def _stream_voice_pipeline_turn(
+    websocket: WebSocket,
+    *,
+    audio_in: AsyncIterator[Any],
+    stt: Any,
+    tts: Any,
+    executor: Any,
+    bundle: Any,
+    tenant_id: str,
+    config: Any,
+    stt_api_key: str | None,
+    tts_api_key: str | None,
+) -> bool:
+    """Stream one pipeline voice turn with barge-in + a latency badge.
+
+    Wraps :func:`movate.voice.run_voice_pipeline` with two pieces of demo
+    polish, both additive:
+
+    * **barge-in** — a concurrent watcher (:func:`_watch_voice_barge_in`) sets a
+      ``cancel`` event when the user cuts in (an ``interrupt`` control frame or a
+      mic frame mid-answer); the pipeline honors it by stopping the in-flight
+      TTS so the agent isn't talking over the user.
+    * **latency badge** — just before the terminal ``done``, one ``latency``
+      frame carrying the turn's per-stage timings is emitted (the demo's
+      "responded in {X}ms" UI + the voice-latency observability win).
+
+    Returns ``True`` when the session should end (the watcher saw a ``close``
+    during the turn), else ``False`` to run the next turn.
+    """
+    from movate.voice import run_voice_pipeline  # noqa: PLC0415
+
+    cancel = asyncio.Event()
+    buffered: list[dict[str, Any]] = []
+    watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
+    latency_events: list[Any] = []
+    try:
+        async for event in run_voice_pipeline(
+            audio_in=audio_in,
+            stt=stt,
+            tts=tts,
+            executor=executor,
+            bundle=bundle,
+            tenant_id=tenant_id,
+            input_key=config.input_key,
+            language=config.language,
+            voice_id=config.voice_id,
+            stt_api_key=stt_api_key,
+            tts_api_key=tts_api_key,
+            cancel=cancel,
+        ):
+            latency_events.append(event)
+            if event.kind == "done":
+                # Emit the latency badge just BEFORE done so it lands inside the
+                # turn (a client draining to ``done`` still sees it).
+                await _send_voice_latency(websocket, latency_events)
+            await _send_voice_event(websocket, event)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watcher
+
+    # A ``close`` the watcher read mid-turn ends the session after this turn.
+    return any(b.get("type") == "close" for b in buffered)
 
 
 async def _send_realtime_chunk(websocket: WebSocket, chunk: Any) -> None:
@@ -14468,7 +14608,6 @@ def build_app(
         from movate.providers.mock import MockProvider  # noqa: PLC0415
         from movate.providers.pricing import load_pricing  # noqa: PLC0415
         from movate.tracing import build_tracer  # noqa: PLC0415
-        from movate.voice import run_voice_pipeline  # noqa: PLC0415
         from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
 
         # Phase-1 reference adapters, built from the app-state factories
@@ -14512,20 +14651,20 @@ def build_app(
                     for raw_bytes in frames:
                         yield _AudioChunk(data=raw_bytes)
 
-                async for event in run_voice_pipeline(
+                stop = await _stream_voice_pipeline_turn(
+                    websocket,
                     audio_in=_audio_in(),
                     stt=stt,
                     tts=tts,
                     executor=executor,
                     bundle=bundle,
                     tenant_id=ctx.tenant_id,
-                    input_key=config.input_key,
-                    language=config.language,
-                    voice_id=config.voice_id,
+                    config=config,
                     stt_api_key=stt_api_key,
                     tts_api_key=tts_api_key,
-                ):
-                    await _send_voice_event(websocket, event)
+                )
+                if stop:
+                    return
         except WebSocketDisconnect:
             # Client hung up — nothing to clean up beyond the executor task,
             # which run_voice_pipeline reaps in its own finally. Normal exit.

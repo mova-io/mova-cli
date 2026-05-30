@@ -15,6 +15,7 @@ and the agent stage driven by ``MockProvider`` via the ``mock`` config flag
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -28,7 +29,7 @@ from movate.core.auth import ALL_SCOPES, SCOPE_READ, ApiKeyEnv, mint_api_key
 from movate.core.provider_keys import ENV_PROVIDER_KEY_SECRET, mint_tenant_provider_key
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
-from movate.voice import FakeRealtime, FakeSTT, FakeTTS
+from movate.voice import AudioChunk, FakeRealtime, FakeSTT, FakeTTS
 
 
 @pytest.fixture
@@ -170,6 +171,80 @@ async def test_voice_ws_full_turn(client: TestClient, storage, auth_setup, app_a
     assert record is not None
     assert record.agent == "voice-demo"
     assert record.input == {"text": "turn the lights on"}
+
+
+async def test_voice_ws_emits_latency_frame_before_done(
+    client: TestClient, storage, auth_setup, app_and_fakes
+) -> None:
+    """The demo latency badge: a ``latency`` control frame (with a rendered
+    badge + per-stage ms) lands just before the terminal ``done``."""
+    token, _ = auth_setup
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "end"})
+        frames = _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    ctrl = [f for f in frames if isinstance(f, dict)]
+    types = [c["type"] for c in ctrl]
+    assert "latency" in types
+    # The latency frame precedes the terminal done.
+    assert types.index("latency") < types.index("done")
+    latency = next(c for c in ctrl if c["type"] == "latency")
+    assert isinstance(latency.get("badge"), str) and latency["badge"]
+    assert "responded in" in latency["badge"]
+    # The per-stage fields are present for the trace/observability consumer.
+    assert "responded_in_ms" in latency
+
+
+class _SlowTTS:
+    """A TTS that yields several frames with an await between each, so an
+    ``interrupt`` control frame has time to land mid-answer (barge-in test)."""
+
+    name = "slow_tts"
+    version = "0.0.1"
+
+    def __init__(self) -> None:
+        self.emitted = 0
+
+    async def synthesize(self, text, *, voice_id="", codec="pcm16", api_key=None):
+        async for _ in text:
+            pass
+        for i in range(20):
+            yield AudioChunk(data=f"chunk-{i}".encode(), codec=codec)
+            self.emitted += 1
+            await asyncio.sleep(0.02)
+
+
+async def test_voice_ws_interrupt_bargein_cancels_tts(storage, agents_path, auth_setup) -> None:
+    """An ``{"type":"interrupt"}`` frame sent mid-answer cancels the in-flight
+    TTS: the turn ends with ``done`` status ``interrupted`` and the slow TTS did
+    NOT emit all its frames."""
+    slow = _SlowTTS()
+    app = build_app(storage, agents_path=agents_path)
+    app.state.voice_stt_factory = lambda: FakeSTT("hello there")
+    app.state.voice_tts_factory = lambda: slow
+    client = TestClient(app)
+    token, _ = auth_setup
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01")
+        ws.send_json({"type": "end"})
+        # Barge in almost immediately — the user starts talking over the answer.
+        ws.send_json({"type": "interrupt"})
+        frames = _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    ctrl = [f for f in frames if isinstance(f, dict)]
+    done = next(c for c in ctrl if c["type"] == "done")
+    assert done["status"] == "interrupted"
+    # The slow TTS was cut short (it would have emitted 20 frames otherwise).
+    assert slow.emitted < 20
 
 
 # ---------------------------------------------------------------------------
