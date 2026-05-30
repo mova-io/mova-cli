@@ -66,6 +66,14 @@ class RuntimeCapabilities:
     """True when a first-class ``POST /runs/{id}/feedback`` endpoint is
     advertised. Routes feedback there; otherwise the legacy path."""
 
+    voice: bool = False
+    """True when the runtime advertises the voice transport
+    (``WS /api/v1/agents/{name}/voice``, ADR 048 D4). NOTE: today's runtime
+    capabilities probe skips WebSocket routes, so this is usually ``False``
+    even when the route exists — the playground treats it as a *hint* for the
+    banner, never a hard gate (voice mode attempts the connection and degrades
+    gracefully on failure). See :mod:`movate.playground.voice`."""
+
     max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
     """Per-file upload ceiling (MB). Taken from
     ``limits.max_kb_upload_mb`` when present, else the default."""
@@ -170,6 +178,7 @@ def parse_capabilities(payload: dict[str, Any] | None) -> RuntimeCapabilities:
         sessions=_flag(features, "sessions", "stateful_sessions"),
         run_streaming=_flag(features, "run_streaming", "streaming", "sse"),
         feedback_api=_flag(features, "feedback_api", "feedback"),
+        voice=_flag(features, "voice", "voice_ws", "voice_pipeline"),
         max_upload_mb=_int_limit(limits, "max_kb_upload_mb", DEFAULT_MAX_UPLOAD_MB),
         max_upload_count=_int_limit(limits, "max_kb_upload_count", DEFAULT_MAX_UPLOAD_COUNT),
         raw=payload,
