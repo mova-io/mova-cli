@@ -213,6 +213,18 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "is unchanged."
         ),
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Agents-mode only. Overwrite skills that already exist on the "
+            "runtime. Without this flag a 409 is returned when a skill "
+            "already exists, preventing silent breakage on accidental "
+            "re-deploy. Pass --force for intentional overwrites (e.g. "
+            "bumping a skill's implementation without changing its name). "
+            "CLI FLAG (additive): does not affect agent conflict policy."
+        ),
+    ),
 ) -> None:
     """Build the runtime image + roll out to Azure Container Apps.
 
@@ -271,6 +283,7 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             auto_recover=not no_auto_recover,
             with_kb=with_kb,
             smoke_test=smoke_test,
+            force=force,
         )
         return
 
@@ -741,6 +754,7 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
     auto_recover: bool = True,
     with_kb: bool = False,
     smoke_test: bool | None = None,
+    force: bool = False,
 ) -> None:
     """Upload every agent under ``<project>/agents/*/`` to the deployed
     runtime via ``POST /api/v1/agents``.
@@ -966,6 +980,7 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
             base_url=base_url,
             headers=headers,
             project_root=project_root,
+            force=force,
         )
 
         uploaded: list[str] = []
@@ -1015,6 +1030,7 @@ def _deploy_agents(  # noqa: PLR0912 — orchestrator; branch count reflects per
                             base_url=base_url,
                             headers=headers,
                             project_root=project_root,
+                            force=force,
                         )
                         skill_uploaded = re_uploaded
                         skill_failed = re_failed
@@ -1911,26 +1927,32 @@ def _render_unauthorized_message(headers: dict[str, str], target_name: str) -> s
     )
 
 
-def _upload_skills(
+def _upload_skills(  # noqa: PLR0912 — response-code dispatch; branches reflect HTTP status taxonomy
     *,
     client: object,  # httpx.Client
     base_url: str,
     headers: dict[str, str],
     project_root: Path,
+    force: bool = False,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     """Upload every skill under ``<project_root>/skills/*/`` to ``POST /api/v1/skills``.
 
     Returns ``(uploaded_names, failed)`` where ``failed`` is a list of
-    ``(name, reason)`` pairs. The runtime endpoint uses PUT semantics —
-    re-uploading an existing skill overwrites it atomically, so this is
-    safe to call on every deploy.
+    ``(name, reason)`` pairs.
+
+    ``force=True`` appends ``?force=true`` to the request so the runtime
+    overwrites an existing skill with the same name.  Without it (the
+    default), a 409 is returned when the skill already exists — surface
+    the error so the operator can choose ``--force`` consciously.
 
     Silently returns two empty lists if the project has no ``skills/``
     directory (most demo projects don't have custom skills).
     """
+    from typing import cast  # noqa: PLC0415
+
     import httpx as _httpx  # noqa: PLC0415
 
-    assert isinstance(client, _httpx.Client)
+    _client = cast(_httpx.Client, client)
 
     skills_dir = project_root / "skills"
     if not skills_dir.is_dir():
@@ -1944,6 +1966,11 @@ def _upload_skills(
 
     uploaded: list[str] = []
     failed: list[tuple[str, str]] = []
+
+    # Append ?force=true when the operator explicitly requested an overwrite.
+    skills_url = f"{base_url}/api/v1/skills"
+    if force:
+        skills_url = f"{skills_url}?force=true"
 
     for skill_dir in skill_dirs:
         name = skill_dir.name
@@ -1963,13 +1990,20 @@ def _upload_skills(
             files.append(("readme", ("README.md", readme.read_bytes(), "text/markdown")))
 
         try:
-            resp = client.post(f"{base_url}/api/v1/skills", files=files, headers=headers)
+            resp = _client.post(skills_url, files=files, headers=headers)
         except _httpx.HTTPError as exc:
             failed.append((name, f"network error: {exc}"))
             continue
 
         if resp.status_code in (_HTTP_OK, _HTTP_CREATED):
             uploaded.append(name)
+        elif resp.status_code == _HTTP_CONFLICT:
+            failed.append(
+                (
+                    name,
+                    f"Skill {name!r} already exists. Re-run with --force to overwrite.",
+                )
+            )
         elif resp.status_code == _HTTP_SERVICE_UNAVAILABLE:
             failed.append(
                 (

@@ -719,7 +719,7 @@ def _summarize_agent_yaml(bundle: AgentBundle) -> str:
             "max_tokens": (
                 spec.model.params.get("max_tokens") if spec.model and spec.model.params else None
             ),
-            "skills": list(spec.skills) if spec.skills else [],
+            "skills": [str(s) for s in spec.skills] if spec.skills else [],
             "context_count": len(bundle.contexts),
         }
     )

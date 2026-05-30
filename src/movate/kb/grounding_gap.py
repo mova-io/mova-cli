@@ -46,7 +46,7 @@ def is_rag_shaped(spec: AgentSpec) -> bool:
     check the spec's *declared* skill names (not the resolved skills) so the
     detector works off a plain :class:`AgentSpec` with no project on disk.
     """
-    if any("kb-vector" in name.lower() for name in spec.skills):
+    if any("kb-vector" in str(name).lower() for name in spec.skills):
         return True
     return spec.retrieval.auto_retrieval_enabled
 
