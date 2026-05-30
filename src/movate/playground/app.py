@@ -981,6 +981,7 @@ async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
     answer_parts: list[str] = []
     audio_frames: list[Any] = []
     run_id: str | None = None
+    latency_badge = ""
     # Item 3: track the last partial text so we can replace it cleanly
     # when a new partial or the final transcript arrives.
     _last_caption = ""
@@ -988,7 +989,12 @@ async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
     def _compose(caption: str) -> str:
         head = f"🎙 _{caption}_" if caption else ""
         body = "".join(answer_parts)
-        return f"{head}\n\n{body}" if head and body else head or body
+        composed = f"{head}\n\n{body}" if head and body else head or body
+        # Latency badge (demo polish): pin "⚡ responded in {X}ms" under the turn
+        # once the runtime reports it, so the stage sees the speed live.
+        if latency_badge:
+            composed = f"{composed}\n\n`{latency_badge}`" if composed else f"`{latency_badge}`"
+        return composed
 
     async for frame in ws.iter_turn():
         if frame.is_partial:
@@ -1012,6 +1018,12 @@ async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
             await msg.update()
         elif frame.is_audio:
             audio_frames.append(frame)
+        elif frame.is_latency:
+            # Latency badge frame — capture it; the terminal update renders it
+            # under the answer (and the next compose pins it live).
+            latency_badge = frame.latency_badge
+            msg.content = _compose(_last_caption if _last_caption else "")
+            await msg.update()
         elif frame.is_error:
             stage = frame.data.get("stage", "?")
             message = frame.data.get("message", "voice error")
