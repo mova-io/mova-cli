@@ -37,8 +37,10 @@ parameterize which template directory gets copied in; the
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 from collections.abc import Coroutine
+from datetime import UTC, datetime, timedelta
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,8 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+
+logger = logging.getLogger(__name__)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -331,6 +335,13 @@ _PROD_MARKERS = ("prod", "production")
 # overwhelming SQLite's single writer.
 _INSERT_CONCURRENCY = 16
 
+# The ADR 047 Observability-Intelligence project the analyzer writes insights
+# under. The insight-fed + exec dashboards (dashboards/grafana/insights/*,
+# dashboards/grafana/mdk-exec-summary.json) read this same project's insights
+# through the /api/v1/observability API, so analyzing under "default" is what
+# lights them up after a seed. Matches the CLI/runtime default project id.
+_DEMO_INSIGHT_PROJECT = "default"
+
 
 def _looks_like_prod(target: str) -> bool:
     """True if ``target`` contains a prod marker (case-insensitive)."""
@@ -352,6 +363,101 @@ async def _gather_bounded(coros: list[Coroutine[Any, Any, Any]], *, limit: int) 
             await coro
 
     await asyncio.gather(*[_run(c) for c in coros])
+
+
+async def _run_observability_analysis(
+    storage: object,
+    *,
+    tenants: list[str],
+    now: datetime,
+    days: int,
+) -> int:
+    """Run the ADR 047 observability analyst over the freshly-seeded telemetry.
+
+    This is the seeder→analyzer wiring (survey item #1): after the synthetic
+    runs/evals/failures are persisted, we run the same overnight analyst the
+    runtime dispatches as ``JobKind.OBSERVABILITY_ANALYZE`` — once per seeded
+    *(tenant, day)* — so the insight store the insight-fed + exec dashboards
+    read is populated immediately. Without this, those dashboards render empty
+    right after a seed because no insight rows exist yet.
+
+    Runs **inline** (matching the seeder's synchronous, ``asyncio.run``-based
+    execution model) rather than enqueuing a job, because ``mdk demo seed`` has
+    no runtime/worker loop to drain — it persists directly through the
+    StorageProvider Protocol in-process. The analyst is the same pure-core
+    function the dispatch handler calls.
+
+    Uses :class:`MockProvider` for the single narrative-digest LLM call so the
+    seed stays offline + free (no provider key required); the structured
+    insight — the part the dashboards read — is computed in pure Python and
+    needs no LLM.
+
+    **Graceful degrade (CLAUDE.md rule 5/10):** the analyzer and the insight
+    store are an opt-in part of the platform. If either is unavailable (module
+    missing, or a storage backend without ``save_insight``), we log a clear
+    line and return 0 — the seed itself never fails because insights couldn't
+    be produced. Returns the number of insights written.
+    """
+    # Local imports: keep the cli ⊥ core/runtime boundary lazy and avoid paying
+    # the analyst/provider import cost on the common (scaffold) demo path.
+    try:
+        from movate.core.observability.analyst import analyze  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+    except Exception:  # pragma: no cover - analyst is an optional platform layer
+        logger.info(
+            "demo_seed_observability_analyze_skipped — observability analyst "
+            "unavailable; dashboards will populate once an analyze job runs"
+        )
+        return 0
+
+    # The insight store is an additive StorageProvider seam; a backend without
+    # it (older/custom) should degrade, not crash the seed.
+    if not callable(getattr(storage, "save_insight", None)):
+        logger.info(
+            "demo_seed_observability_analyze_skipped — storage backend %s has no "
+            "insight store; run an analyze job once the seam is available",
+            type(storage).__name__,
+        )
+        return 0
+
+    provider = MockProvider()
+    # Analyze each seeded calendar day in the window so the dashboards' time
+    # series (not just the latest day) light up. The seeder's window is
+    # [now - days, now); analyze each whole UTC day in it.
+    window_start = (now - timedelta(days=days)).date()
+    day_count = (now.date() - window_start).days
+    days_to_analyze = [window_start + timedelta(days=offset) for offset in range(day_count + 1)]
+
+    written = 0
+    for tenant_id in tenants:
+        for day in days_to_analyze:
+            try:
+                await analyze(
+                    tenant_id,
+                    _DEMO_INSIGHT_PROJECT,
+                    day,
+                    storage=storage,  # type: ignore[arg-type]
+                    llm=provider,
+                    # Mock provider => $0 spend; keep a budget so the digest runs.
+                    budget_usd=0.10,
+                )
+                written += 1
+            except Exception:  # pragma: no cover - per-day analysis is best-effort
+                logger.warning(
+                    "demo_seed_observability_analyze_day_failed tenant=%s day=%s — "
+                    "continuing; remaining insights still populate",
+                    tenant_id,
+                    day.isoformat(),
+                    exc_info=True,
+                )
+    if written:
+        logger.info(
+            "demo_seed_observability_analyze_done insights=%d tenants=%d days=%d",
+            written,
+            len(tenants),
+            len(days_to_analyze),
+        )
+    return written
 
 
 def seed(
@@ -435,14 +541,27 @@ def seed(
         )
         raise typer.Exit(code=2)
 
+    # Pin ``now`` so the seeder's time window and the analyzer's per-day
+    # analysis (below) agree on exactly which days hold data.
+    now = datetime.now(UTC)
     cfg = SeedConfig(
-        agents=agents, tenants=tenants, days=days, seed=seed_value, with_voice=with_voice
+        agents=agents,
+        tenants=tenants,
+        days=days,
+        seed=seed_value,
+        now=now,
+        with_voice=with_voice,
     )
     bundle = generate_bundle(cfg)
 
+    # The distinct demo tenant ids the analyzer must run for (telemetry is
+    # scoped by tenant_id). Derived from the bundle so it stays in lockstep
+    # with whatever the generator actually produced.
+    seeded_tenants = sorted({r.tenant_id for r in bundle.runs})
+
     storage = build_storage()
 
-    async def _persist() -> int:
+    async def _persist() -> tuple[int, int]:
         await storage.init()
         try:
             cleared = 0
@@ -467,11 +586,19 @@ def seed(
             # the voice-turn table schema. For now they are generated + counted
             # but not persisted — the count is shown in the summary so operators
             # can verify the flag works.
-            return cleared
+
+            # Survey item #1 — run the ADR 047 observability analyst over the
+            # freshly-seeded telemetry so the insight-fed + exec dashboards
+            # render with live data instead of empty. Degrades gracefully (see
+            # _run_observability_analysis) — never fails the seed.
+            insights = await _run_observability_analysis(
+                storage, tenants=seeded_tenants, now=now, days=days
+            )
+            return cleared, insights
         finally:
             await storage.close()
 
-    cleared = asyncio.run(_persist())
+    cleared, insights_written = asyncio.run(_persist())
 
     # Summary table + storyline.
     table = Table(title="mdk demo seed — synthetic fleet", title_justify="left")
@@ -490,7 +617,21 @@ def seed(
     table.add_row("total tokens", f"{s['total_tokens']:,}")
     if clear_first:
         table.add_row("purged first", f"{cleared:,} demo rows")
+    # Insights written by the ADR 047 analyst — what makes the insight-fed +
+    # exec dashboards render with live data. 0 means the analyst/insight store
+    # was unavailable and the seed degraded gracefully (see the logged reason).
+    table.add_row("insights analyzed", f"{insights_written:,}")
     console.print(table)
+
+    insight_line = (
+        "Insight-fed + exec dashboards populated — "
+        f"{insights_written:,} daily insights written (ADR 047 analyst)."
+        if insights_written
+        else (
+            "Observability analyst unavailable — insight-fed dashboards will "
+            "populate once an analyze job runs (see logs)."
+        )
+    )
 
     console.print(
         Panel(
@@ -500,6 +641,7 @@ def seed(
                 f"  • [dim]{e.at:%Y-%m-%d}[/dim] [yellow]{e.kind}[/yellow] — {e.detail}"
                 for e in bundle.events
             )
+            + f"\n\n[bold]{insight_line}[/bold]"
             + "\n\n[dim]All rows tagged tenant=demo-* + input.__mdk_demo__=true. "
             "Purge anytime with [bold]mdk demo clear[/bold].[/dim]",
             title="[green]✓[/green] Dashboards seeded",
