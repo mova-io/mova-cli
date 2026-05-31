@@ -297,6 +297,23 @@ emails. Ignored entirely when ``enableAlerts=false``.
 param alertEmail string = ''
 
 @description('''
+Provision the four prescriptive Azure Monitor Workbooks (operator / platform /
+eval-and-drift / tenant-ops) — the Azure-native parallel to the in-repo Grafana
+dashboards (dashboards/grafana/). They render the SAME OTel catalog the Grafana
+dashboards do, via KQL against the workspace-based App Insights App* tables, and
+give on-call / platform-eng / eval-owners / tenant-ops each a portal-native
+runbook.
+
+Gated on BOTH this flag AND ``enableAppInsights`` (the Workbook KQL queries the
+App* tables the workspace-based App Insights populates — no App Insights, no
+data to render). Off by default and purely additive (matches deployLangfuse /
+enableScheduler / enableTeamsBot / enableAlerts): when false, ZERO
+Microsoft.Insights/workbooks resources are emitted and the template is
+byte-for-byte unchanged.
+''')
+param enableWorkbooks bool = false
+
+@description('''
 Cold-start knob for the API. Override for the API Container App's
 ``scale.minReplicas``. Leave at the ``-1`` sentinel (default) to keep
 the per-env default (``dev``/``staging`` = 1, ``prod`` = 2) — i.e. no
@@ -791,6 +808,27 @@ module alerts 'modules/monitor-alerts.bicep' = if (enableAlerts && enableAppInsi
 }
 
 // ---------------------------------------------------------------------------
+// Azure Monitor Workbooks — the Azure-native parallel to the in-repo Grafana
+// dashboards (dashboards/grafana/). Gated on BOTH ``enableWorkbooks`` AND
+// ``enableAppInsights`` for the same reason as the alerts module: the Workbook
+// KQL targets the App* tables (AppDependencies / AppRequests / AppMetrics) the
+// workspace-based App Insights populates via the OTel Collector's azuremonitor
+// exporter, so without App Insights there's nothing to render. Each Workbook's
+// `sourceId` is the EXISTING Log Analytics workspace (logs.outputs.workspaceId)
+// where those tables live — the same workspace the alert rules scope to.
+// Default-off: with enableWorkbooks=false the module isn't instantiated, so no
+// Microsoft.Insights/workbooks resources are emitted.
+// ---------------------------------------------------------------------------
+module workbooks 'modules/monitor-workbooks.bicep' = if (enableWorkbooks && enableAppInsights) {
+  name: 'workbooks-${env}'
+  params: {
+    workspaceResourceId: logs.outputs.workspaceId
+    location: location
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Teams bot (slice 3.1.e) — Container App + Azure Bot Service.
 //
 // Gated on ``enableTeamsBot`` for the same first-pass / second-pass
@@ -1062,3 +1100,6 @@ output otelCollectorFqdn string = appInsightsExportEnabled ? otelCollector!.outp
 
 @description('Resource id of the golden-signal alerts Action Group. Empty unless alerts are wired (enableAlerts AND enableAppInsights). Operators can attach extra receivers (webhook/SMS/ITSM) to it post-deploy.')
 output alertsActionGroupId string = (enableAlerts && enableAppInsights) ? alerts!.outputs.actionGroupId : ''
+
+@description('Resource id of the deployed operator Workbook. Empty unless Workbooks are wired (enableWorkbooks AND enableAppInsights). Open it first when an SLO alert fires.')
+output operatorWorkbookId string = (enableWorkbooks && enableAppInsights) ? workbooks!.outputs.operatorWorkbookId : ''
