@@ -1274,6 +1274,7 @@ class Executor:
                 input=accumulated_tokens.input + completion.tokens.input,
                 output=accumulated_tokens.output + completion.tokens.output,
                 cached_input=accumulated_tokens.cached_input + completion.tokens.cached_input,
+                cache_write=accumulated_tokens.cache_write + completion.tokens.cache_write,
             )
             if completion.raw:
                 accumulated_raw.update(completion.raw)
