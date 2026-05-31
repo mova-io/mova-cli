@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 from jsonschema import ValidationError as JsonSchemaError
 
+from movate.core.alert_emit import budget_alert, emit_alert
 from movate.core.cache import (
     CachedResponse,
     CacheProvider,
@@ -1789,6 +1790,29 @@ class Executor:
             return
         current = await self._storage.sum_tenant_cost_current_month(tenant_id)
         if current >= budget.monthly_usd_limit:
+            # ADR 057 D1 (step 2) — the tenant crossed its budget threshold:
+            # raise a typed ``budget_threshold`` alert onto the outbox so the
+            # router can page on it BEFORE we abort the run. Fire-and-forget,
+            # best-effort (D5): emitting the alert must never replace the
+            # TenantBudgetExceededError the run actually needs (so emit, then
+            # raise). Recorded-but-undelivered when no routes are configured
+            # (D7). The dedup_key is per-tenant, so a tenant pinned at its cap
+            # pages once per throttle window, not on every blocked run.
+            emit_alert(
+                self._storage,
+                budget_alert(
+                    tenant_id=tenant_id,
+                    summary=(
+                        f"tenant {tenant_id!r} crossed its monthly budget — "
+                        f"spent ${current:.2f} of ${budget.monthly_usd_limit:.2f}; "
+                        f"runs are paused"
+                    ),
+                    data={
+                        "spent_usd": current,
+                        "limit_usd": budget.monthly_usd_limit,
+                    },
+                ),
+            )
             raise TenantBudgetExceededError(
                 f"tenant {tenant_id!r} has spent ${current:.2f} of "
                 f"${budget.monthly_usd_limit:.2f} this month; runs are paused. "
