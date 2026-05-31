@@ -1,6 +1,12 @@
 # ADR 059 — Assign CalVer at merge, not in the PR (kill the version-line merge tax)
 
-**Status:** Proposed
+**Status:** Superseded (2026-05-31) — the at-merge `release-version.yml` it
+introduced pushed the bump commit **directly to `main`**, which the org's branch
+protection wouldn't authorize for any available token (`403 — denied to
+<user>`); it failed on every merge, freezing the version at the last good bump.
+Reverted to **per-PR bump** (run `scripts/bump_version.py` in the PR; the merge
+queue lands it — no push-to-`main` token needed). The at-merge workflow was
+removed. See CLAUDE.md "Versioning".
 **Date:** 2026-05-30
 **Deciders:** Engineering (process/release)
 **Context window:** remove the dominant source of merge friction — the version

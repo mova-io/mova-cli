@@ -54,12 +54,15 @@ pytest -m "not smoke"
 python scripts/check_licenses.py --strict   # shipped-dep license gate
 ```
 
-Versioning is automatic (CalVer `YYYY.M.D.N`) and **assigned at merge** by
-`.github/workflows/release-version.yml` (ADR 059) — **do not bump the version in
-a PR**; leave `pyproject.toml` / `src/movate/__init__.py` / `uv.lock` version
-lines untouched on your branch. (The old per-PR `.githooks/pre-commit` bump is
-deprecated — a branch-local version caused merge-line conflicts.) Never skip
-hooks or use `--no-verify` unless explicitly asked.
+Versioning is CalVer (`YYYY.M.D.N`). **Bump it IN your PR** — run
+`python scripts/bump_version.py` (updates `pyproject.toml` /
+`src/movate/__init__.py` / `uv.lock` together) and commit the result, so the
+new version lands when the merge queue merges the PR. No separate push to
+`main` is involved. (ADR 059's *at-merge* `release-version.yml` was removed:
+its bump commit pushed directly to `main`, which the org's protection wouldn't
+grant a token for — it failed on every merge. Per-PR bump via the queue needs
+no special token. If two open PRs collide on the version line, rebase the later
+one + re-run the script.) Never skip hooks or use `--no-verify` unless asked.
 
 ## Canonical docs (source of truth — read, don't reinvent)
 
