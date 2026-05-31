@@ -142,7 +142,7 @@ class RunView(BaseModel):
     endpoint vs. ``GET /jobs/{id}`` which only carries pointer state.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     run_id: str
     job_id: str
@@ -165,10 +165,15 @@ class RunView(BaseModel):
     ConversationThread this run belongs to. ``None`` for standalone
     runs. Surfaces here so ``GET /runs/{id}`` clients can navigate
     back to the parent thread."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``: ``self``,
+    ``trace``, ``explain``, and ``agent``. Populated by :meth:`from_record`."""
 
     @classmethod
     def from_record(cls, record: RunRecord) -> RunView:
-        return cls(
+        from movate.runtime.hypermedia import run_links  # noqa: PLC0415
+
+        view = cls(
             run_id=record.run_id,
             job_id=record.job_id,
             agent=record.agent,
@@ -187,6 +192,11 @@ class RunView(BaseModel):
             node_id=record.node_id,
             thread_id=record.thread_id,
         )
+        # Set the aliased ``_links`` field by name post-construction (keeps the
+        # pydantic-mypy plugin happy — it expects the ``_links`` alias in the
+        # constructor; the field name works on assignment).
+        view.links = run_links(record.run_id, record.agent)
+        return view
 
 
 class RunEstimatePredictionView(BaseModel):
@@ -1789,7 +1799,7 @@ class SkillCreatedView(BaseModel):
     Mirror of :class:`AgentCreatedView` for the skill resource.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     name: str
     version: str
@@ -1800,6 +1810,16 @@ class SkillCreatedView(BaseModel):
     files_persisted: list[str]
     """Sorted list of files written, relative to ``skill_dir``.
     E.g. ``["impl.py", "skill.yaml"]``."""
+    id: str | None = None
+    """Uniform created-resource id (ADR 061 D2) — the skill's ``name``, under
+    the common ``id`` key. Additive; ``name`` stays."""
+    created_at: datetime | None = None
+    """Create-response timestamp (UTC, ADR 061 D2) — aligns the skill-create
+    envelope with project/agent."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``. Empty
+    ``{}`` until the skill GET/attach routes ship (ADR 060) — no dead links
+    (ADR 061 D4)."""
 
 
 class AgentDeletedView(BaseModel):
@@ -2078,7 +2098,7 @@ class KbIngestView(BaseModel):
     front-end branch.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     agent_name: str
     files: list[KbIngestFileResult] = Field(default_factory=list)
@@ -2115,6 +2135,10 @@ class KbIngestView(BaseModel):
     """The LLM-authored Markdown body. Set ONLY for ``kind="generated"``
     so the caller can review (and surface in the UI) what was actually
     embedded. ``None`` for every other kind."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``: ``self``
+    (the corpus), ``search``, ``stats``. Empty ``{}`` for callers/paths that
+    don't populate it."""
 
 
 # ---------------------------------------------------------------------------
@@ -4247,7 +4271,7 @@ class ProjectView(BaseModel):
     concurrency on PUT (412 on stale).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     project_id: str
     tenant_id: str
@@ -4262,10 +4286,20 @@ class ProjectView(BaseModel):
     client sends it back as ``If-Match: "<etag>"`` on PUT to opt into
     optimistic concurrency; absent header → last-write-wins (back-compat
     with the rest of the runtime)."""
+    id: str | None = None
+    """Uniform created-resource id (ADR 061 D2) — the same value as
+    ``project_id``, exposed under the common ``id`` key so a client can treat
+    any created resource uniformly. Additive; the typed ``project_id`` stays."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``: ``self``,
+    ``agents``, ``members``, ``graph``. Empty ``{}`` for older callers/paths
+    that don't populate it."""
 
     @classmethod
     def from_record(cls, p: Project) -> ProjectView:
-        return cls(
+        from movate.runtime.hypermedia import project_links  # noqa: PLC0415
+
+        view = cls(
             project_id=p.project_id,
             tenant_id=p.tenant_id,
             name=p.name,
@@ -4275,7 +4309,11 @@ class ProjectView(BaseModel):
             updated_at=p.updated_at,
             archived_at=p.archived_at,
             etag=_project_etag(p),
+            id=p.project_id,
         )
+        # ``_links`` is aliased — set by field name post-construction (mypy).
+        view.links = project_links(p.project_id)
+        return view
 
 
 class ProjectListResponse(BaseModel):
@@ -4577,7 +4615,7 @@ class UnifiedAgentCreatedView(BaseModel):
     and ``project_id`` (which project the agent landed in).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     source: Literal["bundle", "spec", "wizard", "catalog"]
     project_id: str
@@ -4597,6 +4635,21 @@ class UnifiedAgentCreatedView(BaseModel):
             "(degrades cleanly per the dependency note in the PR body)."
         ),
     )
+    id: str | None = None
+    """Uniform created-resource id (ADR 061 D2) — the agent's ``agent_name``,
+    exposed under the common ``id`` key so a client can treat any created
+    resource uniformly. Additive; ``agent_name`` stays."""
+    created_at: datetime | None = None
+    """Create-response timestamp (UTC, ADR 061 D2). Aligns the agent-create
+    envelope with the project-create one, which already carries it."""
+    etag: str | None = None
+    """Content-hash concurrency token for the published bundle (ADR 061 D2) —
+    the registry ``content_hash``. A true content ETag; ``None`` when the
+    registry write degraded (the agent is still persisted to the FS)."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``: ``self``,
+    ``validate``, ``kb``, ``publish``, ``run``, ``versions`` — the build→ship→run
+    path. Empty ``{}`` for callers/paths that don't populate it."""
 
 
 # ---------------------------------------------------------------------------
