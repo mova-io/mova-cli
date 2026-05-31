@@ -559,6 +559,37 @@ class CapabilityLimitsView(BaseModel):
     server-enforced ``MDK_BATCH_MAX_ROWS`` cap."""
 
 
+class CapabilityResourceView(BaseModel):
+    """One managed resource type in the capabilities matrix.
+
+    Lets an API-first client (e.g. a front end or an integrator) discover the
+    *manageable resource surface* — agents, projects, skills, contexts, KB —
+    without crawling the route table itself. Like every other capability field,
+    it's derived from the *deployed* route table: ``operations`` lists exactly
+    the CRUD verbs registered on THIS build, so a half-managed resource
+    (skills: create-only today) and a not-yet-shipped one (contexts, until
+    ADR 060) are reported honestly rather than promised.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """Resource family — ``agents`` / ``projects`` / ``skills`` / ``contexts``
+    / ``kb``."""
+    path: str
+    """Base ``/api/v1`` path for the resource (the collection or, for KB, the
+    per-agent sub-resource template)."""
+    operations: list[str]
+    """The lifecycle verbs registered for this resource on this build — a
+    subset of ``list``/``create``/``get``/``update``/``delete`` (plus
+    ``ingest``/``search``/``stats`` for KB). Detected from the live route
+    table, sorted for a stable wire shape."""
+    managed: bool
+    """``True`` when the resource has a full API lifecycle here (a write verb +
+    a read verb + ``delete``). ``False`` for a partial surface (e.g. skills,
+    which only expose ``create`` until ADR 060 lands)."""
+
+
 class CapabilitiesView(BaseModel):
     """``GET /api/v1/capabilities`` response — the runtime's self-description.
 
@@ -609,6 +640,14 @@ class CapabilitiesView(BaseModel):
     and whether voice is effectively enabled. ``None`` in the minimal
     (unauthenticated) view. Additive — absent on runtimes that predate this
     field; callers fall back to ``features["voice"]``/``features["voice_realtime"]``.
+
+    CLAUDE.md rule 5 — flagged: new additive field on an existing endpoint."""
+    resources: list[CapabilityResourceView] | None = None
+    """The manageable resource surface (agents/projects/skills/contexts/kb)
+    with the CRUD operations registered on this build — the API-first
+    discoverability answer to "what can I manage here, and how complete is
+    each?". ``None`` in the minimal view. Detected from the live route table,
+    so it tracks the deployed surface as resources gain operations.
 
     CLAUDE.md rule 5 — flagged: new additive field on an existing endpoint."""
 
