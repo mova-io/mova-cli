@@ -45,7 +45,7 @@ COPY pyproject.toml uv.lock ./
 # README.md + src/, which we deliberately don't copy until the next stage
 # to keep this slow layer cached across source-only changes. The app
 # stage finalizes the install once those files are present.
-RUN uv sync --all-extras --no-dev --frozen --no-install-project
+RUN uv sync --all-extras --no-extra airflow --no-dev --frozen --no-install-project
 
 # ---------------------------------------------------------------------------
 # Stage 3: app — copy the source + README, then complete the sync to
@@ -56,7 +56,7 @@ FROM deps AS app
 COPY src/ ./src/
 COPY README.md ./
 COPY pyproject.toml uv.lock ./
-RUN uv sync --all-extras --no-dev --frozen
+RUN uv sync --all-extras --no-extra airflow --no-dev --frozen
 
 # Bake the default templates so `movate init` works inside the
 # container if an operator shells in. Production runs ignore this.
