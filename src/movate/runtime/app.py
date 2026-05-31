@@ -176,6 +176,10 @@ from movate.runtime.hardening import (
     resolve_max_request_bytes,
     set_response_economics,
 )
+from movate.runtime.hypermedia import (
+    agent_links,
+    kb_links,
+)
 from movate.runtime.long_poll import (
     HEADER_POLL_TIMEOUT,
     HEADER_WAIT_CLAMPED,
@@ -2318,7 +2322,7 @@ async def _unified_create_persist_and_attach(
         agent_name=result.bundle.spec.name,
         tenant_id=ctx.tenant_id,
     )
-    return UnifiedAgentCreatedView(
+    view = UnifiedAgentCreatedView(
         source=source,  # type: ignore[arg-type]
         project_id=project_id,
         agent_name=result.bundle.spec.name,
@@ -2329,7 +2333,14 @@ async def _unified_create_persist_and_attach(
         published_version=published.version if published is not None else None,
         changed=published.published if published is not None else True,
         attached=attachment.attached,
+        # Uniform created-resource envelope (ADR 061).
+        id=result.bundle.spec.name,
+        created_at=datetime.now(UTC),
+        etag=published.content_hash if published is not None else None,
     )
+    # Aliased ``_links`` set by field name post-construction (pydantic-mypy).
+    view.links = agent_links(result.bundle.spec.name)
+    return view
 
 
 async def _unified_create_spec(
@@ -5421,7 +5432,7 @@ def build_app(
                 agent_name=result.bundle.spec.name,
                 tenant_id=ctx.tenant_id,
             )
-            return UnifiedAgentCreatedView(
+            agent_view = UnifiedAgentCreatedView(
                 source="bundle",
                 project_id=project_id,
                 agent_name=result.bundle.spec.name,
@@ -5432,7 +5443,13 @@ def build_app(
                 published_version=published.version if published is not None else None,
                 changed=published.published if published is not None else True,
                 attached=attachment.attached,
+                # Uniform created-resource envelope (ADR 061).
+                id=result.bundle.spec.name,
+                created_at=datetime.now(UTC),
+                etag=published.content_hash if published is not None else None,
             )
+            agent_view.links = agent_links(result.bundle.spec.name)
+            return agent_view
 
         # ---- JSON path → parse discriminator ----
         try:
@@ -5752,6 +5769,11 @@ def build_app(
             description=spec.description or "",
             skill_dir=result.skill_dir.name,
             files_persisted=result.files_persisted,
+            # Uniform created-resource envelope (ADR 061). ``_links`` stays
+            # empty until the skill GET/attach routes ship (ADR 060) — no dead
+            # links.
+            id=spec.name,
+            created_at=datetime.now(UTC),
         )
 
     @v1.get(
@@ -6745,15 +6767,19 @@ def build_app(
         # in the chosen handler. Keeps the multipart path byte-for-byte
         # the same as before.
         content_type = (request.headers.get("content-type") or "").lower()
-        if content_type.startswith("multipart/"):
-            return await _ingest_upload(name, request, ctx)
         if content_type.startswith("application/json"):
-            return await _ingest_json(name, request, ctx)
-        # Other content types: most front-end clients will hit one of
-        # the two above. Treat unknown as multipart for the existing
-        # error shape — the multipart parser will fail with a clean
-        # 400 ("no files in the multipart form") on a bogus body.
-        return await _ingest_upload(name, request, ctx)
+            view = await _ingest_json(name, request, ctx)
+        else:
+            # Other content types: most front-end clients will hit JSON or
+            # multipart. Treat unknown as multipart for the existing error
+            # shape — the multipart parser fails with a clean 400 ("no files
+            # in the multipart form") on a bogus body.
+            view = await _ingest_upload(name, request, ctx)
+        # Hypermedia next-calls (ADR 061) — set once at the route boundary so
+        # every ingest kind (upload/text/url/generated) carries ``_links``
+        # (self / search / stats) without touching each builder.
+        view.links = kb_links(name)
+        return view
 
     @v1.get(
         "/agents/{name}/kb",
