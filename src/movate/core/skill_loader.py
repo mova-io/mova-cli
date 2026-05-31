@@ -27,7 +27,7 @@ import yaml
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from movate.core.loader import AgentLoadError, _resolve_schema
+from movate.core.loader import AgentLoadError, _resolve_schema, format_agent_validation_error
 from movate.core.models import SkillSpec
 
 if TYPE_CHECKING:
@@ -81,7 +81,12 @@ def load_skill(path: str | Path) -> SkillBundle:
     try:
         spec = SkillSpec.model_validate(raw)
     except ValidationError as exc:
-        raise SkillLoadError(f"{skill_dir.name}/skill.yaml validation failed:\n{exc}") from exc
+        # Reuse the agent loader's friendly formatter (drops pydantic's raw
+        # ``errors.pydantic.dev`` trailer + ``input_type=dict`` noise, lists the
+        # offending fields with a did-you-mean) so the customer-facing
+        # ``invalid_bundle`` message is readable instead of a raw pydantic dump.
+        friendly = format_agent_validation_error(exc, SkillSpec, filename="skill.yaml")
+        raise SkillLoadError(f"{skill_dir.name}/skill.yaml validation failed:\n{friendly}") from exc
 
     # Reuse the agent loader's schema-resolution helper — same
     # path-or-inline-dict semantics, just labelled with the field name
