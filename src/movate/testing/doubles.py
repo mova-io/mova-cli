@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from movate.storage.base import RunSubmissionRecord
 
 from movate.core.dr_backup import ImportResult
 from movate.core.events import Event
@@ -118,7 +121,10 @@ class InMemoryStorage:
         self.trigger_deliveries: dict[tuple[str, str], str] = {}
         # item 37: submission idempotency, keyed by (tenant_id, idempotency_key)
         # → the job_id the first async submit enqueued.
-        self.run_submissions: dict[tuple[str, str], str] = {}
+        # (tenant_id, idempotency_key) -> (job_id, request_hash). The
+        # request_hash (item 37 payload-conflict guard) is None when the submit
+        # recorded no fingerprint (back-compat path).
+        self.run_submissions: dict[tuple[str, str], tuple[str, str | None]] = {}
         self.canary_configs: list[CanaryConfig] = []
         # ADR 040 — projects + members + M:N junctions for agents/workflows/KBs.
         # Lists for direct test assertion (matches the other entities here).
@@ -457,17 +463,33 @@ class InMemoryStorage:
         return True
 
     async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
-        return self.run_submissions.get((tenant_id, idempotency_key))
+        row = self.run_submissions.get((tenant_id, idempotency_key))
+        return row[0] if row is not None else None
+
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        from movate.storage.base import RunSubmissionRecord  # noqa: PLC0415
+
+        row = self.run_submissions.get((tenant_id, idempotency_key))
+        if row is None:
+            return None
+        job_id, request_hash = row
+        return RunSubmissionRecord(job_id=job_id, request_hash=request_hash)
 
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         # Mirrors the DB's atomic INSERT-OR-IGNORE: only the first write for a
         # key lands; a later one finds the row and is a no-op.
         key = (tenant_id, idempotency_key)
         if key in self.run_submissions:
             return False
-        self.run_submissions[key] = job_id
+        self.run_submissions[key] = (job_id, request_hash)
         return True
 
     # ------------------------------------------------------------------

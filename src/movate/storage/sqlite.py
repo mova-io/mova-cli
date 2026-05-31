@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiosqlite
 
@@ -73,6 +73,9 @@ from movate.core.models import (
 )
 from movate.core.observability.models import ObservabilityInsight
 from movate.core.webhooks import WebhookAttempt, WebhookSubscription
+
+if TYPE_CHECKING:
+    from movate.storage.base import RunSubmissionRecord
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -568,6 +571,7 @@ _MIGRATIONS = [
         idempotency_key TEXT NOT NULL,
         job_id          TEXT NOT NULL,
         created_at      TEXT NOT NULL,
+        request_hash    TEXT,
         PRIMARY KEY (tenant_id, idempotency_key)
     )
     """,
@@ -699,6 +703,15 @@ _MIGRATIONS = [
     # duplicate-column guard in init() keeps this idempotent on re-run (mirrors
     # the attempt_count additive-column pattern above).
     "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+    # item 37 (payload-conflict guard): a nullable request fingerprint on
+    # run_submissions. A repeat submit reusing an Idempotency-Key but with a
+    # DIFFERENT canonical payload must 409 (don't silently return the wrong
+    # run) rather than dedup to the original job. NULL on pre-migration rows
+    # (and on submits recorded before this column existed) means "fingerprint
+    # unknown" → the app skips the conflict check and returns the prior job,
+    # so the upgrade is byte-for-byte back-compatible. Idempotent via the
+    # duplicate-column guard in init() (same pattern as cancel_requested).
+    "ALTER TABLE run_submissions ADD COLUMN request_hash TEXT",
     # ADR 024 D2 — per-step observability retention. Both are JSON-array TEXT
     # columns (same strategy as runs.metrics): the executor populates them and
     # they round-trip through save_run / _row_to_run so `mdk explain` can
@@ -1980,17 +1993,44 @@ class SqliteProvider:
             row = await cur.fetchone()
         return row["job_id"] if row else None
 
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        from movate.storage.base import RunSubmissionRecord  # noqa: PLC0415
+
+        async with self._db.execute(
+            "SELECT job_id, request_hash FROM run_submissions "
+            "WHERE tenant_id = ? AND idempotency_key = ? LIMIT 1",
+            (tenant_id, idempotency_key),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return RunSubmissionRecord(job_id=row["job_id"], request_hash=row["request_hash"])
+
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         # INSERT OR IGNORE on the (tenant_id, idempotency_key) PRIMARY KEY: the
         # row is written only if absent, so a concurrent retry races atomically
         # to one winner. cur.rowcount is 1 on a fresh insert, 0 when the row
-        # already existed.
+        # already existed. ``request_hash`` (item 37 payload-conflict guard) is
+        # the canonical-payload fingerprint; None preserves the pre-guard shape.
         cur = await self._db.execute(
             "INSERT OR IGNORE INTO run_submissions "
-            "(tenant_id, idempotency_key, job_id, created_at) VALUES (?, ?, ?, ?)",
-            (tenant_id, idempotency_key, job_id, datetime.now(UTC).isoformat()),
+            "(tenant_id, idempotency_key, job_id, created_at, request_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                tenant_id,
+                idempotency_key,
+                job_id,
+                datetime.now(UTC).isoformat(),
+                request_hash,
+            ),
         )
         await self._db.commit()
         return cur.rowcount > 0

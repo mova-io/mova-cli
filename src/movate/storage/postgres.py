@@ -25,9 +25,12 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
+
+if TYPE_CHECKING:
+    from movate.storage.base import RunSubmissionRecord
 
 from movate.core.dr_backup import ImportResult
 from movate.core.events import Event
@@ -659,8 +662,16 @@ CREATE TABLE IF NOT EXISTS run_submissions (
     idempotency_key TEXT NOT NULL,
     job_id          TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL,
+    request_hash    TEXT,
     PRIMARY KEY (tenant_id, idempotency_key)
 );
+-- item 37 (payload-conflict guard): nullable canonical-payload fingerprint.
+-- A repeat submit reusing an Idempotency-Key with a DIFFERENT payload must 409
+-- rather than silently dedup to the original job. NULL on rows recorded before
+-- this column existed → "fingerprint unknown" → the app skips the conflict
+-- check and returns the prior job, so the upgrade is byte-for-byte
+-- back-compatible. Idempotent ADD COLUMN IF NOT EXISTS.
+ALTER TABLE run_submissions ADD COLUMN IF NOT EXISTS request_hash TEXT;
 
 -- ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
 -- agent): a challenger version + a traffic weight (0 = kill switch), with an
@@ -2237,21 +2248,44 @@ class PostgresProvider:
         )
         return row["job_id"] if row else None
 
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        from movate.storage.base import RunSubmissionRecord  # noqa: PLC0415
+
+        row = await self._db.fetchrow(
+            "SELECT job_id, request_hash FROM run_submissions "
+            "WHERE tenant_id = $1 AND idempotency_key = $2",
+            tenant_id,
+            idempotency_key,
+        )
+        if row is None:
+            return None
+        return RunSubmissionRecord(job_id=row["job_id"], request_hash=row["request_hash"])
+
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         # INSERT ... ON CONFLICT DO NOTHING on the (tenant_id, idempotency_key)
         # PRIMARY KEY: the row is written only if absent, so a concurrent retry
         # races atomically to one winner. asyncpg returns the command tag
         # "INSERT 0 1" on a fresh insert, "INSERT 0 0" when the conflict
-        # suppressed it.
+        # suppressed it. ``request_hash`` (item 37 payload-conflict guard) is
+        # the canonical-payload fingerprint; None preserves the pre-guard shape.
         status: str = await self._db.execute(
-            "INSERT INTO run_submissions (tenant_id, idempotency_key, job_id, created_at) "
-            "VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
+            "INSERT INTO run_submissions "
+            "(tenant_id, idempotency_key, job_id, created_at, request_hash) "
+            "VALUES ($1, $2, $3, $4, $5) "
+            "ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
             tenant_id,
             idempotency_key,
             job_id,
             datetime.now(UTC),
+            request_hash,
         )
         return status.endswith(" 1")
 

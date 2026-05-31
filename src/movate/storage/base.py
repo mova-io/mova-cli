@@ -92,6 +92,27 @@ class EvalCommitResult:
     judge_yaml_updated: bool
 
 
+@dataclass(frozen=True)
+class RunSubmissionRecord:
+    """A persisted run-submission dedup row (item 37).
+
+    Returned by :meth:`StorageProvider.get_run_submission_record`. Carries the
+    ``job_id`` the first submission enqueued plus the ``request_hash`` — a
+    canonical fingerprint of that submission's payload — so the submit endpoint
+    can tell apart *"the same retry"* (return the prior job) from *"the same key
+    reused for a DIFFERENT payload"* (a 409 conflict; never silently return the
+    wrong run).
+
+    ``request_hash`` is ``None`` for rows recorded before the fingerprint
+    column existed (legacy / mixed-version fleets). A ``None`` fingerprint means
+    *"unknown"* — the endpoint skips the conflict check and returns the prior
+    job, preserving byte-for-byte the pre-guard behavior.
+    """
+
+    job_id: str
+    request_hash: str | None
+
+
 class StorageProvider(Protocol):
     async def init(self) -> None:
         """Idempotent setup (schema migration, etc.)."""
@@ -468,8 +489,26 @@ class StorageProvider(Protocol):
         first time we've seen this key for this tenant.
         """
 
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        """Return the full dedup row (``job_id`` + ``request_hash``) or ``None``.
+
+        Keyed by ``(tenant_id, idempotency_key)``. ``None`` means first-seen for
+        this tenant. The ``request_hash`` (item 37 payload-conflict guard) lets
+        the submit endpoint distinguish a genuine retry from a key reused for a
+        different payload (→ 409). ``request_hash`` is ``None`` on legacy rows
+        recorded before the fingerprint column existed → "unknown" → no
+        conflict raised (back-compat). Complements :meth:`get_run_submission`,
+        which stays job-id-only for callers that don't need the fingerprint.
+        """
+
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         """Record that ``idempotency_key`` for ``tenant_id`` enqueued ``job_id``.
 
@@ -478,6 +517,12 @@ class StorageProvider(Protocol):
         winner rather than recording two jobs. Returns ``True`` if this call
         inserted the row, ``False`` if a row already existed (the existing
         ``job_id`` is preserved — never overwritten).
+
+        ``request_hash`` (item 37 payload-conflict guard) is an optional
+        canonical fingerprint of the submitted payload, stored so a later submit
+        reusing the same key with a DIFFERENT payload can be rejected with a
+        409. ``None`` (the default) stores no fingerprint — back-compatible with
+        callers / fleets that predate the guard.
         """
 
     # ------------------------------------------------------------------
