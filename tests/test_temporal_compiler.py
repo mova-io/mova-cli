@@ -197,8 +197,9 @@ def test_compile_monitor_pattern() -> None:
 
 
 @pytest.mark.unit
-def test_compile_human_node_stubbed() -> None:
-    """HUMAN node raises ``NotImplementedError`` with a clear Phase 2 pointer."""
+def test_compile_human_node_durable_pause() -> None:
+    """HUMAN node compiles to a durable wait_condition + a human_response signal
+    (ADR 062 / ADR 054 Phase 2) — no longer a fatal Phase-1 stub."""
     human = WorkflowNode(
         id="approval",
         type=NodeType.HUMAN,
@@ -209,11 +210,22 @@ def test_compile_human_node_stubbed() -> None:
         [_make_node("start"), human],
         [WorkflowEdge(from_id="start", to_id="approval")],
     )
-    with pytest.raises(NotImplementedError) as ei:
-        TemporalCompiler().compile(graph)
-    assert "Phase 2" in str(ei.value)
-    assert "ADR 054" in str(ei.value)
-    assert "approval" in str(ei.value)
+    compiled = TemporalCompiler().compile(graph)  # no raise
+    src = compiled.module_source
+    compile(src, "<generated>", "exec")  # valid Python
+    assert "def __init__" in src and "self._human" in src
+    assert "@workflow.signal" in src and "def human_response" in src
+    assert "await workflow.wait_condition(lambda: 'approval' in self._human)" in src
+    assert "state.update(self._human.pop('approval'))" in src
+
+
+@pytest.mark.unit
+def test_human_free_workflow_has_no_signal_machinery() -> None:
+    """The signal handler + inbox are injected ONLY when a HUMAN node is present
+    — a HUMAN-free workflow compiles without them (byte-stable)."""
+    graph = _make_graph([_make_node("a"), _make_node("b")], [WorkflowEdge(from_id="a", to_id="b")])
+    src = TemporalCompiler().compile(graph).module_source
+    assert "human_response" not in src and "self._human" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +246,9 @@ def test_lint_warns_on_time_time_call() -> None:
 
 
 @pytest.mark.unit
-def test_lint_warns_on_human_node() -> None:
-    """HUMAN node → warning carrying the Phase 2 pointer."""
+def test_human_node_no_longer_lints() -> None:
+    """HUMAN nodes compile to durable HITL now (ADR 062), so they emit NO lint
+    warning — the Phase-1 stub warning is gone."""
     human = WorkflowNode(
         id="hold",
         type=NodeType.HUMAN,
@@ -244,10 +257,7 @@ def test_lint_warns_on_human_node() -> None:
     )
     graph = _make_graph([_make_node("a"), human], [WorkflowEdge(from_id="a", to_id="hold")])
     issues = TemporalCompiler().lint(graph)
-    hum = [i for i in issues if i.code == LINT_HUMAN_NODE_PHASE2]
-    assert hum, f"expected a HUMAN warning, got {issues}"
-    assert hum[0].severity == "warning"
-    assert "Phase 2" in hum[0].message
+    assert not [i for i in issues if i.code == LINT_HUMAN_NODE_PHASE2]
 
 
 @pytest.mark.unit

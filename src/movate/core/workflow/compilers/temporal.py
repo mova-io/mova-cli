@@ -265,20 +265,12 @@ class TemporalCompiler:
         worker-launch time. The generated *output* still works on any
         machine with the extra; this gate is for the *invoker*.
 
-        Raises :class:`NotImplementedError` on encountering a HUMAN node —
-        Phase 2's signal-based HITL lands behind the same compiler and is
-        deliberately stubbed here (per ADR 054 D4 / Phase 2 row).
+        HUMAN nodes compile to a durable ``workflow.wait_condition`` + a
+        ``human_response`` signal (ADR 062 / ADR 054 Phase 2) — every node type
+        now lowers to a real construct, so compile is total (no fatal node).
         """
         _require_temporalio()
         lint_issues = self.lint(spec)
-        # HUMAN node is the only fatal Phase 1 condition — every other
-        # determinism concern is a warning (the contract D5 promises).
-        for nid, node in spec.nodes.items():
-            if node.type is NodeType.HUMAN:
-                raise NotImplementedError(
-                    f"HUMAN node {nid!r} requires Phase 2 (signal-based HITL) — "
-                    "see ADR 054, Phase 2: workflow.wait_condition + external signal."
-                )
         return self._emit_workflow_defn(spec, lint_issues)
 
     def lint(self, spec: WorkflowGraph) -> list[LintIssue]:
@@ -339,18 +331,8 @@ class TemporalCompiler:
                             )
                         )
 
-            if node.type is NodeType.HUMAN:
-                issues.append(
-                    LintIssue(
-                        severity="warning",
-                        code=LINT_HUMAN_NODE_PHASE2,
-                        message=(
-                            f"node {nid!r} is a HUMAN node; HITL is stubbed in Phase 1 — "
-                            "see ADR 054 Phase 2 for durable signal-based HITL."
-                        ),
-                        node_id=nid,
-                    )
-                )
+            # HUMAN nodes are no longer a lint concern — they compile to a
+            # durable wait_condition + signal (ADR 062). No warning to emit.
 
         # Cycle / unbounded-loop scan. A back-edge with no node carrying
         # ``max_iterations`` is the canonical Phase 1 unbounded-loop case.
@@ -500,6 +482,14 @@ class TemporalCompiler:
         body_lines.append("")
         body_lines.append("        return state")
 
+        # Durable HITL (ADR 062): when the graph has a HUMAN node, inject the
+        # ``self._human`` inbox + the ``human_response`` signal handler onto the
+        # class, before ``@workflow.run``. Injected only when needed so
+        # HUMAN-free workflows compile byte-identically (golden-test stable).
+        if any(n.type is NodeType.HUMAN for n in spec.nodes.values()):
+            run_idx = body_lines.index("    @workflow.run")
+            body_lines[run_idx:run_idx] = self._human_signal_lines()
+
         source = "\n".join(header + body_lines) + "\n"
 
         manifest: dict[str, Any] = {
@@ -532,7 +522,7 @@ class TemporalCompiler:
         if node_type is NodeType.INTENT_ROUTER:
             return self._emit_gate_node(nid, node, spec)
         if node_type is NodeType.HUMAN:
-            return self._emit_human_node_stub(nid, node)
+            return self._emit_human_node(nid, node, spec)
         if node_type is NodeType.TOOL:
             # TOOL nodes haven't shipped yet (v1.1); the spec validator
             # rejects them, but the compiler is still total: emit a skill
@@ -688,25 +678,60 @@ class TemporalCompiler:
         ]
         return body, {"call_judge_activity"}
 
-    def _emit_human_node_stub(self, nid: str, node: Any) -> tuple[list[str], set[str]]:
-        """HUMAN → STUB for Phase 2 (ADR 054 D4 row 5).
+    def _emit_human_node(
+        self, nid: str, node: Any, spec: WorkflowGraph
+    ) -> tuple[list[str], set[str]]:
+        """HUMAN → durable pause/resume (ADR 062 D1 — ADR 054 Phase 2).
 
-        Phase 2 lowers this to ``await workflow.wait_condition(...)`` paired
-        with an external ``signal``. Phase 1 emits a placeholder + a clear
-        ``NotImplementedError`` so a HUMAN node compiled today fails loudly
-        the moment a Temporal worker tries to execute it — never silently.
-        (``compile()`` already rejects HUMAN nodes before emission; this is the
-        defensive in-body guard if one ever reaches the dispatch loop.)
+        Lowers to ``await workflow.wait_condition(...)`` on the
+        ``human_response`` signal's inbox, then merges the human's decision into
+        ``state`` and advances to the sequential successor — **native parity**
+        with the runner's HUMAN gate (ADR 017 D5): it executes nothing, merges
+        the decision, and continues; branch on the decision with a *following*
+        GATE node.
+
+        The pause is **durable**: ``wait_condition`` parks the workflow in
+        Temporal history, so a worker / runtime restart re-hydrates it and keeps
+        waiting for days / weeks — no poller, no re-walk. The ``human_response``
+        signal handler + the ``self._human`` inbox are injected onto the class
+        by :meth:`_emit_workflow_defn` whenever the graph contains a HUMAN node.
         """
+        nxt = self._sequential_successor(spec, nid)
+        advance = f"current = {nxt!r}" if nxt is not None else "current = None"
         body = [
-            "# STUB for Phase 2 — will become workflow.wait_condition + signal.",
-            "# See ADR 054 Phase 2 row (HUMAN). Until then this node is",
-            "# rejected by the compiler (see TemporalCompiler.compile).",
-            "raise NotImplementedError(",
-            f'    "HUMAN node {nid!r} requires Phase 2 (signal-based HITL) — see ADR 054"',
-            ")",
+            f"# node {nid!r} — HUMAN: durable HITL pause (ADR 062 D1). Park until a",
+            "# ``human_response`` signal arrives (durable across worker/runtime",
+            "# restarts), merge the decision into state, then advance to the",
+            "# successor (native parity, ADR 017 D5 — branch via a following GATE).",
+            f"await workflow.wait_condition(lambda: {nid!r} in self._human)",
+            f"state.update(self._human.pop({nid!r}))",
+            advance,
         ]
         return body, set()
+
+    @staticmethod
+    def _human_signal_lines() -> list[str]:
+        """Class-body lines injected when a graph has a HUMAN node: the
+        ``self._human`` inbox + the ``human_response`` signal handler (ADR 062
+        D1/D2). Injected only when needed so HUMAN-free workflows stay
+        byte-identical."""
+        return [
+            "    def __init__(self) -> None:",
+            "        # Durable HITL inbox (ADR 062): node_id -> human response payload,",
+            "        # set by the ``human_response`` signal, consumed by a HUMAN node's",
+            "        # wait_condition. Instance state so a signal delivered BEFORE the",
+            "        # workflow reaches the node is retained, not lost.",
+            "        self._human: dict[str, Any] = {}",
+            "",
+            "    @workflow.signal",
+            "    def human_response(self, node_id: str, payload: dict[str, Any]) -> None:",
+            "        # Resume a paused HUMAN node (ADR 062 D2). The HUMAN node merges",
+            "        # ``payload`` into workflow state. Idempotent: the node pops the key",
+            "        # on resume, so a retried / double-clicked signal for an",
+            "        # already-resumed node is a no-op (last-write-wins before resume).",
+            "        self._human[node_id] = dict(payload)",
+            "",
+        ]
 
     @staticmethod
     def _sequential_successor(graph: WorkflowGraph, node_id: str) -> str | None:
