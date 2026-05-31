@@ -36,6 +36,7 @@ from typing import Any
 import httpx
 
 from movate.core.alerts import AlertEvent, Severity, SinkRegistry
+from movate.core.notify import NotificationDispatcher, build_dispatcher
 from movate.core.webhooks import sign_payload
 
 logger = logging.getLogger(__name__)
@@ -266,12 +267,90 @@ class GenericWebhookSink:
 
 
 # ---------------------------------------------------------------------------
+# EmailSink — alert delivery via the existing NotificationDispatcher (ADR 057 D3)
+# ---------------------------------------------------------------------------
+
+
+class EmailSink:
+    """Deliver an :class:`AlertEvent` as an email via :class:`NotificationDispatcher`.
+
+    ADR 057 D3 says new sinks are **new backends behind the existing
+    ``core/notify.py`` Protocol** — email is the one that already exists. Rather
+    than a second SMTP client, this sink *adapts* a
+    :class:`NotificationDispatcher` (SMTP in production, console in dev/test) to
+    the :class:`~movate.core.alerts.AlertSink` Protocol: it renders the alert to
+    a subject + body and calls :meth:`NotificationDispatcher.notify_alert`. So an
+    ``email`` route reuses the exact SMTP path operators already configure
+    (``MOVATE_SMTP_*``), and in dev it logs via the console backend.
+
+    The recipient is fixed at construction (the ops alert address) — alerts are
+    operator-facing, not tied to a job's ``notify_email``.
+    """
+
+    def __init__(
+        self,
+        *,
+        dispatcher: NotificationDispatcher,
+        email: str | None = None,
+        name: str = "email",
+    ) -> None:
+        self._dispatcher = dispatcher
+        self._email = email
+        self.name = name
+
+    def _subject(self, event: AlertEvent, suppressed_count: int) -> str:
+        return (
+            f"[movate alert] [{event.severity.label.upper()}] {event.kind.value}"
+            f"{_suppressed_suffix(suppressed_count)} — {event.subject}"
+        )
+
+    def _body(self, event: AlertEvent, suppressed_count: int) -> str:
+        lines = [
+            f"{event.summary}{_suppressed_suffix(suppressed_count)}",
+            "",
+            f"kind:     {event.kind.value}",
+            f"severity: {event.severity.label}",
+            f"tenant:   {event.tenant_id}",
+            f"subject:  {event.subject}",
+        ]
+        if event.data:
+            lines.append("")
+            lines.append("context:")
+            lines.extend(f"  - {k}: {v}" for k, v in sorted(event.data.items()))
+        lines.append("")
+        lines.append("— movate alert routing (ADR 057)")
+        return "\n".join(lines)
+
+    async def deliver(self, event: AlertEvent, *, suppressed_count: int = 0) -> bool:
+        # ``notify_alert`` never raises on operational failure (its contract);
+        # we still treat any raise as a failed delivery so the router's
+        # best-effort guard (D5) handles it uniformly.
+        try:
+            await self._dispatcher.notify_alert(
+                subject=self._subject(event, suppressed_count),
+                body=self._body(event, suppressed_count),
+                email=self._email,
+            )
+        except Exception:
+            logger.warning(
+                "alert_email_dispatch_error sink=%s event_id=%s — delivery only",
+                self.name,
+                event.id,
+                exc_info=True,
+            )
+            return False
+        return True
+
+
+# ---------------------------------------------------------------------------
 # BYOK autoload (ADR 018) — env → SinkRegistry
 # ---------------------------------------------------------------------------
 
 
 def build_sinks_from_env(
     env: dict[str, str] | None = None,
+    *,
+    dispatcher: NotificationDispatcher | None = None,
 ) -> SinkRegistry:
     """Build a :class:`SinkRegistry` from configured env vars (BYOK, ADR 018).
 
@@ -282,10 +361,18 @@ def build_sinks_from_env(
     * ``TEAMS_WEBHOOK_URL``  → :class:`TeamsSink` registered as ``teams``.
     * ``MDK_ALERT_WEBHOOK_URL`` (+ optional ``MDK_ALERT_WEBHOOK_SECRET``)
       → :class:`GenericWebhookSink` registered as ``webhook``.
+    * ``MDK_ALERT_EMAIL`` → :class:`EmailSink` registered as ``email``,
+      delivering through the env-selected :class:`NotificationDispatcher`
+      (SMTP when ``MOVATE_SMTP_HOST`` is set, else the console backend that
+      logs the intent — so an ``email`` route works in dev too).
 
     The registry's sink names are what routes reference. Operators who want
     several Slack channels (or several webhooks) register additional sinks
     programmatically; this autoload covers the common single-target case.
+
+    ``dispatcher`` is injectable for tests (a fake :class:`NotificationDispatcher`
+    captures the email route end-to-end without SMTP); when ``None`` and an
+    email is configured it's built from the env via :func:`build_dispatcher`.
     """
     source = env if env is not None else dict(os.environ)
     registry = SinkRegistry()
@@ -303,11 +390,17 @@ def build_sinks_from_env(
         secret = (source.get("MDK_ALERT_WEBHOOK_SECRET") or "").strip() or None
         registry.register(GenericWebhookSink(url=webhook_url, secret=secret, name="webhook"))
 
+    email = (source.get("MDK_ALERT_EMAIL") or "").strip()
+    if email:
+        disp = dispatcher if dispatcher is not None else build_dispatcher()
+        registry.register(EmailSink(dispatcher=disp, email=email, name="email"))
+
     return registry
 
 
 __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
+    "EmailSink",
     "GenericWebhookSink",
     "SlackSink",
     "TeamsSink",

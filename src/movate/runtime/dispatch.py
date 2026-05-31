@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from movate.core.alert_emit import drift_alert, emit_alert
 from movate.core.events import EventKind
 from movate.core.executor import Executor
 from movate.core.loader import AgentBundle
@@ -412,6 +413,34 @@ class WorkerDispatch:
                         "pass_rate_delta": result.pass_rate_delta,
                         "tolerance": tolerance,
                     },
+                )
+                # ADR 057 D1 (step 2) — also raise a typed alert onto the same
+                # outbox so the alert router can *page* on this regression (the
+                # ``drift.detected`` event above is the lifecycle record; this
+                # is the routable alert). Fire-and-forget, best-effort (D5):
+                # this never raises into the eval/worker path, and with no
+                # routes configured it's a recorded-but-undelivered no-op (D7).
+                emit_alert(
+                    self._storage,
+                    drift_alert(
+                        tenant_id=job.tenant_id,
+                        agent=record.agent,
+                        summary=(
+                            f"eval drift — {record.agent} regressed "
+                            f"(mean_score {result.mean_score_delta:+.4f}, "
+                            f"pass_rate {result.pass_rate_delta:+.4f}) vs baseline "
+                            f"{result.baseline.eval_id}"
+                        ),
+                        data={
+                            "eval_id": record.eval_id,
+                            "baseline_eval_id": result.baseline.eval_id,
+                            "agent_version": record.agent_version,
+                            "mean_score_delta": result.mean_score_delta,
+                            "pass_rate_delta": result.pass_rate_delta,
+                            "tolerance": tolerance,
+                            "regressed_metrics": list(result.regressed_metrics),
+                        },
+                    ),
                 )
             await alert_on_drift(
                 result,

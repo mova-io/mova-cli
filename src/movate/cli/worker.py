@@ -28,6 +28,7 @@ from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.job_retry import DEFAULT_VISIBILITY_TIMEOUT_SECONDS
 from movate.core.models import JobRecord, JobStatus
 from movate.core.notify import build_dispatcher
+from movate.runtime.alert_worker import build_alert_worker
 from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
 from movate.runtime.registry import scan_agents, scan_workflows
 from movate.runtime.webhook_worker import WebhookWorker, WebhookWorkerConfig
@@ -298,6 +299,16 @@ async def _run_worker(
         config=WebhookWorkerConfig(tenant_id=tenant_id),
     )
 
+    # ADR 057 step 2 — alert-router consumer runs in the SAME process / loop.
+    # It drains ``alert.raised`` events (raised by the drift / dead-letter /
+    # budget sources) and routes them to the configured sinks. Opt-in: with no
+    # ``alerts:`` routes + no sink env vars the router is inactive and this is a
+    # pure no-op (zero behavior change). Fully independent of the job/webhook
+    # workers (separate task; a sink that hangs can't sink dispatch).
+    alert_worker = build_alert_worker(storage=rt.storage, tenant_id=tenant_id)
+    if alert_worker.is_active:
+        hint("[dim]alert routing: active (ADR 057)[/dim]")
+
     stop_event = asyncio.Event()
 
     def _handle_signal(*_: object) -> None:
@@ -320,6 +331,7 @@ async def _run_worker(
         await asyncio.gather(
             worker_obj.run_forever(stop_event),
             webhook_worker.run_forever(stop_event),
+            alert_worker.run_forever(stop_event),
             return_exceptions=True,
         )
     finally:
