@@ -1,6 +1,6 @@
 # ADR 065 — Temporal as mdk's optional durable-execution seam
 
-**Status:** Proposed
+**Status:** Accepted (2026-05-31 — direction ratified: "make Temporal optional")
 **Date:** 2026-05-31
 **Deciders:** Engineering (platform direction — human-ratified)
 **Context window:** establish a *strategic, principled* path for deeper Temporal
