@@ -1777,6 +1777,18 @@ class TokenUsage(BaseModel):
     input: int = 0
     output: int = 0
     cached_input: int = 0
+    """Prompt tokens served FROM the cache (Anthropic
+    ``cache_read_input_tokens`` / OpenAI ``cached_tokens``). Billed at the
+    discounted cache-read rate (~0.1x input). Already counted within
+    ``input`` for OpenAI-style providers, but reported separately by
+    Anthropic — see ``cost_for`` for how the two conventions reconcile."""
+    cache_write: int = 0
+    """Prompt tokens WRITTEN to the cache this request (Anthropic
+    ``cache_creation_input_tokens``). Billed at the cache-write premium
+    (~1.25x input for the default 5-minute TTL). Disjoint from ``input``
+    on Anthropic — the SDK reports uncached input, cache reads, and cache
+    writes as three separate counts. Defaults to ``0`` so non-caching and
+    non-Anthropic paths serialize byte-for-byte as before (additive)."""
 
 
 class Metrics(BaseModel):
