@@ -35,6 +35,7 @@ YAML file (see `dashboards/README.md` → "Import — Grafana + Prometheus").
 | 2 | `mdk-golden-signals.json` | Latency p50/p95/p99, error rate, throughput, dead-letter |
 | 3 | `mdk-cost.json` | Per-agent / per-tenant cost breakdown |
 | 4 | `mdk-runtime-overview.json` | Queue depth, DB pool saturation, pod autoscale |
+| 5 | `mdk-dead-letter.json` | Dead-letter rate / share / backlog (operate with `mdk jobs dead-letter`) |
 
 Open exec-summary first for the leadership "one screen", then drill down via
 the top-right links.

@@ -271,6 +271,7 @@ from movate.runtime.schemas import (
     CatalogSyncResponse,
     CentralityScoreView,
     CommunityView,
+    DeadLetterPurgeView,
     DescribeAgentRequest,
     DescribeAgentResponse,
     DescribeAgentTokenUsageView,
@@ -8468,6 +8469,121 @@ def build_app(
         )
         views = [JobView.from_record(r) for r in records]
         return JobListView(jobs=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Dead-letter management (additive /api/v1 surface). Operate the jobs
+    # that exhausted their retry budget and landed in DEAD_LETTER. The
+    # GET is registered BEFORE ``/jobs/{job_id}`` so the static path
+    # ``/jobs/dead-letter`` is matched here, not captured as a job_id.
+    # ------------------------------------------------------------------
+    @v1.get(
+        "/jobs/dead-letter",
+        response_model=JobListView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_dead_letter_jobs(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        agent: str | None = Query(
+            default=None,
+            description="Narrow to one agent/workflow name (the job ``target``).",
+        ),
+        limit: int = 20,
+    ) -> JobListView:
+        """List this tenant's retry-exhausted (``DEAD_LETTER``) jobs.
+
+        The operator triage surface for jobs the retry policy gave up on
+        (distinct from a one-off ``ERROR``). Newest-first, tenant-scoped
+        (a tenant never sees another's dead-letters). ``agent`` narrows to
+        a single component. Limit hard-capped at 100.
+
+        Read-only (``read`` scope). Recover a row with
+        ``POST /api/v1/jobs/{job_id}/requeue``; prune with
+        ``POST /api/v1/jobs/dead-letter/purge``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_dead_letter_jobs(ctx.tenant_id, limit=capped_limit, agent=agent)
+        views = [JobView.from_record(r) for r in records]
+        return JobListView(jobs=views, count=len(views))
+
+    @v1.post(
+        "/jobs/{job_id}/requeue",
+        response_model=JobView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_requeue_dead_letter_job(
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JobView:
+        """Recover a ``DEAD_LETTER`` job back onto the queue.
+
+        Body-less. Resets the job to a fresh ``QUEUED`` state
+        (``attempt_count=0``, ``next_retry_at`` / ``claimed_at`` /
+        ``completed_at`` / ``error`` cleared) so the worker claims it
+        again on the next poll. Returns the requeued :class:`JobView`.
+
+        Gated on the ``run`` scope (it re-enqueues work — a stronger
+        capability than the ``read`` used to list). Tenant-scoped at the
+        storage layer; status-guarded on ``DEAD_LETTER``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``run`` scope
+        * **404** — no ``DEAD_LETTER`` job with this id for this tenant
+          (missing, cross-tenant, or the job is not dead-lettered — you
+          can only requeue a retry-exhausted job)
+        """
+        store: StorageProvider = request.app.state.storage
+        ok = await store.requeue_dead_letter_job(job_id, tenant_id=ctx.tenant_id)
+        if not ok:
+            raise not_found("dead-letter job", job_id)
+        record = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+        if record is None:  # pragma: no cover — requeue just succeeded
+            raise not_found("job", job_id)
+        return JobView.from_record(record)
+
+    @v1.post(
+        "/jobs/dead-letter/purge",
+        response_model=DeadLetterPurgeView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_purge_dead_letter_jobs(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        before: datetime | None = Query(
+            default=None,
+            description=(
+                "Only purge dead-letters whose ``completed_at`` is strictly "
+                "older than this ISO-8601 instant. Omit to purge all."
+            ),
+        ),
+    ) -> DeadLetterPurgeView:
+        """Permanently delete this tenant's ``DEAD_LETTER`` jobs.
+
+        Destructive housekeeping. Gated on the ``admin`` scope (the
+        strongest — it irrecoverably deletes rows) and tenant-scoped:
+        deletes ONLY this tenant's dead-letter rows, never a live job and
+        never another tenant's. ``before`` keeps recent dead-letters for
+        inspection while clearing stale ones. Returns the count purged.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        purged = await store.purge_dead_letter_jobs(ctx.tenant_id, before=before)
+        return DeadLetterPurgeView(purged=purged)
 
     # ------------------------------------------------------------------
     # /api/v1 aliases for the unversioned job-poll + run-fetch routes.

@@ -374,6 +374,153 @@ async def test_update_job_accepts_cancelled_terminal(storage) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Dead-letter operations — list / requeue / purge. Parametrized over
+# memory + sqlite + postgres via the shared ``storage`` fixture (postgres
+# skips when MOVATE_PG_TEST_URL is unset). These operate the EXISTING
+# DEAD_LETTER status the retry policy produces; additive, no schema change.
+# ---------------------------------------------------------------------------
+
+
+async def _dead_letter(storage, *, tenant_id: str = "tenant-a", target: str = "demo-agent"):
+    """Insert a job and drive it to DEAD_LETTER via the worker's own path
+    (claim → update_job), so the test exercises the real terminal write."""
+    j = _make_job(tenant_id=tenant_id, target=target)
+    await storage.save_job(j)
+    await storage.claim_next_job(tenant_id=tenant_id)
+    err = ErrorInfo(type="provider_error", message="exhausted", retryable=True)
+    await storage.update_job(
+        j.job_id, tenant_id=tenant_id, status=JobStatus.DEAD_LETTER, error=err.model_dump()
+    )
+    return j
+
+
+@pytest.mark.unit
+async def test_list_dead_letter_jobs_tenant_scoped(storage) -> None:
+    dl_a = await _dead_letter(storage, tenant_id="tenant-a")
+    await _dead_letter(storage, tenant_id="tenant-b")
+    # A non-dead-letter job for tenant-a must NOT appear.
+    live = _make_job(tenant_id="tenant-a", status=JobStatus.QUEUED)
+    await storage.save_job(live)
+
+    rows = await storage.list_dead_letter_jobs("tenant-a")
+    assert {j.job_id for j in rows} == {dl_a.job_id}
+    assert all(j.status == JobStatus.DEAD_LETTER for j in rows)
+
+
+@pytest.mark.unit
+async def test_list_dead_letter_jobs_agent_filter(storage) -> None:
+    a = await _dead_letter(storage, target="alpha")
+    await _dead_letter(storage, target="beta")
+    rows = await storage.list_dead_letter_jobs("tenant-a", agent="alpha")
+    assert {j.job_id for j in rows} == {a.job_id}
+
+
+@pytest.mark.unit
+async def test_list_dead_letter_jobs_newest_first_and_limit(storage) -> None:
+    older = _make_job(status=JobStatus.DEAD_LETTER, created_at=datetime.now(UTC) - timedelta(60))
+    newer = _make_job(status=JobStatus.DEAD_LETTER, created_at=datetime.now(UTC))
+    await storage.save_job(older)
+    await storage.save_job(newer)
+    rows = await storage.list_dead_letter_jobs("tenant-a", limit=1)
+    assert [j.job_id for j in rows] == [newer.job_id]
+
+
+@pytest.mark.unit
+async def test_requeue_dead_letter_resets_to_fresh_queued(storage) -> None:
+    """THE state transition: DEAD_LETTER → QUEUED with a fresh budget
+    (attempt_count=0, next_retry_at cleared) so the worker reclaims it."""
+    dl = await _dead_letter(storage)
+    # Sanity: it really is dead-lettered with a recorded error + completed_at.
+    pre = await storage.get_job(dl.job_id, tenant_id="tenant-a")
+    assert pre is not None and pre.status == JobStatus.DEAD_LETTER
+    assert pre.error is not None and pre.completed_at is not None
+
+    ok = await storage.requeue_dead_letter_job(dl.job_id, tenant_id="tenant-a")
+    assert ok is True
+
+    got = await storage.get_job(dl.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.QUEUED
+    assert got.attempt_count == 0
+    assert got.next_retry_at is None
+    assert got.claimed_at is None
+    assert got.completed_at is None
+    assert got.error is None
+
+    # And it is claimable again — the whole point of a requeue.
+    claimed = await storage.claim_next_job(tenant_id="tenant-a")
+    assert claimed is not None
+    assert claimed.job_id == dl.job_id
+
+
+@pytest.mark.unit
+async def test_requeue_non_dead_letter_is_rejected(storage) -> None:
+    """Requeuing a job that is NOT dead-lettered (here: queued) must be a
+    no-op returning False — never silently corrupt a live job."""
+    live = _make_job(status=JobStatus.QUEUED)
+    await storage.save_job(live)
+    ok = await storage.requeue_dead_letter_job(live.job_id, tenant_id="tenant-a")
+    assert ok is False
+    got = await storage.get_job(live.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.QUEUED  # untouched
+
+
+@pytest.mark.unit
+async def test_requeue_missing_returns_false(storage) -> None:
+    assert await storage.requeue_dead_letter_job("ghost", tenant_id="tenant-a") is False
+
+
+@pytest.mark.unit
+async def test_requeue_cross_tenant_returns_false_no_effect(storage) -> None:
+    dl = await _dead_letter(storage, tenant_id="tenant-a")
+    ok = await storage.requeue_dead_letter_job(dl.job_id, tenant_id="tenant-b")
+    assert ok is False
+    got = await storage.get_job(dl.job_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.status == JobStatus.DEAD_LETTER  # untouched for its real tenant
+
+
+@pytest.mark.unit
+async def test_purge_dead_letter_jobs_tenant_scoped(storage) -> None:
+    dl_a = await _dead_letter(storage, tenant_id="tenant-a")
+    dl_b = await _dead_letter(storage, tenant_id="tenant-b")
+    live = _make_job(tenant_id="tenant-a", status=JobStatus.QUEUED)
+    await storage.save_job(live)
+
+    deleted = await storage.purge_dead_letter_jobs("tenant-a")
+    assert deleted == 1
+    # tenant-a's dead-letter is gone; its live job + tenant-b's are intact.
+    assert await storage.get_job(dl_a.job_id, tenant_id="tenant-a") is None
+    assert await storage.get_job(live.job_id, tenant_id="tenant-a") is not None
+    assert await storage.get_job(dl_b.job_id, tenant_id="tenant-b") is not None
+
+
+@pytest.mark.unit
+async def test_purge_dead_letter_jobs_before_cutoff(storage) -> None:
+    """``before`` keeps recent dead-letters, prunes stale ones (by
+    completed_at). We set completed_at via the real update path, then
+    purge with a cutoff between the two."""
+    old = _make_job(status=JobStatus.DEAD_LETTER, created_at=datetime.now(UTC) - timedelta(days=2))
+    old = old.model_copy(update={"completed_at": datetime.now(UTC) - timedelta(days=2)})
+    recent = _make_job(status=JobStatus.DEAD_LETTER)
+    recent = recent.model_copy(update={"completed_at": datetime.now(UTC)})
+    await storage.save_job(old)
+    await storage.save_job(recent)
+
+    cutoff = datetime.now(UTC) - timedelta(days=1)
+    deleted = await storage.purge_dead_letter_jobs("tenant-a", before=cutoff)
+    assert deleted == 1
+    assert await storage.get_job(old.job_id, tenant_id="tenant-a") is None
+    assert await storage.get_job(recent.job_id, tenant_id="tenant-a") is not None
+
+
+@pytest.mark.unit
+async def test_purge_dead_letter_jobs_empty_returns_zero(storage) -> None:
+    assert await storage.purge_dead_letter_jobs("tenant-a") == 0
+
+
+# ---------------------------------------------------------------------------
 # Concurrent claim — sqlite-only because the in-memory double is single-loop
 # ---------------------------------------------------------------------------
 

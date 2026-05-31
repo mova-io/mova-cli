@@ -87,6 +87,15 @@ REMOTE_VERB_ROUTES: dict[str, list[tuple[str, str]]] = {
     "jobs cancel": [("POST", "/api/v1/jobs/{job_id}/cancel")],
     "jobs list": [("GET", "/jobs")],
     "jobs list-agents": [("GET", "/agents")],
+    # dead-letter management — operate retry-exhausted jobs
+    "jobs dead-letter list": [("GET", "/api/v1/jobs/dead-letter")],
+    # `show` reuses the standard job-poll route (the id is a dead-lettered job)
+    "jobs dead-letter show": [("GET", "/jobs/{job_id}")],
+    "jobs dead-letter retry": [
+        ("GET", "/api/v1/jobs/dead-letter"),  # --all lists then requeues each
+        ("POST", "/api/v1/jobs/{job_id}/requeue"),
+    ],
+    "jobs dead-letter purge": [("POST", "/api/v1/jobs/dead-letter/purge")],
     "runs show": [("GET", "/runs/{run_id}")],
     # batch inference
     "batch submit": [("POST", "/api/v1/agents/{name}/batch")],
