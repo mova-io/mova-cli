@@ -40,6 +40,7 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     Header,
     HTTPException,
     Query,
@@ -380,6 +381,7 @@ from movate.runtime.schemas import (
     TroubleshootRequest,
     UnifiedAgentCreatedView,
     UsageView,
+    VoiceTurnView,
     WizardAgentSubmission,
     WorkflowCreatedView,
     WorkflowCreateRequest,
@@ -873,6 +875,314 @@ async def _stream_voice_pipeline_turn(
 
     # A ``close`` the watcher read mid-turn ends the session after this turn.
     return any(b.get("type") == "close" for b in buffered)
+
+
+@dataclass
+class _OneShotVoiceResult:
+    """The collapsed result of one one-shot voice turn (the REST POST path).
+
+    ADR 050 D2 — the same ``run_voice_pipeline`` turn as the WS, but drained to
+    a single request/response instead of streamed. Built by
+    :func:`_run_voice_pipeline_oneshot` from the SAME event stream the WS
+    serializes, so there is exactly ONE voice execution path (no fork — ADR 050
+    D1 / Consequences). The route reads ``transcript`` / ``answer_text`` / the
+    synthesized ``audio`` for the JSON envelope + headers, and ``latency`` for
+    the per-stage timing headers (ADR 050 D7).
+    """
+
+    transcript: str = ""
+    answer_text: str = ""
+    run_id: str = ""
+    status: str = ""
+    audio: bytearray = field(default_factory=bytearray)
+    audio_codec: str | None = None
+    audio_sample_rate: int | None = None
+    error_message: str = ""
+    error_stage: str = ""
+    events: list[Any] = field(default_factory=list)
+
+
+async def _run_voice_pipeline_oneshot(
+    *,
+    audio_in: AsyncIterator[Any],
+    stt: Any,
+    tts: Any,
+    executor: Any,
+    bundle: Any,
+    tenant_id: str,
+    input_key: str = "text",
+    language: str | None = None,
+    voice_id: str = "",
+    stt_api_key: str | None = None,
+    tts_api_key: str | None = None,
+) -> _OneShotVoiceResult:
+    """Drive ONE voice turn to completion and collect its outcome (ADR 050 D2).
+
+    The REST one-shot parity to the streaming WS: it runs the **same**
+    :func:`movate.voice.run_voice_pipeline` (STT → the UNCHANGED Executor →
+    TTS) the WS route drives, but instead of serializing each event onto a
+    socket it accumulates them — concatenating the ``tts.audio`` frames into one
+    answer-audio buffer and capturing the transcript / answer / run id / status
+    / any stage error. This is deliberately NOT a second execution path (ADR 050
+    Consequences): it is the same pipeline, drained to a request/response.
+
+    No ``cancel`` event is passed — a one-shot REST turn has no live barge-in
+    (there is no concurrent mic stream); the turn runs to its natural end.
+    """
+    from movate.voice import run_voice_pipeline  # noqa: PLC0415
+
+    result = _OneShotVoiceResult()
+    async for event in run_voice_pipeline(
+        audio_in=audio_in,
+        stt=stt,
+        tts=tts,
+        executor=executor,
+        bundle=bundle,
+        tenant_id=tenant_id,
+        input_key=input_key,
+        language=language,
+        voice_id=voice_id,
+        stt_api_key=stt_api_key,
+        tts_api_key=tts_api_key,
+    ):
+        result.events.append(event)
+        if event.kind == "transcript.final":
+            result.transcript = event.text
+        elif event.kind == "tts.audio" and event.audio is not None:
+            result.audio.extend(event.audio.data)
+            # The codec/sample-rate is uniform across a turn's frames; record
+            # the first non-empty frame's so the envelope can describe the bytes.
+            if result.audio_codec is None:
+                result.audio_codec = event.audio.codec
+                result.audio_sample_rate = event.audio.sample_rate
+        elif event.kind == "error":
+            # First error wins — the pipeline degrades and stops at STT/agent
+            # errors (TTS errors still leave the text answer intact, D8).
+            if not result.error_message:
+                result.error_message = event.message
+                result.error_stage = event.stage
+        elif event.kind == "done":
+            result.run_id = event.run_id
+            result.status = event.status
+
+    # The answer text is the concatenation of the streamed agent tokens (the
+    # same text TTS spoke). Derive it from the event stream so the envelope's
+    # ``response_text`` matches what was synthesized.
+    result.answer_text = "".join(ev.text for ev in result.events if ev.kind == "agent.token")
+    # A turn that errored before ``done`` (STT/agent stage) has no terminal
+    # event — surface the failure as the status so the envelope is truthful.
+    if not result.status and result.error_message:
+        result.status = "error"
+    return result
+
+
+class _PrefilledSTT:
+    """An STT adapter that yields a caller-supplied transcript verbatim.
+
+    The ``mdk voice say <agent> <text>`` path (ADR 050 D11) speaks an answer to
+    *text* the caller typed — there is no audio to recognize. Rather than fork a
+    second, STT-less execution path (which ADR 050 D1 forbids), this stands in as
+    the STT stage of the SAME ``run_voice_pipeline``: it drains any inbound audio
+    and immediately endpoints with the provided text as the final transcript, so
+    the turn is STT(=given text) → the UNCHANGED agent → TTS exactly like every
+    other turn — just entered with the words already known.
+    """
+
+    name = "prefilled_stt"
+    version = "0.0.1"
+
+    def __init__(self, transcript: str) -> None:
+        self._transcript = transcript
+
+    async def transcribe(
+        self,
+        audio: Any,
+        *,
+        language: str | None = None,
+        api_key: str | None = None,
+    ) -> AsyncIterator[Any]:
+        from movate.voice.base import TranscriptChunk  # noqa: PLC0415
+
+        async for _ in audio:
+            pass
+        yield TranscriptChunk(text=self._transcript, is_final=True, confidence=1.0)
+
+
+# Inbound-audio fetch ceiling for the ``audio_url`` path (ADR 050 D10). A turn's
+# audio is bounded — 25 MiB is comfortably above a long phone call's recording
+# while capping a hostile / mistyped URL from streaming an unbounded body into a
+# replica. Mirrors the default request-body guard (hardening D6).
+_VOICE_AUDIO_URL_MAX_BYTES = 25 * 1024 * 1024
+
+
+async def _fetch_voice_audio_url(url: str) -> bytes:
+    """Fetch inbound audio from a URL for the one-shot voice POST (ADR 050 D10).
+
+    The "large / already-hosted audio" path — a telephony recording in blob
+    storage, etc. Bounded by :data:`_VOICE_AUDIO_URL_MAX_BYTES` so a mistyped or
+    hostile URL can't stream an unbounded body into the replica. Only ``http``/
+    ``https`` are accepted (no ``file://`` / SSRF-to-localhost-scheme tricks at
+    the scheme level; deeper SSRF policy is an operator network concern, flagged
+    in the PR). Any fetch failure becomes a clean 400 rather than a 500.
+    """
+    import httpx  # noqa: PLC0415
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise AgentCreationError("audio_url must be an http(s) URL (ADR 050 D10)", status_code=400)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.content
+    except Exception as exc:
+        raise AgentCreationError(f"could not fetch audio_url: {exc}", status_code=400) from exc
+    if len(data) > _VOICE_AUDIO_URL_MAX_BYTES:
+        raise AgentCreationError(
+            f"fetched audio exceeds the {_VOICE_AUDIO_URL_MAX_BYTES}-byte limit",
+            status_code=400,
+        )
+    return data
+
+
+def _build_voice_adapter(app: Any, kind: str, override: str | None) -> Any:
+    """Build an STT/TTS adapter for one turn, honoring a per-request override.
+
+    ``kind`` is ``"stt"`` or ``"tts"``. Absent an override, returns the runtime
+    default from the app-state factory (the SAME factory the WS path uses — so
+    the REST and WS surfaces resolve providers identically, ADR 050 D2/D6). An
+    override names a provider family (``deepgram`` / ``cartesia`` / ``openai`` /
+    ``elevenlabs`` / ``azure``); an unknown name falls back to the default
+    rather than erroring, so a typo degrades to the configured provider instead
+    of failing the turn (the per-request override is a hint routed through the
+    edge, mirroring the WS init-frame override).
+
+    NOTE (honest scope, §11): full ADR-049 router validation of the override
+    against the tenant policy/manifests is the router's job (ADR 050 D6) and is
+    NOT re-implemented here — this resolves the override to a built adapter and
+    defers richer policy to the router seam the WS path shares.
+    """
+    factory = getattr(app.state, f"voice_{kind}_factory", None)
+    default_adapter = factory() if factory is not None else None
+    if not override:
+        return default_adapter
+    built = _build_named_voice_adapter(kind, override)
+    return built if built is not None else default_adapter
+
+
+def _build_named_voice_adapter(kind: str, name: str) -> Any:
+    """Construct a named voice adapter (provider-family) or ``None`` if unknown.
+
+    Lazy-imports the concrete adapter so a runtime without the relevant SDK
+    only pays for what the override asks for. ``None`` (unknown name / import
+    failure) lets the caller fall back to the configured default.
+    """
+    family = (name or "").strip().lower()
+    try:
+        if kind == "stt":
+            if family == "deepgram":
+                from movate.voice import DeepgramSTT  # noqa: PLC0415
+
+                return DeepgramSTT()
+            if family in ("openai", "whisper", "openai_whisper"):
+                from movate.voice import OpenAIWhisperSTT  # noqa: PLC0415
+
+                return OpenAIWhisperSTT()
+            if family in ("azure", "azure_speech"):
+                from movate.voice import AzureSpeechSTT  # noqa: PLC0415
+
+                return AzureSpeechSTT()
+        elif kind == "tts":
+            if family == "cartesia":
+                from movate.voice import CartesiaTTS  # noqa: PLC0415
+
+                return CartesiaTTS()
+            if family == "elevenlabs":
+                from movate.voice import ElevenLabsTTS  # noqa: PLC0415
+
+                return ElevenLabsTTS()
+            if family in ("openai", "openai_tts"):
+                from movate.voice import OpenAITTS  # noqa: PLC0415
+
+                return OpenAITTS()
+            if family in ("azure", "azure_neural"):
+                from movate.voice import AzureNeuralTTS  # noqa: PLC0415
+
+                return AzureNeuralTTS()
+    except Exception:
+        # Unknown family or an adapter whose construction needs config we don't
+        # have → fall back to the runtime default (never fail the turn on a hint).
+        return None
+    return None
+
+
+def _header_safe(value: str) -> str:
+    """Make a string safe to put in an HTTP header value.
+
+    Transcripts/answers can contain newlines or non-latin-1 characters that an
+    HTTP header value cannot carry; collapse newlines and drop un-encodable
+    characters so the stream-mode response can echo them as headers without a
+    serialization error. (The full text is always available in the JSON body
+    mode; the header echo is a convenience for the binary-body path.)
+    """
+    flat = " ".join(value.splitlines())
+    return flat.encode("latin-1", "ignore").decode("latin-1")
+
+
+async def _voice_economics_from_run(
+    store: StorageProvider, *, run_id: str, tenant_id: str
+) -> ResponseEconomics | None:
+    """Read a finished voice turn's run-record metrics into ResponseEconomics.
+
+    Best-effort (ADR 045 R2): returns ``None`` when the run record isn't
+    retrievable (e.g. the turn errored and persisted a FailureRecord, or a
+    storage hiccup) so the middleware omits the cost/token headers rather than
+    emitting a misleading zero. Never raises.
+    """
+    if not run_id:
+        return None
+    try:
+        record = await store.get_run(run_id, tenant_id=tenant_id)
+    except Exception:
+        return None
+    if record is None:
+        return None
+    metrics = getattr(record, "metrics", None)
+    if metrics is None:
+        # Some run records carry flat cost/token fields instead of a metrics
+        # object — read those when present.
+        cost = getattr(record, "cost_usd", None)
+        return ResponseEconomics(cost_usd=cost) if cost is not None else None
+    tokens = getattr(metrics, "tokens", None)
+    return ResponseEconomics(
+        cost_usd=getattr(metrics, "cost_usd", None),
+        tokens_in=getattr(tokens, "input", None) if tokens is not None else None,
+        tokens_out=getattr(tokens, "output", None) if tokens is not None else None,
+    )
+
+
+def _set_voice_latency_headers(response: Response, events: list[Any]) -> None:
+    """Stamp the voice turn's per-stage latency onto additive response headers.
+
+    Derives the per-stage timings from the ``at_ms`` offsets stamped on the
+    event stream (the SAME ``compute_turn_latency`` the WS ``latency`` frame
+    uses, ADR 050 D7) and emits them as ``X-MDK-Voice-Latency-*`` headers (the
+    REST analogue of the WS latency frame). Additive + best-effort: a milestone
+    never reached (an STT-stage error) simply omits that header. Never raises.
+    """
+    try:
+        from movate.voice.pipeline import compute_turn_latency  # noqa: PLC0415
+
+        latency = compute_turn_latency(events)
+    except Exception:
+        return
+    if latency.responded_in_ms is not None:
+        response.headers["X-MDK-Voice-Latency-Responded-Ms"] = str(round(latency.responded_in_ms))
+    if latency.stt_final_ms is not None:
+        response.headers["X-MDK-Voice-Latency-Stt-Ms"] = str(round(latency.stt_final_ms))
+    if latency.agent_first_token_ms is not None:
+        response.headers["X-MDK-Voice-Latency-Agent-Ms"] = str(round(latency.agent_first_token_ms))
+    if latency.tts_first_audio_ms is not None:
+        response.headers["X-MDK-Voice-Latency-Tts-Ms"] = str(round(latency.tts_first_audio_ms))
 
 
 async def _send_realtime_chunk(websocket: WebSocket, chunk: Any) -> None:
@@ -15013,6 +15323,288 @@ def build_app(
             # Client hung up — nothing to clean up beyond the executor task,
             # which run_voice_pipeline reaps in its own finally. Normal exit.
             return
+
+    # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/voice — One-shot / batch voice (ADR 050 D2)
+    #
+    # The REST parity to the streaming WS above: audio in → STT → the UNCHANGED
+    # Executor → TTS → ``{transcript, response_text, audio_*}`` out in a single
+    # request/response. The surface a telephony bridge, a "transcribe this file
+    # and answer it", or an automated test reaches for when a socket is overkill
+    # (ADR 050 D2 / Alternatives (c)). It runs the SAME ``run_voice_pipeline``
+    # the WS drives (no second execution path — ADR 050 D1 / Consequences) and
+    # reuses the SAME edge BYOK key resolution (``_resolve_voice_api_key``).
+    #
+    # Audio I/O (ADR 050 D10): inbound audio is a multipart file part (never
+    # base64-in-JSON); outbound audio is a binary streamed body by default, with
+    # ``?audio=inline`` returning base64 in the JSON envelope for small
+    # test/telephony turns. The transcript + response text + cost/latency ride
+    # the JSON body + headers; the audio bytes never bloat the JSON.
+    #
+    # New surface — flag (CLAUDE.md rule 5): a NEW additive ``/api/v1`` endpoint
+    # (scope ``run``, same as the WS). Changes no existing endpoint.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/voice",
+        response_model=VoiceTurnView,
+        tags=["agents-v1"],
+        dependencies=[_scope("run")],
+        responses={
+            200: {
+                "description": (
+                    "One-shot voice turn result. JSON (the default, or "
+                    "``?audio=inline``) carries the transcript + response text + "
+                    "an audio reference; ``?audio=stream`` (the default for a "
+                    "telephony bridge) returns the synthesized audio as the "
+                    "binary body with the transcript/response in headers."
+                ),
+            },
+        },
+    )
+    async def v1_agent_voice_oneshot(
+        name: str,
+        request: Request,
+        response: Response,
+        ctx: AuthContext = Depends(auth_dep),
+        audio: UploadFile | None = File(
+            default=None,
+            description=(
+                "The inbound audio as a multipart file part (ADR 050 D10 — "
+                "never base64-in-JSON). Either this or ``audio_url`` is required."
+            ),
+        ),
+        audio_url: str | None = Form(
+            default=None,
+            description=(
+                "A URL the runtime fetches the inbound audio from (ADR 050 D10 — "
+                "the large / already-hosted path, e.g. a telephony recording). "
+                "Alternative to the ``audio`` multipart part."
+            ),
+        ),
+        text: str | None = Form(
+            default=None,
+            description=(
+                "Text to speak instead of audio in (the ``mdk voice say`` path, "
+                "ADR 050 D11). When set, STT is bypassed — the text IS the "
+                "transcript and the SAME pipeline runs agent → TTS. Mutually "
+                "exclusive with ``audio`` / ``audio_url``."
+            ),
+        ),
+        stt: str | None = Form(
+            default=None, description="STT provider override for this turn (ADR 050 D6)."
+        ),
+        tts: str | None = Form(
+            default=None, description="TTS provider override for this turn (ADR 050 D6)."
+        ),
+        voice_id: str | None = Form(
+            default=None, description="TTS voice id override for this turn (ADR 050 D6)."
+        ),
+        language: str | None = Form(
+            default=None, description="STT language hint for this turn (ADR 050 D6)."
+        ),
+        input_key: str = Form(
+            default="text",
+            description="The agent-input field the transcript is bound to (default ``text``).",
+        ),
+        codec: str = Form(
+            default="pcm16", description="Codec of the inbound audio bytes (pcm16 / opus / mulaw)."
+        ),
+        mock: bool = Form(
+            default=False,
+            description="Run the agent stage offline with MockProvider (test hook; mirrors WS).",
+        ),
+        audio_out: str = Query(
+            default="inline",
+            alias="audio",
+            description=(
+                "How the synthesized answer audio travels (ADR 050 D10): "
+                "``inline`` (default) = base64 in the JSON envelope (small "
+                "test/telephony turns); ``stream`` = the raw audio bytes as the "
+                "binary response body, transcript/response in headers; ``none`` "
+                "= no audio (transcribe-only)."
+            ),
+        ),
+    ) -> Any:
+        """Run one voice turn over REST: audio → STT → the unchanged agent → TTS.
+
+        The one-shot / batch parity to the streaming WS (ADR 050 D2). A voice
+        turn **is** a run (ADR 050 D1): it runs the SAME ``run_voice_pipeline``
+        the WS drives — STT, then the **unchanged** text Executor (this route
+        never edits ``core/executor.py``; it calls the executor exactly like
+        the SSE run-stream + WS voice routes), then TTS — and the resulting run
+        shows up in ``mdk runs list`` / ``/api/v1/usage`` / traces like any run.
+
+        Audio I/O (ADR 050 D10): inbound audio is the ``audio`` multipart file
+        part **or** an ``audio_url`` the runtime fetches; outbound audio rides a
+        binary body (``?audio=stream``) or base64 in the JSON envelope
+        (``?audio=inline``), **never** base64-in-JSON by default for the
+        codegen-clean shape.
+
+        Per-request ``stt`` / ``tts`` / ``voice_id`` / ``language`` overrides
+        (ADR 050 D6) tune this one turn. The tenant's own BYOK STT/TTS keys are
+        resolved at this edge (ADR 048 D6) — reusing the WS path's resolver, not
+        a second mechanism.
+
+        Lazily imports the ``mdk[voice]`` extra — a runtime without it returns a
+        clear 503 rather than a cryptic ImportError (the REST degrade).
+
+        Errors:
+
+        * **400** — neither ``audio`` nor ``audio_url`` supplied, or an empty
+          audio part.
+        * **404** — agent not in the registry for this tenant.
+        * **503** — the ``mdk[voice]`` extra is not installed on this runtime.
+        """
+        store: StorageProvider = request.app.state.storage
+
+        # ── Voice extra gate (lazy import; clear 503 if absent) ──
+        # The route module imports nothing voice-heavy at module scope; the
+        # speech adapters + pipeline only import here, so a non-voice runtime
+        # pays nothing until a voice request actually arrives.
+        try:
+            from movate.voice import run_voice_pipeline as _  # noqa: F401, PLC0415
+            from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
+        except ImportError as exc:
+            raise AgentCreationError(
+                "this runtime was built without the mdk[voice] extra; "
+                "POST /api/v1/agents/{name}/voice is unavailable "
+                "(install 'movate-cli[voice]')",
+                status_code=503,
+            ) from exc
+
+        # ── Resolve the inbound input: text-to-speak OR audio (part / URL) ──
+        # The ``mdk voice say`` path supplies ``text`` (no audio); STT is then
+        # bypassed via _PrefilledSTT below. Otherwise audio arrives as a
+        # multipart part or a fetched URL (ADR 050 D10).
+        audio_data = b""
+        if text is None:
+            if audio is not None:
+                audio_data = await audio.read()
+            elif audio_url:
+                audio_data = await _fetch_voice_audio_url(audio_url)
+            else:
+                raise AgentCreationError(
+                    "no input: supply 'text' to speak, an 'audio' multipart file "
+                    "part, or an 'audio_url' to fetch (ADR 050 D2 / D10)",
+                    status_code=400,
+                )
+            if not audio_data:
+                raise AgentCreationError("the inbound audio is empty", status_code=400)
+
+        # ── Resolve the agent (same routing as the run/stream/WS paths) ──
+        canary = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        chosen_version = choose_version(canary, thread_id=None)
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=ctx.tenant_id, version=chosen_version, fallback=agents_reg
+        )
+        if bundle is None:
+            raise AgentCreationError(f"agent {name!r} not found", status_code=404)
+
+        # ── Wire the speech adapters + the UNCHANGED Executor ──
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        # Per-request STT/TTS provider overrides (ADR 050 D6) select a built
+        # adapter from the app-state factories; absent, the runtime default
+        # (the same the WS uses). Building from the factory keeps the route
+        # provider-agnostic (ADR 048 D3). For the ``text``-in path, STT is
+        # bypassed with a prefilled adapter so the SAME pipeline runs (the text
+        # IS the transcript) — no separate STT-less execution path (ADR 050 D1).
+        stt_adapter: Any = (
+            _PrefilledSTT(text)
+            if text is not None
+            else _build_voice_adapter(request.app, "stt", stt)
+        )
+        tts_adapter = _build_voice_adapter(request.app, "tts", tts)
+
+        # BYOK (ADR 048 D6 / ADR 018) — resolve the tenant's OWN keys at this
+        # edge, exactly as the WS path does. No tenant key → None → the
+        # adapter's env default (byte-for-byte today's behavior).
+        stt_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, stt_adapter)
+        tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts_adapter)
+
+        provider: BaseLLMProvider = MockProvider() if mock else LiteLLMProvider()
+        executor = Executor(
+            provider=provider,
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=ctx.tenant_id,
+            cache=request.app.state.llm_cache,
+        )
+
+        async def _audio_in() -> AsyncIterator[Any]:
+            # One chunk: the whole uploaded utterance. STT endpoints it.
+            yield _AudioChunk(data=audio_data, codec=cast(Any, codec))
+
+        turn = await _run_voice_pipeline_oneshot(
+            audio_in=_audio_in(),
+            stt=stt_adapter,
+            tts=tts_adapter,
+            executor=executor,
+            bundle=bundle,
+            tenant_id=ctx.tenant_id,
+            input_key=input_key,
+            language=language,
+            voice_id=voice_id or "",
+            stt_api_key=stt_api_key,
+            tts_api_key=tts_api_key,
+        )
+
+        # ── Cost (ADR 036 / ADR 050 D7) + per-stage latency headers ──
+        # The run's economics ride the SAME X-MDK-Cost-USD / -Tokens-* headers
+        # every other run uses (via the economics middleware); the voice-specific
+        # per-stage latency rides additive X-MDK-Voice-Latency-* headers derived
+        # from the event stream. Best-effort: a missing record omits the headers.
+        econ = await _voice_economics_from_run(store, run_id=turn.run_id, tenant_id=ctx.tenant_id)
+        if econ is not None:
+            set_response_economics(request, econ)
+        _set_voice_latency_headers(response, turn.events)
+
+        # ── Shape the response per the audio-transport choice (ADR 050 D10) ──
+        out_mode = (audio_out or "inline").strip().lower()
+        has_audio = bool(turn.audio)
+        if out_mode == "stream" and has_audio:
+            # Binary body: the synthesized audio bytes, transcript/response in
+            # headers (the telephony-bridge path — a socket-free spoken answer).
+            media_type = (
+                "audio/basic" if turn.audio_codec == "mulaw" else "application/octet-stream"
+            )
+            stream_resp = Response(content=bytes(turn.audio), media_type=media_type)
+            stream_resp.headers["X-MDK-Voice-Transcript"] = _header_safe(turn.transcript)
+            stream_resp.headers["X-MDK-Voice-Response"] = _header_safe(turn.answer_text)
+            if turn.run_id:
+                stream_resp.headers["X-MDK-Voice-Run-Id"] = turn.run_id
+            if turn.status:
+                stream_resp.headers["X-MDK-Voice-Status"] = turn.status
+            if turn.audio_codec:
+                stream_resp.headers["X-MDK-Voice-Codec"] = turn.audio_codec
+            # Re-stamp the cost/latency headers onto the replacement response
+            # (a fresh Response doesn't inherit the injected one's headers).
+            _set_voice_latency_headers(stream_resp, turn.events)
+            return stream_resp
+
+        view = VoiceTurnView(
+            transcript=turn.transcript,
+            response_text=turn.answer_text,
+            audio_bytes_b64=(
+                base64.b64encode(bytes(turn.audio)).decode("ascii")
+                if (out_mode == "inline" and has_audio)
+                else None
+            ),
+            audio_url=None,
+            audio_codec=turn.audio_codec if has_audio else None,
+            audio_sample_rate=turn.audio_sample_rate if has_audio else None,
+            run_id=turn.run_id,
+            status=turn.status,
+            error=turn.error_message or None,
+        )
+        return view
 
     app.include_router(v1)
 

@@ -51,6 +51,7 @@ from movate.runtime.schemas import (
     RunAccepted,
     RunSubmission,
     RunView,
+    VoiceTurnView,
     WorkflowCreateRequest,
     WorkflowDetailView,
     WorkflowListResponse,
@@ -820,6 +821,67 @@ class MovateClient:
         )
         self._raise_for_status(r)
         return WebhookAttemptListView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Voice — one-shot / batch REST turn (ADR 050 D2)
+    # ------------------------------------------------------------------
+
+    async def voice_oneshot(
+        self,
+        *,
+        agent: str,
+        audio: bytes | None = None,
+        text: str | None = None,
+        filename: str = "audio.wav",
+        content_type: str = "application/octet-stream",
+        stt: str | None = None,
+        tts: str | None = None,
+        voice_id: str | None = None,
+        language: str | None = None,
+        input_key: str = "text",
+        codec: str = "pcm16",
+        mock: bool = False,
+        audio_out: str = "inline",
+    ) -> VoiceTurnView:
+        """``POST /api/v1/agents/{name}/voice`` — one-shot voice turn (ADR 050 D2).
+
+        The REST parity to the streaming WS. Supply EITHER ``audio`` (sent as a
+        multipart file part, ADR 050 D10 — never base64-in-JSON; the
+        ``ask``/``transcribe`` paths) OR ``text`` to speak (the ``say`` path,
+        ADR 050 D11 — STT is bypassed server-side). Returns the
+        ``{transcript, response_text, audio_*}`` envelope. ``audio_out`` selects
+        how the synthesized answer travels (``inline`` base64 in the envelope,
+        ``stream`` for the binary body, ``none`` to transcribe only).
+
+        Per-request ``stt`` / ``tts`` / ``voice_id`` / ``language`` override the
+        agent's voice defaults for this one turn (ADR 050 D6). ``mock`` runs the
+        agent stage offline (test parity with the WS ``mock`` config). Requires
+        the ``run`` scope.
+        """
+        data: dict[str, str] = {
+            "input_key": input_key,
+            "codec": codec,
+            "mock": "true" if mock else "false",
+        }
+        if text is not None:
+            data["text"] = text
+        if stt is not None:
+            data["stt"] = stt
+        if tts is not None:
+            data["tts"] = tts
+        if voice_id is not None:
+            data["voice_id"] = voice_id
+        if language is not None:
+            data["language"] = language
+        files = {"audio": (filename, audio, content_type)} if audio is not None else None
+        r = await self._client.post(
+            f"/api/v1/agents/{agent}/voice",
+            params={"audio": audio_out},
+            files=files,
+            data=data,
+        )
+        self._raise_for_status(r)
+        return VoiceTurnView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Internal
