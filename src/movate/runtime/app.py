@@ -3368,8 +3368,28 @@ def _read_idempotency_key(request: Request) -> str | None:
     return key
 
 
+def _idempotency_request_hash(payload: dict[str, Any]) -> str:
+    """Stable SHA-256 fingerprint of a submit payload (item 37 conflict guard).
+
+    Canonicalizes with ``json.dumps(..., sort_keys=True)`` so key order /
+    whitespace don't perturb the digest — two semantically-identical retries
+    fingerprint the same, while a genuinely different payload fingerprints
+    differently. ``default=str`` keeps non-JSON-native values (rare in a submit
+    body) from raising. The caller passes only the request-identifying fields
+    (agent/target/kind/input) — NOT volatile metadata like request_id — so a
+    retry that differs only in a fresh request id is still recognised as the
+    same submission.
+    """
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def _idempotent_submit_guard(
-    request: Request, store: StorageProvider, ctx: AuthContext
+    request: Request,
+    store: StorageProvider,
+    ctx: AuthContext,
+    *,
+    request_hash: str | None = None,
 ) -> str | None:
     """Return the ``job_id`` a prior submission with this key enqueued, or ``None``.
 
@@ -3379,11 +3399,31 @@ async def _idempotent_submit_guard(
     header (or an unusable one) → ``None`` → the endpoint creates a job as
     today. After creating, the endpoint calls
     :meth:`StorageProvider.record_run_submission` (race-safe) to bind the key.
+
+    **Payload-conflict guard.** When ``request_hash`` is supplied and the prior
+    row stored a (non-None) fingerprint that DIFFERS, the key was reused for a
+    different payload — we raise a **409** rather than silently returning the
+    wrong run. A prior row with a ``None`` fingerprint (legacy / pre-guard
+    record) is treated as "unknown" and returns the prior job unchanged
+    (back-compat). Passing ``request_hash=None`` disables the comparison
+    entirely (the pre-guard behavior).
     """
     key = _read_idempotency_key(request)
     if key is None:
         return None
-    return await store.get_run_submission(ctx.tenant_id, key)
+    prior = await store.get_run_submission_record(ctx.tenant_id, key)
+    if prior is None:
+        return None
+    if (
+        request_hash is not None
+        and prior.request_hash is not None
+        and prior.request_hash != request_hash
+    ):
+        raise conflict(
+            f"Idempotency-Key {key!r} was already used for a different request payload "
+            f"(prior job {prior.job_id}); reuse a key only for an identical retry"
+        )
+    return prior.job_id
 
 
 def _apply_history_char_budget(
@@ -4713,8 +4753,14 @@ def build_app(
 
         # item 37 — submission idempotency. Pre-create check: a prior submit
         # with this key for this tenant returns the SAME job; do NOT enqueue
-        # again. No header → prior is None → today's path.
-        prior_job_id = await _idempotent_submit_guard(request, store, ctx)
+        # again. No header → prior is None → today's path. The fingerprint
+        # (kind/target/input — the request-identifying fields) lets the guard
+        # 409 a key reused for a DIFFERENT payload instead of silently
+        # returning the wrong job.
+        req_hash = _idempotency_request_hash(
+            {"kind": body.kind, "target": body.target, "input": body.input}
+        )
+        prior_job_id = await _idempotent_submit_guard(request, store, ctx, request_hash=req_hash)
         if prior_job_id is not None:
             return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
 
@@ -4738,7 +4784,7 @@ def build_app(
         # simultaneous race we may have enqueued one extra job).
         key = _read_idempotency_key(request)
         if key is not None:
-            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id)
+            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id, req_hash)
             if not recorded:
                 winning_job_id = await store.get_run_submission(ctx.tenant_id, key)
                 if winning_job_id is not None and winning_job_id != job.job_id:
@@ -8048,7 +8094,13 @@ def build_app(
         # ?wait=true branch above returns before here and is out of scope).
         # Pre-create check: a prior submit with this key for this tenant
         # returns the SAME job; do NOT enqueue again. No header → today's path.
-        prior_job_id = await _idempotent_submit_guard(request, store, ctx)
+        # The fingerprint (agent name / input / thread — the request-identifying
+        # fields) lets the guard 409 a key reused for a DIFFERENT payload
+        # instead of silently returning the wrong job.
+        req_hash = _idempotency_request_hash(
+            {"agent": name, "input": body.input, "thread_id": body.thread_id}
+        )
+        prior_job_id = await _idempotent_submit_guard(request, store, ctx, request_hash=req_hash)
         if prior_job_id is not None:
             response.status_code = 202
             return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
@@ -8084,7 +8136,7 @@ def build_app(
         # enqueued one extra job).
         key = _read_idempotency_key(request)
         if key is not None:
-            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id)
+            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id, req_hash)
             if not recorded:
                 winning_job_id = await store.get_run_submission(ctx.tenant_id, key)
                 if winning_job_id is not None and winning_job_id != job.job_id:
