@@ -2,7 +2,7 @@
   "info": {
     "name": "Movate \u2014 Core Flow",
     "_postman_id": "b9f0c1a2-3d4e-4f56-8a7b-0c1d2e3f4a5b",
-    "description": "A top-to-bottom live demo of the mdk (`movate-cli`) runtime `/api/v1` surface against a deployed Azure Container Apps runtime.\n\nEach request maps to an `mdk <verb>` (or is labelled **API-first** when there is no CLI equivalent) and demonstrates one core feature. Run the folders in order \u2014 `test` scripts capture key IDs (`agent_name`, `run_id`, `session_id`, `project_id`, `graph_node_id`) into collection/environment variables so the chain flows without manual copy/paste.\n\n**Auth:** collection-level Bearer using `{{bearer_token}}` (set it in the environment \u2014 never hardcoded). The token needs `admin` + `read` (and `run` + `kb:write` for the run/KB steps). See `postman/README.md` for how to mint one with `mdk auth create-key`.\n\n**Entry point:** start with `GET /api/v1/capabilities` to discover what the runtime supports before running the rest of the flow.\n\n**Source of truth:** request bodies and scopes mirror `src/movate/runtime/app.py` + `src/movate/runtime/schemas.py` and the audit in `docs/front-end-api.md`. You can also `Import \u2192 Link \u2192 {{runtime_url}}/api/v1/openapi.json` for the full typed API.",
+    "description": "## START HERE\n1. Set `runtime_url` (deployed URL, no trailing slash) + `bearer_token` (`mdk auth create-key \u2026` or `mdk serve --dev` prints one).\n2. Ensure the runtime has `OPENAI_API_KEY` (or Azure OpenAI) \u2014 the KB steps embed.\n3. For the async beats (Async Eval E2/E3, async runs) run a worker: `mdk worker`. Sync demo? add `?wait=true`.\n4. Run **0. Reset** first (re-runnable), then the **Movate \u2014 Core Flow** folder top-to-bottom, then **Async Eval**.\n\nA top-to-bottom live demo of the mdk (`movate-cli`) runtime `/api/v1` surface against a deployed Azure Container Apps runtime.\n\nEach request maps to an `mdk <verb>` (or is labelled **API-first** when there is no CLI equivalent) and demonstrates one core feature. Run the folders in order \u2014 `test` scripts capture key IDs (`agent_name`, `run_id`, `session_id`, `project_id`, `graph_node_id`) into collection/environment variables so the chain flows without manual copy/paste.\n\n**Auth:** collection-level Bearer using `{{bearer_token}}` (set it in the environment \u2014 never hardcoded). The token needs `admin` + `read` (and `run` + `kb:write` for the run/KB steps). See `postman/README.md` for how to mint one with `mdk auth create-key`.\n\n**Entry point:** start with `GET /api/v1/capabilities` to discover what the runtime supports before running the rest of the flow.\n\n**Source of truth:** request bodies and scopes mirror `src/movate/runtime/app.py` + `src/movate/runtime/schemas.py` and the audit in `docs/front-end-api.md`. You can also `Import \u2192 Link \u2192 {{runtime_url}}/api/v1/openapi.json` for the full typed API.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -91,6 +91,20 @@
                   "console.log('mdk_version', cap.mdk_version, 'api_version', cap.api_version, 'minimal', cap.minimal);"
                 ]
               }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('advertises the manageable resource catalog (ADR 060/_links era)', function () {",
+                  "  const b = pm.response.json();",
+                  "  pm.expect(b.resources, 'resources block').to.be.an('array');",
+                  "  const names = b.resources.map(r => r.name);",
+                  "  pm.expect(names).to.include.members(['agents', 'projects', 'kb']);",
+                  "});"
+                ]
+              }
             }
           ]
         }
@@ -100,6 +114,45 @@
       "name": "Movate \u2014 Core Flow",
       "description": "The ordered demo. Run from top to bottom (Postman Runner or one-by-one).",
       "item": [
+        {
+          "name": "0. Reset \u2014 delete demo agent (idempotent re-run)",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "agents",
+                "{{agent_name}}"
+              ]
+            },
+            "description": "CLI equivalent: `mdk delete <agent>`.\n\nRun this FIRST so the collection is re-runnable: the create steps (1a/1b) 409 if `{{agent_name}}` already exists from a prior run. A 404 here (nothing to delete) is fine \u2014 the test passes on 200 OR 404. Scope: `admin`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('reset ok (deleted or already absent)', function () {",
+                  "  pm.expect([200, 204, 404]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": []
+        },
         {
           "name": "0. Whoami \u2014 verify token + scopes",
           "request": {
@@ -278,7 +331,20 @@
               ]
             },
             "description": "CLI equivalent: `mdk init` / `mdk deploy --mode agents`.\n\nThe bundle/multipart variant \u2014 `POST /api/v1/agents`. Use this when you already have a pre-built canonical bundle (e.g. produced by `mdk init --llm` locally, since there is NO server-side LLM authoring endpoint \u2014 see `docs/front-end-api.md`).\n\nTwo mutually-exclusive modes: attach a single `bundle` .zip (Option A, enabled below), OR enable the four individual files `agent_yaml` + `prompt` + `input_schema` + `output_schema` (Option B). A bundle that ships `skills/<name>/` folders persists those skills into the registry first, then the agent \u2014 so the full skill + context wiring can ride in one upload. Scope: `admin`. Returns `AgentCreatedView`.\n\nThis request is illustrative \u2014 attach your own file(s) before sending. Disabled by default in the auto-run is the individual-file set; pick one mode."
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('no client/server error (catches a bad token / URL fast)', function () {",
+                  "  pm.expect(pm.response.code, 'HTTP status').to.be.below(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "1c. Edit agent (PUT bundle) \u2014 mdk edit",
@@ -333,7 +399,20 @@
             },
             "description": "CLI equivalent: `mdk edit <agent>` (re-deploy).\n\nUpdate a deployed agent by re-uploading its canonical bundle. PUT is a MULTIPART bundle (either a single zipped `bundle` part, or the four individual files: `agent.yaml` + `prompt.md` + `schema/input.json` + `schema/output.json`) \u2014 NOT a JSON patch. A content-changed PUT writes a new immutable registry version in Postgres (ADR 014/021); an unchanged re-upload is a no-op. Scope: `admin`."
           },
-          "response": []
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('no client/server error (catches a bad token / URL fast)', function () {",
+                  "  pm.expect(pm.response.code, 'HTTP status').to.be.below(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "2. Validate agent \u2014 mdk validate",
@@ -409,7 +488,20 @@
               ]
             },
             "description": "CLI equivalent: `mdk kb ingest`.\n\nUpload one or more documents into the agent's knowledge base. `multipart/form-data` with a repeating `files` field; each doc is chunked, embedded, and persisted (deduped on content hash). Returns `KbIngestView` (`files[]` with per-file `status`, `total_chunks_saved`). Scope: `kb:write`.\n\nNote: this endpoint takes uploaded files only \u2014 there is no inline-text or URL body field. To ingest a URL, fetch it to an .html/.md file first and upload that. Attach your own small doc before sending (this request ships no file)."
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('no client/server error (catches a bad token / URL fast)', function () {",
+                  "  pm.expect(pm.response.code, 'HTTP status').to.be.below(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "3b. KB stats \u2014 mdk kb stats",
@@ -558,7 +650,20 @@
               ]
             },
             "description": "CLI equivalent: `mdk skills add`.\n\nCreate or replace a skill bundle in the runtime's skill registry (PUT semantics: re-uploading the same name overwrites). `multipart/form-data`: `skill_yaml` (required) + optional `impl` / `corpus` / `readme`. Returns `SkillCreatedView`. Scope: `admin`.\n\nRun this BEFORE request 1a if your wizard body references this skill in `mcp_connectors` \u2014 an agent declaring `skills: [<name>]` 422s if the skill isn't already registered. Attach your own skill.yaml before sending."
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('no client/server error (catches a bad token / URL fast)', function () {",
+                  "  pm.expect(pm.response.code, 'HTTP status').to.be.below(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "5. Publish agent (deploy) \u2014 mdk deploy --mode agents",
@@ -845,7 +950,7 @@
                 "evals"
               ]
             },
-            "description": "CLI equivalent: `mdk eval <agent>`.\n\n`EvalSubmission`: omit `wait` (or `wait:false`) for the ASYNC path \u2014 the runtime creates a `JobRecord(kind=EVAL)` in Postgres and returns **202 `{job_id, status:\"queued\"}`** immediately; the worker pod claims + executes it. (`wait:true` runs inline and returns the scorecard directly \u2014 convenient for a single-process demo, but avoid for big datasets.) `mock:true` skips real provider calls so the lifecycle demos without BYOK keys. Scope: `eval`.\n\nThe test script captures `job_id` for E2/E3."
+            "description": "CLI equivalent: `mdk eval <agent>`.\n\n`EvalSubmission`: omit `wait` (or `wait:false`) for the ASYNC path \u2014 the runtime creates a `JobRecord(kind=EVAL)` in Postgres and returns **202 `{job_id, status:\"queued\"}`** immediately; the worker pod claims + executes it. (`wait:true` runs inline and returns the scorecard directly \u2014 convenient for a single-process demo, but avoid for big datasets.) `mock:true` skips real provider calls so the lifecycle demos without BYOK keys. Scope: `eval`.\n\nThe test script captures `job_id` for E2/E3.\n\n**Demo note:** this 202 + `job_id` IS the async beat \u2014 it always succeeds on any runtime, no worker needed. The worker (`mdk worker`) then runs it; E2/E3 only complete when a worker is running AND the agent has an eval dataset. If E2 stays `queued`, no worker is up \u2014 that's expected; stop at E1 for the async story, or set `\"wait\": true` to run inline (needs a dataset)."
           },
           "event": [
             {
@@ -853,6 +958,8 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
+                  "const _b = pm.response.json();",
+                  "if (_b.eval_id) pm.collectionVariables.set('eval_id', _b.eval_id);",
                   "const b = pm.response.json();",
                   "if (b.job_id) pm.collectionVariables.set('job_id', b.job_id);",
                   "pm.test('queued (202) with a job_id', function () {",
@@ -887,7 +994,7 @@
                 "{{job_id}}"
               ]
             },
-            "description": "CLI equivalent: `mdk jobs get <job_id>`.\n\nPoll until `status` is terminal (`success` / `failed`). On a deployed Azure runtime the worker pod (separate from the API pod) claims the job from the Postgres queue and runs it. For a live stream instead of polling, use `GET /api/v1/jobs/{job_id}/stream` (SSE). When terminal+success, the job carries the eval result id the test script captures into `eval_id` for E3."
+            "description": "CLI equivalent: `mdk jobs get <job_id>`.\n\nPoll until `status` is terminal (`success` / `failed`). On a deployed Azure runtime the worker pod (separate from the API pod) claims the job from the Postgres queue and runs it. For a live stream instead of polling, use `GET /api/v1/jobs/{job_id}/stream` (SSE). When terminal+success, the job carries the eval result id the test script captures into `eval_id` for E3.\n\n**Requires** a running worker (`mdk worker`) + the agent's `evals/dataset.jsonl`. Without a worker E2 stays `queued` \u2014 see E1's note."
           },
           "event": [
             {
@@ -928,9 +1035,22 @@
                 "{{eval_id}}"
               ]
             },
-            "description": "CLI equivalent: `mdk eval show <eval_id>`.\n\nFetch the persisted scorecard (pass-rate, per-case results, gate verdict) once the job is terminal. The `EvalRecord` lives in Postgres on a deployed runtime \u2014 durable across pod restarts."
+            "description": "CLI equivalent: `mdk eval show <eval_id>`.\n\nFetch the persisted scorecard (pass-rate, per-case results, gate verdict) once the job is terminal. The `EvalRecord` lives in Postgres on a deployed runtime \u2014 durable across pod restarts.\n\n**Requires** a running worker (`mdk worker`) + the agent's `evals/dataset.jsonl`. Without a worker E2 stays `queued` \u2014 see E1's note."
           },
-          "response": []
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('no client/server error (catches a bad token / URL fast)', function () {",
+                  "  pm.expect(pm.response.code, 'HTTP status').to.be.below(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
         }
       ]
     },
@@ -1591,6 +1711,21 @@
                   "}"
                 ]
               }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "if (b.id) pm.collectionVariables.set('project_id', b.id);",
+                  "pm.test('uniform envelope + self-navigating _links', function () {",
+                  "  pm.expect(b.id, 'envelope id').to.be.a('string');",
+                  "  pm.expect(b._links, '_links').to.be.an('object');",
+                  "  pm.expect(b._links.agents, '_links.agents (where to add agents next)').to.be.a('string');",
+                  "});"
+                ]
+              }
             }
           ]
         },
@@ -1671,7 +1806,20 @@
               ]
             },
             "description": "CLI equivalent: `mdk project list-agents` (not yet a dedicated verb \u2014 use `mdk agent list --project <id>`).\n\nNote: the `GET /api/v1/projects/{project_id}/agents` route is the streaming creation-status endpoint (`create-stream/{job_id}`). To list agents in a project, use `GET /api/v1/agents` with a project filter, or `GET /api/v1/projects/{project_id}` (project detail includes agent references). The streaming endpoint here is for polling long-running agent creation jobs scoped to a project.\n\nUses `{{run_id}}` from the Core Flow folder as a stand-in for a `job_id`. Scope: `read`."
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('no client/server error (catches a bad token / URL fast)', function () {",
+                  "  pm.expect(pm.response.code, 'HTTP status').to.be.below(400);",
+                  "});"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "POST projects/:id/agents \u2014 add agent to project \u2014 mdk project add-agent",
