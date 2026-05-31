@@ -43,6 +43,7 @@ from movate.core.models import (
     CatalogEntryVersion,
     CatalogRatingsSummary,
     CatalogSource,
+    ContextRecord,
     ConversationThread,
     DiagnosisRecord,
     Entity,
@@ -64,6 +65,7 @@ from movate.core.models import (
     RunRecord,
     Session,
     SessionMessage,
+    SkillRecord,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
@@ -1358,6 +1360,159 @@ class StorageProvider(Protocol):
         Tenant-scoped in WHERE so a caller can't delete another tenant's
         agents by guessing names — a cross-tenant or unknown name deletes
         nothing and returns ``0``.
+        """
+
+    # ------------------------------------------------------------------
+    # Skills registry (ADR 060 D1) — durable, versioned managed skills.
+    #
+    # Skill analogue of the agent-bundle surface above. Same shape /
+    # immutability / tenant-scoping / no-leak guarantees: one immutable
+    # ``(name, tenant_id, version)`` row per publish; ``files`` is the
+    # skill bundle's small text layout, JSON-encoded on every backend.
+    # The managed store is ADDITIVE to bundle-local skills (ADR 002).
+    # ------------------------------------------------------------------
+
+    async def save_skill(self, skill: SkillRecord) -> None:
+        """Persist one published skill as an immutable
+        ``(name, tenant_id, version)`` row.
+
+        Each publish writes a new row, so the table is also the version
+        history. Errors on a duplicate ``(name, tenant_id, version)`` — a
+        given version is written exactly once and never mutated. Mirrors
+        :meth:`save_agent_bundle`.
+        """
+
+    async def get_skill(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> SkillRecord | None:
+        """Fetch one skill by ``name``, scoped to ``tenant_id``.
+
+        ``version=None`` returns the **latest** version (newest
+        ``created_at``); an explicit ``version`` returns that exact version.
+        Returns ``None`` if no match OR if the skill belongs to a different
+        tenant — same 404-not-403 no-leak contract as the agent registry.
+        """
+
+    async def list_skills(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[SkillRecord]:
+        """List the **latest version per skill name**, newest-first, scoped
+        to ``tenant_id``.
+
+        One row per distinct ``name`` (the most recently published version
+        of each), ordered by that version's ``created_at`` DESC. Mirrors
+        :meth:`list_agents`.
+        """
+
+    async def list_skill_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[SkillRecord]:
+        """List the version history for one skill ``name``, newest-first,
+        scoped to ``tenant_id``.
+
+        Drives ``GET /api/v1/skills/{name}/versions``. A cross-tenant or
+        unknown ``name`` returns ``[]`` rather than raising — same no-leak
+        contract as :meth:`list_agent_versions`.
+        """
+
+    async def delete_skill(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        """Delete skill rows scoped to ``tenant_id``; return the count
+        deleted.
+
+        ``version=None`` removes **all** versions of ``name``; an explicit
+        ``version`` removes just that one. Tenant-scoped in WHERE so a
+        cross-tenant or unknown name deletes nothing and returns ``0``.
+        Mirrors :meth:`delete_agent_bundle`.
+        """
+
+    # ------------------------------------------------------------------
+    # Contexts registry (ADR 060 D1) — durable, versioned shared contexts.
+    #
+    # Context analogue of the agent-bundle surface above. Same shape /
+    # immutability / tenant-scoping / no-leak guarantees: one immutable
+    # ``(name, tenant_id, version)`` row per publish; the payload is a
+    # single Markdown ``body`` (the prompt fragment ADR 002 injects)
+    # instead of a file bundle. ADDITIVE to bundle-local contexts (ADR 002).
+    # ------------------------------------------------------------------
+
+    async def save_context(self, context: ContextRecord) -> None:
+        """Persist one published context as an immutable
+        ``(name, tenant_id, version)`` row.
+
+        Each publish writes a new row, so the table is also the version
+        history. Errors on a duplicate ``(name, tenant_id, version)``.
+        Mirrors :meth:`save_agent_bundle`.
+        """
+
+    async def get_context(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> ContextRecord | None:
+        """Fetch one context by ``name``, scoped to ``tenant_id``.
+
+        ``version=None`` returns the **latest** version (newest
+        ``created_at``); an explicit ``version`` returns that exact version.
+        Returns ``None`` if no match OR if the context belongs to a
+        different tenant — same 404-not-403 no-leak contract.
+        """
+
+    async def list_contexts(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[ContextRecord]:
+        """List the **latest version per context name**, newest-first,
+        scoped to ``tenant_id``. Mirrors :meth:`list_agents`.
+        """
+
+    async def list_context_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[ContextRecord]:
+        """List the version history for one context ``name``, newest-first,
+        scoped to ``tenant_id``.
+
+        Drives ``GET /api/v1/contexts/{name}/versions``. A cross-tenant or
+        unknown ``name`` returns ``[]``.
+        """
+
+    async def delete_context(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        """Delete context rows scoped to ``tenant_id``; return the count
+        deleted.
+
+        ``version=None`` removes **all** versions of ``name``; an explicit
+        ``version`` removes just that one. Tenant-scoped in WHERE so a
+        cross-tenant or unknown name deletes nothing and returns ``0``.
         """
 
     # ------------------------------------------------------------------

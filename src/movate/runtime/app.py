@@ -30,7 +30,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from uuid import uuid4
 
 import yaml
@@ -80,6 +80,7 @@ from movate.core.models import (
     CatalogEntry,
     CatalogRatingsSummary,
     CatalogSource,
+    ContextRecord,
     DiagnosisRecord,
     DiagnosisStatus,
     ErrorInfo,
@@ -94,6 +95,7 @@ from movate.core.models import (
     RunRecord,
     Session,
     SessionMessage,
+    SkillRecord,
     TenantProviderKey,
     Trigger,
     WorkflowBundleRecord,
@@ -148,6 +150,7 @@ from movate.runtime.agent_creation import (
 from movate.runtime.agent_resolver import (
     PublishResult,
     bundle_files_from_dir,
+    content_hash,
     import_filesystem_agents,
     publish_agent_bundle,
     resolve_agent_bundle,
@@ -271,6 +274,11 @@ from movate.runtime.schemas import (
     CatalogSyncResponse,
     CentralityScoreView,
     CommunityView,
+    ContextCreateRequest,
+    ContextListResponse,
+    ContextUpsertRequest,
+    ContextVersionsResponse,
+    ContextView,
     DeadLetterPurgeView,
     DescribeAgentRequest,
     DescribeAgentResponse,
@@ -353,6 +361,8 @@ from movate.runtime.schemas import (
     ProviderKeyView,
     ReadyView,
     ReportView,
+    ResourceAttachRequest,
+    ResourceAttachView,
     RunAccepted,
     RunEstimateView,
     RunExplainLlmCallView,
@@ -365,6 +375,10 @@ from movate.runtime.schemas import (
     SessionMessageView,
     SessionView,
     SkillCreatedView,
+    SkillListResponse,
+    SkillUpsertRequest,
+    SkillVersionsResponse,
+    SkillView,
     ThreadCreateSubmission,
     ThreadListView,
     ThreadMessageSubmission,
@@ -484,6 +498,182 @@ def _serialize_proposed_fix(fix: Any) -> dict[str, Any]:
     elif fix.kind == "retrieval_k_change":
         base["delta"] = int(payload.get("delta", 0))
     return base
+
+
+def _body_content_hash(body: str) -> str:
+    """Content-addressed hash over a context's ``body`` (ADR 060 D1).
+
+    Mirrors :func:`movate.runtime.agent_resolver.content_hash` (sha256) so a
+    re-publish of identical text yields a stable, comparable hash.
+    """
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _validate_skill_files(files: dict[str, str]) -> Any:
+    """Validate a managed-skill ``files`` map via the bundle skill loader.
+
+    Writes the files to a throwaway temp dir and runs the same
+    :func:`movate.core.skill_loader.load_skill` the bundle-resolution path
+    uses, so an invalid ``skill.yaml`` 422s at the API edge rather than
+    poisoning the registry (ADR 060 D2). Returns the parsed ``SkillSpec``.
+    Raises an :class:`fastapi.HTTPException` (422) on any validation failure.
+    """
+    import tempfile  # noqa: PLC0415
+
+    from movate.core.skill_loader import SkillLoadError, load_skill  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory(prefix="mdk-skill-validate-") as tmp:
+        tmp_dir = Path(tmp)
+        for rel, content in files.items():
+            dest = tmp_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+        try:
+            bundle = load_skill(tmp_dir)
+        except SkillLoadError as exc:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message=f"skill files failed validation: {exc}",
+            ) from exc
+    return bundle.spec
+
+
+def _bundle_ref_list_add(agent_yaml: str, key: str, ref: str) -> tuple[str, bool]:
+    """Add ``ref`` to an ``agent.yaml`` ``key:`` list (``skills`` / ``contexts``).
+
+    Operates on the bundle file's text in memory, preserving comments +
+    formatting via the same targeted edit ``mdk contexts attach`` uses on
+    disk. Returns ``(new_text, added)`` where ``added`` is ``False`` when the
+    ref was already present (idempotent). Used by the agent-attach endpoints
+    (ADR 060 D2). Handles the three list forms: absent, inline
+    (``key: [a, b]``), and block (``- a`` lines).
+    """
+    import re  # noqa: PLC0415
+
+    data = yaml.safe_load(agent_yaml) or {}
+    spec = data.get("spec", data) if isinstance(data, dict) else {}
+    existing = spec.get(key) if isinstance(spec, dict) else None
+    if existing is None:
+        existing = []
+    if not isinstance(existing, list):
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=f"agent.yaml '{key}:' is not a list",
+        )
+    if ref in existing:
+        return agent_yaml, False
+
+    lines = agent_yaml.splitlines()
+    key_idx = next(
+        (i for i, ln in enumerate(lines) if re.match(rf"^\s*{re.escape(key)}\s*:", ln)),
+        None,
+    )
+    if key_idx is None:
+        while lines and lines[-1].strip() == "":
+            lines.pop()
+        lines.extend(["", f"{key}:", f"  - {ref}"])
+        return "\n".join(lines) + "\n", True
+
+    rest = lines[key_idx].split(":", 1)[1].strip()
+    if rest.startswith("[") and rest.endswith("]"):
+        inner = rest[1:-1].strip()
+        indent = lines[key_idx][: len(lines[key_idx]) - len(lines[key_idx].lstrip())]
+        lines[key_idx] = f"{indent}{key}: [{inner}, {ref}]" if inner else f"{indent}{key}: [{ref}]"
+        return "\n".join(lines) + "\n", True
+
+    insert_idx = key_idx + 1
+    indent = "  "
+    j = key_idx + 1
+    while j < len(lines):
+        line = lines[j]
+        stripped = line.strip()
+        if line[:1] in (" ", "\t") and stripped.startswith("- "):
+            indent = line[: len(line) - len(line.lstrip())]
+            insert_idx = j + 1
+            j += 1
+            continue
+        if stripped == "" or stripped.startswith("#"):
+            j += 1
+            continue
+        break
+    lines.insert(insert_idx, f"{indent}- {ref}")
+    return "\n".join(lines) + "\n", True
+
+
+async def _attach_resource_to_agent(
+    request: Request,
+    ctx: AuthContext,
+    *,
+    agent_name: str,
+    kind: Literal["skill", "context"],
+    body: ResourceAttachRequest,
+) -> ResourceAttachView:
+    """Shared impl for ``POST /api/v1/agents/{name}/{skills,contexts}``.
+
+    Records a registry skill/context reference in the agent's published
+    bundle (ADR 060 D2). Validates that BOTH the agent and the referenced
+    resource exist in the caller's tenant (404 otherwise), edits the
+    bundle's ``agent.yaml`` ``skills:`` / ``contexts:`` list, and re-saves
+    the bundle as a new content-addressed version when the wiring changed.
+    Runtime registry-resolution of the recorded ref is D4 (separate PR).
+    """
+    store: StorageProvider = request.app.state.storage
+    list_key = "skills" if kind == "skill" else "contexts"
+
+    agent = await store.get_agent_bundle(agent_name, tenant_id=ctx.tenant_id)
+    if agent is None:
+        raise not_found("agent", agent_name)
+
+    # The referenced resource must exist in this tenant (404 — no leak).
+    resource: SkillRecord | ContextRecord | None
+    if kind == "skill":
+        resource = await store.get_skill(body.ref, tenant_id=ctx.tenant_id, version=body.version)
+    else:
+        resource = await store.get_context(body.ref, tenant_id=ctx.tenant_id, version=body.version)
+    if resource is None:
+        ident = body.ref if body.version is None else f"{body.ref}@{body.version}"
+        raise not_found(kind, ident)
+
+    files = dict(agent.files)
+    agent_yaml = files.get("agent.yaml")
+    if agent_yaml is None:
+        raise http_error(
+            ErrorCode.BAD_REQUEST,
+            status_code=422,
+            message=f"agent {agent_name!r} bundle has no agent.yaml to attach the {kind} to",
+        )
+
+    new_yaml, added = _bundle_ref_list_add(agent_yaml, list_key, body.ref)
+    if added:
+        files["agent.yaml"] = new_yaml
+        new_hash = content_hash(files)
+        new_version = f"{agent.version}+{kind}-{body.ref}"
+        # Tolerate a duplicate (idempotent re-attach that produced the same
+        # synthetic version) — only save when it's genuinely new.
+        existing_ver = await store.get_agent_bundle(
+            agent_name, tenant_id=ctx.tenant_id, version=new_version
+        )
+        if existing_ver is None:
+            await store.save_agent_bundle(
+                AgentBundleRecord(
+                    name=agent.name,
+                    tenant_id=agent.tenant_id,
+                    version=new_version,
+                    created_by=ctx.api_key_id,
+                    content_hash=new_hash,
+                    files=files,
+                )
+            )
+
+    return ResourceAttachView(
+        agent=agent_name,
+        kind=kind,
+        ref=body.ref,
+        version=body.version,
+        attached=added,
+    )
 
 
 def _sse_frame(event: str, data: dict[str, Any]) -> str:
@@ -5743,15 +5933,461 @@ def build_app(
         on_conflict = "replace" if force else "reject"
         result = persist_skill_bundle(files, skills_path=skills_path, on_conflict=on_conflict)
 
-        _ = ctx.tenant_id  # future per-tenant audit log entry
-
         spec = result.bundle.spec
+
+        # ADR 060 D1/D2: dual-write the bundle into the managed skills registry
+        # so the new GET/list/versions surface sees it (mirrors how the agent
+        # endpoints dual-write to ``save_agent_bundle``). Additive — the
+        # on-disk persist above (bundle-resolution, ADR 002) is unchanged.
+        # A duplicate ``(name, tenant_id, version)`` row (re-deploy of the same
+        # version) is tolerated as an idempotent no-op so ``--force`` overwrites
+        # don't 500 on the registry insert.
+        store: StorageProvider = request.app.state.storage
+        text_files = {k: v.decode("utf-8", errors="replace") for k, v in files.items()}
+        skill_record = SkillRecord(
+            name=spec.name,
+            tenant_id=ctx.tenant_id,
+            version=spec.version,
+            created_by=ctx.api_key_id,
+            content_hash=content_hash(text_files),
+            description=spec.description or "",
+            files=text_files,
+        )
+        existing = await store.get_skill(spec.name, tenant_id=ctx.tenant_id, version=spec.version)
+        if existing is None:
+            await store.save_skill(skill_record)
+
         return SkillCreatedView(
             name=spec.name,
             version=spec.version,
             description=spec.description or "",
             skill_dir=result.skill_dir.name,
             files_persisted=result.files_persisted,
+        )
+
+    @v1.get(
+        "/skills",
+        response_model=SkillListResponse,
+        tags=["skills-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_skills(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=500),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> SkillListResponse:
+        """List this tenant's managed skills — latest version per name,
+        newest-first (ADR 060 D2).
+
+        Tenant-scoped via ``ctx.tenant_id``. Mirrors ``GET /api/v1/projects``
+        / the agent registry listing.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — caller lacks the ``read`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_skills(tenant_id=ctx.tenant_id, limit=limit)
+        views = [SkillView.from_record(s) for s in rows]
+        return SkillListResponse(skills=views, count=len(views))
+
+    @v1.get(
+        "/skills/{name}",
+        response_model=SkillView,
+        tags=["skills-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_skill(
+        request: Request,
+        name: str,
+        version: str | None = None,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> SkillView:
+        """Fetch one managed skill (ADR 060 D2).
+
+        ``?version=<v>`` pins an exact published version; omit for the
+        latest. A cross-tenant or unknown name is **404** (no existence
+        leak) — same contract as the agent registry.
+
+        Errors:
+
+        * **401** / **403** — auth / ``read`` scope
+        * **404** — no such skill (or version) in this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        skill = await store.get_skill(name, tenant_id=ctx.tenant_id, version=version)
+        if skill is None:
+            raise not_found("skill", name if version is None else f"{name}@{version}")
+        return SkillView.from_record(skill)
+
+    @v1.get(
+        "/skills/{name}/versions",
+        response_model=SkillVersionsResponse,
+        tags=["skills-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_skill_versions(
+        request: Request,
+        name: str,
+        limit: int = Query(default=50, ge=1, le=200),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> SkillVersionsResponse:
+        """Version history for one managed skill, newest-first (ADR 060 D2).
+
+        A cross-tenant or unknown name returns an empty list (no leak).
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_skill_versions(name, tenant_id=ctx.tenant_id, limit=limit)
+        views = [SkillView.from_record(s) for s in rows]
+        return SkillVersionsResponse(name=name, versions=views, count=len(views))
+
+    @v1.put(
+        "/skills/{name}",
+        response_model=SkillView,
+        status_code=201,
+        tags=["skills-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_upsert_skill(
+        request: Request,
+        name: str,
+        body: SkillUpsertRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> SkillView:
+        """Publish a NEW version of a managed skill (ADR 060 D2).
+
+        Rows are immutable (mirrors the agent registry): an update writes a
+        new ``(name, tenant_id, version)`` row. ``body.files`` MUST include
+        ``skill.yaml`` and is validated by the same skill loader the bundle
+        path uses; the spec's ``name`` must match the path ``name``.
+
+        Scope: ``admin`` (matches the existing ``POST /skills`` mutate).
+
+        Errors:
+
+        * **401** / **403** — auth / ``admin`` scope
+        * **409** — ``(name, version)`` already exists for this tenant
+        * **422** — files failed validation (missing ``skill.yaml`` / spec
+          parse error / name mismatch)
+        """
+        store: StorageProvider = request.app.state.storage
+        if "skill.yaml" not in body.files:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message="skill files must include 'skill.yaml' (the canonical spec)",
+            )
+        # Validate the spec via the same loader the bundle path uses, in a
+        # throwaway temp dir so a bad upload 422s here rather than poisoning
+        # the registry.
+        spec = _validate_skill_files(body.files)
+        if spec.name != name:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=422,
+                message=(f"skill.yaml name {spec.name!r} does not match the path name {name!r}"),
+            )
+        existing = await store.get_skill(name, tenant_id=ctx.tenant_id, version=body.version)
+        if existing is not None:
+            raise conflict(
+                f"skill {name!r} version {body.version!r} already exists — "
+                "publish a new version (rows are immutable)"
+            )
+        record = SkillRecord(
+            name=name,
+            tenant_id=ctx.tenant_id,
+            version=body.version,
+            created_by=ctx.api_key_id,
+            content_hash=content_hash(body.files),
+            description=(
+                body.description if body.description is not None else (spec.description or "")
+            ),
+            files=body.files,
+        )
+        await store.save_skill(record)
+        return SkillView.from_record(record)
+
+    @v1.delete(
+        "/skills/{name}",
+        response_model=SkillView,
+        tags=["skills-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_skill(
+        request: Request,
+        name: str,
+        version: str | None = None,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> SkillView:
+        """Delete a managed skill (ADR 060 D2).
+
+        ``?version=<v>`` removes just that version; omit to remove **all**
+        versions of the name. Returns the (latest) record that was removed.
+        Tenant-scoped — a cross-tenant or unknown name is **404**.
+
+        NOTE: this removes the **registry** record; the on-disk bundle under
+        ``skills_path`` (bundle-resolution, ADR 002) is left untouched, the
+        same separation the agent registry keeps between the durable row and
+        the working tree.
+
+        Scope: ``admin``.
+
+        Errors:
+
+        * **401** / **403** — auth / ``admin`` scope
+        * **404** — no such skill (or version) in this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        existing = await store.get_skill(name, tenant_id=ctx.tenant_id, version=version)
+        if existing is None:
+            raise not_found("skill", name if version is None else f"{name}@{version}")
+        await store.delete_skill(name, tenant_id=ctx.tenant_id, version=version)
+        return SkillView.from_record(existing)
+
+    @v1.post(
+        "/agents/{name}/skills",
+        response_model=ResourceAttachView,
+        tags=["skills-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_attach_skill_to_agent(
+        request: Request,
+        name: str,
+        body: ResourceAttachRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ResourceAttachView:
+        """Attach a registry skill to an agent by name (ADR 060 D2).
+
+        Records the agent→skill wiring in the agent's published bundle
+        ``skill.yaml`` references (the agent's ``skills:`` list), re-saving the
+        bundle as a new content-addressed version when the wiring changes.
+        The runtime registry-resolution that consumes the wiring at execution
+        time is **D4** (a separate PR) — this endpoint validates the
+        reference + records it, returning ``attached=false`` (idempotent)
+        when it was already present.
+
+        Both the agent and the referenced skill must exist in this tenant.
+
+        Scope: ``admin``.
+
+        Errors:
+
+        * **401** / **403** — auth / ``admin`` scope
+        * **404** — unknown agent, or unknown skill ``ref`` (/ version)
+        """
+        return await _attach_resource_to_agent(
+            request, ctx, agent_name=name, kind="skill", body=body
+        )
+
+    # ==================================================================
+    # /api/v1/contexts (ADR 060 D2) — managed shared-context CRUD +
+    # versions + agent-attach. Context analogue of the skills surface
+    # above; the payload is a single Markdown ``body`` (ADR 002) instead
+    # of a file bundle. Tenant-scoped; ``read`` on GET, ``admin`` on mutate.
+    # ==================================================================
+
+    @v1.get(
+        "/contexts",
+        response_model=ContextListResponse,
+        tags=["contexts-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_contexts(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=500),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ContextListResponse:
+        """List this tenant's managed contexts — latest version per name,
+        newest-first (ADR 060 D2)."""
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_contexts(tenant_id=ctx.tenant_id, limit=limit)
+        views = [ContextView.from_record(c) for c in rows]
+        return ContextListResponse(contexts=views, count=len(views))
+
+    @v1.post(
+        "/contexts",
+        response_model=ContextView,
+        status_code=201,
+        tags=["contexts-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_create_context(
+        request: Request,
+        body: ContextCreateRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ContextView:
+        """Create the first version of a managed context (ADR 060 D2).
+
+        ``name`` is the registry key. ``version`` defaults to ``"v1"``.
+
+        Scope: ``admin``.
+
+        Errors:
+
+        * **401** / **403** — auth / ``admin`` scope
+        * **409** — ``(name, version)`` already exists for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        existing = await store.get_context(body.name, tenant_id=ctx.tenant_id, version=body.version)
+        if existing is not None:
+            raise conflict(
+                f"context {body.name!r} version {body.version!r} already exists — "
+                "publish a new version via PUT (rows are immutable)"
+            )
+        record = ContextRecord(
+            name=body.name,
+            tenant_id=ctx.tenant_id,
+            version=body.version,
+            created_by=ctx.api_key_id,
+            content_hash=_body_content_hash(body.body),
+            description=body.description or "",
+            body=body.body,
+        )
+        await store.save_context(record)
+        return ContextView.from_record(record)
+
+    @v1.get(
+        "/contexts/{name}",
+        response_model=ContextView,
+        tags=["contexts-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_get_context(
+        request: Request,
+        name: str,
+        version: str | None = None,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ContextView:
+        """Fetch one managed context (ADR 060 D2).
+
+        ``?version=<v>`` pins an exact version; omit for the latest. A
+        cross-tenant or unknown name is **404** (no existence leak).
+        """
+        store: StorageProvider = request.app.state.storage
+        context = await store.get_context(name, tenant_id=ctx.tenant_id, version=version)
+        if context is None:
+            raise not_found("context", name if version is None else f"{name}@{version}")
+        return ContextView.from_record(context)
+
+    @v1.get(
+        "/contexts/{name}/versions",
+        response_model=ContextVersionsResponse,
+        tags=["contexts-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_context_versions(
+        request: Request,
+        name: str,
+        limit: int = Query(default=50, ge=1, le=200),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ContextVersionsResponse:
+        """Version history for one managed context, newest-first (ADR 060 D2).
+
+        A cross-tenant or unknown name returns an empty list (no leak)."""
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_context_versions(name, tenant_id=ctx.tenant_id, limit=limit)
+        views = [ContextView.from_record(c) for c in rows]
+        return ContextVersionsResponse(name=name, versions=views, count=len(views))
+
+    @v1.put(
+        "/contexts/{name}",
+        response_model=ContextView,
+        status_code=201,
+        tags=["contexts-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_upsert_context(
+        request: Request,
+        name: str,
+        body: ContextUpsertRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ContextView:
+        """Publish a NEW version of a managed context (ADR 060 D2).
+
+        Rows are immutable: an update writes a new
+        ``(name, tenant_id, version)`` row. Scope: ``admin``.
+
+        Errors:
+
+        * **401** / **403** — auth / ``admin`` scope
+        * **409** — ``(name, version)`` already exists for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        existing = await store.get_context(name, tenant_id=ctx.tenant_id, version=body.version)
+        if existing is not None:
+            raise conflict(
+                f"context {name!r} version {body.version!r} already exists — "
+                "publish a new version (rows are immutable)"
+            )
+        record = ContextRecord(
+            name=name,
+            tenant_id=ctx.tenant_id,
+            version=body.version,
+            created_by=ctx.api_key_id,
+            content_hash=_body_content_hash(body.body),
+            description=body.description or "",
+            body=body.body,
+        )
+        await store.save_context(record)
+        return ContextView.from_record(record)
+
+    @v1.delete(
+        "/contexts/{name}",
+        response_model=ContextView,
+        tags=["contexts-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_delete_context(
+        request: Request,
+        name: str,
+        version: str | None = None,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ContextView:
+        """Delete a managed context (ADR 060 D2).
+
+        ``?version=<v>`` removes just that version; omit to remove **all**
+        versions of the name. Returns the (latest) record removed.
+        Tenant-scoped — a cross-tenant or unknown name is **404**.
+
+        Scope: ``admin``.
+        """
+        store: StorageProvider = request.app.state.storage
+        existing = await store.get_context(name, tenant_id=ctx.tenant_id, version=version)
+        if existing is None:
+            raise not_found("context", name if version is None else f"{name}@{version}")
+        await store.delete_context(name, tenant_id=ctx.tenant_id, version=version)
+        return ContextView.from_record(existing)
+
+    @v1.post(
+        "/agents/{name}/contexts",
+        response_model=ResourceAttachView,
+        tags=["contexts-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_attach_context_to_agent(
+        request: Request,
+        name: str,
+        body: ResourceAttachRequest,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ResourceAttachView:
+        """Attach a registry context to an agent by name (ADR 060 D2).
+
+        Records the agent→context wiring in the agent's published bundle
+        (the agent's ``contexts:`` list), re-saving the bundle as a new
+        content-addressed version when the wiring changes. Runtime
+        registry-resolution is **D4** (a separate PR).
+
+        Both the agent and the referenced context must exist in this tenant.
+        Scope: ``admin``.
+
+        Errors:
+
+        * **401** / **403** — auth / ``admin`` scope
+        * **404** — unknown agent, or unknown context ``ref`` (/ version)
+        """
+        return await _attach_resource_to_agent(
+            request, ctx, agent_name=name, kind="context", body=body
         )
 
     @v1.get(

@@ -145,6 +145,24 @@ REMOTE_VERB_ROUTES: dict[str, list[tuple[str, str]]] = {
     "webhooks attempts": [("GET", "/api/v1/webhooks/{webhook_id}/attempts")],
     # capability discovery (ADR 045 D9)
     "capabilities": [("GET", "/api/v1/capabilities")],
+    # managed skills registry (ADR 060 D2/D3) — the local ``mdk skills`` verbs
+    # operate on the bundle's skills/ folder; these ``remote`` verbs manage the
+    # durable, tenant-scoped registry over the API.
+    "skills remote list": [("GET", "/api/v1/skills")],
+    "skills remote get": [("GET", "/api/v1/skills/{name}")],
+    "skills remote versions": [("GET", "/api/v1/skills/{name}/versions")],
+    "skills remote create": [("PUT", "/api/v1/skills/{name}")],
+    "skills remote update": [("PUT", "/api/v1/skills/{name}")],
+    "skills remote delete": [("DELETE", "/api/v1/skills/{name}")],
+    "skills remote attach": [("POST", "/api/v1/agents/{name}/skills")],
+    # managed contexts registry (ADR 060 D2/D3)
+    "contexts remote list": [("GET", "/api/v1/contexts")],
+    "contexts remote get": [("GET", "/api/v1/contexts/{name}")],
+    "contexts remote versions": [("GET", "/api/v1/contexts/{name}/versions")],
+    "contexts remote create": [("POST", "/api/v1/contexts")],
+    "contexts remote update": [("PUT", "/api/v1/contexts/{name}")],
+    "contexts remote delete": [("DELETE", "/api/v1/contexts/{name}")],
+    "contexts remote attach": [("POST", "/api/v1/agents/{name}/contexts")],
 }
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ from movate.core.models import (
     CatalogEntryVersion,
     CatalogRatingsSummary,
     CatalogSource,
+    ContextRecord,
     ConversationThread,
     DiagnosisRecord,
     Entity,
@@ -53,6 +54,7 @@ from movate.core.models import (
     RunRecord,
     Session,
     SessionMessage,
+    SkillRecord,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
@@ -90,6 +92,10 @@ class InMemoryStorage:
         self.evals: list[EvalRecord] = []
         self.bench: list[BenchRecord] = []
         self.agent_bundles: list[AgentBundleRecord] = []
+        # ADR 060 D1: skill + context analogues of agent_bundles. Same shape;
+        # the registry doubles as the version history.
+        self.skills: list[SkillRecord] = []
+        self.contexts: list[ContextRecord] = []
         # ADR 037 D1: workflow analogue of agent_bundles. Same shape; the
         # registry doubles as the version history.
         self.workflow_bundles: list[WorkflowBundleRecord] = []
@@ -617,6 +623,131 @@ class InMemoryStorage:
 
         to_delete = [b for b in self.agent_bundles if _matches(b)]
         self.agent_bundles = [b for b in self.agent_bundles if not _matches(b)]
+        return len(to_delete)
+
+    # ------------------------------------------------------------------
+    # Skills registry (ADR 060 D1) — mirrors the agent-bundle surface.
+    # ------------------------------------------------------------------
+
+    async def save_skill(self, skill: SkillRecord) -> None:
+        self.skills.append(skill)
+
+    async def get_skill(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> SkillRecord | None:
+        matches = [s for s in self.skills if s.name == name and s.tenant_id == tenant_id]
+        if version is not None:
+            matches = [s for s in matches if s.version == version]
+        if not matches:
+            return None
+        # version=None → latest by created_at (matches the SQL backends).
+        return max(matches, key=lambda s: s.created_at)
+
+    async def list_skills(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[SkillRecord]:
+        rows = [s for s in self.skills if s.tenant_id == tenant_id]
+        latest: dict[str, SkillRecord] = {}
+        for s in rows:
+            current = latest.get(s.name)
+            if current is None or s.created_at > current.created_at:
+                latest[s.name] = s
+        ordered = sorted(latest.values(), key=lambda s: s.created_at, reverse=True)
+        return ordered[:limit]
+
+    async def list_skill_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[SkillRecord]:
+        rows = [s for s in self.skills if s.name == name and s.tenant_id == tenant_id]
+        return sorted(rows, key=lambda s: s.created_at, reverse=True)[:limit]
+
+    async def delete_skill(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        def _matches(s: SkillRecord) -> bool:
+            if s.name != name or s.tenant_id != tenant_id:
+                return False
+            return version is None or s.version == version
+
+        to_delete = [s for s in self.skills if _matches(s)]
+        self.skills = [s for s in self.skills if not _matches(s)]
+        return len(to_delete)
+
+    # ------------------------------------------------------------------
+    # Contexts registry (ADR 060 D1) — mirrors the agent-bundle surface.
+    # ------------------------------------------------------------------
+
+    async def save_context(self, context: ContextRecord) -> None:
+        self.contexts.append(context)
+
+    async def get_context(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> ContextRecord | None:
+        matches = [c for c in self.contexts if c.name == name and c.tenant_id == tenant_id]
+        if version is not None:
+            matches = [c for c in matches if c.version == version]
+        if not matches:
+            return None
+        return max(matches, key=lambda c: c.created_at)
+
+    async def list_contexts(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[ContextRecord]:
+        rows = [c for c in self.contexts if c.tenant_id == tenant_id]
+        latest: dict[str, ContextRecord] = {}
+        for c in rows:
+            current = latest.get(c.name)
+            if current is None or c.created_at > current.created_at:
+                latest[c.name] = c
+        ordered = sorted(latest.values(), key=lambda c: c.created_at, reverse=True)
+        return ordered[:limit]
+
+    async def list_context_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[ContextRecord]:
+        rows = [c for c in self.contexts if c.name == name and c.tenant_id == tenant_id]
+        return sorted(rows, key=lambda c: c.created_at, reverse=True)[:limit]
+
+    async def delete_context(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        def _matches(c: ContextRecord) -> bool:
+            if c.name != name or c.tenant_id != tenant_id:
+                return False
+            return version is None or c.version == version
+
+        to_delete = [c for c in self.contexts if _matches(c)]
+        self.contexts = [c for c in self.contexts if not _matches(c)]
         return len(to_delete)
 
     # ------------------------------------------------------------------
