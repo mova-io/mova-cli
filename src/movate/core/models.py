@@ -2891,6 +2891,16 @@ class JobKind(StrEnum):
     agent registry, prompts, contexts, or eval datasets — read-only is
     enforced by construction (the Auditor only reads + calls the
     BaseLLMProvider; never invokes the storage save_agent / save_kb paths)."""
+    FINETUNE = "finetune"
+    """Async fine-tune job (ADR 063). ``JobRecord.input`` carries the
+    fine-tune config (``base_model``, ``min_score``, ``provider``,
+    ``promote_if_better``). The worker builds a training dataset from the
+    agent's harvested/golden eval cases (:func:`movate.core.finetune.
+    build_finetune_dataset`), dispatches a hosted fine-tune via the
+    :class:`movate.core.finetune.FineTuneProvider` seam (BYOK keys), registers
+    the resulting model in the catalog with provenance, and runs eval-vs-base
+    — never auto-promoting unless ``promote_if_better`` is set. The job's
+    output payload carries ``{model_id, eval_id}``."""
 
 
 class JobRecord(BaseModel):
