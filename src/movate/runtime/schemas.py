@@ -515,6 +515,62 @@ class CapabilityVoiceView(BaseModel):
     Empty when no TTS key is configured."""
 
 
+class VoiceTurnView(BaseModel):
+    """The JSON envelope of one one-shot voice turn (ADR 050 D2 / D10).
+
+    Returned by ``POST /api/v1/agents/{name}/voice`` — the REST parity to the
+    streaming WS. It is the *same* turn as a WS turn collapsed to a single
+    request/response: STT → the UNCHANGED Executor → TTS. The envelope carries
+    the transcript (what the caller said), the response text (what the agent
+    answered), and a **reference** to the synthesized audio — **never** the
+    audio bytes inline (ADR 050 D10 rejects base64-in-JSON; the bytes ride a
+    binary side-channel / signed URL).
+
+    The three-stage cost (STT-seconds + LLM-tokens + TTS-chars, ADR 036) and
+    the per-stage latency ride the response **headers** (ADR 050 D7 /
+    ``X-MDK-Cost-USD`` / ``X-MDK-Voice-Latency-*``), not this body — the body
+    stays clean + codegen-friendly (ADR 045 D8).
+
+    CLAUDE.md rule 5 — flagged: this is the response shape of a NEW additive
+    ``/api/v1`` endpoint. It changes no existing endpoint's contract.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    transcript: str
+    """What the caller said — STT's endpointed (final) transcript of the
+    inbound audio. Empty string only if STT produced no final (an ``error``
+    status accompanies that case)."""
+    response_text: str
+    """What the agent answered — the unchanged Executor's human-readable
+    output text for this turn (the text that was spoken via TTS)."""
+    audio_url: str | None = None
+    """A short-lived signed URL to fetch the synthesized answer audio
+    (ADR 050 D10 — the batch/large-audio path). ``None`` when the audio was
+    returned inline on the binary side-channel instead, or when TTS produced
+    no audio (a degraded text-only turn)."""
+    audio_bytes_b64: str | None = None
+    """Base64 of the synthesized answer audio, populated ONLY when the caller
+    explicitly opts into an inline body (``?audio=inline``) for small
+    test/telephony turns where a side-channel is overkill. ``None`` by default
+    — the codegen-clean shape keeps audio out of the JSON (ADR 050 D10). When
+    set, ``audio_codec`` + ``audio_sample_rate`` describe the bytes."""
+    audio_codec: str | None = None
+    """The codec of the synthesized audio (e.g. ``pcm16``), when audio was
+    produced. ``None`` on a text-only / errored turn."""
+    audio_sample_rate: int | None = None
+    """The sample rate (Hz) of the synthesized audio, when produced."""
+    run_id: str = ""
+    """The run id of this turn — a voice turn IS a run (ADR 050 D1), so it
+    shows up in ``mdk runs list`` / ``/api/v1/usage`` / traces like any run."""
+    status: str = ""
+    """Terminal status of the turn (``success`` / ``error`` / ``interrupted``),
+    mirroring the WS terminal ``done`` frame."""
+    error: str | None = None
+    """A human-readable failure reason when ``status == "error"`` (the stage
+    that degraded — STT/agent/TTS — per ADR 048 D8), else ``None``."""
+
+
 class CapabilityModelsView(BaseModel):
     """The ``models`` block of :class:`CapabilitiesView`.
 
@@ -3062,6 +3118,7 @@ __all__ = [
     "TriggerCreatedView",
     "TriggerListView",
     "TriggerView",
+    "VoiceTurnView",
     "WizardAgentSubmission",
     "WorkflowRunListView",
     "WorkflowRunView",
