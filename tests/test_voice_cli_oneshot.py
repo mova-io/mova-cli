@@ -51,7 +51,11 @@ def test_oneshot_verbs_registered() -> None:
     for verb in ("say", "transcribe", "ask"):
         result = runner.invoke(voice_app, [verb, "--help"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
-        assert "--target" in result.output
+    # Only the remote one-shot `ask` targets a deployed runtime; `say` (local
+    # TTS) and `transcribe` (local STT) run against the local voice pipeline and
+    # take no `--target`. (Remote-verb→route mapping is covered by the parity gate.)
+    ask_help = runner.invoke(voice_app, ["ask", "--help"], env={"COLUMNS": "200"})
+    assert "--target" in ask_help.output, ask_help.output
 
 
 # ---------------------------------------------------------------------------
