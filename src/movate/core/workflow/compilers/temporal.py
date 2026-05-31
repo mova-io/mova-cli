@@ -406,6 +406,7 @@ class TemporalCompiler:
             "",
             "from temporalio import workflow",
             "from temporalio.common import RetryPolicy",
+            "from temporalio.exceptions import ApplicationError",
             "",
             "# Phase 1 retry/timeout defaults — ADR 054 D9. Per-node overrides land",
             "# in Phase 3 (per-activity policies declared in workflow.yaml).",
@@ -432,35 +433,71 @@ class TemporalCompiler:
             f"class {cls_name}:",
             f'    """Temporal workflow for {spec.name!r} (v{spec.version}).',
             "",
+            "    Control flow is a DISPATCH LOOP over node ids that mirrors the",
+            "    native runner's dynamic traversal (runner._walk): each node sets",
+            "    the next ``current`` node id — AGENT/SKILL nodes advance to their",
+            "    sequential successor, GATE/INTENT_ROUTER nodes branch to",
+            "    ``routes[label]`` (or ``fallback``) on the classifier's decision.",
+            "    Branch decisions are recorded in Temporal history (the gate",
+            "    activity's result), so replay reaches the same branch (ADR 054 D4/D5).",
+            "",
             "    State (ADR 054 D10): workflow-scope holds CONTROL FLOW only —",
-            "    activity-result handles, branch decisions, current-node id, session id.",
+            "    activity results, the current-node id, the visited set, run id.",
             "    Conversation state lives in the session store (ADR 045 D10), read",
             "    + written by the activity through the existing Executor.",
             '    """',
             "",
             "    @workflow.run",
             "    async def run(self, initial_state: dict[str, Any]) -> dict[str, Any]:",
-            f'        """Run from entrypoint {spec.entrypoint!r} → terminal node.',
+            f'        """Run from entrypoint {spec.entrypoint!r}, following the chosen branch.',
             "",
             "        ``initial_state`` is the parsed JSON state object the native",
             "        runner also takes. Determinism: every clock/RNG/IO call is",
-            "        inside an activity (ADR 054 D5).",
+            "        inside an activity (ADR 054 D5); the loop branches only on",
+            "        recorded activity results, so replay is deterministic.",
             '        """',
             "        state: dict[str, Any] = dict(initial_state)",
             "        run_id = workflow.info().workflow_id",
-            "",
+            f"        current: str | None = {spec.entrypoint!r}",
+            "        # Cycle guard — mirrors the native runner; a revisited node means",
+            "        # a non-deterministic loop the bounded patterns never produce.",
+            "        visited: set[str] = set()",
+            "        while current is not None:",
+            "            if current in visited:",
+            "                raise ApplicationError(",
+            '                    f"workflow cycle detected at node {current!r}"',
+            "                )",
+            "            visited.add(current)",
         ]
 
-        # Emit each node in topological order. Per-node code is a tiny
-        # self-contained block; this keeps the generated file linear and
-        # easy to skim, matching the LangGraph emitter's convention.
+        # Emit each node as an ``if/elif current == <id>:`` branch of the
+        # dispatch loop. The per-node emitters return zero-indented statement
+        # lines (the work + the ``current = <next>`` advance); we wrap each in
+        # its branch and indent the body uniformly. Topological order only
+        # affects the file layout (operator-friendly) — the loop dispatches by
+        # id, so any order is correct.
+        first = True
         for nid in order:
             node = spec.nodes[nid]
-            block, used = self._emit_node(nid, node, spec)
-            body_lines.extend(block)
+            stmts, used = self._emit_node(nid, node, spec)
+            keyword = "if" if first else "elif"
+            body_lines.append(f"            {keyword} current == {nid!r}:")
+            body_lines.extend(("                " + ln if ln else "") for ln in stmts)
             activity_names.update(used)
-            body_lines.append("")
+            first = False
 
+        if order:
+            # Defensive else — every route target / successor is a validated
+            # node id, so this is unreachable in practice; it fails loud rather
+            # than spinning the loop forever on an unknown id.
+            body_lines.append("            else:")
+            body_lines.append(
+                '                raise ApplicationError(f"unknown workflow node {current!r}")'
+            )
+        else:  # pragma: no cover — compile_workflow guarantees a valid entrypoint.
+            body_lines.append("            current = None")
+
+        body_lines.append("")
         body_lines.append("        return state")
 
         source = "\n".join(header + body_lines) + "\n"
@@ -483,7 +520,12 @@ class TemporalCompiler:
         )
 
     def _emit_node(self, nid: str, node: Any, spec: WorkflowGraph) -> tuple[list[str], set[str]]:
-        """Dispatch by node type, returning ``(body_lines, activity_names_used)``."""
+        """Dispatch by node type, returning ``(stmt_lines, activity_names_used)``.
+
+        ``stmt_lines`` are *zero-indented* statements (the node's work plus the
+        ``current = <next>`` advance); :meth:`_emit_workflow_defn` wraps them in
+        the dispatch loop's ``if/elif current == <id>:`` branch and indents.
+        """
         node_type = node.type
         if node_type is NodeType.AGENT:
             return self._emit_agent_node(nid, node, spec)
@@ -500,16 +542,20 @@ class TemporalCompiler:
             # Sub-workflow support is Phase 3+. Emit a placeholder so the
             # compiler stays total and the operator gets a clear failure.
             lines = [
-                f"        # SUB_WORKFLOW {nid!r}: deferred to a later phase.",
-                f"        raise NotImplementedError("
-                f'"sub_workflow node {nid!r} is not supported in Phase 1")',
+                f"# SUB_WORKFLOW {nid!r}: deferred to a later phase.",
+                (
+                    f'raise NotImplementedError("sub_workflow node {nid!r} '
+                    'is not supported in Phase 1")'
+                ),
             ]
             return lines, set()
         # Default — FUNCTION or unknown future type. Stub.
         lines = [
-            f"        # node {nid!r} (type={node_type.value}): emitted as a generic activity stub.",
-            f"        raise NotImplementedError("
-            f'"node type {node_type.value!r} is not supported in Phase 1")',
+            f"# node {nid!r} (type={node_type.value}): generic activity stub.",
+            (
+                f'raise NotImplementedError("node type {node_type.value!r} '
+                'is not supported in Phase 1")'
+            ),
         ]
         return lines, set()
 
@@ -518,21 +564,25 @@ class TemporalCompiler:
     ) -> tuple[list[str], set[str]]:
         """AGENT → ``await workflow.execute_activity(call_agent_activity, ...)``.
 
-        Per ADR 054 D4: each agent call lowers to a single activity call.
-        Per D11: metering wraps the activity, so retries don't over-meter.
+        Per ADR 054 D4: each agent call lowers to a single activity call; the
+        node then advances to its sequential successor (the native runner's
+        ``_sequential_successor`` rule). Per D11: metering wraps the activity,
+        so retries don't over-meter.
         """
         method = _safe_method_name(nid)
+        nxt = self._sequential_successor(spec, nid)
         body = [
-            f"        # node {nid!r} — AGENT (ADR 054 D4 row 1)",
-            "        # Activity body forwards to Executor.execute(...) via Track C wrapper.",
-            f"        {method}_result = await workflow.execute_activity(",
-            "            call_agent_activity,",
-            f"            args=[{nid!r}, {node.ref!r}, state, run_id],",
-            "            schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
-            "            heartbeat_timeout=_HEARTBEAT,",
-            "            retry_policy=_RETRY_POLICY,",
-            "        )",
-            f"        state.update({method}_result)",
+            f"# node {nid!r} — AGENT (ADR 054 D4 row 1)",
+            "# Activity body forwards to Executor.execute(...) via Track C wrapper.",
+            f"{method}_result = await workflow.execute_activity(",
+            "    call_agent_activity,",
+            f"    args=[{nid!r}, {node.ref!r}, state, run_id],",
+            "    schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+            "    heartbeat_timeout=_HEARTBEAT,",
+            "    retry_policy=_RETRY_POLICY,",
+            ")",
+            f"state.update({method}_result)",
+            f"current = {nxt!r}",
         ]
         return body, {"call_agent_activity"}
 
@@ -541,16 +591,18 @@ class TemporalCompiler:
     ) -> tuple[list[str], set[str]]:
         """SKILL → ``await workflow.execute_activity(call_skill_activity, ...)``."""
         method = _safe_method_name(nid)
+        nxt = self._sequential_successor(spec, nid)
         body = [
-            f"        # node {nid!r} — SKILL (ADR 054 D4 row 7)",
-            f"        {method}_result = await workflow.execute_activity(",
-            "            call_skill_activity,",
-            f"            args=[{nid!r}, {node.ref!r}, state, run_id],",
-            "            schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
-            "            heartbeat_timeout=_HEARTBEAT,",
-            "            retry_policy=_RETRY_POLICY,",
-            "        )",
-            f"        state.update({method}_result)",
+            f"# node {nid!r} — SKILL (ADR 054 D4 row 7)",
+            f"{method}_result = await workflow.execute_activity(",
+            "    call_skill_activity,",
+            f"    args=[{nid!r}, {node.ref!r}, state, run_id],",
+            "    schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+            "    heartbeat_timeout=_HEARTBEAT,",
+            "    retry_policy=_RETRY_POLICY,",
+            ")",
+            f"state.update({method}_result)",
+            f"current = {nxt!r}",
         ]
         return body, {"call_skill_activity"}
 
@@ -559,37 +611,55 @@ class TemporalCompiler:
     ) -> tuple[list[str], set[str]]:
         """GATE / INTENT_ROUTER → activity returns a decision; workflow branches.
 
-        Per ADR 054 D4 row 3: routing decisions are recorded in history so
-        replay arrives at the same branch. The emitted branch table is
-        ordered by the route keys' insertion order so the generated file is
-        stable across runs (matches the langgraph emitter's stability).
+        Emits REAL conditional control flow (ADR 054 D4 row 3): the gate
+        activity returns a decision dict carrying ``"label"``; the workflow
+        selects the next node as ``routes[label]`` (or ``fallback`` when the
+        label is unknown) — byte-for-byte the native runner's
+        ``_run_intent_router`` routing-table semantics. The decision is recorded
+        in Temporal history (the activity result), so replay reaches the same
+        branch (D5).
+
+        The decision is NOT merged into ``state``: the native runner stamps
+        nothing at a gate (it only chooses the next node), so merging it would
+        diverge the final state. The gate records control flow only (D10). The
+        classifier ref is resolved by ``call_gate_activity`` against the
+        workflow dir baked into the args (the IR leaves ``classifier_agent``
+        relative, unlike the absolutized AGENT ``node.ref``).
         """
         method = _safe_method_name(nid)
         routes: dict[str, str] = node.metadata.get("routes", {}) or {}
         fallback: str = node.metadata.get("fallback", "")
         classifier: str = node.metadata.get("classifier_agent", "")
+        input_field: str = node.metadata.get("input_field", "")
+        workflow_dir = str(spec.workflow_dir)
+        routes_literal = "{" + ", ".join(f"{k!r}: {v!r}" for k, v in routes.items()) + "}"
+        labels_literal = "[" + ", ".join(repr(k) for k in routes) + "]"
         body = [
-            f"        # node {nid!r} — GATE / INTENT_ROUTER (ADR 054 D4 row 3)",
-            "        # JUDGE activity also fits this shape — same activity wrapper,",
-            "        # different metadata (see _emit_judge_node).",
-            f"        {method}_decision = await workflow.execute_activity(",
-            "            call_gate_activity,",
-            f"            args=[{nid!r}, {classifier!r}, state, run_id],",
-            "            schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
-            "            heartbeat_timeout=_HEARTBEAT,",
-            "            retry_policy=_RETRY_POLICY,",
-            "        )",
-            "        # Branch on the gate's decision (recorded in history).",
-            f"        state['{method}_decision'] = {method}_decision",
+            f"# node {nid!r} — GATE / INTENT_ROUTER (ADR 054 D4 row 3)",
+            "# The classifier activity returns a decision dict carrying 'label';",
+            "# we branch to routes[label] (or fallback) — mirroring the native",
+            "# runner's _run_intent_router. The decision is NOT merged into state",
+            "# (native parity: a gate records control flow only, ADR 054 D10).",
         ]
-        # Branch comments — purely documentary so the generated file
-        # explains the routing without changing control flow at this layer
-        # (the workflow body is linear by construction in Phase 1; the
-        # gate stamps state, the downstream node reads it).
+        # Documentary route table — kept so the generated file explains the
+        # routing inline (and pins the operator-readable shape in tests).
         for label, target in routes.items():
-            body.append(f"        # route {label!r} → next node {target!r}")
+            body.append(f"# route {label!r} → next node {target!r}")
         if fallback:
-            body.append(f"        # fallback → {fallback!r}")
+            body.append(f"# fallback → {fallback!r}")
+        body += [
+            f"{method}_decision = await workflow.execute_activity(",
+            "    call_gate_activity,",
+            f"    args=[{nid!r}, {classifier!r}, state, run_id, {workflow_dir!r}, "
+            f"{input_field!r}, {labels_literal}],",
+            "    schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+            "    heartbeat_timeout=_HEARTBEAT,",
+            "    retry_policy=_RETRY_POLICY,",
+            ")",
+            f"{method}_label = str({method}_decision.get('label', ''))",
+            f"{method}_routes = {routes_literal}",
+            f"current = {method}_routes.get({method}_label, {fallback!r})",
+        ]
         return body, {"call_gate_activity"}
 
     def _emit_judge_node(
@@ -625,16 +695,32 @@ class TemporalCompiler:
         with an external ``signal``. Phase 1 emits a placeholder + a clear
         ``NotImplementedError`` so a HUMAN node compiled today fails loudly
         the moment a Temporal worker tries to execute it — never silently.
+        (``compile()`` already rejects HUMAN nodes before emission; this is the
+        defensive in-body guard if one ever reaches the dispatch loop.)
         """
         body = [
-            "        # STUB for Phase 2 — will become workflow.wait_condition + signal.",
-            "        # See ADR 054 Phase 2 row (HUMAN). Until then this node is",
-            "        # rejected by the compiler (see TemporalCompiler.compile).",
-            "        raise NotImplementedError(",
-            f'            "HUMAN node {nid!r} requires Phase 2 (signal-based HITL) — see ADR 054"',
-            "        )",
+            "# STUB for Phase 2 — will become workflow.wait_condition + signal.",
+            "# See ADR 054 Phase 2 row (HUMAN). Until then this node is",
+            "# rejected by the compiler (see TemporalCompiler.compile).",
+            "raise NotImplementedError(",
+            f'    "HUMAN node {nid!r} requires Phase 2 (signal-based HITL) — see ADR 054"',
+            ")",
         ]
         return body, set()
+
+    @staticmethod
+    def _sequential_successor(graph: WorkflowGraph, node_id: str) -> str | None:
+        """The single sequential successor of ``node_id`` (or ``None`` at a sink).
+
+        A faithful copy of :meth:`movate.core.workflow.runner.WorkflowRunner.
+        _sequential_successor`: it filters out ``synthetic`` edges (the
+        compiler-injected intent-router fan-out edges) so an AGENT/SKILL node
+        advances down its real next-in-chain edge only. Keeping the rule
+        identical to the native runner is what makes the dispatch loop's
+        traversal match native node-for-node (ADR 055 D7).
+        """
+        seq = [e.to_id for e in graph.successors(node_id) if not e.metadata.get("synthetic")]
+        return seq[0] if seq else None
 
     def _emit_activity_call(
         self,
