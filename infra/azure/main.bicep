@@ -125,6 +125,60 @@ prospects shouldn't see an internal URL).
 param teamsLangfusePublicHost string = ''
 
 @description('''
+Deploy the hosted Chainlit playground Container App (ADR 053) — a
+shareable, Entra-SSO-gated test portal in the SAME Container Apps
+Environment as the runtime. Default-off + purely additive (mirrors
+``enableTeamsBot`` / ``enableScheduler`` / ``deployLangfuse``): when
+false, ZERO playground resources are emitted and the template is
+byte-for-byte unchanged.
+
+Same two-pass story as ``enableApiWorker`` — the app references three
+Key Vault secrets (``pg-admin-password``, ``playground-runtime-key``,
+``playground-entra-client-secret``) that ACA validates at create time,
+so populate them first (see docs/playground-deploy.md), then flip this
+true.
+
+REQUIRES ``enableApiWorker = true`` (the playground points at the api
+app's in-env FQDN) AND ``playgroundEntraClientId`` set (Easy Auth binds
+to the operator-pre-created Entra app registration at create time).
+''')
+param enablePlayground bool = false
+
+@description('''
+Entra ID (Azure AD) application **client id** for the playground's Easy
+Auth (ADR 053 D4). The app registration is **operator-pre-created**
+OUTSIDE Bicep via:
+    az ad app create --display-name "movate-playground-${env}" \
+        --web-redirect-uris "https://<playground-fqdn>/.auth/login/aad/callback"
+Copy the printed appId here. Required when ``enablePlayground`` is true;
+ignored otherwise. See docs/playground-deploy.md for the full ordering —
+the redirect URI needs the app's FQDN, so the app is deployed once to
+learn its FQDN, then the redirect URI is added and the secret minted.
+''')
+param playgroundEntraClientId string = ''
+
+@description('''
+Tenant id whose Entra directory issues the playground's Easy Auth
+tokens. Empty (default) → the deployment's own tenant
+(``subscription().tenantId``), the common case (Movate staff + Entra B2B
+guests in the same directory). Set only for a cross-tenant app
+registration.
+''')
+param playgroundEntraTenantId string = ''
+
+@description('''
+Cold-start knob for the playground (ADR 053 D7). Override for the
+playground Container App's ``scale.minReplicas``. Leave at the ``-1``
+sentinel (default) to keep the module default of ``0`` (scale-to-zero —
+an idle portal costs nothing and spins up on the first authenticated
+request). Set ``1``+ to keep it warm for demos. Any value ``>= 0``
+overrides; ``-1`` means "use the module default".
+''')
+@minValue(-1)
+@maxValue(10)
+param playgroundMinReplicas int = -1
+
+@description('''
 Comma-separated list of origins (no spaces) the API's CORS layer
 allows. Becomes ``MDK_CORS_ALLOWED_ORIGINS`` on the API container.
 Empty string means "no browser callers configured" — the API still
@@ -312,6 +366,13 @@ var workerQueueDepthPerReplica = isProd ? 10 : 3
 var apiMinReplicasEffective = apiMinReplicas >= 0 ? max(apiMinReplicas, 0) : apiMinReplicasDefault
 var workerMinReplicasEffective = workerMinReplicas >= 0 ? max(workerMinReplicas, 0) : workerMinReplicasDefault
 
+// Playground minReplicas (ADR 053 D7). Module default is 0 (scale-to-zero);
+// the -1 sentinel means "use that default". max(override, 0) clamps to the
+// module's @minValue(0) and proves non-negativity to the type-checker (the
+// >= 0 guard already excludes -1, so max() never alters a real value).
+var playgroundMinReplicasDefault = 0
+var playgroundMinReplicasEffective = playgroundMinReplicas >= 0 ? max(playgroundMinReplicas, 0) : playgroundMinReplicasDefault
+
 // ---------------------------------------------------------------------------
 // Resource names — see docs/v1.0-azure-design §2 for the convention.
 // ---------------------------------------------------------------------------
@@ -336,6 +397,7 @@ var schedulerName = 'movate-${env}-scheduler'
 var saName = 'movate${env}sa${sfxNoHyphen}'
 var teamsBotName = 'movate-${env}-teams-bot'
 var botServiceName = 'movate-${env}-bot'
+var playgroundName = 'movate-${env}-playground'
 // User-assigned identities for the api + worker + teams-bot apps.
 // Pre-created at this level (before the app modules) so role assignments
 // can be granted to their principalIds BEFORE the apps exist. Avoids
@@ -348,6 +410,7 @@ var botServiceName = 'movate-${env}-bot'
 var apiUaiName = 'movate-${env}-api-mi'
 var workerUaiName = 'movate-${env}-worker-mi'
 var teamsBotUaiName = 'movate-${env}-teams-bot-mi'
+var playgroundUaiName = 'movate-${env}-playground-mi'
 var langfuseName = 'movate-${env}-langfuse'
 var langfuseUaiName = 'movate-${env}-langfuse-mi'
 // RG-scoped — no global-uniqueness suffix needed (App Insights component
@@ -533,6 +596,16 @@ resource workerUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31'
 // pull the image / read KV on its first revision.
 resource teamsBotUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: teamsBotUaiName
+  location: location
+  tags: tags
+}
+
+// Playground app UAI (ADR 053). Same rationale as the api/worker/teams-bot
+// UAIs: pre-create at the top level (unconditionally — cheap + idempotent) so
+// its ACR-pull + KV-secrets-read role assignments land on pass 1, before the
+// Container App's first revision tries to pull the image / read KV.
+resource playgroundUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: playgroundUaiName
   location: location
   tags: tags
 }
@@ -771,6 +844,45 @@ module botService 'modules/bot-service.bicep' = if (enableTeamsBot) {
 }
 
 // ---------------------------------------------------------------------------
+// Hosted playground (ADR 053 D1 + D4) — the shareable, Entra-SSO-gated test
+// portal. Gated on BOTH ``enablePlayground`` AND ``enableApiWorker``: the
+// playground points at the api app's in-env FQDN (it has nothing to talk to
+// without the runtime), mirroring how the scheduler is gated on
+// ``enableScheduler && enableApiWorker``. Default-off + additive: with
+// enablePlayground=false the module isn't instantiated, so no playground app /
+// authConfig is emitted and the template is byte-for-byte unchanged.
+//
+// Easy Auth (D4) binds to an operator-pre-created Entra app registration
+// (playgroundEntraClientId) inside the module's authConfig child resource; the
+// client secret is read from Key Vault like the other modules' secrets. The
+// empty playgroundEntraTenantId default resolves to subscription().tenantId
+// inside the module.
+// ---------------------------------------------------------------------------
+module playground 'modules/containerapp-playground.bicep' = if (enablePlayground && enableApiWorker) {
+  name: 'playground-${env}'
+  params: {
+    name: playgroundName
+    location: location
+    environmentId: cae.outputs.envId
+    acrLoginServer: acr.outputs.loginServer
+    acrResourceId: acr.outputs.registryId
+    image: image
+    keyVaultUri: kv.outputs.vaultUri
+    // Talk to the api app over the in-env ingress FQDN (same env → reachable).
+    runtimeUrl: enableApiWorker ? 'https://${api!.outputs.fqdn}' : ''
+    postgresFqdn: pg.outputs.serverFqdn
+    postgresDatabase: pg.outputs.databaseName
+    postgresAdminUsername: pg.outputs.adminUsername
+    entraClientId: playgroundEntraClientId
+    // Empty → the module falls back to subscription().tenantId.
+    entraTenantId: empty(playgroundEntraTenantId) ? subscription().tenantId : playgroundEntraTenantId
+    minReplicas: playgroundMinReplicasEffective
+    userAssignedIdentityId: playgroundUai.id
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Role assignments — give the Container Apps' managed identities the
 // permissions they need:
 //
@@ -876,6 +988,31 @@ resource teamsBotKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+// Playground role assignments (ADR 053). Mirror the api/worker/teams-bot
+// grants — the playground needs ACR-pull (same image) + KV-secrets-read
+// (pg-admin-password, playground-runtime-key, playground-entra-client-secret).
+// Un-gated from enablePlayground (the UAI always exists; assignments are cheap
+// + idempotent) so they land on pass 1 before the app's first revision.
+resource playgroundAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: acrResource
+  name: guid(acrResource.id, playgroundUaiName, acrPullRoleId)
+  properties: {
+    principalId: playgroundUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+  }
+}
+
+resource playgroundKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: kvResource
+  name: guid(kvResource.id, playgroundUaiName, kvSecretsUserRoleId)
+  properties: {
+    principalId: playgroundUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
+  }
+}
+
 // Langfuse needs KV-secrets-read (DB URL + nextauth/salt/encryption-key).
 // No AcrPull grant — it runs the public langfuse/langfuse image, not ours.
 // Un-gated (the UAI always exists) so it lands on pass 1.
@@ -910,6 +1047,9 @@ output teamsBotWebhookUrl string = enableTeamsBot ? teamsBot!.outputs.webhookUrl
 
 @description('Bot Service resource id. Empty when enableTeamsBot=false. Used by Teams Admin Center when publishing.')
 output botServiceId string = enableTeamsBot ? botService!.outputs.botServiceId : ''
+
+@description('Shareable (Entra-SSO-gated) URL of the hosted playground (ADR 053). Empty when enablePlayground=false. Share THIS link with invited testers; access is gated by Easy Auth.')
+output playgroundUrl string = (enablePlayground && enableApiWorker) ? playground!.outputs.playgroundUrl : ''
 
 @description('Self-hosted Langfuse URL. Empty when deployLangfuse=false. Open it to create a project + mint keys, then store them in KV as langfuse-public-key / langfuse-secret-key.')
 output langfuseUrl string = deployLangfuse ? langfuse!.outputs.publicUrl : ''

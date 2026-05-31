@@ -107,3 +107,56 @@ FROM app AS worker
 
 ENTRYPOINT ["movate"]
 CMD ["worker"]
+
+# ---------------------------------------------------------------------------
+# Stage 5: playground — hosts the Chainlit playground (ADR 053 D2).
+#
+# Same codebase + CLI as the runtime, but a DIFFERENT extras set: it needs the
+# `[playground]` extra (chainlit + its async-ORM deps) and MUST NOT carry
+# `[airflow]` — the two are declared conflicting in pyproject.toml (chainlit's
+# data layer needs sqlalchemy>=2.0; airflow pins 1.4), so `uv sync --all-extras`
+# can't co-resolve them (ADR 053 D2 + Risks). We therefore give the playground
+# its OWN deps + app layers built from `base` (NOT layered on the runtime `app`
+# stage, which installs a conflicting extras set) and exclude airflow via
+# `--no-extra airflow`. The runtime/worker stages above are untouched.
+#
+# Build:  docker build --target playground -t movate-playground .
+# Run  :  mdk playground serve --host 0.0.0.0 --port 8765 --runtime-url <api>
+# ---------------------------------------------------------------------------
+FROM base AS playground-deps
+
+COPY pyproject.toml uv.lock ./
+# All extras EXCEPT airflow (see stage header for the conflict rationale) —
+# this pulls in `[playground]` (chainlit) while keeping the resolve clean.
+RUN uv sync --all-extras --no-extra airflow --no-dev --frozen --no-install-project
+
+FROM playground-deps AS playground
+
+COPY src/ ./src/
+COPY README.md ./
+COPY pyproject.toml uv.lock ./
+RUN uv sync --all-extras --no-extra airflow --no-dev --frozen
+
+# Bake the default templates so `movate init` works if an operator shells in.
+COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate/templates/
+
+# The playground is an HTTP client of the runtime — it carries no agents/
+# catalog of its own. We still copy agents/ so the COPY context matches the
+# runtime stages (build-context parity) and `movate` subcommands that probe the
+# path don't trip; the playground command never reads it.
+COPY agents/ /app/agents/
+ENV MOVATE_AGENTS_PATH=/app/agents
+
+# Non-root user (defense in depth — matches the runtime/worker stages).
+RUN useradd --create-home --home-dir /home/movate --shell /bin/bash movate \
+    && chown -R movate:movate /opt/movate /app
+USER movate
+
+EXPOSE 8765
+
+# ENTRYPOINT is the `mdk` CLI (an alias of `movate`); CMD launches Chainlit.
+# ACA overrides CMD via `command` + `args` in containerapp-playground.bicep
+# (it injects --runtime-url / --headless / --no-targets), so this CMD is just
+# the sensible local-`docker run` default.
+ENTRYPOINT ["mdk"]
+CMD ["playground", "serve", "--host", "0.0.0.0", "--port", "8765", "--headless"]
