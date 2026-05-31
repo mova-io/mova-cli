@@ -377,23 +377,63 @@ async def call_skill_activity(
     return dict(output)
 
 
+def _resolve_classifier_ref(classifier_agent: str, workflow_dir: str) -> str:
+    """Resolve a possibly-relative classifier ref against the workflow dir.
+
+    Mirrors the native runner's intent-router resolution
+    (:meth:`movate.core.workflow.runner.WorkflowRunner._run_intent_router`): an
+    absolute ref is used as-is; a relative ref (e.g. ``./agents/goal-judge`` —
+    the form the IR leaves ``classifier_agent`` in, unlike the absolutized AGENT
+    ``node.ref``) is resolved against the compiled workflow's source dir, which
+    the Track-B compiler bakes into the activity args (``_emit_gate_node``).
+
+    Without this the worker would call :func:`load_agent` on a CWD-relative ref
+    and raise ``AgentLoadError`` — the exact Phase-1 divergence the conformance
+    suite caught (ADR 055 D7). ``workflow_dir`` empty (a hand-built direct call)
+    falls back to passing the ref through unchanged.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    if not classifier_agent or not workflow_dir:
+        return classifier_agent
+    ref_path = Path(classifier_agent)
+    if ref_path.is_absolute():
+        return classifier_agent
+    return str((Path(workflow_dir) / classifier_agent).resolve())
+
+
 @_activity.defn  # type: ignore[untyped-decorator]
 async def call_gate_activity(
     node_id: str,
     classifier_agent: str,
     state: dict[str, Any],
     run_id: str,
+    workflow_dir: str = "",
+    input_field: str = "",
+    route_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     """GATE / INTENT_ROUTER node → run the classifier agent; return its decision.
 
-    Compiler contract (``_emit_gate_node``): the workflow stores this return
-    value as ``state['<method>_decision']`` and branches on it. Per the
-    compiler the activity receives only ``(node_id, classifier_agent, state,
-    run_id)`` — the ``routes`` / ``input_field`` / ``fallback`` stay in
-    workflow scope — so this activity's job is narrow: run the classifier
-    agent and hand back its decision dict (which carries ``"label"``; see
-    ``pattern_simulation``'s ``turn-judge`` output schema). The workflow then
-    maps that label to the next node.
+    Compiler contract (``_emit_gate_node``): the workflow branches on this
+    return value's ``"label"`` (``current = routes[label] or fallback``) — the
+    ``routes`` / ``fallback`` stay in workflow scope. So this activity's job is
+    narrow: run the classifier agent and hand back its decision dict (which
+    carries ``"label"``; see ``pattern_simulation``'s ``turn-judge`` output
+    schema). The workflow then maps that label to the next node and does NOT
+    merge the decision into state (native parity).
+
+    The compiler passes ``(node_id, classifier_agent, state, run_id,
+    workflow_dir, input_field, route_labels)``:
+
+    * ``workflow_dir`` is the compiled workflow's source dir, used to resolve a
+      relative ``classifier_agent`` ref the same way the native runner does
+      (see :func:`_resolve_classifier_ref`).
+    * ``input_field`` + ``route_labels`` build the classifier input
+      ``{"text": str(state[input_field]), "labels": route_labels}`` — the EXACT
+      shape the native runner sends (``runner._run_intent_router``), which the
+      classifier agents' input schemas require (``text`` + ``labels``). They
+      default so a direct caller passing an already-absolute ref needs only the
+      original four args.
 
     Mirrors the native runner's intent-router path (``runner._run_intent_router``)
     but without the routing table (which the workflow owns): the classifier
@@ -404,8 +444,13 @@ async def call_gate_activity(
     from movate.core.models import RunRequest  # noqa: PLC0415
 
     ctx = _get_context()
-    bundle = load_agent(classifier_agent, defaults=ctx.defaults)
-    clf_input = _project_state(state, bundle)
+    clf_ref = _resolve_classifier_ref(classifier_agent, workflow_dir)
+    bundle = load_agent(clf_ref, defaults=ctx.defaults)
+    # Build the classifier input the SAME way the native runner does
+    # (runner._run_intent_router): {text: <state[input_field]>, labels: <route
+    # keys>}. The classifier agents' input schemas require both keys, so the
+    # _project_state projection used for agent nodes is the wrong builder here.
+    clf_input = {"text": str(state.get(input_field, "")), "labels": list(route_labels or [])}
     executor = _executor_for(ctx, state)
 
     response = await executor.execute(
