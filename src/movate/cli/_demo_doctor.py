@@ -88,6 +88,7 @@ async def _gather_checks(  # noqa: PLR0912 — branch count is inherent to a mul
     from movate.core.demo import (  # noqa: PLC0415
         DEMO_GRAPH_AGENT,
         DEMO_PROJECT_ID,
+        DEMO_TELEMETRY_TENANT_ID,
         DEMO_TENANT_ID,
     )
     from movate.storage import build_storage  # noqa: PLC0415
@@ -185,12 +186,18 @@ async def _gather_checks(  # noqa: PLR0912 — branch count is inherent to a mul
         list_insights = getattr(storage, "list_insights", None)
         if callable(list_insights):
             try:
-                insights = await list_insights(DEMO_TENANT_ID, project_id="default", limit=90)
+                # Insights are written per ``demo-`` telemetry tenant by the
+                # analyzer (NOT under the scenario tenant DEMO_TENANT_ID, which
+                # is the dash-free serve --dev tenant the agents + graph live
+                # under). Read them back under the canonical telemetry tenant.
+                insights = await list_insights(
+                    DEMO_TELEMETRY_TENANT_ID, project_id="default", limit=90
+                )
                 checks.append(
                     Check(
                         "analyzer insights",
                         len(insights) >= _MIN_INSIGHTS,
-                        f"{len(insights)} daily insight(s) for {DEMO_TENANT_ID} "
+                        f"{len(insights)} daily insight(s) for {DEMO_TELEMETRY_TENANT_ID} "
                         f"(need ≥ {_MIN_INSIGHTS})",
                     )
                 )
