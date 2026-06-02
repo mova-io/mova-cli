@@ -305,9 +305,9 @@ _EXTRA_MARKERS: dict[str, str] = {
     "openai": "openai",
     "langchain": "langchain_core",
     "playground": "chainlit",
-    # ADR 048 D9: the voice extra marker is the pipeline module — present only
-    # when mdk[voice] is installed (lazy import confirmed importable).
-    "voice": "movate.voice.pipeline",
+    # ADR 067: the voice extra marker is the extracted ``mdk-voice`` package —
+    # importable only when mdk[voice] is installed (it pulls in mdk-voice).
+    "voice": "mdk_voice",
 }
 
 

@@ -694,7 +694,7 @@ async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
     doesn't know the frame ignores it); silent when there's nothing to report
     (e.g. an STT-stage error produced no milestones).
     """
-    from movate.voice.pipeline import (  # noqa: PLC0415 - lazy, voice-only path
+    from movate.voice import (  # noqa: PLC0415 - lazy, voice-only path
         compute_turn_latency,
         format_latency_badge,
     )
@@ -782,21 +782,24 @@ async def _stream_voice_pipeline_turn(
     Returns ``True`` when the session should end (the watcher saw a ``close``
     during the turn), else ``False`` to run the next turn.
     """
-    from movate.voice import run_voice_pipeline  # noqa: PLC0415
+    from movate.voice import ExecutorAgentTurn, run_voice_pipeline  # noqa: PLC0415
 
     cancel = asyncio.Event()
     buffered: list[dict[str, Any]] = []
     watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
     latency_events: list[Any] = []
+    # The agent stage is the unchanged Executor, adapted to mdk-voice's AgentTurn
+    # seam (ADR 067 D4). The transcript→input-field binding + tenant routing move
+    # into the adapter; the pipeline itself stays framework-neutral.
+    agent = ExecutorAgentTurn(
+        executor, bundle, tenant_id=tenant_id, input_key=config.input_key
+    )
     try:
         async for event in run_voice_pipeline(
             audio_in=audio_in,
             stt=stt,
             tts=tts,
-            executor=executor,
-            bundle=bundle,
-            tenant_id=tenant_id,
-            input_key=config.input_key,
+            agent=agent,
             language=config.language,
             voice_id=config.voice_id,
             stt_api_key=stt_api_key,
@@ -940,7 +943,7 @@ async def _run_voice_realtime(websocket: WebSocket, bundle: Any, *, tenant_id: s
         await websocket.close(code=_WS_POLICY_VIOLATION, reason="realtime not configured")
         return
 
-    from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
+    from movate.voice import AudioChunk as _AudioChunk  # noqa: PLC0415
 
     provider = factory()
     instructions = _realtime_instructions(bundle)
@@ -14887,7 +14890,7 @@ def build_app(
         from movate.providers.mock import MockProvider  # noqa: PLC0415
         from movate.providers.pricing import load_pricing  # noqa: PLC0415
         from movate.tracing import build_tracer  # noqa: PLC0415
-        from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
+        from movate.voice import AudioChunk as _AudioChunk  # noqa: PLC0415
 
         # Phase-1 reference adapters, built from the app-state factories
         # (default: OpenAI Whisper STT + OpenAI TTS). A tenant swaps providers

@@ -69,7 +69,7 @@ def _require_voice_extra() -> None:
     """
     import importlib.util  # noqa: PLC0415
 
-    if importlib.util.find_spec("movate.voice.pipeline") is None:
+    if importlib.util.find_spec("mdk_voice") is None:
         err.print(
             "[red]✗[/red] The [bold]mdk\\[voice][/bold] extra is not installed.\n"
             "  Run: [bold]pip install 'movate-cli[voice]'[/bold]\n"

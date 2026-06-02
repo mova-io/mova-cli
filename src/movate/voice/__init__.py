@@ -1,90 +1,96 @@
-"""Voice — speech adapter seams + the pipeline transport (ADR 048, Phase 1).
+"""``movate.voice`` — re-export shim over the extracted ``mdk-voice`` SDK (ADR 067).
 
-Voice is **not a new kind of agent**. It is a transport + two adapter seams
-that wrap the *unchanged* text Executor (ADR 048 D1): audio in → STT → the
-existing agent → TTS → audio out. An agent shipped last month is
-voice-capable with **zero edits** to its ``agent.yaml`` / ``prompt.md``.
+Voice was extracted into its own framework-neutral distribution, ``mdk-voice``,
+so it can be used **separately from mdk** (e.g. on the Lyzr platform — ADR 069)
+and embedded in deliverables that do not run the mdk runtime. This module keeps
+the ``from movate.voice import ...`` surface working by re-exporting that package
+verbatim, and adds the one mdk-specific piece that cannot live there:
+:class:`~movate.voice.executor.ExecutorAgentTurn`, which runs the unchanged mdk
+``Executor`` behind ``mdk-voice``'s ``AgentTurn`` seam (ADR 067 D2/D4).
 
-Phase 1 scope (pipeline mode only):
-
-* the two Protocols — :class:`SpeechToTextProvider` /
-  :class:`TextToSpeechProvider` — and their chunk types
-  (:class:`TranscriptChunk` / :class:`AudioChunk`), in :mod:`movate.voice.base`;
-* OpenAI reference adapters (:class:`OpenAIWhisperSTT` / :class:`OpenAITTS`)
-  in :mod:`movate.voice.openai_speech` (the T2 low-friction default), plus the
-  T1 low-latency pair (:class:`DeepgramSTT` in :mod:`movate.voice.deepgram` /
-  :class:`CartesiaTTS` in :mod:`movate.voice.cartesia`), the T2 premium-voice
-  TTS (:class:`ElevenLabsTTS` in :mod:`movate.voice.elevenlabs`), and the T1
-  enterprise/sovereignty Azure Speech pair (:class:`AzureSpeechSTT` /
-  :class:`AzureNeuralTTS` in :mod:`movate.voice.azure_speech`, against the
-  customer's own Azure subscription), each with its provider SDK imported
-  lazily so a default install is unaffected (ADR 048 D9);
-* test doubles (:class:`FakeSTT` / :class:`FakeTTS`) in
-  :mod:`movate.voice.doubles`;
-* the pipeline driver (:func:`run_voice_pipeline`) in
-  :mod:`movate.voice.pipeline`, which the runtime's WS ``/voice`` route wraps.
-
-Phase 2 (realtime / speech↔speech) adds the optional full-duplex
-:class:`RealtimeVoiceProvider` seam + its chunk/event types
-(:class:`RealtimeChunk` / :class:`RealtimeEventKind`) in
-:mod:`movate.voice.base`, with two first impls — :class:`OpenAIRealtime`
-(:mod:`movate.voice.realtime_openai`) and the sovereignty-preserving
-:class:`AzureOpenAIRealtime` (:mod:`movate.voice.realtime_azure`, against the
-customer's own Azure OpenAI resource) — plus the :class:`FakeRealtime` double.
-Realtime is **voice-native**: it does NOT reuse the text Executor (ADR 048
-D2b / Boundaries); it is routed by the transport's ``?mode=realtime`` mode
-(ADR 050 D12), separate from the pipeline path.
-
-Deferred (out of scope here): telephony (Phase 3) and the agility layer
-(router / bench / drift — ADR 049).
-
-The Protocols + chunk types + doubles + pipeline are import-cheap (no optional
-deps). The OpenAI / Deepgram / Cartesia / ElevenLabs / Azure Speech / realtime
-adapters import their provider SDK lazily; importing them by name here does **not**
-trigger that import until the class is constructed.
+The extracted package also ships the ADR-068 resilient router
+(:class:`~mdk_voice.FailoverSTT` / :class:`~mdk_voice.FailoverTTS` /
+:class:`~mdk_voice.FailoverRealtime`) and the ADR-069 Lyzr binding
+(:class:`~mdk_voice.LyzrAgentTurn` / :func:`~mdk_voice.voice_agent`), all
+re-exported here for convenience.
 """
 
 from __future__ import annotations
 
-from movate.voice.azure_speech import AzureNeuralTTS, AzureSpeechSTT
-from movate.voice.base import (
+from mdk_voice import (
+    AgentTurn,
+    AgentTurnError,
+    AgentTurnResult,
     AudioChunk,
     AudioCodec,
+    AzureNeuralTTS,
+    AzureOpenAIRealtime,
+    AzureSpeechSTT,
+    CartesiaTTS,
+    CircuitBreaker,
+    DeepgramSTT,
+    ElevenLabsTTS,
+    FailoverRealtime,
+    FailoverSTT,
+    FailoverTTS,
+    FakeAgentTurn,
+    FakeRealtime,
+    FakeSTT,
+    FakeTTS,
+    InMemoryVoiceCache,
+    LyzrAgentTurn,
+    NullObserver,
+    OpenAIRealtime,
+    OpenAITTS,
+    OpenAIWhisperSTT,
     RealtimeChunk,
     RealtimeEventKind,
     RealtimeVoiceProvider,
     SpeechToTextProvider,
+    StderrObserver,
     TextToSpeechProvider,
     TranscriptChunk,
-)
-from movate.voice.cartesia import CartesiaTTS
-from movate.voice.deepgram import DeepgramSTT
-from movate.voice.doubles import FakeRealtime, FakeSTT, FakeTTS
-from movate.voice.elevenlabs import ElevenLabsTTS
-from movate.voice.openai_speech import OpenAITTS, OpenAIWhisperSTT
-from movate.voice.pipeline import (
+    VoiceCache,
     VoiceEvent,
+    VoiceFailureType,
+    VoiceManifest,
+    VoiceObserver,
     VoicePipelineResult,
+    VoiceProviderError,
     VoiceTurnLatency,
     compute_turn_latency,
     format_latency_badge,
+    manifest_for,
     run_voice_pipeline,
+    voice_agent,
 )
-from movate.voice.realtime_azure import AzureOpenAIRealtime
-from movate.voice.realtime_openai import OpenAIRealtime
+
+from movate.voice.executor import ExecutorAgentTurn
 
 __all__ = [
+    "AgentTurn",
+    "AgentTurnError",
+    "AgentTurnResult",
     "AudioChunk",
     "AudioCodec",
     "AzureNeuralTTS",
     "AzureOpenAIRealtime",
     "AzureSpeechSTT",
     "CartesiaTTS",
+    "CircuitBreaker",
     "DeepgramSTT",
     "ElevenLabsTTS",
+    "ExecutorAgentTurn",
+    "FailoverRealtime",
+    "FailoverSTT",
+    "FailoverTTS",
+    "FakeAgentTurn",
     "FakeRealtime",
     "FakeSTT",
     "FakeTTS",
+    "InMemoryVoiceCache",
+    "LyzrAgentTurn",
+    "NullObserver",
     "OpenAIRealtime",
     "OpenAITTS",
     "OpenAIWhisperSTT",
@@ -92,12 +98,20 @@ __all__ = [
     "RealtimeEventKind",
     "RealtimeVoiceProvider",
     "SpeechToTextProvider",
+    "StderrObserver",
     "TextToSpeechProvider",
     "TranscriptChunk",
+    "VoiceCache",
     "VoiceEvent",
+    "VoiceFailureType",
+    "VoiceManifest",
+    "VoiceObserver",
     "VoicePipelineResult",
+    "VoiceProviderError",
     "VoiceTurnLatency",
     "compute_turn_latency",
     "format_latency_badge",
+    "manifest_for",
     "run_voice_pipeline",
+    "voice_agent",
 ]

@@ -174,82 +174,30 @@ openai = [
     "openai>=1.40,<2",
 ]
 voice = [
-    # Voice agents (ADR 048, Phase 1 — pipeline mode). Opt-in + heavy +
-    # NEVER core: the voice package imports these lazily, so a runtime/CLI
-    # installed WITHOUT mdk[voice] is wholly unaffected (the WS /voice route
-    # only does real work when an adapter is constructed; nothing imports a
-    # provider SDK or audio lib at module scope).
+    # Voice is an EXTRACTED, framework-neutral package: ``mdk-voice`` (ADR 067).
+    # The voice Protocols, all provider adapters (OpenAI / Deepgram / Cartesia /
+    # ElevenLabs / Azure Speech / realtime), the streaming pipeline, AND the
+    # ADR-068 resilient ``Failover*`` router (failover, circuit breaker,
+    # cost-budget guard, hedging, TTS phrase cache) all live there now, with the
+    # provider SDKs as that package's own opt-in extras. ``movate.voice`` is a
+    # thin re-export shim (ADR 067 D5) so every existing ``from movate.voice
+    # import ...`` keeps working, plus the mdk-side ``ExecutorAgentTurn`` adapter
+    # that runs the UNCHANGED Executor behind mdk-voice's ``AgentTurn`` seam
+    # (ADR 067 D2/D4 — the Executor stays modality-blind).
     #
-    # T2 low-friction default: OpenAI Whisper STT + OpenAI TTS (most customers
-    # already hold an OpenAI key). Needs ONLY the official `openai` SDK
-    # (Apache-2.0 — permissive, already vetted for the [openai] extra). No
-    # audio/codec/VAD library is required for pipeline mode: the WS transport
-    # passes opaque PCM bytes straight through to the provider and back, and
-    # codec transcoding is an edge concern (ADR 048 D8) deferred with telephony.
-    "openai>=1.40,<2",
-    # T1 low-latency "wow" pair (ADR 048/049): Deepgram streaming STT + Cartesia
-    # (Sonic) streaming TTS. Both SDKs are permissive (deepgram-sdk declares MIT;
-    # cartesia is MIT per its upstream repo) and imported lazily by
-    # movate.voice.deepgram / movate.voice.cartesia, so they ship ONLY in this
-    # opt-in extra and never touch a core/default install. [voice] is not a
-    # shipped-core extra (see SHIPPED_EXTRAS in scripts/check_licenses.py), so it
-    # is out of scope for the strict license gate either way.
-    "deepgram-sdk>=3.7,<4",
-    "cartesia>=1.4,<3",
-    # T1 enterprise/sovereignty pair (ADR 048/049): Azure Speech STT + Azure
-    # Neural TTS, run against the CUSTOMER's OWN Azure subscription (data
-    # residency / BYOK → Key Vault). Imported LAZILY in
-    # movate.voice.azure_speech, so a default install (and an install that
-    # picks the OpenAI or Deepgram/Cartesia voice pairs) never loads it.
+    # Private git dependency: mdk-voice is not yet on a package index. ``[all]``
+    # pulls every provider SDK (their permissive-license posture moved with the
+    # code; the Azure Speech SDK remains opt-in within mdk-voice's own [azure]
+    # extra). CI needs a token with read access to github.com/mova-io/mdk-voice.
+    "mdk-voice[all] @ git+https://github.com/mova-io/mdk-voice.git",
     #
-    # LICENSE NOTE (CLAUDE.md rule 8 / docs/license-posture.md): unlike the
-    # `openai` SDK (Apache-2.0) this SDK ships under the MICROSOFT SOFTWARE
-    # LICENSE TERMS (PyPI classifier "Other/Proprietary License") — NOT a
-    # permissive OSS license. It is acceptable here ONLY because it is strictly
-    # OPT-IN: the `voice` extra is NOT in the license gate's SHIPPED_EXTRAS
-    # (scripts/check_licenses.py only scopes runtime+langfuse), so it is not
-    # part of the default customer deliverable and is not policed by the gate.
-    # An operator who adds `mdk[voice]` and constructs the Azure adapters is
-    # opting into Microsoft's terms for their own Azure subscription. Do NOT
-    # promote this dep into core / SHIPPED_EXTRAS without an ADR + license
-    # sign-off (the gate would correctly reject it there).
-    "azure-cognitiveservices-speech>=1.40,<2",
-    #
-    # Realtime / speech↔speech (ADR 048 D2b / Phase 2): OpenAI Realtime + Azure
-    # OpenAI Realtime. BOTH are served by the official `openai` SDK already
-    # declared above (Apache-2.0 — permissive, vetted for the [openai] extra):
-    # the public adapter uses `AsyncOpenAI(...).beta.realtime.connect(...)` and
-    # the sovereignty-preserving Azure adapter uses `AsyncAzureOpenAI(...)` with
-    # the SAME wire protocol. So realtime adds NO new shipped dependency — it
-    # reuses the `openai` SDK and the existing OPENAI_API_KEY /
-    # AZURE_OPENAI_API_KEY credentials (already in the autoload whitelist), and
-    # is imported LAZILY by movate.voice.realtime_openai / .realtime_azure (a
-    # default install is unaffected, ADR 048 D9).
-    #
-    # T2 premium-voice TTS (ADR 048/049): ElevenLabs streaming synthesis — the
-    # most lifelike voices in the lineup, the "premium voice" tier complementing
-    # Cartesia's low-latency T1. The SDK is MIT-licensed (PyPI classifier
-    # "License :: OSI Approved :: MIT License" — permissive, vetted at build
-    # time) and imported LAZILY by movate.voice.elevenlabs, so it ships ONLY in
-    # this opt-in extra and never touches a core/default install. Like the rest
-    # of [voice] it is NOT in the license gate's SHIPPED_EXTRAS, so it is out of
-    # scope for the strict gate either way.
-    "elevenlabs>=1.50,<3",
-    #
-    # ``mdk voice try`` — mic capture + TTS playback in the terminal
-    # (feat/voice-cli-ux, ADR 050 D11). sounddevice wraps PortAudio and is
-    # MIT-licensed (PyPI: "MIT License" — permissive, vetted). numpy is required
-    # by sounddevice for the audio buffer dtype. Both are imported LAZILY inside
-    # movate.cli.voice_cmd._voice_try_async, so a runtime/CLI installed WITHOUT
-    # mdk[voice] is wholly unaffected (the import only fires when a voice
-    # conversation actually starts). These stay OUT of core / SHIPPED_EXTRAS
-    # (they are NOT in scripts/check_licenses.py's SHIPPED_EXTRAS list).
+    # ``mdk voice try`` — mic capture + TTS playback in the terminal (ADR 050
+    # D11) — stays in ``movate.cli`` (it is a CLI concern, not part of the
+    # extracted SDK). sounddevice wraps PortAudio (MIT) and numpy is its buffer
+    # dtype; both are imported LAZILY inside movate.cli.voice_cmd, so a runtime/
+    # CLI installed WITHOUT mdk[voice] is unaffected. NOT in SHIPPED_EXTRAS.
     "sounddevice>=0.4,<1",
     "numpy>=1.24",
-    #
-    # Deferred to further fast-follows (each behind this same extra,
-    # permissive-only, justified in its own PR): Gemini Live realtime (a
-    # fast-follow), and any audio lib for edge transcoding or VAD when needed.
 ]
 langchain = [
     "langchain-core>=0.3,<1",
@@ -385,6 +333,11 @@ dev = [
 # cycle — until then both are first-class.
 movate = "movate.cli.main:app"
 mdk = "movate.cli.main:app"
+
+[tool.hatch.metadata]
+# Required for the `mdk-voice @ git+...` direct reference in the [voice] extra
+# (ADR 067 — voice is an extracted, privately-hosted package not yet on an index).
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/movate"]
