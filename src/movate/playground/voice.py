@@ -16,6 +16,7 @@ protocol (see the "Voice WS message protocol" block in ``runtime/app.py``):
                                    voice_id / mock for THIS turn
       <binary frame>               an inbound audio chunk (pcm16 by default)
       {"type": "end"}              the caller finished the utterance → run it
+      {"type": "interrupt"}        barge-in — cancel the in-flight answer
       {"type": "close"}            end the session
 
     server → client
@@ -24,6 +25,7 @@ protocol (see the "Voice WS message protocol" block in ``runtime/app.py``):
       {"type": "agent.token",        "text": ...}   streamed agent token
       {"type": "tts.audio", "codec","sample_rate","bytes"}  audio header, then
       <binary frame>                                the raw synthesized audio
+      {"type": "latency", "badge", "responded_in_ms", ...}  per-stage timings
       {"type": "usage", ...}                        end-of-turn meter
       {"type": "error", "message","code","stage"}   a stage failure + degrade
       {"type": "done", "run_id","status"}           terminal for the turn
@@ -179,6 +181,22 @@ class VoiceFrame:
     def is_done(self) -> bool:
         return self.type == "done"
 
+    @property
+    def is_latency(self) -> bool:
+        """A ``latency`` frame carrying the turn's per-stage badge (demo polish)."""
+        return self.type == "latency"
+
+    @property
+    def is_speech_started(self) -> bool:
+        """The realtime barge-in cue — the caller started speaking; stop playback."""
+        return self.type == "speech_started"
+
+    @property
+    def latency_badge(self) -> str:
+        """The ready-to-render "responded in {X}ms" string off a ``latency`` frame."""
+        value = self.data.get("badge")
+        return value if isinstance(value, str) else ""
+
 
 # ---------------------------------------------------------------------------
 # Control-frame builders (client → server)
@@ -217,6 +235,17 @@ def end_frame() -> str:
 def close_frame() -> str:
     """JSON ``close`` control frame — end the voice session."""
     return json.dumps({"type": "close"}, separators=(",", ":"))
+
+
+def interrupt_frame() -> str:
+    """JSON ``interrupt`` control frame — barge-in: cancel the in-flight answer.
+
+    Sent when the user starts speaking while the agent is still talking; the
+    runtime's pipeline path honors it by stopping the in-flight TTS so the agent
+    isn't talking over the user (the realtime path uses the provider's own VAD
+    instead). Additive — an older runtime ignores an unknown control frame.
+    """
+    return json.dumps({"type": "interrupt"}, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +371,15 @@ class VoiceWSClient:
         """Signal end-of-utterance — the runtime runs the turn."""
         await self._ws.send(end_frame())
 
+    async def send_interrupt(self) -> None:
+        """Barge-in: ask the runtime to cancel the in-flight answer (best-effort).
+
+        Never raises — a barge-in racing a socket teardown must not crash the
+        UI; the turn ends on its own if the signal doesn't land.
+        """
+        with contextlib.suppress(Exception):
+            await self._ws.send(interrupt_frame())
+
     async def iter_turn(self) -> AsyncIterator[VoiceFrame]:
         """Yield server frames for the current turn until ``done``/``error``.
 
@@ -395,6 +433,7 @@ __all__ = [
     "collect_audio",
     "config_frame",
     "end_frame",
+    "interrupt_frame",
     "parse_control_frame",
     "runtime_advertises_voice",
 ]

@@ -276,6 +276,31 @@ def test_install_idempotent_no_double_suffix(
 
 
 # ---------------------------------------------------------------------------
+# Wiring: build_app() installs the filter at the runtime edge (item 38) so
+# correlation is active whenever the runtime is built — direct ASGI/uvicorn
+# factory or embedded — not only under the CLI top-level callback.
+# ---------------------------------------------------------------------------
+
+
+def test_build_app_installs_log_correlation(isolated_root_logger: logging.Logger) -> None:
+    """Building the runtime app attaches a TraceContextFilter to the root logger.
+
+    Mirrors how ``build_app`` already wires ``install_request_id_logging``: the
+    log↔trace filter must be live wherever the runtime executes, regardless of
+    whether the process came up through the CLI callback. Needs the optional
+    ``runtime`` extra (fastapi); skipped in a minimal build.
+    """
+    pytest.importorskip("fastapi")
+    from movate.runtime import build_app  # noqa: PLC0415
+    from movate.testing import InMemoryStorage  # noqa: PLC0415
+
+    build_app(InMemoryStorage())
+
+    root = isolated_root_logger
+    assert any(isinstance(f, TraceContextFilter) for f in root.filters)
+
+
+# ---------------------------------------------------------------------------
 # Real OTel span end-to-end (gated on the SDK being installed)
 # ---------------------------------------------------------------------------
 

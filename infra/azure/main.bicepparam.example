@@ -121,3 +121,13 @@ param corsAllowedOrigins = ''
 // them here only if you need to tune.
 // param enableAlerts = false
 // param alertEmail = ''
+
+// OPTIONAL — Azure Monitor Workbooks (the Azure-native parallel to the in-repo
+// Grafana dashboards). Provisions the four prescriptive persona Workbooks
+// (operator / platform / eval-and-drift / tenant-ops) as
+// Microsoft.Insights/workbooks resources over the workspace-based App Insights
+// telemetry. Gated on BOTH this flag AND enableAppInsights — the Workbook KQL
+// queries the App* tables App Insights populates, so they're only useful when
+// App Insights exists. Default false (purely additive). See
+// docs/azure-monitor-workbooks.md for the per-persona on-call flow.
+// param enableWorkbooks = false

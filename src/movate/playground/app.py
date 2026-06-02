@@ -94,10 +94,12 @@ from movate.playground.connection import (
 from movate.playground.conversation import (
     ConversationState,
     FeedbackRoute,
+    Role,
     extract_output_text,
     feedback_route,
     select_backend,
 )
+from movate.playground.harvest_feedback import harvest_feedback_turn
 from movate.playground.state import resolve_data_layer_config
 from movate.playground.targets import (
     TARGETS_ENV_VAR,
@@ -981,6 +983,7 @@ async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
     answer_parts: list[str] = []
     audio_frames: list[Any] = []
     run_id: str | None = None
+    latency_badge = ""
     # Item 3: track the last partial text so we can replace it cleanly
     # when a new partial or the final transcript arrives.
     _last_caption = ""
@@ -988,7 +991,12 @@ async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
     def _compose(caption: str) -> str:
         head = f"🎙 _{caption}_" if caption else ""
         body = "".join(answer_parts)
-        return f"{head}\n\n{body}" if head and body else head or body
+        composed = f"{head}\n\n{body}" if head and body else head or body
+        # Latency badge (demo polish): pin "⚡ responded in {X}ms" under the turn
+        # once the runtime reports it, so the stage sees the speed live.
+        if latency_badge:
+            composed = f"{composed}\n\n`{latency_badge}`" if composed else f"`{latency_badge}`"
+        return composed
 
     async for frame in ws.iter_turn():
         if frame.is_partial:
@@ -1012,6 +1020,12 @@ async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
             await msg.update()
         elif frame.is_audio:
             audio_frames.append(frame)
+        elif frame.is_latency:
+            # Latency badge frame — capture it; the terminal update renders it
+            # under the answer (and the next compose pins it live).
+            latency_badge = frame.latency_badge
+            msg.content = _compose(_last_caption if _last_caption else "")
+            await msg.update()
         elif frame.is_error:
             stage = frame.data.get("stage", "?")
             message = frame.data.get("message", "voice error")
@@ -1144,9 +1158,37 @@ def _feedback_actions(run_id: str | None) -> list[cl.Action]:
     ]
 
 
+def _turn_io_for_run(convo: ConversationState | None, run_id: str) -> tuple[str, str]:
+    """Look up a turn's (user_input, assistant_output) by its ``run_id``.
+
+    Reads the playground's structured :class:`ConversationState` mirror — the
+    assistant turn carries the ``run_id``; the nearest preceding user turn is
+    its input. Returns empty strings when the turn can't be located (e.g. a
+    resumed thread whose mirror lacks this run). Pure + side-effect-free so the
+    feedback-harvest path stays unit-testable and never touches the render path.
+    """
+    if convo is None:
+        return "", ""
+    output_text = ""
+    idx: int | None = None
+    for i, turn in enumerate(convo.turns):
+        if turn.role is Role.ASSISTANT and turn.run_id == run_id:
+            output_text = turn.text
+            idx = i
+            break
+    if idx is None:
+        return "", ""
+    user_input = ""
+    for j in range(idx - 1, -1, -1):
+        if convo.turns[j].role is Role.USER:
+            user_input = convo.turns[j].text
+            break
+    return user_input, output_text
+
+
 @cl.action_callback("feedback")
 async def on_feedback(action: cl.Action) -> None:
-    """Persist 👍/👎 (+ optional comment) for a run.
+    """Persist 👍/👎 (+ optional comment) for a run, and harvest an eval case.
 
     Routes to the feedback API when the runtime advertises it (ADR 045
     D14), else the existing persistence path — never regressing today's
@@ -1158,6 +1200,13 @@ async def on_feedback(action: cl.Action) -> None:
       buttons can't be double-submitted).
     * On success: emits "✓ Thanks!" confirmation.
     * On failure: emits a toast-style note and leaves buttons active.
+
+    Eval-harvest (ADR 016 D1): on a recorded thumb the turn becomes a
+    **proposed** eval case written to ``<agent>/evals/harvested.jsonl`` — the
+    same human-review artifact ``mdk eval harvest`` produces, never auto-
+    promoted into the live dataset. 👎 prompts for an optional *expected-better*
+    answer and lands needs-review (no asserted expected); 👍 lands a golden
+    case. Best-effort: if harvest is unavailable the feedback still records.
     """
     client: PlaygroundClient = cl.user_session.get(_K_CLIENT)
     caps: RuntimeCapabilities = cl.user_session.get(_K_CAPS)
@@ -1213,10 +1262,50 @@ async def on_feedback(action: cl.Action) -> None:
     submitted.add(feedback_key)
     cl.user_session.set(_K_FEEDBACK_SUBMITTED, submitted)
 
+    # Eval-harvest (ADR 016 D1): turn this graded turn into a *proposed* eval
+    # case via the existing harvest pipeline. On a 👎, optionally ask the tester
+    # for the expected-better answer so the proposed case carries a suggested
+    # expected (still needs-review — a human confirms before it enters the gate).
+    expected_better: str | None = None
+    if score == -1:
+        better_msg = await cl.AskUserMessage(
+            content=(
+                "Optional: what *should* the answer have been? "
+                "This seeds a proposed eval case for review (or press Enter to skip)."
+            ),
+            timeout=120,
+        ).send()
+        if better_msg and isinstance(better_msg, dict):
+            better_text = better_msg.get("output", "").strip()
+            if better_text:
+                expected_better = better_text
+
+    agent_name = cl.user_session.get(_K_AGENT)
+    agent_detail = cl.user_session.get(_K_AGENT_DETAIL) or {}
+    convo: ConversationState | None = cl.user_session.get(_K_CONVO)
+    user_input, output_text = _turn_io_for_run(convo, run_id)
+    harvested_to = harvest_feedback_turn(
+        value="up" if score == 1 else "down",
+        run_id=run_id,
+        user_input=user_input,
+        output_text=output_text,
+        comment=comment_text,
+        expected_better=expected_better,
+        agent_name=str(agent_name) if agent_name else None,
+        agent_version=(agent_detail.get("version") if isinstance(agent_detail, dict) else None),
+    )
+
     suffix = " + comment" if comment_text else ""
     via = "feedback API" if route is FeedbackRoute.FEEDBACK_API else "runtime persistence"
+    harvest_note = ""
+    if harvested_to is not None:
+        kind = "golden eval case" if score == 1 else "proposed eval case (needs review)"
+        harvest_note = f" Saved as a {kind} for review — run `mdk eval harvest` to promote."
     await cl.Message(
-        content=(f"✓ Thanks! Feedback saved ({'👍' if score == 1 else '👎'}{suffix}) via {via}.")
+        content=(
+            f"✓ Thanks! Feedback saved ({'👍' if score == 1 else '👎'}{suffix}) via {via}."
+            f"{harvest_note}"
+        )
     ).send()
 
 

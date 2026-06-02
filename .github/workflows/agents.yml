@@ -16,6 +16,10 @@
 name: agents
 
 on:
+  # ADR 059 D4 — run inside the GitHub merge queue (merge_group has no path
+  # filter, so this hermetic mock-mode gate runs on every merge group; cheap).
+  merge_group:
+    types: [checks_requested]
   pull_request:
     paths:
       - "agents/**"

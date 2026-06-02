@@ -105,6 +105,26 @@ html, body {
 }
 .toggle.live.on .live-dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
 
+/* Confidence slider readout — a small monospace number next to the range. */
+.range-val {
+  min-width: 2.4em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+#min-confidence { width: 92px; accent-color: var(--accent); }
+
+/* "Replay growth" button — a toolbar-styled action (not a toggle/checkbox). */
+.replay-btn {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 9px;
+  font: inherit;
+  cursor: pointer;
+}
+.replay-btn:hover { border-color: var(--accent); }
+
 #filters {
   grid-area: filters;
   background: var(--panel);

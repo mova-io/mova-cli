@@ -1,0 +1,15 @@
+{"version": "2026.5.30.4", "pr": 605, "id": "temporal-track-b-compiler", "title": "Temporal Track B — workflow compiler skeleton + node mapping"}
+{"version": "2026.5.30.5", "pr": 606, "id": "adr-055-runtime-dispatch-fork", "title": "ADR 055 — workflow runtime selection dispatch fork (native / LangGraph / Temporal)"}
+{"version": "2026.5.30.5", "pr": 607, "id": "graph-viewer-bakeoff", "title": "Resolve graph viewer bake-off (sigma.js sole v1 viewer) + chainlit welcome"}
+{"version": "2026.5.30.5", "pr": 608, "id": "voice-byok-key-resolution", "title": "Per-tenant BYOK key resolution for voice STT/TTS/realtime at the WS edge"}
+{"version": "2026.5.30.5", "pr": 609, "id": "temporal-track-c-activities", "title": "Temporal Track C — activity wrappers around Executor/SkillBackend"}
+{"version": "2026.5.30.5", "pr": 611, "id": "adr-056-judge-node", "title": "ADR 056 — JUDGE as a first-class workflow node (verdict-gated branching + reflection)"}
+{"version": "2026.5.30.5", "pr": 612, "id": "cli-api-parity-gate", "title": "CLI <-> API drift gate — every remote verb maps to a route"}
+{"version": "2026.5.30.5", "pr": 613, "id": "demo-seed-analyzer", "title": "Run observability analyzer after demo seed so dashboards light up"}
+{"version": "2026.5.30.5", "pr": 614, "id": "log-trace-correlation", "title": "Wire log <-> trace correlation into runtime + worker"}
+{"version": "2026.5.30.6", "pr": 616, "id": "voice-barge-in", "title": "Playground voice polish — live transcript, barge-in, latency badge"}
+{"version": "2026.5.30.6", "pr": 617, "id": "eval-in-the-loop", "title": "eval-in-the-loop for mdk dev (--eval-sample-size)"}
+{"version": "2026.5.30.6", "pr": 618, "id": "temporal-exec-backend", "title": "Runtime dispatch fork + Temporal as an executable backend"}
+{"version": "2026.5.30.6", "pr": 619, "id": "demo-runbook-doctor", "title": "Bulletproof demo flow — one-command seed + demo doctor + runbook"}
+{"version": "2026.5.30.6", "pr": 620, "id": "mission-control-dashboard", "title": "Mission-control single-pane operator dashboard"}
+{"version": "2026.5.30.6", "pr": 621, "id": "graph-viz-live-growth", "title": "Knowledge-graph viz — paced live growth + confidence dimming + centrality cues"}

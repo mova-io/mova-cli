@@ -15,6 +15,10 @@ Derivations (so the client doesn't have to compute them):
   requests (the client can override, but a sane default ships).
 * **x / y** ← stored layout coords *if present* in the entity metadata,
   else **omitted** (the client runs ForceAtlas2).
+* **confidence** ← ``metadata["confidence"]`` *if present* (ADR 046 D2's
+  ``properties.confidence``), clamped to ``[0, 1]``, else **omitted** so the
+  viewer treats the node as full-confidence and the wire shape is unchanged
+  for graphs that never recorded a score.
 
 Pure + backend-agnostic: takes already-loaded ``Entity`` / ``Relation``
 lists, returns a ``GraphologyDoc``. No storage, no I/O.
@@ -80,6 +84,27 @@ def size_from_degree(degree: int) -> float:
         return _MIN_SIZE
     frac = min(degree, _SIZE_SATURATION_DEGREE) / _SIZE_SATURATION_DEGREE
     return round(_MIN_SIZE + frac * (_MAX_SIZE - _MIN_SIZE), 2)
+
+
+def _confidence_of(entity: Entity) -> float | None:
+    """Read a stored extraction-confidence score from an entity's metadata.
+
+    ADR 046 D2 specifies that extraction confidence, where present, rides on
+    the node as ``properties.confidence`` so the viewer can dim/filter
+    low-confidence nodes. The extractor stores it under
+    ``metadata["confidence"]`` (a ``[0, 1]``-ish score). Absent / non-numeric
+    → ``None`` (the node is treated as full-confidence by the viewer + the
+    ``min_confidence`` filter, so a graph that never recorded confidence is
+    byte-for-byte unchanged). ``bool`` is rejected explicitly (it's an ``int``
+    subclass) and the value is clamped into ``[0, 1]`` so a stray out-of-range
+    score can't break the viewer's dim ramp.
+    """
+    if entity.metadata is None:
+        return None
+    raw = entity.metadata.get("confidence")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return max(0.0, min(1.0, float(raw)))
 
 
 def _community_of(entity: Entity) -> int | str | None:
@@ -150,6 +175,13 @@ def to_graphology(
         }
         if community is not None:
             attributes["community"] = community
+        confidence = _confidence_of(e)
+        if confidence is not None:
+            # ADR 046 D2: extraction confidence rides on the node so the viewer
+            # can dim/filter low-confidence nodes. Omitted when unrecorded (the
+            # viewer treats an absent score as full confidence), keeping a
+            # confidence-less graph's wire shape byte-for-byte unchanged.
+            attributes["confidence"] = confidence
         coords = _layout_coords(e)
         if coords is not None:
             attributes["x"], attributes["y"] = coords

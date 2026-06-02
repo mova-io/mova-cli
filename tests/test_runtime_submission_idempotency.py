@@ -268,6 +268,88 @@ async def test_legacy_run_no_header_enqueues_each_call(
 
 
 # ---------------------------------------------------------------------------
+# Payload-conflict guard (item 37): a key reused for a DIFFERENT payload must
+# 409 — never silently return the wrong run. A same-payload retry still dedups.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_same_key_different_payload_conflicts(
+    storage: InMemoryStorage, client: TestClient, auth_setup
+) -> None:
+    """Reusing a key with a different agent input → 409, no second job."""
+    headers, tenant_id = auth_setup
+    await _publish(storage, tenant_id=tenant_id)
+
+    first = client.post(
+        "/api/v1/agents/bot/runs",
+        json={"input": {"text": "hi"}},
+        headers={**headers, "Idempotency-Key": "dup-key"},
+    )
+    conflicting = client.post(
+        "/api/v1/agents/bot/runs",
+        json={"input": {"text": "DIFFERENT"}},
+        headers={**headers, "Idempotency-Key": "dup-key"},
+    )
+
+    assert first.status_code == 202
+    assert conflicting.status_code == 409
+    # Only the first submission's job exists — the conflicting one never enqueued.
+    jobs = await storage.list_jobs(tenant_id=tenant_id, limit=100)
+    assert len(jobs) == 1
+    assert jobs[0].job_id == first.json()["job_id"]
+
+
+@pytest.mark.unit
+async def test_same_key_same_payload_still_dedups_not_conflicts(
+    storage: InMemoryStorage, client: TestClient, auth_setup
+) -> None:
+    """An IDENTICAL retry must dedup (202), not 409 — the fingerprint matches."""
+    headers, tenant_id = auth_setup
+    await _publish(storage, tenant_id=tenant_id)
+
+    first = client.post(
+        "/api/v1/agents/bot/runs",
+        json={"input": {"text": "hi"}},
+        headers={**headers, "Idempotency-Key": "same-key"},
+    )
+    retry = client.post(
+        "/api/v1/agents/bot/runs",
+        json={"input": {"text": "hi"}},
+        headers={**headers, "Idempotency-Key": "same-key"},
+    )
+
+    assert first.status_code == 202
+    assert retry.status_code == 202
+    assert retry.json()["deduplicated"] is True
+    assert retry.json()["job_id"] == first.json()["job_id"]
+
+
+@pytest.mark.unit
+async def test_legacy_run_same_key_different_payload_conflicts(
+    storage: InMemoryStorage, client: TestClient, auth_setup
+) -> None:
+    """The /run path 409s on a key reused for a different payload too."""
+    headers, tenant_id = auth_setup
+
+    first = client.post(
+        "/run",
+        json={"kind": "agent", "target": "bot", "input": {"text": "hi"}},
+        headers={**headers, "Idempotency-Key": "run-dup"},
+    )
+    conflicting = client.post(
+        "/run",
+        json={"kind": "agent", "target": "bot", "input": {"text": "DIFFERENT"}},
+        headers={**headers, "Idempotency-Key": "run-dup"},
+    )
+
+    assert first.status_code == 202
+    assert conflicting.status_code == 409
+    jobs = await storage.list_jobs(tenant_id=tenant_id, limit=100)
+    assert len(jobs) == 1
+
+
+# ---------------------------------------------------------------------------
 # Cross-tenant isolation (two tenants reusing the same key must not collide)
 # ---------------------------------------------------------------------------
 
