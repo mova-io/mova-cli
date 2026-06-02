@@ -183,7 +183,32 @@ All **ADDITIVE**, all in `movate-voice`; none changes an existing
   deployment prefers no SDK dependency.
 - **(d) Wait for Lyzr streaming before shipping.** Rejected — the buffered path
   is correct today; streaming is a latency optimization the `on_token` seam
-  already anticipates.
+  already anticipates. *(Resolved in implementation, 2026-06-02: Lyzr exposes
+  an OpenAI-compatible `POST /v4/chat/completions` endpoint with SSE token
+  streaming. The shipped Lyzr tier of the web demo points `OpenAIChatAgent` at
+  `https://agent-prod.studio.lyzr.ai/v4` with `send_system=False`, so a Lyzr
+  agent now gets token-by-token streaming and sentence-by-sentence TTS through
+  the **same** code path the OpenAI Chat tier uses — no Lyzr-specific
+  streaming adapter needed. `LyzrAgentTurn` (the SDK-wrapper variant) remains
+  the right binding when the deployment wants Lyzr-native memory/tools/RAI
+  to execute inside `agent.run`.)*
+- **(e) Embed inside Lyzr's hosted voice runtime (LiveKit, via
+  `POST /v1/sessions/start`).** Rejected — researched 2026-06-02. The endpoint
+  returns `{userToken, livekitUrl, roomName, agentDispatched: true}`: Lyzr
+  provisions a LiveKit room and dispatches its own worker, which runs the
+  configured engine (STT → LLM → TTS) **server-side** inside that room.
+  `movate-voice` in that mode is reduced to a media pipe — `STT` / `TTS` /
+  `AgentTurn` are bypassed, and with them every ADR-068 differentiator
+  (failover composites, per-utterance circuit breaking, cost-bounded routing,
+  the TTS phrase cache). Adopting it would turn the deliverable into a thin
+  reseller of Lyzr voice rather than a portable, robust, framework-neutral
+  voice layer (CLAUDE.md rule 1). The status-quo composition — Lyzr at the
+  LLM stage via `/v4`, `movate-voice` owning the audio plane — preserves
+  every voice-layer feature and keeps Lyzr's brain. A narrow opt-in
+  `LyzrLiveKitSession` *transport* adapter is acceptable future work for
+  deployments that explicitly want Lyzr's PSTN/SIP plane
+  (`/v1/telephony/*`) and hosted ops and accept the loss of failover; it would
+  live alongside, not replace, the native pipeline.
 
 ## Boundaries (explicitly NOT in scope)
 
