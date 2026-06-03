@@ -22,10 +22,13 @@ ENV PATH="/home/mdk/.local/bin:${PATH}" \
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN uv pip install --system --no-cache \
-    ".[openai,deepgram,cartesia,elevenlabs]" \
+    ".[voice]" \
     "fastapi>=0.110,<1" "uvicorn[standard]>=0.27,<1" "websockets>=12,<14" \
     "pydub>=0.25,<1" \
     "azure-storage-blob>=12.19,<13"
+# ADR 067 consolidation note: the legacy mdk-voice per-provider extras
+# (`[openai,deepgram,cartesia,elevenlabs]`) collapse into the single mdk[voice]
+# extra in movate-cli's pyproject — same SDK pins, single name.
 # ── B4 call recording: azure-storage-blob is included in the demo image but
 # NOT in the package's base extras (CLAUDE.md rule 6 — recording is a
 # demo-level concern). Lazy-imported inside examples/web_demo/recording.py
