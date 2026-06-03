@@ -704,6 +704,14 @@ def test_seed_voice_turn_config_endpointing() -> None:
     assert cfg2.endpointing_ms is None
 
 
+def test_seed_voice_turn_config_adaptive_endpointing() -> None:
+    """ADR 073 Phase 3: endpointing_adaptive seeds from the agent block (default False)."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.endpointing_adaptive is False
+    _seed_voice_turn_config(cfg, _bundle_with_voice(endpointing_adaptive=True))
+    assert cfg.endpointing_adaptive is True
+
+
 async def test_voice_ws_threads_agent_endpointing_to_stt(storage, agents_path, auth_setup) -> None:
     """End-to-end: an agent's voice.endpointing_ms reaches
     stt.transcribe(endpointing_ms=...)."""

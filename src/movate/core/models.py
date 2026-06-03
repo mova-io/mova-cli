@@ -1372,6 +1372,18 @@ class VoiceConfig(BaseModel):
             "unchanged."
         ),
     )
+    endpointing_adaptive: bool = Field(
+        default=False,
+        description=(
+            "Adaptively tune the silence-hold within a session from observed "
+            "turn cadence (ADR 073 Phase 3) — shorten it when speakers finish "
+            "cleanly (high speculation commit-ratio), lengthen it when they run "
+            "past their interims.  Seeded from ``endpointing_ms`` (or 1500) and "
+            "bounded.  Off by default; requires the streaming/speculatable path "
+            "to have a cadence signal.  When off, ``endpointing_ms`` is used "
+            "verbatim — byte-for-byte unchanged."
+        ),
+    )
 
 
 class AgentSpec(BaseModel):

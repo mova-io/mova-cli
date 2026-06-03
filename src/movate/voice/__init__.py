@@ -33,6 +33,7 @@ does **not** trigger that import until the class is constructed.
 
 from __future__ import annotations
 
+from movate.voice.adaptive import AdaptiveEndpointing
 from movate.voice.agent_turn import AgentTurn, AgentTurnError, AgentTurnResult
 from movate.voice.azure_speech import AzureNeuralTTS, AzureSpeechSTT
 from movate.voice.base import (
@@ -114,6 +115,7 @@ __all__ = [
     "DEFAULT_RETRY",
     "LYZR_PROVIDER_MAP",
     "LYZR_VOICE_BASE",
+    "AdaptiveEndpointing",
     "AgentTurn",
     "AgentTurnError",
     "AgentTurnResult",

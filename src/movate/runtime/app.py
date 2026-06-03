@@ -640,6 +640,10 @@ class _VoiceTurnConfig:
     # override per-turn via ``endpointing_ms`` in its config frame. Endpointing-
     # capable providers (Deepgram) honor it; others ignore it.
     endpointing_ms: int | None = None
+    # ADR 073 Phase 3 — adaptively move the endpointing hold within the session
+    # from observed turn cadence (speculation commit-ratio). Off by default; when
+    # on, the session controller seeds from ``endpointing_ms`` (or 1500).
+    endpointing_adaptive: bool = False
 
 
 def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
@@ -670,6 +674,8 @@ def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
     # ADR 073 D3: per-agent endpointing override (None = keep adapter default).
     if getattr(voice, "endpointing_ms", None) is not None:
         config.endpointing_ms = int(voice.endpointing_ms)
+    # ADR 073 Phase 3: adaptive endpointing opt-in (default False).
+    config.endpointing_adaptive = bool(getattr(voice, "endpointing_adaptive", False))
 
 
 async def _collect_voice_turn(
@@ -711,6 +717,8 @@ async def _collect_voice_turn(
             if "endpointing_ms" in ctrl:
                 raw = ctrl.get("endpointing_ms")
                 config.endpointing_ms = int(raw) if raw is not None else None
+            if "endpointing_adaptive" in ctrl:
+                config.endpointing_adaptive = bool(ctrl.get("endpointing_adaptive"))
         elif ctrl_type == "end":
             return audio_frames, False
         elif ctrl_type == "close":
@@ -836,6 +844,7 @@ async def _stream_voice_pipeline_turn(
     stt_api_key: str | None,
     tts_api_key: str | None,
     guard: Any = None,
+    adaptive: Any = None,
 ) -> bool:
     """Stream one pipeline voice turn with barge-in + a latency badge.
 
@@ -880,6 +889,11 @@ async def _stream_voice_pipeline_turn(
     # session-scoped guard hasn't tripped (a low commit-ratio profile auto-
     # disables it mid-session so cancelled runs stop costing — ADR 070's risk).
     effective_speculative = config.speculative and (guard is None or guard.should_speculate())
+    # ADR 073 Phase 3: when adaptive endpointing is on, the controller's current
+    # hold (moved from observed cadence) wins over the static value for this turn.
+    effective_endpointing = config.endpointing_ms
+    if adaptive is not None and config.endpointing_adaptive:
+        effective_endpointing = adaptive.current_ms
     try:
         async for event in run_voice_pipeline(
             audio_in=audio_in,
@@ -891,7 +905,7 @@ async def _stream_voice_pipeline_turn(
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
             keyterms=config.keyterms or None,
-            endpointing_ms=config.endpointing_ms,
+            endpointing_ms=effective_endpointing,
             tts_streaming=config.tts_streaming,
             speculative=effective_speculative,
             observer=metrics,
@@ -917,6 +931,12 @@ async def _stream_voice_pipeline_turn(
                     commit_ratio=round(guard.commit_ratio, 3),
                 )
             )
+        # ADR 073 Phase 3: feed the turn's cadence to the adaptive controller; if
+        # it moved the hold, tell the client so the UI can show the new value.
+        if adaptive is not None and config.endpointing_adaptive:
+            moved = adaptive.record(metrics.speculation_snapshot())
+            if moved is not None:
+                await websocket.send_json(_voice_ctrl("endpointing_adapted", endpointing_ms=moved))
     finally:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -15346,9 +15366,14 @@ def build_app(
         _seed_voice_turn_config(config, bundle)
         # ADR 073 cost-guard — one per WS session: auto-disables speculation if its
         # commit-ratio proves too low over the session (no-op unless speculating).
+        from movate.voice.adaptive import AdaptiveEndpointing  # noqa: PLC0415
         from movate.voice.observer import SpeculationGuard  # noqa: PLC0415
 
         speculation_guard = SpeculationGuard()
+        # ADR 073 Phase 3 — one adaptive-endpointing controller per session,
+        # seeded from the agent's static hold (or 1500). Only consulted when
+        # ``config.endpointing_adaptive`` is on (no-op otherwise).
+        adaptive_endpointing = AdaptiveEndpointing(base_ms=config.endpointing_ms or 1500)
         try:
             while True:
                 audio_frames, closed = await _collect_voice_turn(websocket, config)
@@ -15384,6 +15409,7 @@ def build_app(
                     stt_api_key=stt_api_key,
                     tts_api_key=tts_api_key,
                     guard=speculation_guard,
+                    adaptive=adaptive_endpointing,
                 )
                 if stop:
                     return
