@@ -203,6 +203,7 @@ class AzureSpeechSTT:
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Sequence[str] | None = None,  # ADR 071 D4: accepted; Azure phrase-lists TBD
+        endpointing_ms: int | None = None,  # ADR 073 D3: accepted; Azure segmentation TBD
     ) -> AsyncIterator[TranscriptChunk]:
         key, region = _resolve_key_region(
             api_key=api_key, ctor_key=self._ctor_key, region=self._region

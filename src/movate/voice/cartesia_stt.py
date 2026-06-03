@@ -132,6 +132,7 @@ class CartesiaSTT:
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Sequence[str] | None = None,  # ADR 071 D4: accepted, not used by Cartesia STT
+        endpointing_ms: int | None = None,  # ADR 073 D3: accepted, not used by Cartesia STT
     ) -> AsyncIterator[TranscriptChunk]:
         # PEEK the first audio chunk so we can declare the correct sample rate
         # to Cartesia. The Deepgram adapter learned this the hard way — a

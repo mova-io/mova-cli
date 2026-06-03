@@ -227,6 +227,7 @@ class DeepgramSTT:
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Sequence[str] | None = None,
+        endpointing_ms: int | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         import asyncio  # noqa: PLC0415
         import contextlib  # noqa: PLC0415
@@ -236,6 +237,12 @@ class DeepgramSTT:
         # default + a per-agent set both apply.
         call_keyterms = [t for t in (keyterms or []) if t and t.strip()]
         effective_keyterms = list(dict.fromkeys([*self._keyterms, *call_keyterms]))
+
+        # ADR 073 D3: a per-call endpointing override (an agent's silence-hold)
+        # wins over the constructor default for this turn; None keeps the default.
+        effective_endpointing = (
+            max(0, int(endpointing_ms)) if endpointing_ms is not None else self._endpointing_ms
+        )
 
         # PEEK the first audio chunk so we can declare the correct sample rate
         # to Deepgram (mismatch yields empty transcripts — verified live with
@@ -289,7 +296,11 @@ class DeepgramSTT:
             connection.on(getattr(events, "Close", "Close"), _on_close)
             connection.on(getattr(events, "Error", "Error"), _on_error)
 
-        await connection.start(self._build_options(language, sample_rate, effective_keyterms))
+        await connection.start(
+            self._build_options(
+                language, sample_rate, effective_keyterms, endpointing_ms=effective_endpointing
+            )
+        )
 
         async def _pump() -> None:
             # Rate-limit OUTBOUND to real-time: Deepgram needs at least
@@ -387,7 +398,12 @@ class DeepgramSTT:
             yield TranscriptChunk(text=tail, is_final=True)
 
     def _build_options(
-        self, language: str | None, sample_rate: int, keyterms: Sequence[str] | None = None
+        self,
+        language: str | None,
+        sample_rate: int,
+        keyterms: Sequence[str] | None = None,
+        *,
+        endpointing_ms: int | None = None,
     ) -> Any:
         """Build Deepgram ``LiveOptions`` for the socket.
 
@@ -409,8 +425,11 @@ class DeepgramSTT:
             "interim_results": True,
             # See ``__init__`` docstring — 1500 ms keeps the agent from jumping
             # in on a mid-sentence pause to think (Deepgram's default ~10 ms
-            # is way too aggressive for voice-agent UX).
-            "endpointing": self._endpointing_ms,
+            # is way too aggressive for voice-agent UX). A per-call override
+            # (ADR 073 D3, an agent's tuned silence-hold) wins when supplied.
+            "endpointing": (
+                self._endpointing_ms if endpointing_ms is None else max(0, int(endpointing_ms))
+            ),
         }
         if self._utterance_end_ms is not None:
             opts["utterance_end_ms"] = self._utterance_end_ms

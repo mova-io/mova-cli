@@ -238,6 +238,32 @@ async def test_deepgram_custom_endpointing_kwargs_reach_socket() -> None:
     assert "utterance_end_ms" not in conn.started_with
 
 
+async def test_deepgram_per_call_endpointing_overrides_constructor() -> None:
+    """ADR 073 D3: a per-call ``endpointing_ms`` wins over the constructor value
+    for that turn (a deliberate-speaker agent holds longer)."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        endpointing_ms=1500,  # session/adapter default
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k", endpointing_ms=800)]
+    assert conn.started_with["endpointing"] == 800
+
+
+async def test_deepgram_per_call_endpointing_none_keeps_constructor() -> None:
+    """``endpointing_ms=None`` (the default) keeps the adapter value — byte-for-
+    byte the prior behavior."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        endpointing_ms=1500,
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert conn.started_with["endpointing"] == 1500
+
+
 async def test_deepgram_keyterms_reach_socket_as_keyterm_on_nova3() -> None:
     """Domain vocab is boosted via nova-3 ``keyterm`` prompting (accuracy win)."""
     conn = _FakeDeepgramConnection([_dg_event("VPN for the VIP", is_final=True)])

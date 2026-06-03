@@ -95,7 +95,7 @@ class _SlowSTT:
         self._delay = delay
 
     async def transcribe(
-        self, audio, *, language=None, api_key=None, keyterms=None
+        self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
     ) -> AsyncIterator[TranscriptChunk]:
         async for _ in audio:
             pass
@@ -119,7 +119,9 @@ async def test_hedge_falls_through_when_both_candidates_fail() -> None:
             self.name = name
             self.version = "0.0.1"
 
-        async def transcribe(self, audio, *, language=None, api_key=None, keyterms=None):
+        async def transcribe(
+            self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
+        ):
             async for _ in audio:
                 pass
             raise RuntimeError("down")

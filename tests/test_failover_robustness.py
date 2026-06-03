@@ -52,7 +52,7 @@ class _HangingSTT:
     version = "0.0.1"
 
     async def transcribe(
-        self, audio, *, language=None, api_key=None, keyterms=None
+        self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
     ) -> AsyncIterator[TranscriptChunk]:
         async for _ in audio:
             pass
@@ -93,7 +93,9 @@ async def test_jitter_does_not_break_retry() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def transcribe(self, audio, *, language=None, api_key=None, keyterms=None):
+        async def transcribe(
+            self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
+        ):
             self.calls += 1
             async for _ in audio:
                 pass

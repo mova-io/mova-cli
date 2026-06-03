@@ -32,7 +32,7 @@ class _ConfSTT:
         self._c = conf
 
     async def transcribe(
-        self, audio, *, language=None, api_key=None, keyterms=None
+        self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
     ) -> AsyncIterator[TranscriptChunk]:
         async for _ in audio:
             pass

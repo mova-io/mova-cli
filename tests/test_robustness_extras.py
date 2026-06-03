@@ -71,7 +71,7 @@ class _ChaosSTT:
         self._behavior = behavior
 
     async def transcribe(
-        self, audio, *, language=None, api_key=None, keyterms=None
+        self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
     ) -> AsyncIterator[TranscriptChunk]:
         async for _ in audio:
             pass

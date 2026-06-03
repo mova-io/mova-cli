@@ -109,6 +109,7 @@ class OpenAIWhisperSTT:
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Sequence[str] | None = None,  # ADR 071 D4: accepted, not supported by Whisper
+        endpointing_ms: int | None = None,  # ADR 073 D3: accepted; Whisper is buffered, no endpoint
     ) -> AsyncIterator[TranscriptChunk]:
         # Drain the inbound stream into one buffer, tracking the codec/sample
         # rate so we can build a real container (Whisper rejects header-less

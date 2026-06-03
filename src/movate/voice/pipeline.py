@@ -383,6 +383,7 @@ async def run_voice_pipeline(
     stt_api_key: str | None = None,
     tts_api_key: str | None = None,
     keyterms: Sequence[str] | None = None,
+    endpointing_ms: int | None = None,
     session_id: str | None = None,
     cancel: asyncio.Event | None = None,
     tts_streaming: bool = False,
@@ -434,6 +435,12 @@ async def run_voice_pipeline(
     straight to ``stt.transcribe(keyterms=...)`` — an agent-specific boost list
     (names, acronyms, jargon) that a boosting-capable provider (Deepgram) honors
     and others ignore. ``None`` (default) sends no boosting.
+
+    ``endpointing_ms`` (opt-in, ADR 073 D3) is a per-turn override of the STT
+    silence-hold passed straight to ``stt.transcribe(endpointing_ms=...)`` — an
+    agent's tuned turn-end wait (deliberate speakers hold longer, snappy ones
+    cut shorter). Endpointing-capable providers (Deepgram) honor it; others
+    ignore it. ``None`` (default) keeps the adapter's configured value.
 
     ``pii_redactor`` (opt-in) masks PII in the **emitted** ``transcript.*`` events
     (captions / logs / observability) while the agent stage still runs on the raw
@@ -527,7 +534,11 @@ async def run_voice_pipeline(
     final_transcript: str | None = None
     try:
         async for tchunk in stt.transcribe(
-            audio_in, language=language, api_key=stt_api_key, keyterms=keyterms
+            audio_in,
+            language=language,
+            api_key=stt_api_key,
+            keyterms=keyterms,
+            endpointing_ms=endpointing_ms,
         ):
             if tchunk.is_final:
                 final_transcript = tchunk.text

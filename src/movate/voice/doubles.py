@@ -126,6 +126,8 @@ class FakeSTT:
         self.api_keys: list[str | None] = []
         # ADR 071 D4: record per-call keyterms so a test can assert they threaded.
         self.keyterms_seen: list[list[str] | None] = []
+        # ADR 073 D3: record per-call endpointing override so a test can assert it.
+        self.endpointing_seen: list[int | None] = []
 
     async def transcribe(
         self,
@@ -134,12 +136,14 @@ class FakeSTT:
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Sequence[str] | None = None,
+        endpointing_ms: int | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         import asyncio  # noqa: PLC0415
 
         self.languages.append(language)
         self.api_keys.append(api_key)
         self.keyterms_seen.append(list(keyterms) if keyterms is not None else None)
+        self.endpointing_seen.append(endpointing_ms)
         async for chunk in audio:
             self.received.append(chunk.data)
         for partial in self._partials:
