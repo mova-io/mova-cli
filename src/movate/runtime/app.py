@@ -609,12 +609,20 @@ class _VoiceTurnConfig:
     Defaults reproduce the zero-change promise (the common single-text-field
     agent, tenant-default voice). ``mock`` mirrors the SSE run-stream route's
     ``body.mock`` so a turn can run offline without a live LLM key.
+
+    ``session_id`` (ADR 050 D1/D8 — voice session threading): when set on the
+    initial ``config`` frame, the voice handler threads prior session turns as
+    context and appends completed voice turns — the same ``_assemble_session_input``
+    + ``_append_session_turn`` pattern the text run endpoint uses. This means
+    a client can start a text conversation, switch to voice, and the agent has
+    full context from both modalities.
     """
 
     input_key: str = "text"
     language: str | None = None
     voice_id: str = ""
     mock: bool = False
+    session_id: str | None = None
 
 
 async def _collect_voice_turn(
@@ -649,6 +657,13 @@ async def _collect_voice_turn(
             config.language = ctrl.get("language") or config.language
             config.voice_id = str(ctrl.get("voice_id") or config.voice_id)
             config.mock = bool(ctrl.get("mock", config.mock))
+            # ADR 050 D1/D8 — session_id threading through voice WS. Set
+            # once on the initial config frame; subsequent config frames in
+            # the same connection can update it (e.g. to start a new session
+            # mid-connection). ``None`` (the default / absent) is the
+            # stateless path, byte-for-byte unchanged.
+            if "session_id" in ctrl:
+                config.session_id = ctrl["session_id"] or None
         elif ctrl_type == "end":
             return audio_frames, False
         elif ctrl_type == "close":
@@ -753,6 +768,29 @@ async def _watch_voice_barge_in(
                 buffered.append(ctrl)
 
 
+@dataclass
+class _VoicePipelineTurnResult:
+    """What :func:`_stream_voice_pipeline_turn` returns after streaming one turn.
+
+    Captures the outcome (stop / continue, events for latency + cost, and the
+    ``done`` frame data) so the caller (the WS handler loop) can persist a
+    RunRecord and thread session state WITHOUT re-parsing the event stream.
+    """
+
+    stop: bool
+    """True when the session should end (the watcher saw a ``close``)."""
+    events: list[Any]
+    """All VoiceEvents emitted during the turn (for latency + cost derivation)."""
+    run_id: str
+    """The Executor's run_id from the ``done`` event (empty on error)."""
+    status: str
+    """The turn's terminal status from ``done`` (empty on error)."""
+    transcript: str
+    """The final STT transcript (the user's words)."""
+    answer_text: str
+    """The agent's answer text (concatenated agent.token deltas)."""
+
+
 async def _stream_voice_pipeline_turn(
     websocket: WebSocket,
     *,
@@ -765,7 +803,8 @@ async def _stream_voice_pipeline_turn(
     config: Any,
     stt_api_key: str | None,
     tts_api_key: str | None,
-) -> bool:
+    extra_input: dict[str, Any] | None = None,
+) -> _VoicePipelineTurnResult:
     """Stream one pipeline voice turn with barge-in + a latency badge.
 
     Wraps :func:`movate.voice.run_voice_pipeline` with two pieces of demo
@@ -779,8 +818,8 @@ async def _stream_voice_pipeline_turn(
       frame carrying the turn's per-stage timings is emitted (the demo's
       "responded in {X}ms" UI + the voice-latency observability win).
 
-    Returns ``True`` when the session should end (the watcher saw a ``close``
-    during the turn), else ``False`` to run the next turn.
+    Returns a :class:`_VoicePipelineTurnResult` with the stop signal plus the
+    data needed to persist a RunRecord and thread session state.
     """
     from movate.voice import run_voice_pipeline  # noqa: PLC0415
 
@@ -788,6 +827,10 @@ async def _stream_voice_pipeline_turn(
     buffered: list[dict[str, Any]] = []
     watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
     latency_events: list[Any] = []
+    run_id = ""
+    status = ""
+    transcript = ""
+    answer_parts: list[str] = []
     try:
         async for event in run_voice_pipeline(
             audio_in=audio_in,
@@ -802,9 +845,16 @@ async def _stream_voice_pipeline_turn(
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
             cancel=cancel,
+            extra_input=extra_input,
         ):
             latency_events.append(event)
-            if event.kind == "done":
+            if event.kind == "transcript.final":
+                transcript = event.text
+            elif event.kind == "agent.token" and event.text:
+                answer_parts.append(event.text)
+            elif event.kind == "done":
+                run_id = event.run_id
+                status = event.status
                 # Emit the latency badge just BEFORE done so it lands inside the
                 # turn (a client draining to ``done`` still sees it).
                 await _send_voice_latency(websocket, latency_events)
@@ -815,7 +865,88 @@ async def _stream_voice_pipeline_turn(
             await watcher
 
     # A ``close`` the watcher read mid-turn ends the session after this turn.
-    return any(b.get("type") == "close" for b in buffered)
+    stop = any(b.get("type") == "close" for b in buffered)
+    return _VoicePipelineTurnResult(
+        stop=stop,
+        events=latency_events,
+        run_id=run_id,
+        status=status,
+        transcript=transcript,
+        answer_text="".join(answer_parts),
+    )
+
+
+async def _finalize_voice_turn(
+    *,
+    websocket: WebSocket,
+    store: StorageProvider,
+    result: _VoicePipelineTurnResult,
+    tenant_id: str,
+    config: _VoiceTurnConfig,
+    session: Session | None,
+) -> None:
+    """Post-turn processing: patch voice metrics, emit cost, append session.
+
+    Called after each pipeline voice turn completes (ADR 050 D1/D7/D8). Extracted
+    from the main handler loop to keep the branch count manageable.
+    """
+    if not result.run_id:
+        return
+
+    from movate.voice.cost import compute_voice_turn_cost  # noqa: PLC0415
+    from movate.voice.pipeline import compute_turn_latency  # noqa: PLC0415
+
+    latency = compute_turn_latency(result.events)
+    audio_dur_s = (latency.stt_final_ms or 0.0) / 1000.0
+
+    run_record = await store.get_run(result.run_id, tenant_id=tenant_id)
+    if run_record is None:
+        return
+
+    voice_cost = compute_voice_turn_cost(
+        audio_duration_s=audio_dur_s,
+        answer_chars=len(result.answer_text),
+        llm_cost_usd=run_record.metrics.cost_usd,
+    )
+    patched = run_record.model_copy(
+        update={
+            "modality": "voice",
+            "stt_latency_ms": latency.stt_final_ms,
+            "tts_latency_ms": latency.tts_ms,
+            "audio_duration_s": audio_dur_s,
+            "stt_cost_usd": voice_cost.stt_cost_usd,
+            "tts_cost_usd": voice_cost.tts_cost_usd,
+        }
+    )
+    await store.save_run(patched)
+
+    # ADR 050 D7: voice cost in the usage frame.
+    await websocket.send_json(
+        _voice_ctrl(
+            "usage",
+            run_id=result.run_id,
+            llm_cost_usd=voice_cost.llm_cost_usd,
+            stt_cost_usd=voice_cost.stt_cost_usd,
+            tts_cost_usd=voice_cost.tts_cost_usd,
+            total_cost_usd=voice_cost.total_cost_usd,
+            session_id=config.session_id,
+        )
+    )
+
+    # ADR 050 D1/D8: append to session (same pattern as text runs).
+    if session is not None and run_record.status == JobStatus.SUCCESS:
+        await _append_session_turn(
+            store,
+            session=session,
+            user_input={config.input_key: result.transcript},
+            run_id=run_record.run_id,
+            output=run_record.output,
+            cost_usd=(
+                run_record.metrics.cost_usd + voice_cost.stt_cost_usd + voice_cost.tts_cost_usd
+            ),
+            tokens_in=run_record.metrics.tokens.input,
+            tokens_out=run_record.metrics.tokens.output,
+        )
 
 
 async def _send_realtime_chunk(websocket: WebSocket, chunk: Any) -> None:
@@ -14913,6 +15044,15 @@ def build_app(
                 if closed:
                     return
 
+                # ── ADR 050 D1/D8: resolve session for voice (same pattern as
+                # the text run path). ``None`` = stateless, byte-for-byte. ──
+                session: Session | None = None
+                if config.session_id is not None:
+                    session = await store.get_session(config.session_id, tenant_id=ctx.tenant_id)
+                    # If the session doesn't exist / cross-tenant, silently
+                    # fall back to stateless rather than dropping the voice
+                    # connection (failure-mode rule; WS can't 404).
+
                 # ── Drive STT → unchanged Executor → TTS, stream the events ──
                 # `mock` drives the agent stage with MockProvider — the same
                 # offline hook the SSE run-stream route exposes via `body.mock`.
@@ -14930,7 +15070,25 @@ def build_app(
                     for raw_bytes in frames:
                         yield _AudioChunk(data=raw_bytes)
 
-                stop = await _stream_voice_pipeline_turn(
+                # ADR 050 D1/D8: when a session is active, assemble prior
+                # turns as conversation_history (same pattern as the text
+                # ``POST /runs`` path). The history dict is passed to the
+                # pipeline as ``extra_input`` and merged into the RunRequest
+                # input alongside the transcript.
+                voice_extra_input: dict[str, Any] | None = None
+                if session is not None:
+                    # Build a stub input dict that _assemble_session_input
+                    # augments with conversation_history. We pass an empty
+                    # user_input because the actual transcript (input_key)
+                    # is set by the pipeline after STT.
+                    voice_extra_input = await _assemble_session_input(
+                        store,
+                        session_id=session.session_id,
+                        tenant_id=ctx.tenant_id,
+                        user_input={},
+                    )
+
+                result = await _stream_voice_pipeline_turn(
                     websocket,
                     audio_in=_audio_in(),
                     stt=stt,
@@ -14941,8 +15099,20 @@ def build_app(
                     config=config,
                     stt_api_key=stt_api_key,
                     tts_api_key=tts_api_key,
+                    extra_input=voice_extra_input,
                 )
-                if stop:
+
+                # ADR 050 D1/D7/D8 — patch voice metrics + emit cost + session.
+                await _finalize_voice_turn(
+                    websocket=websocket,
+                    store=store,
+                    result=result,
+                    tenant_id=ctx.tenant_id,
+                    config=config,
+                    session=session,
+                )
+
+                if result.stop:
                     return
         except WebSocketDisconnect:
             # Client hung up — nothing to clean up beyond the executor task,
