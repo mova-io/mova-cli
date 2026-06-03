@@ -835,6 +835,7 @@ async def _stream_voice_pipeline_turn(
     config: Any,
     stt_api_key: str | None,
     tts_api_key: str | None,
+    guard: Any = None,
 ) -> bool:
     """Stream one pipeline voice turn with barge-in + a latency badge.
 
@@ -875,6 +876,10 @@ async def _stream_voice_pipeline_turn(
         tenant_id=tenant_id,
         input_key=config.input_key,
     )
+    # ADR 073 cost-guard: speculation only fires if the agent requested it AND the
+    # session-scoped guard hasn't tripped (a low commit-ratio profile auto-
+    # disables it mid-session so cancelled runs stop costing — ADR 070's risk).
+    effective_speculative = config.speculative and (guard is None or guard.should_speculate())
     try:
         async for event in run_voice_pipeline(
             audio_in=audio_in,
@@ -888,7 +893,7 @@ async def _stream_voice_pipeline_turn(
             keyterms=config.keyterms or None,
             endpointing_ms=config.endpointing_ms,
             tts_streaming=config.tts_streaming,
-            speculative=config.speculative,
+            speculative=effective_speculative,
             observer=metrics,
             cancel=cancel,
         ):
@@ -898,6 +903,20 @@ async def _stream_voice_pipeline_turn(
                 # turn (a client draining to ``done`` still sees it).
                 await _send_voice_latency(websocket, latency_events, metrics)
             await _send_voice_event(websocket, event)
+        # Feed this turn's speculation outcome to the guard; if it trips now,
+        # tell the client so the UI can reflect that speculation went dormant.
+        if (
+            guard is not None
+            and effective_speculative
+            and guard.record(metrics.speculation_snapshot())
+        ):
+            await websocket.send_json(
+                _voice_ctrl(
+                    "speculation_disabled",
+                    reason="low_commit_ratio",
+                    commit_ratio=round(guard.commit_ratio, 3),
+                )
+            )
     finally:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -15325,6 +15344,11 @@ def build_app(
         # tts_streaming / speculative apply without a client frame.
         config = _VoiceTurnConfig()
         _seed_voice_turn_config(config, bundle)
+        # ADR 073 cost-guard — one per WS session: auto-disables speculation if its
+        # commit-ratio proves too low over the session (no-op unless speculating).
+        from movate.voice.observer import SpeculationGuard  # noqa: PLC0415
+
+        speculation_guard = SpeculationGuard()
         try:
             while True:
                 audio_frames, closed = await _collect_voice_turn(websocket, config)
@@ -15359,6 +15383,7 @@ def build_app(
                     config=config,
                     stt_api_key=stt_api_key,
                     tts_api_key=tts_api_key,
+                    guard=speculation_guard,
                 )
                 if stop:
                     return
