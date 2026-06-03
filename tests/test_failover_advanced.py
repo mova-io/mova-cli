@@ -213,3 +213,32 @@ def test_cache_key_is_stable_and_distinct() -> None:
     assert cache_key("hi", "v", "pcm16") == cache_key("hi", "v", "pcm16")
     assert cache_key("hi", "v", "pcm16") != cache_key("hi", "v", "opus")
     assert cache_key("hi", "v", "pcm16") != cache_key("hi", "w", "pcm16")
+
+
+def test_in_memory_cache_stats_track_hit_rate() -> None:
+    """``stats()`` exposes hit-rate so cache effectiveness ($/turn) is observable."""
+    cache = InMemoryVoiceCache(max_entries=2)
+    # Cold: a miss before anything is stored.
+    assert cache.get("a") is None
+    cache.put("a", [AudioChunk(data=b"a")])
+    # Two hits on the warmed key.
+    assert cache.get("a") is not None
+    assert cache.get("a") is not None
+    stats = cache.stats()
+    assert stats["hits"] == 2
+    assert stats["misses"] == 1
+    assert stats["lookups"] == 3
+    assert stats["entries"] == 1
+    assert abs(stats["hit_rate"] - (2 / 3)) < 1e-9
+
+
+def test_in_memory_cache_stats_count_evictions() -> None:
+    cache = InMemoryVoiceCache(max_entries=1)
+    cache.put("a", [AudioChunk(data=b"a")])
+    cache.put("b", [AudioChunk(data=b"b")])  # evicts a
+    assert cache.stats()["evictions"] == 1
+
+
+def test_in_memory_cache_stats_zero_lookups_is_zero_hit_rate() -> None:
+    """No division-by-zero before any lookup happens."""
+    assert InMemoryVoiceCache().stats()["hit_rate"] == 0.0

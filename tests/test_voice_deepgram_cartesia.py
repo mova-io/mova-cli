@@ -238,6 +238,42 @@ async def test_deepgram_custom_endpointing_kwargs_reach_socket() -> None:
     assert "utterance_end_ms" not in conn.started_with
 
 
+async def test_deepgram_keyterms_reach_socket_as_keyterm_on_nova3() -> None:
+    """Domain vocab is boosted via nova-3 ``keyterm`` prompting (accuracy win)."""
+    conn = _FakeDeepgramConnection([_dg_event("VPN for the VIP", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        keyterms=["VPN", "VIP", "Mova-iO"],
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert conn.started_with["keyterm"] == ["VPN", "VIP", "Mova-iO"]
+    assert "keywords" not in conn.started_with
+
+
+async def test_deepgram_keyterms_fall_back_to_keywords_on_nova2() -> None:
+    """On nova-2 the same list rides the legacy ``keywords`` boosting param."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        model="nova-2",
+        keyterms=["Okta", "SSO"],
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert conn.started_with["keywords"] == ["Okta", "SSO"]
+    assert "keyterm" not in conn.started_with
+
+
+async def test_deepgram_no_keyterms_sends_neither_param() -> None:
+    """Default (no keyterms) is byte-for-byte the prior behavior."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert "keyterm" not in conn.started_with
+    assert "keywords" not in conn.started_with
+
+
 async def test_deepgram_promotes_last_partial_when_no_final() -> None:
     # Socket emits only interims (no endpointed final). The adapter must
     # promote the last partial to is_final=True so the pipeline's

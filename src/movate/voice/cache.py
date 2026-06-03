@@ -58,10 +58,15 @@ class InMemoryVoiceCache:
     def __init__(self, *, max_entries: int = 256) -> None:
         self._max = max(1, max_entries)
         self._store: OrderedDict[str, list[AudioChunk]] = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
 
     def get(self, key: str) -> list[AudioChunk] | None:
         if key not in self._store:
+            self._misses += 1
             return None
+        self._hits += 1
         self._store.move_to_end(key)  # mark recently used
         return list(self._store[key])
 
@@ -70,6 +75,26 @@ class InMemoryVoiceCache:
         self._store.move_to_end(key)
         while len(self._store) > self._max:
             self._store.popitem(last=False)  # evict LRU
+            self._evictions += 1
+
+    def stats(self) -> dict[str, float | int]:
+        """A snapshot of cache effectiveness (cost-observability, ADR 068 D7).
+
+        ``hit_rate`` is the fraction of lookups served from memory — the headline
+        for "is the phrase cache earning its keep?". Every cache hit is one TTS
+        synthesis NOT paid for, so a rising hit-rate is a falling $/turn. Wire
+        this into a :class:`~movate.voice.observer.VoiceObserver` or a dashboard
+        to watch it live. Pure read — calling it never perturbs the cache.
+        """
+        lookups = self._hits + self._misses
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "lookups": lookups,
+            "entries": len(self._store),
+            "evictions": self._evictions,
+            "hit_rate": (self._hits / lookups) if lookups else 0.0,
+        }
 
 
 async def warm_cache(

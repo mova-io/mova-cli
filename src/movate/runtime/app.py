@@ -615,6 +615,13 @@ class _VoiceTurnConfig:
     language: str | None = None
     voice_id: str = ""
     mock: bool = False
+    # Sentence-level TTS overlap (ADR 048 D7 / pipeline ``tts_streaming``): speak
+    # sentence one while the agent is still generating sentence two — the biggest
+    # time-to-first-audio win. Defaults ON so production mdk voice agents get the
+    # same latency the demo already ships; a client can set ``tts_streaming:
+    # false`` in its config frame to fall back to the strictly-sequential turn.
+    # The WS event protocol is unchanged either way (consumers key off ``kind``).
+    tts_streaming: bool = True
 
 
 async def _collect_voice_turn(
@@ -649,6 +656,7 @@ async def _collect_voice_turn(
             config.language = ctrl.get("language") or config.language
             config.voice_id = str(ctrl.get("voice_id") or config.voice_id)
             config.mock = bool(ctrl.get("mock", config.mock))
+            config.tts_streaming = bool(ctrl.get("tts_streaming", config.tts_streaming))
         elif ctrl_type == "end":
             return audio_frames, False
         elif ctrl_type == "close":
@@ -809,6 +817,7 @@ async def _stream_voice_pipeline_turn(
             voice_id=config.voice_id,
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
+            tts_streaming=config.tts_streaming,
             cancel=cancel,
         ):
             latency_events.append(event)

@@ -73,11 +73,24 @@ fi
 step "Build image in ACR (no local Docker required)"
 # `az acr build` uploads the build context to ACR and runs the Dockerfile
 # server-side. ~2-3 min the first time, then cached.
+#
+# IMPORTANT: build from a `git archive` tarball of TRACKED files only, NOT the
+# working tree. `az acr build <dir>` WALKS the entire directory to evaluate
+# .dockerignore per-file — and this repo can carry a multi-GB (observed: 200GB+)
+# `.claude/worktrees/` tree of nested agent worktrees that .dockerignore excludes
+# from the image but cannot stop the walker from traversing. That walk hangs the
+# upload for many minutes. `git archive` sidesteps it: the tarball contains only
+# committed files (a few MB), so the context is tiny and deterministic. The
+# Dockerfile path inside the tar is repo-root-relative, same as before.
+CONTEXT_TAR="$(mktemp -t mdk-voice-ctx-XXXXXX.tar.gz)"
+trap 'rm -f "$CONTEXT_TAR"' EXIT
+git -C "$REPO_ROOT" archive --format=tar.gz -o "$CONTEXT_TAR" HEAD
+ok "build context: $(du -h "$CONTEXT_TAR" | cut -f1) tarball (tracked files only)"
 az acr build \
     --registry "$ACR" \
     --image "$IMAGE" \
     --file "$DOCKERFILE_REL" \
-    "$REPO_ROOT" \
+    "$CONTEXT_TAR" \
     -o table
 ok "image built: $ACR.azurecr.io/$IMAGE"
 

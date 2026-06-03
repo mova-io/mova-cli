@@ -35,7 +35,7 @@ landscape moves fast):
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 from movate.voice.base import AudioChunk, TranscriptChunk
@@ -43,14 +43,22 @@ from movate.voice.base import AudioChunk, TranscriptChunk
 if TYPE_CHECKING:
     import deepgram
 
-# Deepgram's live model + defaults. ``nova-2`` is the current low-latency
-# general model; ``smart_format`` gives punctuated, readable transcripts. The
+# Deepgram's live model + defaults. ``nova-3`` is Deepgram's current most
+# accurate streaming model (succeeds nova-2 at the same price tier) and is the
+# one that supports **keyterm prompting** — boosting domain vocabulary at
+# recognition time. ``smart_format`` gives punctuated, readable transcripts. The
 # encoding/sample-rate hint matches our ``pcm16`` ``AudioChunk`` default (raw
 # signed 16-bit LE) so Deepgram decodes the raw frames the transport forwards
 # without a container.
-_DEEPGRAM_MODEL = "nova-2"
+_DEEPGRAM_MODEL = "nova-3"
 _DEEPGRAM_ENCODING = "linear16"
 _DEEPGRAM_SAMPLE_RATE = 24_000
+
+# Models that take the newer ``keyterm`` prompting param (nova-3 family). Older
+# models (nova-2 and earlier) use the legacy ``keywords`` boosting param
+# instead. We pick the right option key from the configured model so callers
+# pass one ``keyterms`` list and the adapter wires it correctly either way.
+_KEYTERM_MODEL_PREFIXES = ("nova-3",)
 
 
 def _require_deepgram() -> Any:
@@ -150,6 +158,7 @@ class DeepgramSTT:
         finish_grace_seconds: float = 0.25,
         endpointing_ms: int = 1500,
         utterance_end_ms: int | None = 2500,
+        keyterms: Sequence[str] | None = None,
         client: deepgram.DeepgramClient | None = None,
     ) -> None:
         """``client`` is for tests — pass a fake exposing the live-transcription
@@ -178,6 +187,14 @@ class DeepgramSTT:
         safety backstop, even when no speech-final has fired. Set ``None`` to
         disable. We default to **2000 ms** — slightly above ``endpointing_ms``
         so it acts as the ceiling, not the primary trigger.
+
+        ``keyterms`` is an optional list of domain terms to **boost** at
+        recognition time — names, acronyms, and jargon a general model
+        otherwise mis-hears (``["VPN", "VIP", "Okta", "Mova-iO"]``). On a
+        nova-3 model these become Deepgram ``keyterm`` prompts; on nova-2 and
+        earlier they fall back to the legacy ``keywords`` param. ``None`` (the
+        default) sends no boosting and is byte-for-byte the prior behavior.
+        This is the cheapest accuracy win for enterprise vocabularies.
         """
         self._model = model
         self._finish_grace_seconds = max(0.0, finish_grace_seconds)
@@ -185,7 +202,12 @@ class DeepgramSTT:
         self._utterance_end_ms = (
             max(0, int(utterance_end_ms)) if utterance_end_ms is not None else None
         )
+        self._keyterms = [t for t in (keyterms or []) if t and t.strip()]
         self._client = client
+
+    def _uses_keyterm_prompting(self) -> bool:
+        """Whether the configured model takes ``keyterm`` (vs legacy ``keywords``)."""
+        return any(self._model.startswith(p) for p in _KEYTERM_MODEL_PREFIXES)
 
     def _resolve_client(self, api_key: str | None) -> Any:
         if self._client is not None:
@@ -385,6 +407,11 @@ class DeepgramSTT:
             opts["utterance_end_ms"] = self._utterance_end_ms
         if language:
             opts["language"] = language
+        if self._keyterms:
+            # nova-3 → keyterm prompting; nova-2/earlier → legacy keyword boost.
+            # Deepgram accepts a list for both; the SDK serializes each as a
+            # repeated query param.
+            opts["keyterm" if self._uses_keyterm_prompting() else "keywords"] = list(self._keyterms)
         if self._client is not None:
             # Test path: hand the fake the raw option dict.
             return opts
