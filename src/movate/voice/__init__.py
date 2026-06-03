@@ -76,7 +76,14 @@ from movate.voice.lyzr_parity import (
     format_parity_report,
 )
 from movate.voice.manifest import DEFAULT_MANIFESTS, VoiceManifest, manifest_for
-from movate.voice.observer import MetricsObserver, NullObserver, StderrObserver, VoiceObserver
+from movate.voice.observer import (
+    MetricsObserver,
+    NullObserver,
+    SpeculationABVerdict,
+    StderrObserver,
+    VoiceObserver,
+    speculation_ab_report,
+)
 from movate.voice.openai_speech import OpenAITTS, OpenAIWhisperSTT
 from movate.voice.pii import redact_pii
 from movate.voice.pipeline import (
@@ -146,6 +153,7 @@ __all__ = [
     "STTBenchReport",
     "SentenceChunker",
     "SilenceGatedSTT",
+    "SpeculationABVerdict",
     "SpeechToTextProvider",
     "StderrObserver",
     "TextToSpeechProvider",
@@ -177,6 +185,7 @@ __all__ = [
     "resample_pcm16",
     "run_voice_pipeline",
     "speakify",
+    "speculation_ab_report",
     "telephony_inbound",
     "telephony_outbound",
     "voice_agent",

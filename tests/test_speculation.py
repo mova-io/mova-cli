@@ -20,7 +20,7 @@ import pytest
 
 from movate.voice.base import AudioChunk, TranscriptChunk
 from movate.voice.doubles import FakeAgentTurn, FakeTTS
-from movate.voice.observer import MetricsObserver
+from movate.voice.observer import MetricsObserver, speculation_ab_report
 from movate.voice.pipeline import run_voice_pipeline
 
 pytestmark = pytest.mark.asyncio
@@ -224,3 +224,73 @@ async def test_speculative_tokens_not_emitted_until_commit() -> None:
     # Final agent run was on the corrected transcript; the turn completed.
     assert agent.prompts[-1] == "final text"
     assert any(e.kind == "done" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Speculation A/B verdict (ADR 070/073 Phase 1) — the flip/no-flip aggregator.
+# Synchronous (operates on a snapshot), so opt out of the module asyncio mark.
+# ---------------------------------------------------------------------------
+
+
+async def test_ab_verdict_insufficient_data() -> None:
+    """Below min_samples → no decision, regardless of ratio."""
+    snap = {
+        "started": 3,
+        "committed": 3,
+        "cancelled": 0,
+        "commit_ratio": 1.0,
+        "avg_head_start_ms": 900.0,
+    }
+    v = speculation_ab_report(snap, min_samples=20)
+    assert v.recommendation == "insufficient-data"
+    assert "need ≥20" in v.rationale
+
+
+async def test_ab_verdict_enable_when_both_bars_cleared() -> None:
+    snap = {
+        "started": 50,
+        "committed": 35,
+        "cancelled": 15,
+        "commit_ratio": 0.7,
+        "avg_head_start_ms": 850.0,
+    }
+    v = speculation_ab_report(snap)
+    assert v.recommendation == "enable"
+    assert v.commit_ratio == 0.7
+
+
+async def test_ab_verdict_hold_when_commit_ratio_too_low() -> None:
+    snap = {
+        "started": 50,
+        "committed": 10,
+        "cancelled": 40,
+        "commit_ratio": 0.2,
+        "avg_head_start_ms": 900.0,
+    }
+    v = speculation_ab_report(snap)
+    assert v.recommendation == "hold"
+    assert "commit-ratio" in v.rationale
+
+
+async def test_ab_verdict_hold_when_head_start_marginal() -> None:
+    snap = {
+        "started": 50,
+        "committed": 45,
+        "cancelled": 5,
+        "commit_ratio": 0.9,
+        "avg_head_start_ms": 50.0,
+    }
+    v = speculation_ab_report(snap)
+    assert v.recommendation == "hold"
+    assert "head-start" in v.rationale
+
+
+async def test_ab_verdict_reads_nested_full_snapshot() -> None:
+    """Accepts a full MetricsObserver.snapshot() (reads the nested block)."""
+    obs = MetricsObserver()
+    for _ in range(30):
+        obs.on_event("speculation_started")
+        obs.on_event("speculation_committed", head_start_ms=600)
+    v = speculation_ab_report(obs.snapshot())
+    assert v.recommendation == "enable"
+    assert v.started == 30 and v.committed == 30
