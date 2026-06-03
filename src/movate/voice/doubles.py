@@ -7,16 +7,91 @@ against them, and capture what they were fed in plain lists so a test can
 assert directly (``assert stt.received == [...]``). No network, no SDK, no
 audio libs — usable from a default install with no ``mdk[voice]`` extra.
 
-These live in ``movate.voice`` (not ``tests/``) so an agent author writing
+These live in ``mdk_voice`` (not ``tests/``) so an agent author writing
 voice tests for their own deployment can import them too, same as
-:class:`movate.testing.InMemoryStorage`.
+an in-memory storage double.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Sequence
 
+from movate.voice.agent_turn import AgentTurnError, AgentTurnResult
 from movate.voice.base import AudioChunk, AudioCodec, RealtimeChunk, TranscriptChunk
+
+
+class FakeAgentTurn:
+    """Scripted :class:`~movate.voice.agent_turn.AgentTurn` for pipeline tests.
+
+    Replaces a real agent framework (the mdk ``Executor``, a Lyzr agent) in the
+    voice pipeline so the package is testable with no framework present. It
+    records every transcript it was asked to run in :attr:`prompts`, streams its
+    configured ``answer`` through ``on_token`` (one token per whitespace word,
+    so a test sees ``agent.token`` events), and returns an
+    :class:`~movate.voice.agent_turn.AgentTurnResult`.
+
+    * ``answer`` — the human-readable answer the pipeline speaks via TTS.
+    * ``stream`` — when ``True`` (default) the answer is emitted word-by-word via
+      ``on_token``; set ``False`` to model a non-streaming agent (e.g. Lyzr's
+      buffered ``agent.run``) that returns the whole answer at once.
+    * ``error`` — when set, the turn returns a failed result (no answer), which
+      the pipeline surfaces as a ``stage="agent"`` error.
+    * ``answer_in_result`` — when ``False``, the result's ``answer_text`` is left
+      empty so the pipeline's fall-back-to-streamed-tokens path is exercised.
+    """
+
+    name = "fake_agent"
+    version = "0.0.1"
+    speculatable = False
+
+    def __init__(
+        self,
+        answer: str = "spoken answer",
+        *,
+        stream: bool = True,
+        error: AgentTurnError | None = None,
+        answer_in_result: bool = True,
+        run_id: str = "run-fake",
+        speculatable: bool = False,
+        run_delay_s: float = 0.0,
+    ) -> None:
+        self._answer = answer
+        self._stream = stream
+        self._error = error
+        self._answer_in_result = answer_in_result
+        self._run_id = run_id
+        # ADR 070: per-instance opt-in for speculative kickoff, and an optional
+        # per-run delay so a test can keep a speculative run in flight while it
+        # drives more interims (to exercise commit vs cancel).
+        self.speculatable = speculatable
+        self._run_delay_s = run_delay_s
+        self.prompts: list[str] = []
+        self.session_ids: list[str | None] = []
+        self.languages: list[str | None] = []
+
+    async def run(
+        self,
+        text: str,
+        *,
+        on_token: Callable[[str], None] | None = None,
+        language: str | None = None,
+        session_id: str | None = None,
+    ) -> AgentTurnResult:
+        self.prompts.append(text)
+        self.session_ids.append(session_id)
+        self.languages.append(language)
+        if self._run_delay_s:
+            import asyncio  # noqa: PLC0415
+
+            await asyncio.sleep(self._run_delay_s)
+        if self._error is not None:
+            return AgentTurnResult(run_id=self._run_id, status="error", error=self._error)
+        if self._stream and on_token is not None and self._answer:
+            words = self._answer.split(" ")
+            for i, word in enumerate(words):
+                on_token(word if i == 0 else " " + word)
+        answer_text = self._answer if self._answer_in_result else ""
+        return AgentTurnResult(answer_text=answer_text, run_id=self._run_id, status="ok")
 
 
 class FakeSTT:
@@ -32,12 +107,25 @@ class FakeSTT:
     name = "fake_stt"
     version = "0.0.1"
 
-    def __init__(self, transcript: str = "hello", *, partials: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        transcript: str = "hello",
+        *,
+        partials: list[str] | None = None,
+        partial_delay_s: float = 0.0,
+        final_delay_s: float = 0.0,
+    ) -> None:
         self.transcript = transcript
         self._partials = partials or []
+        # ADR 070: pace partials / the final so a test can let the speculator's
+        # quiet-gap debounce fire and keep a speculation in flight across the gap.
+        self._partial_delay_s = partial_delay_s
+        self._final_delay_s = final_delay_s
         self.received: list[bytes] = []
         self.languages: list[str | None] = []
         self.api_keys: list[str | None] = []
+        # ADR 071 D4: record per-call keyterms so a test can assert they threaded.
+        self.keyterms_seen: list[list[str] | None] = []
 
     async def transcribe(
         self,
@@ -45,13 +133,21 @@ class FakeSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
+        import asyncio  # noqa: PLC0415
+
         self.languages.append(language)
         self.api_keys.append(api_key)
+        self.keyterms_seen.append(list(keyterms) if keyterms is not None else None)
         async for chunk in audio:
             self.received.append(chunk.data)
         for partial in self._partials:
+            if self._partial_delay_s:
+                await asyncio.sleep(self._partial_delay_s)
             yield TranscriptChunk(text=partial, is_final=False)
+        if self._final_delay_s:
+            await asyncio.sleep(self._final_delay_s)
         yield TranscriptChunk(text=self.transcript, is_final=True, confidence=1.0)
 
 

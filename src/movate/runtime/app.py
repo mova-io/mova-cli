@@ -27,7 +27,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
@@ -615,6 +615,50 @@ class _VoiceTurnConfig:
     language: str | None = None
     voice_id: str = ""
     mock: bool = False
+    # Sentence-level TTS overlap (ADR 048 D7 / pipeline ``tts_streaming``): speak
+    # sentence one while the agent is still generating sentence two — the biggest
+    # time-to-first-audio win. Defaults ON so production mdk voice agents get the
+    # same latency the demo already ships; a client can set ``tts_streaming:
+    # false`` in its config frame to fall back to the strictly-sequential turn.
+    # The WS event protocol is unchanged either way (consumers key off ``kind``).
+    tts_streaming: bool = True
+    # Speculative agent kickoff (ADR 070): start the agent on a stable interim,
+    # before STT endpoints, to recover the ~1.5s endpointing wait. Defaults OFF
+    # (opt-in) because it changes the cost profile (cancelled speculative runs);
+    # a client enables it per-turn via ``speculative: true`` in the config frame.
+    # Only takes effect when the agent is cancel-safe (``speculatable``).
+    speculative: bool = False
+    # Per-agent STT keyterm boosting (ADR 071 D4): domain vocab passed to
+    # ``stt.transcribe(keyterms=...)``. Empty → no boosting. Seeded from the
+    # agent's voice block; boosting-capable providers (Deepgram) honor it.
+    keyterms: list[str] = field(default_factory=list)
+
+
+def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
+    """Seed the per-turn config from the agent's ``voice`` block (ADR 071 D1-D3).
+
+    The ``agent.yaml`` voice block (:class:`movate.core.models.VoiceConfig`) used
+    to be parsed but **ignored** by the runtime — this closes that gap. The block
+    is the *default* for the session; a client ``config`` frame still overrides
+    per-turn (handled in :func:`_collect_voice_turn`). Absent block / unset
+    fields leave the runtime defaults untouched, byte-for-byte today's behavior.
+    """
+    voice = getattr(getattr(bundle, "spec", None), "voice", None)
+    if voice is None:
+        return
+    if getattr(voice, "voice_id", ""):
+        config.voice_id = voice.voice_id
+    if getattr(voice, "language", None) is not None:
+        config.language = voice.language
+    # ADR 071 D2: tri-state — None means "keep the runtime default".
+    if getattr(voice, "tts_streaming", None) is not None:
+        config.tts_streaming = bool(voice.tts_streaming)
+    # ADR 071 D3: speculative is a plain bool (default False).
+    config.speculative = bool(getattr(voice, "speculative", False))
+    # ADR 071 D4: per-agent STT keyterm boosting (empty list = no boosting).
+    keyterms = getattr(voice, "keyterms", None)
+    if keyterms:
+        config.keyterms = list(keyterms)
 
 
 async def _collect_voice_turn(
@@ -649,6 +693,8 @@ async def _collect_voice_turn(
             config.language = ctrl.get("language") or config.language
             config.voice_id = str(ctrl.get("voice_id") or config.voice_id)
             config.mock = bool(ctrl.get("mock", config.mock))
+            config.tts_streaming = bool(ctrl.get("tts_streaming", config.tts_streaming))
+            config.speculative = bool(ctrl.get("speculative", config.speculative))
         elif ctrl_type == "end":
             return audio_frames, False
         elif ctrl_type == "close":
@@ -782,25 +828,36 @@ async def _stream_voice_pipeline_turn(
     Returns ``True`` when the session should end (the watcher saw a ``close``
     during the turn), else ``False`` to run the next turn.
     """
+    from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
     from movate.voice import run_voice_pipeline  # noqa: PLC0415
 
     cancel = asyncio.Event()
     buffered: list[dict[str, Any]] = []
     watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
     latency_events: list[Any] = []
+    # ADR 067 D4: the mdk Executor enters the framework-neutral pipeline as an
+    # ``AgentTurn`` adapter — the only place the runtime threads bundle /
+    # tenant / input_key into the voice path. The pipeline sees the seam, not
+    # the executor.
+    agent = ExecutorAgentTurn(
+        executor=executor,
+        bundle=bundle,
+        tenant_id=tenant_id,
+        input_key=config.input_key,
+    )
     try:
         async for event in run_voice_pipeline(
             audio_in=audio_in,
             stt=stt,
             tts=tts,
-            executor=executor,
-            bundle=bundle,
-            tenant_id=tenant_id,
-            input_key=config.input_key,
+            agent=agent,
             language=config.language,
             voice_id=config.voice_id,
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
+            keyterms=config.keyterms or None,
+            tts_streaming=config.tts_streaming,
+            speculative=config.speculative,
             cancel=cancel,
         ):
             latency_events.append(event)
@@ -944,7 +1001,12 @@ async def _run_voice_realtime(websocket: WebSocket, bundle: Any, *, tenant_id: s
 
     provider = factory()
     instructions = _realtime_instructions(bundle)
+    # ADR 071 D1: seed from the agent's voice block so per-agent voice_id /
+    # language apply on the realtime path too (the streaming/speculative/keyterms
+    # fields are pipeline-only and ignored here). Client config frames still
+    # override per-turn.
     config = _VoiceTurnConfig()
+    _seed_voice_turn_config(config, bundle)
 
     # BYOK (ADR 048 D6 / ADR 018): the tenant's own realtime-provider key,
     # resolved at the edge. ``None`` → the adapter's env default (back-compat).
@@ -14905,8 +14967,11 @@ def build_app(
         tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts)
 
         # Config persists across turns in a session; a per-turn ``config`` frame
-        # can override it before that turn's ``end``.
+        # can override it before that turn's ``end``. Seed from the agent's
+        # ``voice`` block first (ADR 071 D1-D3) so per-agent voice_id / language /
+        # tts_streaming / speculative apply without a client frame.
         config = _VoiceTurnConfig()
+        _seed_voice_turn_config(config, bundle)
         try:
             while True:
                 audio_frames, closed = await _collect_voice_turn(websocket, config)
