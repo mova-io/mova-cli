@@ -12,6 +12,7 @@ shows the transcript / answer / saved audio. The endpoint itself is covered by
 from __future__ import annotations
 
 import base64
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -20,6 +21,18 @@ from typer.testing import CliRunner
 from movate.cli.voice_cmd import voice_app
 from movate.core.client import MovateClientError
 from movate.runtime.schemas import VoiceTurnView
+
+
+def _flat_help(output: str) -> str:
+    """Flatten Rich --help output for CI-robust substring matching.
+
+    CI runs non-TTY with FORCE_COLOR=1, so Rich styles ``--`` and the flag name
+    as separate ANSI spans and wraps/pads rows — a raw substring search misses
+    ``--target``. Strip ANSI, then collapse whitespace so a wrapped/styled flag
+    flattens to one searchable string. (Same fix as test_voice_cli_ux._help_text.)
+    """
+    plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", output)
+    return " ".join(plain.split())
 
 
 def _turn(**over: object) -> VoiceTurnView:
@@ -55,7 +68,7 @@ def test_oneshot_verbs_registered() -> None:
     # TTS) and `transcribe` (local STT) run against the local voice pipeline and
     # take no `--target`. (Remote-verb→route mapping is covered by the parity gate.)
     ask_help = runner.invoke(voice_app, ["ask", "--help"], env={"COLUMNS": "200"})
-    assert "--target" in ask_help.output, ask_help.output
+    assert "--target" in _flat_help(ask_help.output), ask_help.output
 
 
 # ---------------------------------------------------------------------------
