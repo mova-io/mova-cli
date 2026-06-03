@@ -172,14 +172,19 @@ class TestAuthStatusNotifications:
             "MOVATE_DEPLOY_WEBHOOK",
             "AZURE_SPEECH_KEY",
             "AZURE_SPEECH_REGION",
+            "TEMPORAL_HOST",
+            "TEMPORAL_NAMESPACE",
+            "TEMPORAL_TLS_CERT",
+            "TEMPORAL_TLS_KEY",
         ):
             monkeypatch.delenv(key, raising=False)
         result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         # 5 provider env vars + 3 notification env vars + 2 voice env vars
-        # (Azure Speech key + region, ADR 048/049) = 10 unset.
+        # (Azure Speech key + region, ADR 048/049) + 4 temporal env vars
+        # (TEMPORAL_HOST/NAMESPACE/TLS_CERT/TLS_KEY, ADR 054) = 14 unset.
         assert "set=0" in result.stdout
-        assert "unset=10" in result.stdout
+        assert "unset=14" in result.stdout
 
 
 # ---------------------------------------------------------------------------
