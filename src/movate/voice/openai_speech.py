@@ -33,10 +33,11 @@ provider landscape moves fast):
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 from movate.voice.base import AudioChunk, AudioCodec, TranscriptChunk
+from movate.voice.telephony import mulaw_to_pcm16, pcm16_to_wav
 
 if TYPE_CHECKING:
     import openai
@@ -65,7 +66,7 @@ def _require_openai() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised via the import-guard test
         raise ImportError(
             "the 'openai' package is required for OpenAI voice adapters. "
-            "Install with: uv add 'movate-cli[voice]'"
+            "Install with: pip install 'mdk-voice[openai]'"
         ) from exc
     return _openai
 
@@ -107,13 +108,19 @@ class OpenAIWhisperSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,  # ADR 071 D4: accepted, not supported by Whisper
+        endpointing_ms: int | None = None,  # ADR 073 D3: accepted; Whisper is buffered, no endpoint
     ) -> AsyncIterator[TranscriptChunk]:
-        # Drain the inbound stream into one buffer. The transport feeds us
-        # endpointed audio (one utterance per call), so a single transcription
-        # is the right granularity for the buffered API.
+        # Drain the inbound stream into one buffer, tracking the codec/sample
+        # rate so we can build a real container (Whisper rejects header-less
+        # PCM). The transport feeds endpointed audio (one utterance per call).
         buf = bytearray()
+        codec: AudioCodec = "pcm16"
+        sample_rate = 24_000
         async for chunk in audio:
             buf.extend(chunk.data)
+            codec = chunk.codec
+            sample_rate = chunk.sample_rate
 
         if not buf:
             # Empty utterance (caller sent end with no audio) — emit an empty
@@ -124,11 +131,20 @@ class OpenAIWhisperSTT:
 
         client = self._resolve_client(api_key)
         # OpenAI's SDK wants a file-like with a ``.name`` so it can infer the
-        # format. We hand it the raw PCM bytes wrapped in a named buffer.
+        # format — and it must be a DECODABLE container, not raw PCM. Wrap PCM
+        # (and μ-law, after decoding) in a WAV header; pass an already-containered
+        # codec (opus) through with the right extension.
         import io  # noqa: PLC0415
 
-        file_obj = io.BytesIO(bytes(buf))
-        file_obj.name = "audio.wav"
+        if codec == "pcm16":
+            body, filename = pcm16_to_wav(bytes(buf), sample_rate), "audio.wav"
+        elif codec == "mulaw":
+            body, filename = pcm16_to_wav(mulaw_to_pcm16(bytes(buf)), sample_rate), "audio.wav"
+        else:  # already a self-describing container (e.g. opus/ogg)
+            body, filename = bytes(buf), "audio.ogg"
+
+        file_obj = io.BytesIO(body)
+        file_obj.name = filename
 
         extra: dict[str, Any] = {}
         if language:
@@ -194,10 +210,25 @@ class OpenAITTS:
             return  # nothing to say → no audio frames
 
         client = self._resolve_client(api_key)
-        # Request raw PCM so the bytes map directly onto our ``pcm16`` codec
-        # (no WAV/Opus container to parse at the edge). The SDK exposes a
-        # streaming-response context manager; we fall back to reading the whole
-        # body if the fake/older client returns a plain response object.
+        # Request raw PCM (no container at the edge). Prefer the SDK's
+        # streaming-response context manager so the FIRST audio bytes arrive
+        # before the whole utterance is synthesized — drops perceived latency
+        # from ~1.2s (buffered) to ~300-500ms. Fall back to a one-shot call for
+        # older SDKs / fakes that don't expose ``with_streaming_response``.
+        streamer = getattr(
+            getattr(client.audio.speech, "with_streaming_response", None), "create", None
+        )
+        if streamer is not None:
+            async with streamer(
+                model=self._model,
+                voice=voice_id or self._default_voice,
+                input=utterance,
+                response_format="pcm",
+            ) as resp:
+                async for chunk in _iter_audio_bytes(resp):
+                    yield AudioChunk(data=chunk, codec=codec, sample_rate=_OPENAI_TTS_SAMPLE_RATE)
+            return
+
         resp = await client.audio.speech.create(
             model=self._model,
             voice=voice_id or self._default_voice,
@@ -205,13 +236,31 @@ class OpenAITTS:
             response_format="pcm",
         )
         data = await _read_audio_bytes(resp)
-
         for start in range(0, len(data), _TTS_CHUNK_BYTES):
             yield AudioChunk(
                 data=data[start : start + _TTS_CHUNK_BYTES],
                 codec=codec,
                 sample_rate=_OPENAI_TTS_SAMPLE_RATE,
             )
+
+
+async def _iter_audio_bytes(resp: Any) -> AsyncIterator[bytes]:
+    """Stream the audio body in chunks if the SDK supports it.
+
+    OpenAI's StreamedBinaryAPIResponse exposes ``iter_bytes(chunk_size)`` — that's
+    the path that drops first-byte latency. Anything older falls back to a single
+    full-body read so the contract still holds.
+    """
+    iterator = getattr(resp, "iter_bytes", None)
+    if iterator is not None:
+        agen = iterator(chunk_size=_TTS_CHUNK_BYTES)
+        async for piece in agen:
+            if piece:
+                yield bytes(piece)
+        return
+    data = await _read_audio_bytes(resp)
+    for start in range(0, len(data), _TTS_CHUNK_BYTES):
+        yield data[start : start + _TTS_CHUNK_BYTES]
 
 
 async def _read_audio_bytes(resp: Any) -> bytes:
