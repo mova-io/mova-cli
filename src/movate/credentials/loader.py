@@ -80,6 +80,23 @@ VOICE_KEY_ENV_VARS: tuple[str, ...] = (
     "AZURE_SPEECH_REGION",
 )
 
+# Temporal connection (ADR 054) — host + namespace + optional TLS cert/key for
+# Temporal Cloud; reads from ~/.movate/credentials via ``mdk auth login
+# temporal``. Same BYOK seam as every other provider credential (ADR 054 D8) —
+# distinct from LLM keys because Temporal is a workflow BACKEND, not an LLM
+# provider, so it lives in its own group (kept out of PROVIDER_KEY_ENV_VARS so
+# ``_has_any_provider_key`` still answers "can this machine run a text agent?"
+# correctly). The TLS pair is only required for Temporal Cloud; self-hosted
+# (``temporal server start-dev`` locally, AKS, docker-compose) leaves them
+# unset. All four go through the standard autoload-from-credentials-file
+# pipeline so operators don't re-export each shell.
+TEMPORAL_KEY_ENV_VARS: tuple[str, ...] = (
+    "TEMPORAL_HOST",
+    "TEMPORAL_NAMESPACE",
+    "TEMPORAL_TLS_CERT",
+    "TEMPORAL_TLS_KEY",
+)
+
 # Every env var the credentials store should autoload. Union of the
 # groups above; surfaced as a constant so `autoload_credentials`
 # and any future "what does mdk track?" enumeration agree on the
@@ -89,6 +106,7 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
     *VOICE_KEY_ENV_VARS,
+    *TEMPORAL_KEY_ENV_VARS,
 )
 
 

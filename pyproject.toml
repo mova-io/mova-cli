@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.6.3.12"
+version = "2026.6.3.14"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -307,16 +307,20 @@ airflow = [
     # unrelated stub). The import package, however, is `airflow`.
     "apache-airflow>=2.7,<3",
 ]
+# Temporal — opt-in deterministic, durable workflow backend (ADR 054).
+# Per-workflow opt-in via `workflow.yaml: runtime: temporal`. The native
+# runner is the default; this extra is only needed when running workflows
+# with `runtime: temporal` and/or running `mdk worker --backend temporal`
+# (Phase 1 in progress; see docs/adr/054-temporal-backend.md).
+#
+# Single shipped dep: `temporalio` is the ONLY Python SDK for Temporal —
+# hand-rolling JSON-over-gRPC against the Temporal Service API is not viable
+# (ADR 054 D7). MIT-licensed (PyPI: "License :: OSI Approved :: MIT License")
+# — passes scripts/check_licenses.py. OPT-IN only, NOT in SHIPPED_EXTRAS:
+# nothing in core/cli/runtime imports `temporalio` at module scope (import
+# isolation per ADR 054 D7 / ADR 030 D1). Same posture as [prefect] /
+# [airflow] / [voice] — listed here, not policed by the strict gate.
 temporal = [
-    # ADR 054 — Temporal as a first-class OPTIONAL execution backend behind
-    # the runner Protocol. Phase 1 ships the workflow compiler skeleton +
-    # activity wrappers; this extra installs the only Python SDK for Temporal
-    # (no JSON-over-gRPC hand-rolling — see ADR 054 D7). MIT-licensed; passes
-    # the license gate; ~50 MB installed. Imported LAZILY inside
-    # movate.core.workflow.compilers.temporal (and the Track C activity
-    # wrappers / Track D worker entry), so the base install + every existing
-    # command + the native runner + the LangGraph backend are unaffected.
-    # OPT-IN only — NOT in the license gate's SHIPPED_EXTRAS.
     "temporalio>=1.7,<2",
 ]
 playground = [
@@ -539,6 +543,12 @@ module = [
     "azure.cognitiveservices.speech.*",
     "azure.cognitiveservices.*",
     "azure.*",
+    # Temporal SDK — optional [temporal] extra (ADR 054 Phase 1). The SDK
+    # ships its own type stubs, but mypy on `src` should stay clean whether
+    # or not the [temporal] extra is installed. Imported LAZILY inside the
+    # Temporal compiler / worker glue (Phase 1 Track B/C), so a base install
+    # is unaffected.
+    "temporalio.*",
 ]
 ignore_missing_imports = true
 
