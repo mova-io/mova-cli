@@ -4236,6 +4236,9 @@ async def _ingest_upload(
             tenant_id=ctx.tenant_id,
             embedding_model=embedding_model(),
             ocr=parse_result.ocr_used,
+            build_graph=True,
+            emit_growth_events=True,
+            project_id=getattr(ctx, "project_id", None),
         )
         if summary is None:
             per_file.append(KbIngestFileResult(source=basename, status="empty"))

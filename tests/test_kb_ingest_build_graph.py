@@ -76,12 +76,13 @@ async def test_build_graph_persists_entities_and_relations():
         assert set(e.source_chunk_ids) <= chunk_ids
 
 
-async def test_build_graph_off_by_default():
+async def test_build_graph_on_by_default():
+    """Graph extraction runs by default (build_graph=True since 2026.6).
+
+    The stub complete_fn MUST be called when build_graph defaults to True.
+    """
     storage = InMemoryStorage()
     await storage.init()
-
-    async def _boom(prompt: str) -> str:  # must never be called
-        raise AssertionError("extraction ran without --build-graph")
 
     summary = await ingest_text(
         storage=storage,
@@ -89,6 +90,28 @@ async def test_build_graph_off_by_default():
         source="doc.md",
         agent="a1",
         tenant_id="t1",
+        complete_fn=_stub_complete,
+    )
+    assert summary is not None
+    assert summary.entities_saved > 0
+    assert summary.relations_saved > 0
+
+
+async def test_build_graph_skipped_when_false():
+    """Passing build_graph=False (CLI: --skip-graph) suppresses extraction."""
+    storage = InMemoryStorage()
+    await storage.init()
+
+    async def _boom(prompt: str) -> str:  # must never be called
+        raise AssertionError("extraction ran with build_graph=False")
+
+    summary = await ingest_text(
+        storage=storage,
+        text=_DOC,
+        source="doc.md",
+        agent="a1",
+        tenant_id="t1",
+        build_graph=False,
         complete_fn=_boom,
     )
     assert summary is not None
