@@ -604,18 +604,6 @@ async def run_voice_pipeline(
         )
         return
 
-    # ── Stage 2: the UNCHANGED text Executor, with token streaming (D11) ──
-    # Decouple the executor's *sync* on_token callback from our *async*
-    # generator with a queue — the exact pattern ``_sse_run_stream`` uses.
-    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-    # ADR 050 D1/D8: ``extra_input`` merges session history (conversation_history)
-    # into the run input so voice turns see prior context — the same augmented
-    # input dict the text ``_assemble_session_input`` produces. The transcript
-    # key is set last so it can't be overridden by extra_input.
-    run_input: dict[str, Any] = dict(extra_input or {})
-    run_input[input_key] = final_transcript
-    run_request = RunRequest(agent=bundle.spec.name, input=run_input)
-
     # STT endpointed: commit a matching speculation (adopt its in-flight run) or
     # cancel it. Either way the agent stage below sees one uniform run handle.
     # ``aclose`` then drains any *abandoned* (cancelled / superseded) speculative
