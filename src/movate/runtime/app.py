@@ -913,6 +913,7 @@ async def _run_voice_pipeline_oneshot(
     input_key: str = "text",
     language: str | None = None,
     voice_id: str = "",
+    keyterms: list[str] | None = None,
     stt_api_key: str | None = None,
     tts_api_key: str | None = None,
 ) -> _OneShotVoiceResult:
@@ -949,6 +950,7 @@ async def _run_voice_pipeline_oneshot(
         agent=agent,
         language=language,
         voice_id=voice_id,
+        keyterms=keyterms or None,
         stt_api_key=stt_api_key,
         tts_api_key=tts_api_key,
     ):
@@ -15550,6 +15552,15 @@ def build_app(
             # One chunk: the whole uploaded utterance. STT endpoints it.
             yield _AudioChunk(data=audio_data, codec=cast(Any, codec))
 
+        # ADR 071 D1 — apply the agent's voice block as DEFAULTS (an explicit
+        # request param still wins). Mirrors the WS/realtime seeding so a
+        # per-agent voice_id / language / keyterms applies on the REST path too;
+        # absent block leaves the request values untouched (today's behavior).
+        _vblock = getattr(getattr(bundle, "spec", None), "voice", None)
+        eff_voice_id = (voice_id or "") or getattr(_vblock, "voice_id", "")
+        eff_language = language if language is not None else getattr(_vblock, "language", None)
+        eff_keyterms = list(getattr(_vblock, "keyterms", []) or [])
+
         turn = await _run_voice_pipeline_oneshot(
             audio_in=_audio_in(),
             stt=stt_adapter,
@@ -15558,8 +15569,9 @@ def build_app(
             bundle=bundle,
             tenant_id=ctx.tenant_id,
             input_key=input_key,
-            language=language,
-            voice_id=voice_id or "",
+            language=eff_language,
+            voice_id=eff_voice_id,
+            keyterms=eff_keyterms,
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
         )

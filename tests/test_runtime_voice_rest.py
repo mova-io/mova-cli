@@ -230,6 +230,81 @@ async def test_voice_rest_text_in_bypasses_stt(client, auth_setup, app_and_fakes
     assert stt.received == []
 
 
+async def test_voice_rest_applies_agent_voice_block(storage, agents_path, auth_setup) -> None:
+    """ADR 071 D1 — an agent's voice block (voice_id + keyterms) is the default on
+    the REST path with no explicit request param (mirrors the WS/realtime fix)."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("the vpn is down")
+    tts = FakeTTS()
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = lambda: tts
+    token, _ = auth_setup
+    client = TestClient(app)
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice REST transport",
+        b"description: demo agent for the voice REST transport\n"
+        b"voice:\n  enabled: true\n  voice_id: rachel\n  keyterms: ['VPN', 'Okta']",
+    )
+    r = client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+
+    resp = client.post(
+        "/api/v1/agents/voice-demo/voice",
+        files={"audio": ("clip.wav", b"\x00\x01", "application/octet-stream")},
+        data={"mock": "true"},  # NO voice_id / no keyterms in the request
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    # The agent block's keyterms reached STT and its voice_id reached TTS.
+    assert stt.keyterms_seen == [["VPN", "Okta"]]
+    assert tts.voice_ids == ["rachel"]
+
+
+async def test_voice_rest_request_voice_id_overrides_agent_block(
+    storage, agents_path, auth_setup
+) -> None:
+    """Precedence: an explicit request voice_id wins over the agent block."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("hi")
+    tts = FakeTTS()
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = lambda: tts
+    token, _ = auth_setup
+    client = TestClient(app)
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice REST transport",
+        b"description: demo agent for the voice REST transport\n"
+        b"voice:\n  enabled: true\n  voice_id: rachel",
+    )
+    client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers=_auth(token),
+    )
+    resp = client.post(
+        "/api/v1/agents/voice-demo/voice",
+        files={"audio": ("clip.wav", b"\x00\x01", "application/octet-stream")},
+        data={"mock": "true", "voice_id": "nova"},  # explicit → wins
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    assert tts.voice_ids == ["nova"]
+
+
 # ---------------------------------------------------------------------------
 # Errors + auth
 # ---------------------------------------------------------------------------
