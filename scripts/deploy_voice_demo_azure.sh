@@ -74,23 +74,24 @@ step "Build image in ACR (no local Docker required)"
 # `az acr build` uploads the build context to ACR and runs the Dockerfile
 # server-side. ~2-3 min the first time, then cached.
 #
-# IMPORTANT: build from a `git archive` tarball of TRACKED files only, NOT the
-# working tree. `az acr build <dir>` WALKS the entire directory to evaluate
-# .dockerignore per-file — and this repo can carry a multi-GB (observed: 200GB+)
-# `.claude/worktrees/` tree of nested agent worktrees that .dockerignore excludes
-# from the image but cannot stop the walker from traversing. That walk hangs the
-# upload for many minutes. `git archive` sidesteps it: the tarball contains only
-# committed files (a few MB), so the context is tiny and deterministic. The
-# Dockerfile path inside the tar is repo-root-relative, same as before.
-CONTEXT_TAR="$(mktemp -t mdk-voice-ctx-XXXXXX.tar.gz)"
-trap 'rm -f "$CONTEXT_TAR"' EXIT
-git -C "$REPO_ROOT" archive --format=tar.gz -o "$CONTEXT_TAR" HEAD
-ok "build context: $(du -h "$CONTEXT_TAR" | cut -f1) tarball (tracked files only)"
+# IMPORTANT: build from a clean `git archive` checkout of TRACKED files only,
+# NOT the working tree. `az acr build <dir>` WALKS the entire directory to
+# evaluate .dockerignore per-file — and this repo can carry a multi-GB (observed:
+# 200GB+) `.claude/worktrees/` tree of nested agent worktrees that .dockerignore
+# excludes from the image but cannot stop the walker from traversing. That walk
+# hangs the upload for many minutes. We sidestep it by exporting HEAD's tracked
+# files (a few MB) into a clean temp directory and building from there: tiny,
+# deterministic, and no worktrees underneath. (az acr build wants a directory or
+# remote URL, not a tarball path, so we extract rather than pass the tar.)
+CONTEXT_DIR="$(mktemp -d -t mdk-voice-ctx-XXXXXX)"
+trap 'rm -rf "$CONTEXT_DIR"' EXIT
+git -C "$REPO_ROOT" archive --format=tar HEAD | tar -x -C "$CONTEXT_DIR"
+ok "build context: $(du -sh "$CONTEXT_DIR" | cut -f1) clean checkout (tracked files only)"
 az acr build \
     --registry "$ACR" \
     --image "$IMAGE" \
     --file "$DOCKERFILE_REL" \
-    "$CONTEXT_TAR" \
+    "$CONTEXT_DIR" \
     -o table
 ok "image built: $ACR.azurecr.io/$IMAGE"
 

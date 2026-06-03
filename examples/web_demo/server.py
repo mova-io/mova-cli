@@ -69,6 +69,35 @@ from recording import (  # noqa: E402 - relative import after path tweak
 log = logging.getLogger("movate.voice.demo")
 DEMO_DIR = Path(__file__).parent
 
+# Deepgram keyterm boosting (nova-3): domain vocabulary the general model often
+# mis-hears in enterprise IT-support calls. Boosting these at recognition time is
+# the cheapest accuracy win — "VPN" / "VIP" / "Okta" / "Mova-iO" come back right
+# instead of "BPM" / "VP" / "October" / "movie I/O". Tune per deployment; an
+# operator can override the whole list via the DEEPGRAM_KEYTERMS env var
+# (comma-separated). Empty list / unset = no boosting (the prior behavior).
+_DEFAULT_KEYTERMS = [
+    "VPN",
+    "VIP",
+    "Okta",
+    "Mova-iO",
+    "Movate",
+    "Lyzr",
+    "SSO",
+    "MFA",
+    "Active Directory",
+    "Outlook",
+    "SharePoint",
+    "Azure",
+]
+
+
+def _demo_keyterms() -> list[str]:
+    """Curated keyterm list, overridable via DEEPGRAM_KEYTERMS (comma-separated)."""
+    override = os.environ.get("DEEPGRAM_KEYTERMS")
+    if override is not None:
+        return [t.strip() for t in override.split(",") if t.strip()]
+    return list(_DEFAULT_KEYTERMS)
+
 
 # ── key loading ───────────────────────────────────────────────────────────────
 
@@ -696,7 +725,9 @@ class Session:
         )
         # Fault wrappers sit in front of the primaries so a one-shot inject
         # forces the failover composite to pick the fallback.
-        self._fault_stt = _FaultSTT(DeepgramSTT(), name="deepgram_with_fault")
+        self._fault_stt = _FaultSTT(
+            DeepgramSTT(keyterms=_demo_keyterms()), name="deepgram_with_fault"
+        )
         self._fault_tts_cartesia = _FaultTTS(CartesiaTTS(), name="cartesia_with_fault")
         self._fault_tts_openai = _FaultTTS(OpenAITTS(), name="openai_with_fault")
         # B2: latency-hedging toggles (default off — doubles cost when on, so
@@ -2201,6 +2232,10 @@ async def voice(ws: WebSocket) -> None:
                     "responded_in_ms": latency.responded_in_ms,
                 },
                 metrics=session.metrics.snapshot(),
+                # TTS phrase-cache effectiveness (ADR 068 D6): every hit is one
+                # synthesis NOT paid for, so a rising hit_rate is a falling
+                # $/turn — surfaced so the dashboard can show the cost win live.
+                cache=session.cache.stats(),
             )
     except WebSocketDisconnect:
         log.info("session closed")
