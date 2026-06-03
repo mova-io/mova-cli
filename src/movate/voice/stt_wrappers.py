@@ -58,6 +58,7 @@ class SilenceGatedSTT:
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Sequence[str] | None = None,
+        endpointing_ms: int | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         async def _gated() -> AsyncIterator[AudioChunk]:
             silence_run = 0
@@ -79,7 +80,11 @@ class SilenceGatedSTT:
             self._observer.on_event("audio_gated", dropped=dropped, kept=kept)
 
         return self._inner.transcribe(
-            _gated(), language=language, api_key=api_key, keyterms=keyterms
+            _gated(),
+            language=language,
+            api_key=api_key,
+            keyterms=keyterms,
+            endpointing_ms=endpointing_ms,
         )
 
 
@@ -117,6 +122,7 @@ class ConfidenceGatedSTT:
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Sequence[str] | None = None,
+        endpointing_ms: int | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         # Buffer so the same audio can be replayed to the escalation provider.
         buffered: list[AudioChunk] = [chunk async for chunk in audio]
@@ -127,7 +133,11 @@ class ConfidenceGatedSTT:
 
         primary_final: TranscriptChunk | None = None
         async for chunk in self._primary.transcribe(
-            _replay(), language=language, api_key=api_key, keyterms=keyterms
+            _replay(),
+            language=language,
+            api_key=api_key,
+            keyterms=keyterms,
+            endpointing_ms=endpointing_ms,
         ):
             if chunk.is_final:
                 primary_final = chunk
@@ -144,7 +154,11 @@ class ConfidenceGatedSTT:
             )
             escalated_final: TranscriptChunk | None = None
             async for chunk in self._escalation.transcribe(
-                _replay(), language=language, api_key=api_key, keyterms=keyterms
+                _replay(),
+                language=language,
+                api_key=api_key,
+                keyterms=keyterms,
+                endpointing_ms=endpointing_ms,
             ):
                 if chunk.is_final:
                     escalated_final = chunk

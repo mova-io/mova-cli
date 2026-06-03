@@ -692,6 +692,77 @@ def test_seed_voice_turn_config_keyterms() -> None:
     assert cfg2.keyterms == []
 
 
+def test_seed_voice_turn_config_endpointing() -> None:
+    """ADR 073 D3: endpointing_ms seeds from the agent block; None keeps default."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.endpointing_ms is None  # default → adapter value (1500)
+    _seed_voice_turn_config(cfg, _bundle_with_voice(endpointing_ms=800))
+    assert cfg.endpointing_ms == 800
+    # Absent endpointing in the block leaves the default (None) untouched.
+    cfg2 = _VoiceTurnConfig()
+    _seed_voice_turn_config(cfg2, _bundle_with_voice(voice_id="x"))
+    assert cfg2.endpointing_ms is None
+
+
+async def test_voice_ws_threads_agent_endpointing_to_stt(storage, agents_path, auth_setup) -> None:
+    """End-to-end: an agent's voice.endpointing_ms reaches
+    stt.transcribe(endpointing_ms=...)."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("turn the lights on")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = FakeTTS
+    token, _ = auth_setup
+    client = TestClient(app)
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice WS transport",
+        b"description: demo agent for the voice WS transport\n"
+        b"voice:\n  enabled: true\n  endpointing_ms: 700",
+    )
+    r = client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "end"})
+        _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    assert stt.endpointing_seen == [700]
+
+
+async def test_voice_ws_config_frame_overrides_endpointing(
+    storage, agents_path, auth_setup
+) -> None:
+    """A client ``config`` frame can pin endpointing_ms per-turn (the demo A/B
+    toggle), overriding the agent-block seed."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("turn the lights on")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = FakeTTS
+    token, _ = auth_setup
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True, "endpointing_ms": 300})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "end"})
+        _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    assert stt.endpointing_seen == [300]
+
+
 async def test_voice_ws_threads_agent_keyterms_to_stt(storage, agents_path, auth_setup) -> None:
     """End-to-end: an agent's voice.keyterms reach stt.transcribe(keyterms=...)."""
     app = build_app(storage, agents_path=agents_path)

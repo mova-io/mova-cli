@@ -134,7 +134,9 @@ class _BoomSTT:
     name = "boom_stt"
     version = "0.0.1"
 
-    async def transcribe(self, audio, *, language=None, api_key=None, keyterms=None):
+    async def transcribe(
+        self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
+    ):
         async for _ in audio:
             pass
         raise RuntimeError("stt provider down")
@@ -145,7 +147,9 @@ class _NoFinalSTT:
     name = "no_final_stt"
     version = "0.0.1"
 
-    async def transcribe(self, audio, *, language=None, api_key=None, keyterms=None):
+    async def transcribe(
+        self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
+    ):
         async for _ in audio:
             pass
         yield TranscriptChunk(text="partial only", is_final=False)
@@ -155,7 +159,9 @@ class _BoomTTS:
     name = "boom_tts"
     version = "0.0.1"
 
-    async def synthesize(self, text, *, voice_id="", codec="pcm16", api_key=None, keyterms=None):
+    async def synthesize(
+        self, text, *, voice_id="", codec="pcm16", api_key=None, keyterms=None, endpointing_ms=None
+    ):
         async for _ in text:
             pass
         raise RuntimeError("tts provider down")

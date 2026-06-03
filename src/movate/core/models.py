@@ -1357,6 +1357,21 @@ class VoiceConfig(BaseModel):
             "ignore it.  Empty (the default) sends no boosting."
         ),
     )
+    endpointing_ms: int | None = Field(
+        default=None,
+        ge=0,
+        le=10_000,
+        description=(
+            "Silence-hold (ms) this agent waits before declaring the speaker's "
+            "turn finished (ADR 073 D3) — the dominant fixed latency of a "
+            "pipeline turn.  Raise it for deliberate speakers (fewer mid-pause "
+            "barge-ins), lower it for snappy command-style agents.  Passed "
+            "per-turn to the STT provider; endpointing-capable providers "
+            "(Deepgram) honor it, others ignore it.  ``None`` (the default) "
+            "keeps the runtime/adapter default (1500 ms) — byte-for-byte "
+            "unchanged."
+        ),
+    )
 
 
 class AgentSpec(BaseModel):

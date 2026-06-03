@@ -634,6 +634,12 @@ class _VoiceTurnConfig:
     # ``stt.transcribe(keyterms=...)``. Empty → no boosting. Seeded from the
     # agent's voice block; boosting-capable providers (Deepgram) honor it.
     keyterms: list[str] = field(default_factory=list)
+    # Per-agent endpointing override (ADR 073 D3): the silence-hold (ms) before
+    # the turn is declared final — the dominant fixed latency. ``None`` keeps the
+    # adapter default (1500 ms). Seeded from the agent's voice block; a client may
+    # override per-turn via ``endpointing_ms`` in its config frame. Endpointing-
+    # capable providers (Deepgram) honor it; others ignore it.
+    endpointing_ms: int | None = None
 
 
 def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
@@ -661,6 +667,9 @@ def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
     keyterms = getattr(voice, "keyterms", None)
     if keyterms:
         config.keyterms = list(keyterms)
+    # ADR 073 D3: per-agent endpointing override (None = keep adapter default).
+    if getattr(voice, "endpointing_ms", None) is not None:
+        config.endpointing_ms = int(voice.endpointing_ms)
 
 
 async def _collect_voice_turn(
@@ -697,6 +706,11 @@ async def _collect_voice_turn(
             config.mock = bool(ctrl.get("mock", config.mock))
             config.tts_streaming = bool(ctrl.get("tts_streaming", config.tts_streaming))
             config.speculative = bool(ctrl.get("speculative", config.speculative))
+            # ADR 073 D3: a client may pin the silence-hold per-turn. An explicit
+            # ``null`` resets to the adapter default; absent leaves it untouched.
+            if "endpointing_ms" in ctrl:
+                raw = ctrl.get("endpointing_ms")
+                config.endpointing_ms = int(raw) if raw is not None else None
         elif ctrl_type == "end":
             return audio_frames, False
         elif ctrl_type == "close":
@@ -872,6 +886,7 @@ async def _stream_voice_pipeline_turn(
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
             keyterms=config.keyterms or None,
+            endpointing_ms=config.endpointing_ms,
             tts_streaming=config.tts_streaming,
             speculative=config.speculative,
             observer=metrics,
@@ -929,6 +944,7 @@ async def _run_voice_pipeline_oneshot(
     language: str | None = None,
     voice_id: str = "",
     keyterms: list[str] | None = None,
+    endpointing_ms: int | None = None,
     stt_api_key: str | None = None,
     tts_api_key: str | None = None,
 ) -> _OneShotVoiceResult:
@@ -966,6 +982,7 @@ async def _run_voice_pipeline_oneshot(
         language=language,
         voice_id=voice_id,
         keyterms=keyterms or None,
+        endpointing_ms=endpointing_ms,
         stt_api_key=stt_api_key,
         tts_api_key=tts_api_key,
     ):
@@ -1025,6 +1042,7 @@ class _PrefilledSTT:
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Any = None,  # ADR 071 D4: accepted; no recognition happens here
+        endpointing_ms: int | None = None,  # ADR 073 D3: accepted; no silence-wait here
     ) -> AsyncIterator[Any]:
         from movate.voice.base import TranscriptChunk  # noqa: PLC0415
 
@@ -15575,6 +15593,8 @@ def build_app(
         eff_voice_id = (voice_id or "") or getattr(_vblock, "voice_id", "")
         eff_language = language if language is not None else getattr(_vblock, "language", None)
         eff_keyterms = list(getattr(_vblock, "keyterms", []) or [])
+        # ADR 073 D3 — the agent's tuned silence-hold applies on REST too.
+        eff_endpointing = getattr(_vblock, "endpointing_ms", None)
 
         turn = await _run_voice_pipeline_oneshot(
             audio_in=_audio_in(),
@@ -15587,6 +15607,7 @@ def build_app(
             language=eff_language,
             voice_id=eff_voice_id,
             keyterms=eff_keyterms,
+            endpointing_ms=eff_endpointing,
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
         )

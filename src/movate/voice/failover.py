@@ -294,6 +294,7 @@ class FailoverSTT(_FailoverBase):
         language: str | None = None,
         api_key: str | None = None,
         keyterms: Sequence[str] | None = None,
+        endpointing_ms: int | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         # Buffer the turn's audio once so it can be replayed to a fallback
         # provider (a consumed live stream cannot be re-fed), capped so a long /
@@ -323,7 +324,9 @@ class FailoverSTT(_FailoverBase):
         if self._hedge_enabled and len(ordered) >= _HEDGE_FANOUT:
             winner = await self._hedge(
                 ordered[:_HEDGE_FANOUT],
-                lambda p: self._collect_stt(p, replay(), language, api_key, keyterms),
+                lambda p: self._collect_stt(
+                    p, replay(), language, api_key, keyterms, endpointing_ms
+                ),
                 "stt",
             )
             if winner is not None:
@@ -338,7 +341,9 @@ class FailoverSTT(_FailoverBase):
                     failure_type=VoiceFailureType.UNAVAILABLE,
                 )
 
-        async for chunk in self._sequential_stt(ordered, replay, language, api_key, keyterms):
+        async for chunk in self._sequential_stt(
+            ordered, replay, language, api_key, keyterms, endpointing_ms
+        ):
             yield chunk
 
     async def _collect_stt(
@@ -348,10 +353,17 @@ class FailoverSTT(_FailoverBase):
         language: str | None,
         api_key: str | None,
         keyterms: Sequence[str] | None = None,
+        endpointing_ms: int | None = None,
     ) -> list[TranscriptChunk]:
         chunks: list[TranscriptChunk] = []
         stream = _with_timeouts(
-            provider.transcribe(src, language=language, api_key=api_key, keyterms=keyterms),
+            provider.transcribe(
+                src,
+                language=language,
+                api_key=api_key,
+                keyterms=keyterms,
+                endpointing_ms=endpointing_ms,
+            ),
             self._connect_timeout,
             self._call_timeout,
         )
@@ -372,6 +384,7 @@ class FailoverSTT(_FailoverBase):
         language: str | None,
         api_key: str | None,
         keyterms: Sequence[str] | None = None,
+        endpointing_ms: int | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         last_exc: Exception | None = None
         for provider in providers:
@@ -382,7 +395,11 @@ class FailoverSTT(_FailoverBase):
                 try:
                     stream = _with_timeouts(
                         provider.transcribe(
-                            replay(), language=language, api_key=api_key, keyterms=keyterms
+                            replay(),
+                            language=language,
+                            api_key=api_key,
+                            keyterms=keyterms,
+                            endpointing_ms=endpointing_ms,
                         ),
                         self._connect_timeout,
                         self._call_timeout,
