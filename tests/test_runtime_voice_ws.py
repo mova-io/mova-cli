@@ -343,6 +343,49 @@ def test_voice_ws_realtime_routes_to_realtime_provider(
     assert rt.voice_ids == ["rachel"]
 
 
+def test_voice_ws_realtime_seeds_voice_id_from_agent_block(
+    storage, agents_path, auth_setup
+) -> None:
+    """ADR 071 D1: an agent's voice.voice_id reaches the realtime provider with
+    NO client config frame (the block is the default)."""
+    app = build_app(storage, agents_path=agents_path)
+    rt = FakeRealtime(transcript="hi", answer="done", frames=1)
+    app.state.voice_realtime_factory = lambda: rt
+    token, _ = auth_setup
+    client = TestClient(app)
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice WS transport",
+        b"description: demo agent for the voice WS transport\n"
+        b"voice:\n  enabled: true\n  voice_id: rachel",
+    )
+    r = client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect(
+        f"/api/v1/agents/voice-demo/voice?mode=realtime&token={token}"
+    ) as ws:
+        ws.send_bytes(b"\x00\x01")  # a mic frame — NO config frame
+        ws.send_json({"type": "close"})
+        while True:
+            msg = ws.receive()
+            if msg.get("type") == "websocket.close":
+                break
+            if msg.get("text") and json.loads(msg["text"]).get("type") == "response_done":
+                break
+
+    # The agent block's voice_id reached the provider without a client frame.
+    assert rt.voice_ids == ["rachel"]
+
+
 def test_voice_ws_realtime_unconfigured_is_rejected(client: TestClient, auth_setup) -> None:
     # With no realtime factory configured (the default), ?mode=realtime must
     # degrade with a clear error frame, not hard-fail — the pipeline mode stays

@@ -992,7 +992,12 @@ async def _run_voice_realtime(websocket: WebSocket, bundle: Any, *, tenant_id: s
 
     provider = factory()
     instructions = _realtime_instructions(bundle)
+    # ADR 071 D1: seed from the agent's voice block so per-agent voice_id /
+    # language apply on the realtime path too (the streaming/speculative/keyterms
+    # fields are pipeline-only and ignored here). Client config frames still
+    # override per-turn.
     config = _VoiceTurnConfig()
+    _seed_voice_turn_config(config, bundle)
 
     # BYOK (ADR 048 D6 / ADR 018): the tenant's own realtime-provider key,
     # resolved at the edge. ``None`` → the adapter's env default (back-compat).

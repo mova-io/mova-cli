@@ -45,10 +45,12 @@ the failover composite + wrappers. That asymmetry drives the split below.
 
 When a voice WS connection resolves an agent whose `spec.voice` is present, seed
 `_VoiceTurnConfig` from it **before** the first turn: `voice_id`, `language`
-(and `mode` continues to select pipeline vs realtime). A client `config` frame
-can still override per-turn (unchanged precedence: agent block = the default,
-client frame = the override). Agents with no voice block are byte-for-byte
-unchanged (defaults).
+(and `mode` continues to select pipeline vs realtime). **Both** WS handlers are
+seeded — the pipeline path (all fields) and the realtime path (`voice_id` /
+`language`; the streaming/speculative/keyterms fields are pipeline-only and
+ignored there). A client `config` frame can still override per-turn (unchanged
+precedence: agent block = the default, client frame = the override). Agents with
+no voice block are byte-for-byte unchanged (defaults).
 
 ### D2 — Extend `VoiceConfig` with `tts_streaming` (additive)
 
@@ -114,7 +116,8 @@ rejects typos). `mdk show` renders them. No new CLI verbs.
 
 ## Boundaries (explicitly NOT in scope)
 
-- Does not change the realtime path, the Executor, or make any provider
+- Seeds the realtime path's `voice_id`/`language` from the block (D1) but adds
+  no realtime-specific tuning; does not change the Executor or make any provider
   voice-aware beyond the existing seams.
 - Does not implement D4 (keyterms at the seam) — Proposed, pending agreement.
 - Does not change client-frame override precedence.
