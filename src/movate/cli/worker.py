@@ -28,6 +28,7 @@ from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.job_retry import DEFAULT_VISIBILITY_TIMEOUT_SECONDS
 from movate.core.models import JobRecord, JobStatus
 from movate.core.notify import build_dispatcher
+from movate.runtime.alert_worker import build_alert_worker
 from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
 from movate.runtime.registry import scan_agents, scan_workflows
 from movate.runtime.webhook_worker import WebhookWorker, WebhookWorkerConfig
@@ -140,6 +141,17 @@ def worker(
         "--mock",
         help="Use the deterministic MockProvider (no API keys; for smoke tests).",
     ),
+    backend: str = typer.Option(
+        "queue",
+        "--backend",
+        help=(
+            "Worker backend (ADR 055 D4): [bold]queue[/bold] (default) drains the "
+            "job queue and serves native + langgraph (in-process) workflows — "
+            "unchanged. [bold]temporal[/bold] connects to the Temporal service "
+            "(TEMPORAL_HOST/NAMESPACE/TLS_CERT), registers every 'runtime: temporal' "
+            "workflow + the activities, and runs a Temporal worker (needs mdk[temporal])."
+        ),
+    ),
 ) -> None:
     """Drain the queue, dispatch each job, persist the result.
 
@@ -154,6 +166,20 @@ def worker(
       [dim]# Hermetic smoke (no API keys)[/dim]
       $ movate worker --mock
     """
+    if backend not in ("queue", "temporal"):
+        err.print(f"[red]✗[/red] --backend must be 'queue' or 'temporal' (got {backend!r})")
+        raise typer.Exit(code=2)
+
+    if backend == "temporal":
+        asyncio.run(
+            _run_temporal_worker(
+                tenant_id=tenant_id,
+                workflows_path=workflows_path,
+                mock=mock,
+            )
+        )
+        return
+
     asyncio.run(
         _run_worker(
             tenant_id=tenant_id,
@@ -174,13 +200,21 @@ async def _run_worker(
     mock: bool,
 ) -> None:
     from movate.cli._runtime import register_pool_observability  # noqa: PLC0415
-    from movate.tracing import init_metrics  # noqa: PLC0415
+    from movate.tracing import init_metrics, install_log_correlation  # noqa: PLC0415
 
     # Initialize OTel metrics once at worker startup (R3 / item 33), after
     # dotenv + MDK_*→MOVATE_* alias sync (both run at CLI import in main.py).
     # Mirrors the tracer wiring; a complete no-op when the otel extra is absent
     # or the OTLP sink/endpoint isn't configured. Never raises.
     init_metrics()
+    # Stamp the active distributed-trace trace_id/span_id (ADR 019/024) onto
+    # every log line the worker emits while executing a job, so App Insights /
+    # Log Analytics can pivot from a trace to its correlated logs (item 38).
+    # Wired here at the execution edge — not only in the CLI callback — so jobs
+    # drained by this worker are correlated even when the process is launched
+    # outside the top-level callback. Idempotent; a complete no-op when the otel
+    # extra is absent; never raises.
+    install_log_correlation()
 
     rt = await build_local_runtime(mock=mock)
     # ADR 034 D3 — wire the asyncpg pool's saturation gauges. build_local_runtime
@@ -265,6 +299,16 @@ async def _run_worker(
         config=WebhookWorkerConfig(tenant_id=tenant_id),
     )
 
+    # ADR 057 step 2 — alert-router consumer runs in the SAME process / loop.
+    # It drains ``alert.raised`` events (raised by the drift / dead-letter /
+    # budget sources) and routes them to the configured sinks. Opt-in: with no
+    # ``alerts:`` routes + no sink env vars the router is inactive and this is a
+    # pure no-op (zero behavior change). Fully independent of the job/webhook
+    # workers (separate task; a sink that hangs can't sink dispatch).
+    alert_worker = build_alert_worker(storage=rt.storage, tenant_id=tenant_id)
+    if alert_worker.is_active:
+        hint("[dim]alert routing: active (ADR 057)[/dim]")
+
     stop_event = asyncio.Event()
 
     def _handle_signal(*_: object) -> None:
@@ -287,8 +331,92 @@ async def _run_worker(
         await asyncio.gather(
             worker_obj.run_forever(stop_event),
             webhook_worker.run_forever(stop_event),
+            alert_worker.run_forever(stop_event),
             return_exceptions=True,
         )
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
         success("worker stopped cleanly")
+
+
+async def _run_temporal_worker(
+    *,
+    tenant_id: str | None,
+    workflows_path: Path,
+    mock: bool,
+) -> None:
+    """Run a Temporal worker (``mdk worker --backend temporal``, ADR 055 D4).
+
+    Connects to the Temporal service (TEMPORAL_HOST/NAMESPACE/TLS_CERT, D5),
+    scans + compiles every ``runtime: temporal`` workflow, installs the Track-C
+    activity context with this process's storage/pricing/tracer/provider (the
+    SAME Executor wiring the queue worker uses — ADR 054 D3), registers the
+    compiled workflows + the four activities on the shared task queue, and
+    polls until SIGINT/SIGTERM.
+
+    Kept thin: the heavy lifting (compile + register + run) lives in
+    :func:`movate.runtime.workflow_backend.run_temporal_worker`; this is the
+    CLI shell (runtime build, env hint, signal handling, banner).
+    """
+    from movate.providers.pricing import load_pricing  # noqa: PLC0415
+    from movate.runtime.registry import scan_workflows  # noqa: PLC0415
+    from movate.runtime.workflow_backend import (  # noqa: PLC0415
+        WorkflowBackendError,
+        require_backend_available,
+        run_temporal_worker,
+    )
+
+    # Fail loud BEFORE building anything if the extra/connection isn't ready.
+    try:
+        require_backend_available("temporal")
+    except WorkflowBackendError as exc:
+        err.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    rt = await build_local_runtime(mock=mock)
+    workflows = scan_workflows(workflows_path)
+    temporal_wfs = {
+        name: g for name, g in workflows.items() if getattr(g, "runtime", "native") == "temporal"
+    }
+    if not temporal_wfs:
+        err.print(
+            f"[yellow]⚠[/yellow] no [bold]runtime: temporal[/bold] workflows at "
+            f"{workflows_path} — the worker will start but host nothing. Add "
+            f"[bold]runtime: temporal[/bold] to a workflow.yaml to register it."
+        )
+
+    stop_event = asyncio.Event()
+
+    def _handle_signal(*_: object) -> None:
+        err.print()  # newline after ^C
+        hint("[dim]received shutdown signal — stopping Temporal worker...[/dim]")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _handle_signal)
+
+    if temporal_wfs:
+        success(f"{len(temporal_wfs)} temporal workflow(s) registering:")
+        for name in sorted(temporal_wfs):
+            err.print(f"  - {name}")
+    err.print(
+        f"[bold]movate worker[/bold] (temporal) — tenant={tenant_id or '<all>'} "
+        f"workflows={len(temporal_wfs)} — waiting for Temporal workflow tasks"
+    )
+    try:
+        await run_temporal_worker(
+            temporal_wfs,
+            storage=rt.storage,
+            pricing=load_pricing(),
+            tracer=rt.tracer,
+            provider=rt.provider,
+            tenant_id=tenant_id or "local",
+            stop_event=stop_event,
+        )
+    except WorkflowBackendError as exc:
+        err.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
+    finally:
+        await shutdown_runtime(rt.storage, rt.tracer)
+        success("temporal worker stopped cleanly")

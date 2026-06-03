@@ -17,13 +17,19 @@ reused as-is (no Executor edit). With a real scaffolded agent + a real
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from movate.core.loader import load_agent
 from movate.testing.scaffold import build_test_executor, scaffold_agent
 from movate.voice import AudioChunk, FakeSTT, FakeTTS, run_voice_pipeline
-from movate.voice.pipeline import VoiceEvent
+from movate.voice.pipeline import (
+    VoiceEvent,
+    VoiceTurnLatency,
+    compute_turn_latency,
+    format_latency_badge,
+)
 
 
 async def _audio_in(*blobs: bytes) -> AsyncIterator[AudioChunk]:
@@ -290,3 +296,232 @@ async def test_pipeline_tts_failure_still_yields_answer_and_done(tmp_path: Path)
     assert kinds[-1] == "done"
     # The run still succeeded (it's the audio output that failed, not the run).
     assert len(storage.runs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Latency badge (demo polish) — per-stage timings off the event stream
+# ---------------------------------------------------------------------------
+
+
+def test_compute_turn_latency_reads_milestone_offsets() -> None:
+    """compute_turn_latency picks the FIRST event of each milestone kind and
+    reports STT-final / agent-first-token / TTS-first-audio offsets + derived
+    spans."""
+    events = [
+        VoiceEvent(kind="transcript.partial", text="he", at_ms=50.0),
+        VoiceEvent(kind="transcript.final", text="hello", at_ms=120.0),
+        VoiceEvent(kind="agent.token", text="hi", at_ms=300.0),
+        VoiceEvent(kind="agent.token", text=" there", at_ms=350.0),  # later token ignored
+        VoiceEvent(kind="tts.audio", audio=AudioChunk(data=b"x"), at_ms=480.0),
+        VoiceEvent(kind="tts.audio", audio=AudioChunk(data=b"y"), at_ms=520.0),
+        VoiceEvent(kind="done", run_id="r1", status="success", at_ms=600.0),
+    ]
+    lat = compute_turn_latency(events)
+    assert lat.stt_final_ms == 120.0
+    assert lat.agent_first_token_ms == 300.0  # first token, not the second
+    assert lat.tts_first_audio_ms == 480.0  # first audio frame
+    # responded_in_ms headlines the first audible response.
+    assert lat.responded_in_ms == 480.0
+    # Derived spans: agent think = final→first-token, voice = first-token→audio.
+    assert lat.agent_think_ms == 180.0
+    assert lat.tts_ms == 180.0
+
+
+def test_compute_turn_latency_falls_back_to_first_token_without_audio() -> None:
+    """A degraded text-only turn (TTS produced no audio) still has a meaningful
+    'responded' latency: the agent's first token."""
+    events = [
+        VoiceEvent(kind="transcript.final", text="hi", at_ms=100.0),
+        VoiceEvent(kind="agent.token", text="answer", at_ms=250.0),
+        VoiceEvent(kind="error", code="tts_error", stage="tts", at_ms=260.0),
+        VoiceEvent(kind="done", run_id="r", status="success", at_ms=270.0),
+    ]
+    lat = compute_turn_latency(events)
+    assert lat.tts_first_audio_ms is None
+    assert lat.responded_in_ms == 250.0  # falls back to first token
+    assert lat.tts_ms is None  # no audio → no synthesis span
+
+
+def test_format_latency_badge_renders_headline_and_breakdown() -> None:
+    """The badge headlines 'responded in {X}ms' and appends the per-stage split
+    when available; an empty latency renders nothing."""
+    lat = VoiceTurnLatency(stt_final_ms=100.0, agent_first_token_ms=280.0, tts_first_audio_ms=460.0)
+    badge = format_latency_badge(lat)
+    assert badge.startswith("⚡ responded in 460ms")
+    assert "agent 180ms" in badge
+    assert "voice 180ms" in badge
+    # Nothing reached → empty string (nothing useful to show).
+    assert format_latency_badge(VoiceTurnLatency()) == ""
+
+
+async def test_pipeline_stamps_at_ms_on_every_event(tmp_path: Path) -> None:
+    """run_voice_pipeline stamps a monotonic at_ms offset on every event, in
+    non-decreasing order, so the badge can be computed off the stream."""
+    bundle = _scaffold_bundle(tmp_path)
+    executor, _p, _s, _t = build_test_executor(
+        response='{"message": "spoken"}', tenant_id="t-voice"
+    )
+
+    # A deterministic clock: a list of monotonic-seconds the pipeline pops in
+    # order, so the stamped offsets are exactly assertable.
+    ticks = iter([10.0, 10.12, 10.30, 10.48, 10.60, 10.7, 10.8])
+
+    def _clock() -> float:
+        try:
+            return next(ticks)
+        except StopIteration:
+            return 11.0
+
+    events = await _collect(
+        run_voice_pipeline(
+            audio_in=_audio_in(b"a"),
+            stt=FakeSTT("hello"),
+            tts=FakeTTS(),
+            executor=executor,
+            bundle=bundle,
+            tenant_id="t-voice",
+            clock=_clock,
+        )
+    )
+    offsets = [e.at_ms for e in events]
+    # Every event carries an offset; offsets are non-decreasing (time only moves
+    # forward) and start at ~0 (the first tick is the turn-start baseline).
+    assert all(o >= 0 for o in offsets)
+    assert offsets == sorted(offsets)
+    lat = compute_turn_latency(events)
+    assert lat.responded_in_ms is not None
+    assert format_latency_badge(lat).startswith("⚡ responded in")
+
+
+# ---------------------------------------------------------------------------
+# Barge-in — a mid-answer interrupt cancels the in-flight TTS (ADR 048 D2b)
+# ---------------------------------------------------------------------------
+
+
+class _ControllableTTS:
+    """A TTS double that yields several frames and lets the test drive barge-in.
+
+    It sets ``cancel`` itself right after emitting its FIRST audio frame
+    (simulating the user starting to speak mid-answer), then keeps trying to
+    emit more frames. It records whether its generator was closed
+    (``aclose``-d) so a test can assert the pipeline tore the in-flight
+    synthesis down rather than draining it.
+    """
+
+    name = "controllable_tts"
+    version = "0.0.1"
+
+    def __init__(self, cancel: asyncio.Event, *, total_frames: int = 5) -> None:
+        self._cancel = cancel
+        self._total = total_frames
+        self.emitted = 0
+        self.closed = False
+
+    async def synthesize(
+        self, text: AsyncIterator[str], *, voice_id: str = "", codec: str = "pcm16", api_key=None
+    ) -> AsyncIterator[AudioChunk]:
+        async for _ in text:
+            pass
+        try:
+            for i in range(self._total):
+                yield AudioChunk(data=f"frame-{i}".encode(), codec=codec)
+                self.emitted += 1
+                if i == 0:
+                    # The user just started talking → barge in.
+                    self._cancel.set()
+                await asyncio.sleep(0)  # yield control so cancel is observed
+        finally:
+            self.closed = True
+
+
+async def test_pipeline_bargein_cancels_inflight_tts(tmp_path: Path) -> None:
+    """When ``cancel`` is set mid-answer, the pipeline stops emitting TTS audio,
+    closes the synthesis generator, and ends with a ``done`` status of
+    ``interrupted`` — proof the in-flight TTS was actually cancelled."""
+    bundle = _scaffold_bundle(tmp_path)
+    executor, _p, _s, _t = build_test_executor(
+        response='{"message": "a very long spoken answer"}', tenant_id="t-voice"
+    )
+    cancel = asyncio.Event()
+    tts = _ControllableTTS(cancel, total_frames=5)
+
+    events = await _collect(
+        run_voice_pipeline(
+            audio_in=_audio_in(b"a"),
+            stt=FakeSTT("hello"),
+            tts=tts,
+            executor=executor,
+            bundle=bundle,
+            tenant_id="t-voice",
+            cancel=cancel,
+        )
+    )
+
+    audio_events = [e for e in events if e.kind == "tts.audio"]
+    # Only the first frame made it out before the barge-in stopped synthesis —
+    # the remaining frames were NOT forwarded to the client.
+    assert len(audio_events) == 1
+    assert tts.emitted < 5  # the TTS did not run to completion
+    # The synthesis generator was closed (the in-flight stream was torn down).
+    assert tts.closed is True
+    # The turn ends cleanly, flagged as interrupted (a barge-in, not an error).
+    done = events[-1]
+    assert done.kind == "done"
+    assert done.status == "interrupted"
+    assert "error" not in [e.kind for e in events]
+
+
+async def test_pipeline_bargein_before_tts_skips_synthesis(tmp_path: Path) -> None:
+    """If the user is already speaking when the answer is ready (cancel set
+    before TTS begins), no audio is synthesized at all."""
+    bundle = _scaffold_bundle(tmp_path)
+    executor, _p, _s, _t = build_test_executor(
+        response='{"message": "answer"}', tenant_id="t-voice"
+    )
+    cancel = asyncio.Event()
+    cancel.set()  # already barging in
+    tts = FakeTTS()
+
+    events = await _collect(
+        run_voice_pipeline(
+            audio_in=_audio_in(b"a"),
+            stt=FakeSTT("hello"),
+            tts=tts,
+            executor=executor,
+            bundle=bundle,
+            tenant_id="t-voice",
+            cancel=cancel,
+        )
+    )
+    assert [e for e in events if e.kind == "tts.audio"] == []
+    # TTS was never invoked (no synthesis attempted).
+    assert tts.spoken == []
+    assert events[-1].status == "interrupted"
+
+
+async def test_pipeline_no_cancel_is_unchanged(tmp_path: Path) -> None:
+    """Back-compat: with no ``cancel`` event, the turn behaves exactly as before
+    (full audio, status reflects the run, not 'interrupted')."""
+    bundle = _scaffold_bundle(tmp_path)
+    executor, _p, _s, _t = build_test_executor(
+        response='{"message": "full answer"}', tenant_id="t-voice"
+    )
+    tts = FakeTTS(frames=3)
+    events = await _collect(
+        run_voice_pipeline(
+            audio_in=_audio_in(b"a"),
+            stt=FakeSTT("hi"),
+            tts=tts,
+            executor=executor,
+            bundle=bundle,
+            tenant_id="t-voice",
+        )
+    )
+    audio_events = [e for e in events if e.kind == "tts.audio"]
+    # The full answer round-tripped through TTS (every frame forwarded).
+    assert audio_events
+    answer_bytes = b"".join(e.audio.data for e in audio_events if e.audio)
+    assert answer_bytes.decode("utf-8") == "full answer"
+    assert tts.spoken == ["full answer"]
+    # Not interrupted — the done status reflects the run.
+    assert events[-1].status == "success"

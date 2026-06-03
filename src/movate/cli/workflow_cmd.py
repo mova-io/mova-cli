@@ -30,6 +30,8 @@ workflow inline; the worker resumes it.
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -185,6 +187,273 @@ def signal(
         f"[bold]{accepted.job_id}[/bold] ({accepted.status.value})"
     )
     hint(f"[dim]poll it:[/dim] mdk jobs wait {accepted.job_id}")
+
+
+# ---------------------------------------------------------------------------
+# Replay — deterministic time-travel against a Temporal run's history
+# (ADR 054 D6 / Phase 3). Lives under `mdk workflow` because the run it
+# targets is a workflow_run_id (== the Temporal workflow id, D6).
+# ---------------------------------------------------------------------------
+
+
+@workflow_app.command("replay")
+def replay(
+    run_id: str = typer.Argument(
+        ...,
+        help=(
+            "The workflow_run_id to replay (== the Temporal workflow id, ADR 054 "
+            "D6). From [bold]mdk workflow runs[/bold] or [bold]mdk runs show[/bold]."
+        ),
+        metavar="RUN_ID",
+    ),
+    workflows_path: Path = typer.Option(
+        Path("./workflows"),
+        "--workflows-path",
+        help=(
+            "Directory holding the workflow bundles (the same layout "
+            "[bold]mdk worker[/bold] scans). The run's workflow is recompiled "
+            "from its on-disk definition here."
+        ),
+    ),
+    tenant_id: str = typer.Option(
+        "local",
+        "--tenant-id",
+        help="Tenant scope for the storage lookup (default: 'local' for CLI use).",
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Emit the replay result as JSON instead of a table."
+    ),
+) -> None:
+    """Replay a Temporal-backed workflow run against its recorded history.
+
+    Time-travel for a past ``runtime: temporal`` run: fetch its full event
+    history from Temporal (the run's id == the mdk workflow_run_id, ADR 054
+    D6), recompile the workflow from its on-disk definition (the SAME Track-B
+    compile path the worker uses), and re-feed history through the workflow
+    code via :class:`temporalio.worker.Replayer`. If the code reproduces every
+    decision the history recorded, the run is [bold]deterministic[/bold]; any
+    drift surfaces as a non-determinism error rather than a silent pass.
+
+    Replay does NOT re-execute activities (no LLM calls, no side effects, no
+    cost) — it replays the workflow's *decisions* against the durable history.
+
+    This is a verification/diagnosis tool: use it after editing a workflow to
+    confirm an in-flight run's trajectory still type-checks against the new
+    code, or to reproduce exactly what a past run decided.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Verify a past run replays deterministically[/dim]
+      $ mdk workflow replay 1f3c...
+
+      [dim]# Machine-readable result[/dim]
+      $ mdk workflow replay 1f3c... --json
+    """
+    result = asyncio.run(
+        _replay_workflow(
+            run_id=run_id,
+            workflows_path=Path(workflows_path),
+            tenant_id=tenant_id,
+            suppress=as_json,
+        )
+    )
+    if as_json:
+        stdout.print(json.dumps(result, indent=2), soft_wrap=True, highlight=False)
+        raise typer.Exit(code=0 if result["deterministic"] else 1)
+    if result["deterministic"]:
+        stdout.print(
+            f"[green]✓ replayed deterministically[/green] — "
+            f"[bold]{result['workflow']}[/bold] run "
+            f"[dim]{run_id}[/dim] reproduces identical decisions against its "
+            f"recorded history."
+        )
+        return
+    stdout.print(
+        f"[red]✗ non-deterministic[/red] — [bold]{result['workflow']}[/bold] run "
+        f"[dim]{run_id}[/dim] diverged from its recorded history:"
+    )
+    stdout.print(f"  [red]{result['divergence']}[/red]")
+    hint(
+        "[dim]the current on-disk workflow no longer reproduces this run's "
+        "decisions — a code change broke determinism for this history.[/dim]"
+    )
+    raise typer.Exit(code=1)
+
+
+async def _replay_workflow(
+    *,
+    run_id: str,
+    workflows_path: Path,
+    tenant_id: str,
+    suppress: bool,
+) -> dict[str, Any]:
+    """Resolve → recompile → fetch history → replay. Returns a result dict.
+
+    Exits cleanly (``typer.Exit``) on every operator-facing failure: an
+    unknown run, a native/non-temporal run, a missing on-disk definition, or
+    a missing ``[temporal]`` extra / connection. Never leaks a traceback.
+    """
+    from movate.runtime.workflow_backend import (  # noqa: PLC0415
+        WorkflowBackendError,
+        load_compiled_workflow_class,
+        require_backend_available,
+    )
+
+    # 1. Resolve the run from storage → recover the workflow name (D6: the
+    #    workflow_run_id is both the storage key AND the Temporal workflow id).
+    record = await _fetch_workflow_run(run_id=run_id, tenant_id=tenant_id)
+    if record is None:
+        error(
+            f"workflow run {run_id!r} not found under tenant {tenant_id!r}. "
+            "Run `mdk workflow runs` to browse recent runs.",
+            context="replay",
+        )
+        raise typer.Exit(code=1)
+
+    # 2. Recover the WorkflowGraph from the on-disk definition and confirm it
+    #    is a runtime: temporal workflow. A native/langgraph run has no
+    #    Temporal history to replay — reject cleanly, never crash.
+    graph = _load_workflow_graph(record.workflow, workflows_path)
+    if graph is None:
+        error(
+            f"workflow {record.workflow!r} (for run {run_id}) not found under "
+            f"{workflows_path}. Point --workflows-path at the directory holding "
+            "its workflow.yaml.",
+            context="replay",
+        )
+        raise typer.Exit(code=2)
+    runtime = getattr(graph, "runtime", "native") or "native"
+    if runtime != "temporal":
+        error(
+            f"replay requires a Temporal-backed run (runtime: temporal); this run used {runtime}.",
+            context="replay",
+        )
+        raise typer.Exit(code=2)
+
+    # 3. Recompile to the @workflow.defn class (the SAME path the worker uses)
+    #    and ensure the [temporal] extra + connection are available (fail loud,
+    #    ADR 054 D6 / ADR 055 D6).
+    try:
+        require_backend_available("temporal")
+    except WorkflowBackendError as exc:
+        error(str(exc), context="replay")
+        raise typer.Exit(code=2) from None
+
+    from movate.core.workflow.compilers.temporal import TemporalCompiler  # noqa: PLC0415
+
+    try:
+        compiled = TemporalCompiler().compile(graph)
+        workflow_cls = load_compiled_workflow_class(
+            compiled.module_source, compiled.workflow_class_name
+        )
+    except WorkflowBackendError as exc:
+        error(str(exc), context="replay")
+        raise typer.Exit(code=2) from None
+    except Exception as exc:  # a compile failure is operator-facing, not a crash.
+        error(f"could not recompile workflow {record.workflow!r}: {exc}", context="replay")
+        raise typer.Exit(code=2) from None
+
+    # 4. Fetch history from Temporal by id (== run_id) and 5. replay it.
+    try:
+        outcome = await _fetch_history_and_replay(
+            run_id=run_id, workflow_cls=workflow_cls, suppress=suppress
+        )
+    except WorkflowBackendError as exc:
+        error(str(exc), context="replay")
+        raise typer.Exit(code=2) from None
+
+    deterministic, divergence = outcome
+    return {
+        "run_id": run_id,
+        "workflow": record.workflow,
+        "workflow_version": record.workflow_version,
+        "runtime": "temporal",
+        "deterministic": deterministic,
+        "divergence": divergence,
+    }
+
+
+async def _fetch_workflow_run(*, run_id: str, tenant_id: str) -> Any:
+    """Pull the WorkflowRunRecord from local storage. ``None`` on miss."""
+    from movate.storage import build_storage  # noqa: PLC0415
+
+    storage = build_storage()
+    await storage.init()
+    try:
+        return await storage.get_workflow_run(run_id, tenant_id=tenant_id)
+    finally:
+        await storage.close()
+
+
+def _load_workflow_graph(name: str, workflows_path: Path) -> Any:
+    """Recover the :class:`WorkflowGraph` for ``name`` from the on-disk bundles.
+
+    Reuses :func:`movate.runtime.registry.scan_workflows` (the SAME scan the
+    worker uses) so the graph — including its ``runtime`` — is recovered
+    identically. ``None`` when no bundle by that name is present.
+    """
+    from movate.runtime.registry import scan_workflows  # noqa: PLC0415
+
+    return scan_workflows(workflows_path).get(name)
+
+
+async def _fetch_history_and_replay(
+    *, run_id: str, workflow_cls: Any, suppress: bool
+) -> tuple[bool, str | None]:
+    """Connect to Temporal, fetch the run's history, and replay it.
+
+    Returns ``(deterministic, divergence_message)``. ``temporalio`` is
+    imported lazily HERE (import isolation — ADR 054 D7 / ADR 055 Boundaries):
+    nothing at this module's scope touches Temporal.
+
+    Replay runs the workflow code against the durable event history WITHOUT
+    re-executing activities; a :class:`temporalio.worker.Replayer` surfaces a
+    non-determinism error if the current code can't reproduce the recorded
+    decisions. We pass ``raise_on_replay_failure=False`` and inspect
+    ``WorkflowReplayResult.replay_failure`` so divergence is reported, not
+    raised as a traceback.
+    """
+    import contextlib  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    from temporalio.client import Client  # noqa: PLC0415
+    from temporalio.service import TLSConfig  # noqa: PLC0415
+    from temporalio.worker import Replayer, UnsandboxedWorkflowRunner  # noqa: PLC0415
+
+    from movate.runtime.workflow_backend import _resolve_temporal_connection  # noqa: PLC0415
+
+    def _spin(message: str) -> Any:
+        # Suppress the stderr spinner under --json so the channel stays clean.
+        return contextlib.nullcontext() if suppress else spinner(message)
+
+    conn = _resolve_temporal_connection()  # fail-loud if no TEMPORAL_HOST.
+
+    tls: Any = False
+    if conn.tls_cert_path:
+        tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
+
+    with _spin("connecting to Temporal..."):
+        client = await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
+
+    with _spin("fetching workflow history..."):
+        handle = client.get_workflow_handle(run_id)
+        history = await handle.fetch_history()
+
+    # Replay unsandboxed: the compiled workflow module is generated at runtime
+    # (a source string, not an importable file the sandbox can re-load), and
+    # determinism is enforced at COMPILE time — the SAME reasoning the worker
+    # applies (workflow_backend._execute_on_temporal).
+    replayer = Replayer(
+        workflows=[workflow_cls],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+    )
+    with _spin("replaying against history..."):
+        result = await replayer.replay_workflow(history, raise_on_replay_failure=False)
+
+    failure = result.replay_failure
+    if failure is None:
+        return True, None
+    return False, str(failure)
 
 
 # ---------------------------------------------------------------------------

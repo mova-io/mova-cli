@@ -145,6 +145,14 @@ _TENANT_SLUGS: tuple[str, ...] = (
     "wayne",
 )
 
+DEMO_TELEMETRY_TENANT_ID = f"{DEMO_TENANT_PREFIX}{_TENANT_SLUGS[0]}"
+"""The canonical telemetry tenant (``demo-acme``) — the first tenant the seeder
+always populates and the one the evals/anomalies/analyzer insights concentrate
+under. ``mdk demo doctor`` reads insights back under this tenant (the analyzer
+runs per ``demo-`` telemetry tenant), distinct from the scenario's
+:data:`~movate.core.demo.scenario.DEMO_TENANT_ID` (the serve --dev tenant the
+agents + graph live under)."""
+
 
 # ---------------------------------------------------------------------------
 # Voice-turn record

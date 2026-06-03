@@ -32,6 +32,7 @@ from movate.runtime.schemas import (
     BatchListView,
     BatchStatusView,
     CapabilitiesView,
+    DeadLetterPurgeView,
     GroundedAnswerView,
     HealthView,
     JobCancelView,
@@ -210,6 +211,49 @@ class MovateClient:
         r = await self._client.get("/jobs", params=params)
         self._raise_for_status(r)
         return JobListView.model_validate(r.json())
+
+    async def list_dead_letter_jobs(
+        self,
+        *,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> JobListView:
+        """``GET /api/v1/jobs/dead-letter`` — this tenant's retry-exhausted
+        jobs, newest-first.
+
+        ``agent`` narrows to one agent/workflow ``target``; ``limit`` is
+        hard-capped at 100 server-side."""
+        params: dict[str, str | int] = {"limit": limit}
+        if agent is not None:
+            params["agent"] = agent
+        r = await self._client.get("/api/v1/jobs/dead-letter", params=params)
+        self._raise_for_status(r)
+        return JobListView.model_validate(r.json())
+
+    async def requeue_dead_letter_job(self, job_id: str) -> JobView:
+        """``POST /api/v1/jobs/{id}/requeue`` — recover a DEAD_LETTER job.
+
+        Body-less; requires the ``run`` scope. Resets the job to a fresh
+        ``QUEUED`` state (attempt budget cleared) so the worker reclaims
+        it. Returns the requeued :class:`JobView`. 404 if the job is not a
+        dead-letter for this tenant."""
+        r = await self._client.post(f"/api/v1/jobs/{job_id}/requeue")
+        self._raise_for_status(r)
+        return JobView.model_validate(r.json())
+
+    async def purge_dead_letter_jobs(self, *, before: str | None = None) -> DeadLetterPurgeView:
+        """``POST /api/v1/jobs/dead-letter/purge`` — delete this tenant's
+        DEAD_LETTER jobs.
+
+        Destructive; requires the ``admin`` scope. ``before`` (an ISO-8601
+        instant) restricts the purge to dead-letters completed strictly
+        before it; omit to purge all. Returns the count purged."""
+        params: dict[str, str] = {}
+        if before is not None:
+            params["before"] = before
+        r = await self._client.post("/api/v1/jobs/dead-letter/purge", params=params)
+        self._raise_for_status(r)
+        return DeadLetterPurgeView.model_validate(r.json())
 
     async def get_run(self, run_id: str) -> RunView:
         """``GET /runs/{id}`` — full run record including ``output``.

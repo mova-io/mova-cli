@@ -531,6 +531,11 @@ module = [
     # keeps mypy on `src` clean whether or not the extras are installed.
     "prefect.*",
     "airflow.*",
+    # Temporal Python SDK — optional [temporal] extra (ADR 054). No type
+    # stubs shipped; imported LAZILY inside movate.core.workflow.compilers
+    # .temporal (Phase 1 compiler) and the Track C activity wrappers, so
+    # mypy on `src` stays clean whether or not the extra is installed.
+    "temporalio.*",
     # Azure Speech SDK — optional [voice] extra (T1 enterprise voice pair,
     # ADR 048/049). No type stubs shipped; imported LAZILY inside
     # movate.voice.azure_speech, so mypy on `src` stays clean whether or not

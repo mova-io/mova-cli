@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from movate.authoring import AuthoringDriver, EvalSnapshot, SessionCostTracker
     from movate.authoring.models import ActionPlan
     from movate.authoring.planner import Planner, ProposedAction
+    from movate.core.eval import DimensionalMeans, EvalSummary
     from movate.core.executor import Executor
     from movate.core.loader import AgentBundle
     from movate.providers.base import BaseLLMProvider
@@ -96,6 +97,16 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
         "--mock",
         help="Use the deterministic MockProvider for runs (no API keys needed).",
     ),
+    eval_sample_size: int = typer.Option(
+        0,
+        "--eval-sample-size",
+        help=(
+            "Eval-in-the-loop: after each live re-run, score the first N eval cases "
+            "and show the mean-accuracy delta vs the previous run. 0 (default) = off "
+            "— a fast quality signal while you tune, capped to N cases. Honors --mock "
+            "so the loop stays free/offline."
+        ),
+    ),
     target: str | None = typer.Option(
         None,
         "--target",
@@ -114,6 +125,17 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
         0.5,
         "--poll-interval",
         help="Seconds between filesystem polls in the live loop.",
+    ),
+    runtime: str = typer.Option(
+        None,
+        "--runtime",
+        help=(
+            "Override the workflow execution backend (ADR 055 D3): native (default), "
+            "temporal, or langgraph. Precedence: this flag > workflow.yaml 'runtime:' "
+            "field > native. Read-only — never mutates the spec. Applies to workflow "
+            "targets only; agent dev ignores it. (The dev loop validates + evals; use "
+            "[bold]mdk run --runtime temporal <wf>[/bold] to execute on the backend.)"
+        ),
     ),
 ) -> None:
     """Guided agent authoring: scaffold → edit → live-test → deploy.
@@ -146,8 +168,14 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
             agent_dir,
             mock=mock,
             poll_interval=poll_interval,
+            runtime_override=runtime,
         )
         return
+    if runtime is not None:
+        # --runtime selects a workflow execution backend; an agent dev session
+        # has no workflow to route. Fail loud rather than silently ignoring it.
+        _console.error("--runtime applies to workflow targets only; this is an agent.")
+        raise typer.Exit(code=2)
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if not interactive:
@@ -176,6 +204,12 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
     if not mock:
         target = _grounding_gap_offer(agent_name, agent_dir, target)
 
+    # Eval-in-the-loop (opt-in, --eval-sample-size > 0). One scorer for the
+    # whole session so the run-to-run delta survives across menu round-trips;
+    # default-off means the live loop is byte-for-byte unchanged.
+    eval_loop = _EvalInLoop(agent_dir, sample_size=eval_sample_size, mock=mock)
+    on_iteration = eval_loop.after_run if eval_loop.enabled else None
+
     while True:
         if test_input is not None:
             # Ctrl-C breaks the live loop and opens the actions menu. The loop
@@ -183,7 +217,13 @@ def dev(  # noqa: PLR0912 — menu dispatch is inherently branchy; flat reads cl
             # `mdk watch --run`); dev drives it as a phase.
             err.print(f"[bold]live[/bold] {agent_dir}")
             with contextlib.suppress(KeyboardInterrupt):
-                run_loop(agent_dir, test_input, mock=mock, poll_interval=poll_interval)
+                run_loop(
+                    agent_dir,
+                    test_input,
+                    mock=mock,
+                    poll_interval=poll_interval,
+                    on_iteration=on_iteration,
+                )
 
         action = _actions_menu()
         if action == "quit":
@@ -1132,6 +1172,7 @@ def _run_workflow_dev_loop(
     *,
     mock: bool,
     poll_interval: float,
+    runtime_override: str | None = None,
 ) -> None:
     """Live-reload loop for a workflow target.
 
@@ -1139,8 +1180,36 @@ def _run_workflow_dev_loop(
     ``agent.yaml`` + ``prompt.md`` + schemas, and the workflow eval
     dataset. On any change, re-validates the spec + re-runs the eval
     dataset (under ``--mock`` by default). Ctrl-C exits.
+
+    ``runtime_override`` (ADR 055 D3) is validated + surfaced for parity with
+    ``mdk run`` — the dev loop validates and evals (it does not *execute* the
+    workflow on the backend), so the override is informational here; it fails
+    loud on an invalid value rather than silently accepting a typo.
     """
     import time  # noqa: PLC0415
+
+    if runtime_override is not None:
+        from movate.runtime.workflow_backend import (  # noqa: PLC0415
+            VALID_RUNTIMES,
+            WorkflowBackendError,
+            require_backend_available,
+        )
+
+        if runtime_override not in VALID_RUNTIMES:
+            _console.error(
+                f"--runtime {runtime_override!r} invalid; expected one of "
+                f"{', '.join(VALID_RUNTIMES)}."
+            )
+            raise typer.Exit(code=2)
+        # Surface availability up front so the operator learns NOW (not at
+        # `mdk run` time) that the backend isn't installed/configured.
+        try:
+            require_backend_available(runtime_override)
+            stdout.print(f"[dim]runtime override (for `mdk run`): {runtime_override}[/dim]")
+        except WorkflowBackendError as exc:
+            err.print(
+                f"[yellow]⚠[/yellow] runtime {runtime_override!r} not ready: [dim]{exc}[/dim]"
+            )
 
     stdout.print(f"\n[bold]mdk dev[/bold] (workflow) · [bold]{workflow_dir.name}[/bold]")
     stdout.print(f"[dim]workflow: {workflow_dir / 'workflow.yaml'}[/dim]")
@@ -1271,6 +1340,206 @@ def _validate_and_eval_workflow(workflow_dir: Path, *, mock: bool) -> None:
     stdout.print(
         f"[green]✓[/green] smoke: [bold]{passed}/{total}[/bold] workflow cases pass under --mock"
     )
+
+
+# ---------------------------------------------------------------------------
+# Eval-in-the-loop (the --eval-sample-size flag)
+# ---------------------------------------------------------------------------
+#
+# After each successful live re-run, optionally score the first N eval cases
+# and show the mean-accuracy delta vs the previous iteration — so an author
+# tunes a prompt and watches quality move in real time. Reuses the shipped
+# :class:`movate.core.eval.EvalEngine` exactly (no new scoring logic) and the
+# same hermetic mock runtime the improve autopilot uses; capped to N cases so
+# it stays a *fast signal*, not a full eval. Every failure mode degrades to a
+# one-line note and keeps the dev loop alive — a buggy dataset, a broken agent,
+# or an eval crash must never sink the session.
+
+
+_DELTA_EPSILON = 1e-9
+"""Means closer than this are treated as 'no change' — guards float noise so a
+re-run that scores identically doesn't show a spurious ±0.00 delta."""
+
+
+class _EvalInLoop:
+    """Stateful eval-in-the-loop scorer for ``mdk dev`` (opt-in).
+
+    Holds the previous iteration's mean accuracy **in memory only** (no
+    storage/schema change) so :meth:`after_run` can print the run-to-run delta.
+    One instance per dev session, so the delta survives across actions-menu
+    round-trips (resume the live loop and the baseline is still there).
+
+    Disabled (``sample_size <= 0``) is the default: :attr:`enabled` is False and
+    ``mdk dev`` never wires the hook, leaving the live loop byte-for-byte
+    unchanged.
+    """
+
+    def __init__(self, agent_dir: Path, *, sample_size: int, mock: bool) -> None:
+        self._agent_dir = agent_dir
+        self._sample_size = sample_size
+        self._mock = mock
+        self._prev_mean: float | None = None
+        self._warned_no_dataset = False
+
+    @property
+    def enabled(self) -> bool:
+        return self._sample_size > 0
+
+    def after_run(self, exit_code: int) -> None:
+        """Post-dispatch hook: score the first N cases + print the scorecard.
+
+        Skipped when the live run itself failed (``exit_code != 0``) — there's
+        nothing meaningful to score, and the diff/output already surfaced the
+        error. Wraps the whole eval so any failure (missing dataset, config
+        error, executor crash, buggy case) degrades to a one-line note and the
+        dev loop keeps polling.
+        """
+        if not self.enabled or exit_code != 0:
+            return
+        try:
+            summary = self._run_capped_eval()
+        except _NoDatasetError:
+            # One-shot hint, then stay quiet — a dataset-less agent shouldn't
+            # spam the loop on every save.
+            if not self._warned_no_dataset:
+                err.print(
+                    "[dim]eval-in-loop: no eval dataset for this agent — add "
+                    "evals/dataset.jsonl to see scores. (skipping)[/dim]"
+                )
+                self._warned_no_dataset = True
+            return
+        except Exception as exc:  # eval must never crash the dev loop
+            err.print(f"[yellow]⚠[/yellow] [dim]eval-in-loop skipped: {exc}[/dim]")
+            return
+
+        if summary is None or summary.sample_count == 0:
+            err.print("[dim]eval-in-loop: dataset has no cases to score.[/dim]")
+            return
+
+        self._print_scorecard(summary)
+
+    def _run_capped_eval(self) -> EvalSummary | None:
+        """Run :class:`EvalEngine` over the first N dataset cases.
+
+        Caps the dataset to the first ``sample_size`` rows by writing them to a
+        throwaway temp file and pointing a copied spec at it — the engine reuses
+        its own ``load_dataset`` path unchanged, so scoring is identical to
+        ``mdk eval`` (just over a prefix of the dataset). The temp file's
+        lifetime is bounded to this call and removed before returning.
+        """
+        import asyncio  # noqa: PLC0415
+
+        from movate.core.eval import EvalEngine  # noqa: PLC0415
+
+        bundle, tmp_path = self._capped_bundle()
+
+        async def _run() -> EvalSummary:
+            executor, provider, storage = await _build_eval_runtime(mock=self._mock, bundle=bundle)
+            try:
+                engine = EvalEngine(executor=executor, provider=provider, gate_mode="mean")
+                return await engine.run(bundle)
+            finally:
+                await storage.close()
+
+        try:
+            return asyncio.run(_run())
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def _capped_bundle(self) -> tuple[AgentBundle, Path]:
+        """Load the agent + return ``(bundle, temp_dataset_path)``.
+
+        The returned bundle's spec points at a temp file holding the first N
+        dataset rows; the caller owns that path and removes it after the eval.
+
+        Raises :class:`_NoDatasetError` when the agent declares no dataset (the
+        common "haven't written evals yet" case) so :meth:`after_run` can give a
+        one-line hint instead of a stack trace.
+        """
+        import dataclasses  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        bundle = load_agent(self._agent_dir)
+        dataset_decl = bundle.spec.evals.dataset
+        if not dataset_decl:
+            raise _NoDatasetError
+        ds_path = (bundle.agent_dir / dataset_decl).resolve()
+        if not ds_path.is_file():
+            raise _NoDatasetError
+
+        rows = [ln for ln in ds_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if not rows:
+            raise _NoDatasetError
+        capped = rows[: self._sample_size]
+
+        # Write the prefix to a temp file and point a copied spec at it. An
+        # absolute path means the engine's `agent_dir / dataset` join resolves
+        # straight to it (pathlib drops the left side for an absolute right).
+        fd, tmp_name = tempfile.mkstemp(suffix=".jsonl", prefix="mdk-dev-eval-")
+        tmp_path = Path(tmp_name)
+        try:
+            with open(fd, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(capped) + "\n")
+            capped_spec = bundle.spec.model_copy(
+                update={"evals": bundle.spec.evals.model_copy(update={"dataset": tmp_name})}
+            )
+            return dataclasses.replace(bundle, spec=capped_spec), tmp_path
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+    def _print_scorecard(self, summary: EvalSummary) -> None:
+        """Print a compact one-line scorecard + the mean-accuracy delta.
+
+        Mean accuracy is the headline (the gate dimension); any other dimension
+        the dataset opted into (faithfulness/coverage/latency/…) is appended so
+        a richer dataset shows richer signal. The delta compares this run's mean
+        accuracy to the previous iteration's, with ▲/▼/= and the numeric change.
+        On stderr (auto-degrading on non-TTY) like the rest of the dev UI.
+        """
+        means = summary.dimensional_means
+        # Mean accuracy is the headline; fall back to the overall mean score if
+        # a legacy exact-match dataset left the accuracy dim unscored.
+        mean_acc = means.accuracy if means.accuracy is not None else summary.mean_score
+
+        delta = self._delta_marker(mean_acc)
+        self._prev_mean = mean_acc
+
+        extras = self._format_extra_dims(means)
+        extras_str = f"  [dim]{extras}[/dim]" if extras else ""
+        err.print(
+            f"[bold cyan]eval[/bold cyan] [dim]({summary.sample_count} case"
+            f"{'s' if summary.sample_count != 1 else ''})[/dim]  "
+            f"accuracy [bold]{mean_acc:.2f}[/bold] {delta}{extras_str}"
+        )
+
+    def _delta_marker(self, mean_acc: float) -> str:
+        """``▲/▼/=`` + numeric change vs the previous iteration's mean accuracy."""
+        if self._prev_mean is None:
+            return "[dim](baseline)[/dim]"
+        change = mean_acc - self._prev_mean
+        if abs(change) < _DELTA_EPSILON:
+            return "[dim]= no change[/dim]"
+        if change > 0:
+            return f"[green]▲ +{change:.2f}[/green]"
+        return f"[red]▼ {change:.2f}[/red]"
+
+    @staticmethod
+    def _format_extra_dims(means: DimensionalMeans) -> str:
+        """Short ``dim=score`` list for every scored dimension besides accuracy.
+
+        Uses :meth:`DimensionalMeans.as_dict` (already drops unscored dims) so a
+        plain dataset shows just accuracy and a richer one shows what it opted
+        into — no hardcoded dimension list to drift from the engine.
+        """
+        parts = [
+            f"{name}={value:.2f}" for name, value in means.as_dict().items() if name != "accuracy"
+        ]
+        return "  ".join(parts)
+
+
+class _NoDatasetError(Exception):
+    """The agent declares no (usable) eval dataset — eval-in-loop is skipped."""
 
 
 __all__ = ["dev"]

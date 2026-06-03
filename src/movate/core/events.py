@@ -105,6 +105,18 @@ class EventKind(StrEnum):
     same scoping, same at-least-once + dedupe-on-id semantics as every
     other ADR 035 event."""
 
+    ALERT_RAISED = "alert.raised"
+    """An alert source raised a typed alert (ADR 057 D1 step 2). The
+    carrier for an :class:`~movate.core.alerts.AlertEvent` on the ADR 035
+    outbox: the drift / dead-letter / budget edges emit one of these
+    (fire-and-forget), and the alert-router consumer
+    (:class:`movate.runtime.alert_worker.AlertWorker`) drains them and
+    routes to the configured notification sinks. ``subject`` = the
+    alert's subject (agent / job / tenant); ``data`` is the serialized
+    ``AlertEvent`` (kind/severity/summary/dedup_key/…). Sources never
+    import a sink — they only append this event (boundary discipline,
+    ADR 057 D1)."""
+
 
 class Event(BaseModel):
     """One persisted lifecycle event.

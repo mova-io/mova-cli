@@ -62,7 +62,14 @@ from movate.voice.deepgram import DeepgramSTT
 from movate.voice.doubles import FakeRealtime, FakeSTT, FakeTTS
 from movate.voice.elevenlabs import ElevenLabsTTS
 from movate.voice.openai_speech import OpenAITTS, OpenAIWhisperSTT
-from movate.voice.pipeline import VoicePipelineResult, run_voice_pipeline
+from movate.voice.pipeline import (
+    VoiceEvent,
+    VoicePipelineResult,
+    VoiceTurnLatency,
+    compute_turn_latency,
+    format_latency_badge,
+    run_voice_pipeline,
+)
 from movate.voice.realtime_azure import AzureOpenAIRealtime
 from movate.voice.realtime_openai import OpenAIRealtime
 
@@ -87,6 +94,10 @@ __all__ = [
     "SpeechToTextProvider",
     "TextToSpeechProvider",
     "TranscriptChunk",
+    "VoiceEvent",
     "VoicePipelineResult",
+    "VoiceTurnLatency",
+    "compute_turn_latency",
+    "format_latency_badge",
     "run_voice_pipeline",
 ]

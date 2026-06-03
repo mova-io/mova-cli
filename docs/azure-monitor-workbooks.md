@@ -45,32 +45,58 @@ The `Tenant` parameter on `tenant-ops.workbook.json` populates from a `distinct`
 KQL query the first time the workbook loads; pick a tenant from the dropdown
 and the other panels refresh.
 
-## How to deploy as code (future, NOT this PR)
+## How to deploy as code (Bicep)
 
-Azure provides a `Microsoft.Insights/workbooks` ARM/Bicep resource that lets
-these JSON files be deployed declaratively (`serializedData` property carries
-the JSON string). We **deliberately do not add Bicep wiring in this PR** - the
-existing `infra/azure/modules/` is reviewed as the deploy surface and adding
-four workbook resources would mix two responsibilities (CLAUDE.md rule 3).
+The four persona Workbooks deploy declaratively via
+`infra/azure/modules/monitor-workbooks.bicep`, wired into `infra/azure/main.bicep`
+behind the **`enableWorkbooks`** flag (default `false`, mirroring
+`enableAlerts` / `deployLangfuse` / `enableScheduler`). The module wraps each
+JSON in a `Microsoft.Insights/workbooks@2023-06-01` resource whose
+`serializedData` is `loadTextContent(...)` of the JSON file — so the JSON under
+`infra/azure-monitor/workbooks/` stays the single source of truth (edit the
+JSON, re-run the deploy, the Workbook refreshes in place).
 
-When that's the right next step, the shape will be roughly:
+The module is gated on **both** `enableWorkbooks` **and** `enableAppInsights`
+(the KQL queries the App* tables the workspace-based App Insights populates — no
+App Insights, no data to render), exactly like `monitor-alerts.bicep`. Each
+Workbook's `sourceId` is `logs.outputs.workspaceId` — the same Log Analytics
+workspace the alert rules scope to.
 
-```bicep
-resource workbook 'Microsoft.Insights/workbooks@2022-04-01' = {
-  name: guid(workspaceResourceId, 'mdk-operator')
-  location: location
-  kind: 'shared'
-  properties: {
-    displayName: 'mdk - operator'
-    serializedData: loadTextContent('../azure-monitor/workbooks/operator.workbook.json')
-    sourceId: workspaceResourceId
-    category: 'workbook'
-  }
-}
+```bash
+# Pass 2 deploy (App Insights already exists from pass 1): turn Workbooks on.
+az deployment group create \
+  --resource-group <rg> \
+  --template-file infra/azure/main.bicep \
+  --parameters @main.bicepparam \
+  --parameters enableAppInsights=true enableWorkbooks=true
 ```
 
-Drop one of these per persona, all keyed on the same workspace. Tag them with
-`movate:appInsightsId` to match `monitor-alerts.bicep`'s convention.
+Resource names are `guid(resourceGroup().id, '<stable-key>')`, so re-deploys
+**update in place** rather than duplicating. The deployment outputs
+`operatorWorkbookId` (the operator Workbook resource id) so tooling can deep-link
+into the portal after deploy. Workbooks land in the portal gallery under the
+`mdk · ` display-name prefix (override the module's `namePrefix` param to brand
+per-tenant, e.g. `Acme · mdk · `).
+
+> **KQL validation is operator-run (🔒).** `bicep build` + `bicep lint` on
+> `main.bicep` are clean in CI, but the KQL inside each Workbook can only be
+> validated against a **live Log Analytics workspace with real `App*` data**.
+> The instrument / table names are taken straight from the spans-and-metrics
+> catalog (`docs/observability.md`, `src/movate/tracing/metrics.py` →
+> `METRIC_NAMES`), so the queries reference real columns; confirm they bind by
+> opening each Workbook against a workspace the runtime is exporting to.
+
+The fifth in-repo JSON, `infra/azure-monitor/workbooks/insights.workbook.json`,
+is **not** wired into this module: its narrative/intelligence panels read the
+ADR-047 Observability Intelligence API (`GET /api/v1/observability/insights`),
+not an App* table, so it stays a portal-import-only artifact for now (see the
+import steps above).
+
+### Portal-only deploy (no Bicep)
+
+If you don't run the `main.bicep` deployment, import each JSON via the portal
+steps in **How to import** above — the Workbooks are self-contained and don't
+require the Bicep wrapper.
 
 ## Where each persona's workbook fits in the on-call flow
 

@@ -332,3 +332,125 @@ def test_days_default_is_7() -> None:
     """SeedConfig.days defaults to 7 (tighter demo window per task spec)."""
     cfg = SeedConfig(seed=1, now=_NOW)
     assert cfg.days == 7
+
+
+# ---------------------------------------------------------------------------
+# Seeder → ADR 047 observability analyzer wiring (survey item #1).
+#
+# After the seeder persists telemetry, `mdk demo seed` runs the same overnight
+# analyst the runtime dispatches as JobKind.OBSERVABILITY_ANALYZE — once per
+# seeded (tenant, day) — so the insight-fed + exec dashboards have data. These
+# tests assert the analyzer IS invoked for the seeded tenants (mocked), that a
+# real SQLite seed actually populates the insight store, and that a missing
+# analyzer degrades gracefully instead of crashing the seed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_seed_invokes_observability_analyzer_for_seeded_tenants(tmp_path, monkeypatch) -> None:
+    """`mdk demo seed` calls analyze() for each seeded demo tenant + day."""
+    db = str(tmp_path / "analyze.db")
+    monkeypatch.setenv("MOVATE_DB", db)
+    if "MOVATE_DB_URL" in os.environ:
+        monkeypatch.delenv("MOVATE_DB_URL")
+
+    calls: list[tuple[str, str]] = []
+
+    async def _fake_analyze(tenant_id, project_id, day, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append((tenant_id, project_id))
+        # The CLI must hand us the live storage + an llm to drive the analyst.
+        assert kwargs.get("storage") is not None
+        assert kwargs.get("llm") is not None
+        return object()  # the seed ignores the returned insight
+
+    monkeypatch.setattr("movate.core.observability.analyst.analyze", _fake_analyze)
+
+    runner = CliRunner(mix_stderr=False)
+    res = runner.invoke(
+        app,
+        ["demo", "seed", "--agents", "3", "--tenants", "2", "--days", "3", "--seed", "9"],
+    )
+    assert res.exit_code == 0, res.stdout + (res.stderr or "")
+
+    # Two demo tenants were seeded → analyze() must have run for both, under
+    # the canonical "default" insight project the dashboards read.
+    analyzed_tenants = {t for t, _ in calls}
+    assert all(t.startswith(DEMO_TENANT_PREFIX) for t in analyzed_tenants)
+    assert len(analyzed_tenants) == 2
+    assert {p for _, p in calls} == {"default"}
+    # 4 days span the 3-day window ([now-3, now] inclusive) x 2 tenants.
+    assert len(calls) == 2 * 4
+    # The summary surfaces the insight count.
+    assert "insights analyzed" in res.stdout
+
+
+@pytest.mark.unit
+def test_seed_populates_insight_store_end_to_end(tmp_path, monkeypatch) -> None:
+    """A real SQLite seed leaves ObservabilityInsight rows the dashboards read."""
+    from datetime import date, timedelta  # noqa: PLC0415
+
+    db = str(tmp_path / "insights.db")
+    monkeypatch.setenv("MOVATE_DB", db)
+    if "MOVATE_DB_URL" in os.environ:
+        monkeypatch.delenv("MOVATE_DB_URL")
+
+    runner = CliRunner(mix_stderr=False)
+    res = runner.invoke(
+        app,
+        ["demo", "seed", "--agents", "2", "--tenants", "1", "--days", "2", "--seed", "5"],
+    )
+    assert res.exit_code == 0, res.stdout + (res.stderr or "")
+
+    async def _read_insights() -> list:  # type: ignore[type-arg]
+        storage = SqliteProvider(db_path=db)
+        await storage.init()
+        try:
+            tenant = f"{DEMO_TENANT_PREFIX}acme"
+            return await storage.list_insights(
+                tenant,
+                project_id="default",
+                since=date.today() - timedelta(days=10),
+                until=date.today() + timedelta(days=1),
+                limit=50,
+            )
+        finally:
+            await storage.close()
+
+    insights = asyncio.run(_read_insights())
+    # The analyst ran for the seeded tenant across the seeded window — the
+    # insight store is non-empty, so the insight-fed dashboards have data.
+    assert insights, "expected the seed to populate the insight store"
+    assert all(i.project_id == "default" for i in insights)
+
+
+@pytest.mark.unit
+def test_seed_degrades_gracefully_when_analyzer_unavailable(tmp_path, monkeypatch, caplog) -> None:
+    """If the analyst raises on import, the seed still succeeds (no insights)."""
+    import builtins  # noqa: PLC0415
+
+    db = str(tmp_path / "noanalyst.db")
+    monkeypatch.setenv("MOVATE_DB", db)
+    if "MOVATE_DB_URL" in os.environ:
+        monkeypatch.delenv("MOVATE_DB_URL")
+
+    real_import = builtins.__import__
+
+    def _blocking_import(name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if name == "movate.core.observability.analyst":
+            raise ImportError("simulated: observability analyst not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+    runner = CliRunner(mix_stderr=False)
+    with caplog.at_level("INFO"):
+        res = runner.invoke(
+            app,
+            ["demo", "seed", "--agents", "2", "--tenants", "1", "--days", "2", "--seed", "1"],
+        )
+
+    # The seed must NOT crash just because insights couldn't be produced.
+    assert res.exit_code == 0, res.stdout + (res.stderr or "")
+    assert "demo_seed_observability_analyze_skipped" in caplog.text
+    # Summary reflects the graceful-degrade path (0 insights).
+    assert "insights analyzed" in res.stdout
