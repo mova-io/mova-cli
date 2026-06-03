@@ -587,6 +587,15 @@ button.active { background:var(--accent); color:white; }
       <button data-hedge="tts" title="Race 2 TTS providers, take first">TTS</button>
       <button data-hedge="both" title="Hedge both STT and TTS (2x cost, lowest p99 latency)">both</button>
     </div>
+    <!-- ADR 070 speculative kickoff — Detailed only -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;"
+          title="Start the agent on a stable interim transcript, before endpointing, to recover the ~1.5s silence wait. Cancels if you keep talking. Only fires on the Mova-iO/OpenAI streaming tiers (not the Lyzr SDK tier).">Speculate</span>
+    <div class="toggle-group detailed-only" id="speculate-toggle">
+      <button data-speculate="off" class="active" title="No speculation (default)">off</button>
+      <button data-speculate="on" title="Speculatively start the agent on a stable interim; recovers endpointing latency, may cancel + re-run">on</button>
+    </div>
+    <span class="muted detailed-only" id="speculate-stats" style="font-size:11px;margin-left:8px;"
+          title="Live commit/cancel ratio for speculative kickoff this session"></span>
     <!-- A4 cost-bounded routing — Detailed only -->
     <span class="muted detailed-only" style="font-size:11px;margin-left:16px;">Budget</span>
     <input id="budget-input" type="number" step="0.01" min="0" value="5.00" class="detailed-only"
@@ -995,6 +1004,19 @@ function handleJson(s) {
     pipelineState.hedge_tts = !!m.tts;
     renderPipeline();
     logEvent(`⤳ hedge → ${mode}`, mode === 'off' ? '' : 'warn');
+    return;
+  }
+  if (ev === 'speculative') {
+    // ADR 070: server echoed our speculation toggle.
+    updateToggle('speculate-toggle', 'speculate', m.enabled ? 'on' : 'off');
+    const stats = $('speculate-stats');
+    if (m.enabled && !m.effective) {
+      stats.textContent = '(no-op on this tier)';
+      logEvent('⤳ speculate on — but this agent tier is not cancel-safe (no-op)', 'warn');
+    } else {
+      stats.textContent = '';
+      logEvent(`⤳ speculate → ${m.enabled ? 'on' : 'off'}`, m.enabled ? 'warn' : '');
+    }
     return;
   }
   if (ev === 'budget') {
@@ -1567,6 +1589,15 @@ function renderMetrics(s, turns) {
   $('m-fo').textContent  = fmtMap(s.failovers) || '—';
   $('m-cache').textContent = s.cache_hits ?? 0;
   $('m-hedge').textContent = fmtMap(s.hedge_wins) || '—';
+  // ADR 070: live speculation commit/cancel ratio from the events counter.
+  const evc = s.events || {};
+  const committed = evc.speculation_committed || 0;
+  const cancelled = evc.speculation_cancelled || 0;
+  const specStats = $('speculate-stats');
+  if (specStats && (committed + cancelled) > 0) {
+    const rate = Math.round((committed / (committed + cancelled)) * 100);
+    specStats.textContent = `${committed}✓ / ${cancelled}✗ (${rate}% commit)`;
+  }
   $('m-circuit').textContent = fmtMap(s.circuit_opens) || '—';
   $('m-sil').textContent = `${s.silence_frames_dropped ?? 0} / ${s.silence_frames_kept ?? 0}`;
   // Cumulative cost lives on the session (A4), not the metrics observer.
@@ -2086,6 +2117,12 @@ document.querySelectorAll('#hedge-toggle button').forEach(b => {
     const stt = (mode === 'stt' || mode === 'both');
     const tts = (mode === 'tts' || mode === 'both');
     ws.send(JSON.stringify({ event: 'set_hedge', stt, tts }));
+  });
+});
+// ADR 070 speculative kickoff toggle.
+document.querySelectorAll('#speculate-toggle button').forEach(b => {
+  b.addEventListener('click', () => {
+    ws.send(JSON.stringify({ event: 'set_speculative', enabled: b.dataset.speculate === 'on' }));
   });
 });
 // Currently-voicing collapse toggle — click the h2 to expand / collapse.

@@ -24,6 +24,13 @@ class OpenAIChatAgent:
 
     name = "openai-chat"
     version = "1"
+    # ADR 070 D3: cancel-safe → speculatable. ``run`` only mutates ``self._history``
+    # AFTER a successful stream (see the tail of ``run``) and re-raises on
+    # CancelledError, so a discarded speculative run leaves no state behind. The
+    # Lyzr v4 tier uses this same class against a *stateless*
+    # ``/v4/chat/completions`` endpoint (server-side memory lives in the SDK/v3
+    # path, not here), so it is cancel-safe too.
+    speculatable = True
 
     def __init__(
         self,

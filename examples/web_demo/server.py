@@ -660,6 +660,10 @@ class _TrailObserver:
             "cache_hit",
             "hedge",
             "hedge_won",
+            # ADR 070 — speculative kickoff outcomes (live commit/cancel trail).
+            "speculation_started",
+            "speculation_committed",
+            "speculation_cancelled",
         }
     )
 
@@ -736,6 +740,13 @@ class Session:
         # shows `hedge` + `hedge_won` events as proof.
         self.hedge_stt: bool = False
         self.hedge_tts: bool = False
+        # ADR 070: speculative agent kickoff — start the agent on a stable interim
+        # to recover the ~1.5s endpointing wait. Off by default (opt-in, changes
+        # the cost profile); only fires when the active agent is cancel-safe
+        # (OpenAIChatAgent yes, LyzrAgentTurn SDK no). Toggled live via the
+        # set_speculative WS event so the demo can A/B it and the dashboard can
+        # watch the real commit/cancel ratio (speculation_* events → metrics).
+        self.speculative: bool = False
         # Wrap the failover chain in SilenceGatedSTT so we don't pay per-minute
         # to transcribe dead air — and so the silence-trimmed metric shows up in
         # the dashboard. The observer captures both gate + failover events.
@@ -804,6 +815,18 @@ class Session:
             self.hedge_tts = tts
             self.tts = self._build_tts()
         return {"stt": self.hedge_stt, "tts": self.hedge_tts}
+
+    def set_speculative(self, enabled: bool) -> dict[str, bool]:
+        """ADR 070: toggle speculative agent kickoff for this session.
+
+        Returns ``{enabled, effective}`` — ``effective`` is whether it will
+        actually fire, i.e. ``enabled`` AND the active agent is cancel-safe
+        (``speculatable``). The UI shows ``effective=false`` so a viewer knows a
+        non-speculatable tier (e.g. the Lyzr SDK agent) silently no-ops.
+        """
+        self.speculative = bool(enabled)
+        effective = self.speculative and bool(getattr(self.agent, "speculatable", False))
+        return {"enabled": self.speculative, "effective": effective}
 
     def set_user_keys(self, keys: dict[str, str | None]) -> dict[str, bool]:
         """BYOK — per-session API key overrides. Rebuilds adapter chains.
@@ -1661,6 +1684,7 @@ _twilio_config: dict[str, Any] = {
     "voice_id": "",
     "hedge_stt": False,
     "hedge_tts": False,
+    "speculative": False,
     "budget_usd": None,
     "updated_by": None,  # browser session_id that last pushed, for telemetry
 }
@@ -1678,6 +1702,7 @@ def _apply_twilio_config(session: Session) -> Session:
     if cfg.get("voice_id"):
         session.set_voice_id(cfg["voice_id"])
     session.set_hedge(stt=bool(cfg.get("hedge_stt")), tts=bool(cfg.get("hedge_tts")))
+    session.set_speculative(bool(cfg.get("speculative")))
     if cfg.get("budget_usd") is not None:
         session.set_budget(float(cfg["budget_usd"]))
     return session
@@ -1996,6 +2021,7 @@ async def voice(ws: WebSocket) -> None:
                 _twilio_config["voice_id"] = session.voice_id
                 _twilio_config["hedge_stt"] = session.hedge_stt
                 _twilio_config["hedge_tts"] = session.hedge_tts
+                _twilio_config["speculative"] = session.speculative
                 _twilio_config["budget_usd"] = session.budget_usd
                 _twilio_config["updated_by"] = session.session_id
                 log.info(
@@ -2018,6 +2044,11 @@ async def voice(ws: WebSocket) -> None:
                     tts=data.get("tts"),
                 )
                 await _send_event(ws, event="hedge", **applied)
+                continue
+            if ev_name == "set_speculative":
+                # ADR 070: speculative agent kickoff (start on a stable interim).
+                spec = session.set_speculative(bool(data.get("enabled")))
+                await _send_event(ws, event="speculative", **spec)
                 continue
             if ev_name == "set_budget":
                 # A4: per-session cost ceiling. None / 0 / negative → unbounded.
@@ -2131,6 +2162,11 @@ async def voice(ws: WebSocket) -> None:
                     cancel=cancel,
                     agent_timeout=15.0,
                     voice_id=session.voice_id,
+                    # ADR 070: opt-in speculative kickoff + observer so the
+                    # speculation_started/committed/cancelled events flow to the
+                    # metrics + trail (the live cancel-ratio the dashboard shows).
+                    speculative=session.speculative,
+                    observer=session.observer,
                 ):
                     events.append(ev)
                     if ev.kind == "transcript.partial":
