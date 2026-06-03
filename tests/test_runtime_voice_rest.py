@@ -321,6 +321,73 @@ async def test_voice_rest_no_input_is_400(client, auth_setup) -> None:
     assert r.status_code == 400, r.text
 
 
+async def test_voice_rest_audio_url_non_http_is_400(client, auth_setup) -> None:
+    """ADR 050 D10 — a non-http(s) ``audio_url`` is rejected at the scheme level."""
+    token, _ = auth_setup
+    _create_agent(client, token)
+    r = client.post(
+        "/api/v1/agents/voice-demo/voice",
+        data={"mock": "true", "audio_url": "file:///etc/passwd"},
+        headers=_auth(token),
+    )
+    assert r.status_code == 400, r.text
+    assert "http" in r.text.lower()
+
+
+async def test_voice_rest_audio_url_fetch_success(
+    storage, agents_path, auth_setup, monkeypatch
+) -> None:
+    """ADR 050 D10 — a valid ``audio_url`` is fetched and drives the turn."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("from the url")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = FakeTTS
+    token, _ = auth_setup
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    async def _fake_fetch(url: str) -> bytes:
+        assert url == "https://blob.example/recording.wav"
+        return b"\x00\x01\x02\x03"
+
+    monkeypatch.setattr("movate.runtime.app._fetch_voice_audio_url", _fake_fetch)
+    r = client.post(
+        "/api/v1/agents/voice-demo/voice",
+        data={"mock": "true", "audio_url": "https://blob.example/recording.wav"},
+        headers=_auth(token),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["transcript"] == "from the url"
+    assert stt.received == [b"\x00\x01\x02\x03"]  # the fetched bytes drove STT
+
+
+async def test_voice_rest_audio_url_oversize_is_400(client, auth_setup, monkeypatch) -> None:
+    """ADR 050 D10 — a fetched body over the byte cap is a clean 400, not a 500."""
+    from movate.runtime import app as _app_mod  # noqa: PLC0415
+
+    token, _ = auth_setup
+    _create_agent(client, token)
+    monkeypatch.setattr(_app_mod, "_VOICE_AUDIO_URL_MAX_BYTES", 4)
+
+    async def _fake_get(self, url):
+        class _R:
+            content = b"\x00\x01\x02\x03\x04\x05"  # 6 bytes > 4-byte cap
+
+            def raise_for_status(self) -> None:
+                return None
+
+        return _R()
+
+    monkeypatch.setattr("httpx.AsyncClient.get", _fake_get)
+    r = client.post(
+        "/api/v1/agents/voice-demo/voice",
+        data={"mock": "true", "audio_url": "https://blob.example/big.wav"},
+        headers=_auth(token),
+    )
+    assert r.status_code == 400, r.text
+    assert "limit" in r.text.lower()
+
+
 async def test_voice_rest_unknown_agent_is_404(client, auth_setup) -> None:
     token, _ = auth_setup
     r = client.post(
