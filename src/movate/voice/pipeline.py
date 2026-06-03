@@ -207,6 +207,161 @@ class VoicePipelineResult:
     events: list[VoiceEvent] = field(default_factory=list)
 
 
+# ── Speculative agent kickoff (ADR 070) ──────────────────────────────────────
+# These helpers run the agent stage as a (token / result / exc) event queue so
+# BOTH TTS paths (sequential + streaming) consume an agent run identically — and
+# so a *speculative* run started early (on a stable interim) can be adopted by
+# either path on commit, byte-for-byte the same as a fresh run.
+
+
+def _norm_text(text: str) -> str:
+    """Normalize for interim==final comparison (case/space/trailing punctuation)."""
+    return " ".join(text.lower().split()).rstrip(".,!?;: ")
+
+
+def _start_agent_run(
+    agent: AgentTurn,
+    transcript: str,
+    *,
+    language: str | None,
+    session_id: str | None,
+    agent_timeout: float | None,
+) -> tuple[asyncio.Queue[tuple[str, Any]], asyncio.Task[None]]:
+    """Start ``agent.run`` as a task feeding a (kind, payload) queue.
+
+    The queue carries ``("token", delta)`` for each streamed delta, then exactly
+    one terminal ``("result", AgentTurnResult)`` or ``("exc", Exception)``. This
+    is the single shape both TTS paths drain — and the same shape a speculative
+    run produces, so commit is just "adopt this queue/task instead of a new one."
+    """
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    async def _drive() -> None:
+        try:
+            run = agent.run(
+                transcript,
+                on_token=lambda delta: queue.put_nowait(("token", delta)),
+                language=language,
+                session_id=session_id,
+            )
+            result = await (asyncio.wait_for(run, agent_timeout) if agent_timeout else run)
+            await queue.put(("result", result))
+        except Exception as exc:  # surface ANY failure (incl. timeout) as an error
+            await queue.put(("exc", exc))
+
+    return queue, asyncio.create_task(_drive())
+
+
+def _agent_is_speculatable(agent: AgentTurn) -> bool:
+    """Whether ``agent`` opted into cancel-safe speculation (ADR 070 D3)."""
+    return bool(getattr(agent, "speculatable", False))
+
+
+class _Speculator:
+    """Runs at most one speculative agent turn during the STT stage (ADR 070).
+
+    Fed each interim transcript via :meth:`note_partial`; debounces by
+    ``quiet_gap_s`` so a run fires only after the interim stops changing. On
+    :meth:`resolve` (STT final), if the running speculation's text matches the
+    final it is **committed** (its queue/task handed to the agent stage); else it
+    is **cancelled** and discarded. A no-op unless the agent is speculatable.
+    """
+
+    def __init__(
+        self,
+        agent: AgentTurn,
+        *,
+        quiet_gap_s: float,
+        language: str | None,
+        session_id: str | None,
+        agent_timeout: float | None,
+        observer: Any,
+    ) -> None:
+        self._agent = agent
+        self._quiet_gap_s = max(0.0, quiet_gap_s)
+        self._language = language
+        self._session_id = session_id
+        self._agent_timeout = agent_timeout
+        self._observer = observer
+        self._loop = asyncio.get_event_loop()
+        self._armed: asyncio.TimerHandle | None = None
+        self._spec_text: str | None = None  # normalized text of the in-flight run
+        self._queue: asyncio.Queue[tuple[str, Any]] | None = None
+        self._task: asyncio.Task[None] | None = None
+        # Tasks we cancelled (or that were superseded) — drained in aclose() so
+        # asyncio never warns about an un-retrieved exception (cancel-safety).
+        self._abandoned: list[asyncio.Task[None]] = []
+
+    def _emit(self, event: str, **fields: Any) -> None:
+        if self._observer is not None:
+            with contextlib.suppress(Exception):
+                self._observer.on_event(event, **fields)
+
+    def note_partial(self, text: str) -> None:
+        """A new interim transcript arrived — (re)arm/replace the speculation."""
+        norm = _norm_text(text)
+        if not norm or norm == self._spec_text:
+            return  # empty, or already speculating on this exact text
+        # The interim changed → drop any in-flight speculation and re-debounce.
+        self._cancel_running()
+        if self._armed is not None:
+            self._armed.cancel()
+        self._armed = self._loop.call_later(self._quiet_gap_s, self._fire, text)
+
+    def _fire(self, text: str) -> None:
+        self._armed = None
+        self._spec_text = _norm_text(text)
+        self._queue, self._task = _start_agent_run(
+            self._agent,
+            text,
+            language=self._language,
+            session_id=self._session_id,
+            agent_timeout=self._agent_timeout,
+        )
+        self._emit("speculation_started", chars=len(text))
+
+    def resolve(
+        self, final_text: str
+    ) -> tuple[asyncio.Queue[tuple[str, Any]], asyncio.Task[None]] | None:
+        """STT endpointed — commit a matching speculation, else cancel it."""
+        if self._armed is not None:
+            self._armed.cancel()
+            self._armed = None
+        if (
+            self._task is not None
+            and self._queue is not None
+            and self._spec_text == _norm_text(final_text)
+        ):
+            self._emit("speculation_committed")
+            committed = (self._queue, self._task)
+            self._queue = self._task = self._spec_text = None
+            return committed
+        if self._task is not None:
+            self._emit("speculation_cancelled")
+        self._cancel_running()
+        return None
+
+    def _cancel_running(self) -> None:
+        if self._task is not None:
+            if not self._task.done():
+                self._task.cancel()
+            self._abandoned.append(self._task)
+        self._task = self._queue = self._spec_text = None
+
+    async def aclose(self) -> None:
+        """Cancel + drain any abandoned speculative tasks (cancel-safety)."""
+        if self._armed is not None:
+            self._armed.cancel()
+            self._armed = None
+        self._cancel_running()
+        for task in self._abandoned:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._abandoned.clear()
+
+
 async def run_voice_pipeline(
     *,
     audio_in: AsyncIterator[AudioChunk],
@@ -224,6 +379,9 @@ async def run_voice_pipeline(
     text_filter: Callable[[str], str] | None = None,
     pii_redactor: Callable[[str], str] | None = None,
     agent_timeout: float | None = None,
+    speculative: bool = False,
+    speculation_quiet_gap_s: float = 0.3,
+    observer: Any = None,
     clock: Any = None,
 ) -> AsyncIterator[VoiceEvent]:
     """Drive one voice turn: audio → STT → the agent stage → TTS → audio.
@@ -278,6 +436,31 @@ async def run_voice_pipeline(
     the answer (sequential) or to each sentence (streaming); ``None`` leaves the
     text untouched.
 
+    ``speculative`` (opt-in, default off — ADR 070) starts the agent stage early,
+    on a **stable interim transcript**, before STT endpoints (``transcript.final``).
+    The biggest fixed cost of a pipeline turn is the endpointing silence-wait
+    (~1.5s, measured ~1.66s headroom in the bench); speculation runs the agent
+    during that wait and, when the endpointed final matches the interim we
+    speculated on, **commits** the in-flight run — recovering most of that gap.
+    When the final differs (the caller kept talking), the speculative run is
+    **cancelled** and discarded, and the agent runs fresh on the corrected
+    transcript. Speculation only fires when ``getattr(agent, "speculatable",
+    False)`` is true (the :class:`~movate.voice.agent_turn.AgentTurn`
+    cancel-safety opt-in, ADR 070 D3): a cancelled speculative run must be safe
+    to discard (no irreversible pre-first-token side effect). Speculative tokens
+    are **buffered**, never emitted, until commit — a cancelled speculation
+    reaches neither the wire nor TTS.
+
+    ``speculation_quiet_gap_s`` (default 0.3s) is the debounce: a speculation
+    fires only after the interim transcript has been stable for this long, so we
+    don't start-and-cancel on every mid-utterance word (the knob that keeps the
+    cancel/waste rate down — ADR 070 D1).
+
+    ``observer`` (optional :class:`~movate.voice.observer.VoiceObserver`) receives
+    ``speculation_started`` / ``speculation_committed`` / ``speculation_cancelled``
+    events so the win and its cost (cancel ratio) are measurable live (ADR 070
+    D5). ``None`` (default) drops them.
+
     ``clock`` is an injectable ``() -> float`` monotonic-seconds source (defaults
     to :func:`time.monotonic`) used to stamp each event's ``at_ms`` offset; a
     test passes a deterministic clock to assert exact latency numbers.
@@ -308,6 +491,24 @@ async def run_voice_pipeline(
     def _shown(text: str) -> str:
         return pii_redactor(text) if pii_redactor is not None else text
 
+    # Speculative agent kickoff (ADR 070): only when opted in AND the agent is
+    # cancel-safe. The speculator watches interims and may start the agent early;
+    # it is a no-op otherwise. ``committed`` (set after STT endpoints) is a
+    # pre-started agent run the agent stage adopts instead of starting fresh.
+    speculator = (
+        _Speculator(
+            agent,
+            quiet_gap_s=speculation_quiet_gap_s,
+            language=language,
+            session_id=session_id,
+            agent_timeout=agent_timeout,
+            observer=observer,
+        )
+        if speculative and _agent_is_speculatable(agent)
+        else None
+    )
+    committed: tuple[asyncio.Queue[tuple[str, Any]], asyncio.Task[None]] | None = None
+
     final_transcript: str | None = None
     try:
         async for tchunk in stt.transcribe(audio_in, language=language, api_key=stt_api_key):
@@ -315,8 +516,12 @@ async def run_voice_pipeline(
                 final_transcript = tchunk.text
                 yield _stamp(VoiceEvent(kind="transcript.final", text=_shown(tchunk.text)))
             else:
+                if speculator is not None:
+                    speculator.note_partial(tchunk.text)
                 yield _stamp(VoiceEvent(kind="transcript.partial", text=_shown(tchunk.text)))
     except Exception as exc:  # provider down mid-stream → degrade (D8)
+        if speculator is not None:
+            await speculator.aclose()
         yield _stamp(
             VoiceEvent(
                 kind="error",
@@ -330,6 +535,8 @@ async def run_voice_pipeline(
     if final_transcript is None:
         # The provider streamed only partials and never endpointed — we have no
         # utterance to run the agent on. Surface it rather than hang.
+        if speculator is not None:
+            await speculator.aclose()
         yield _stamp(
             VoiceEvent(
                 kind="error",
@@ -339,6 +546,15 @@ async def run_voice_pipeline(
             )
         )
         return
+
+    # STT endpointed: commit a matching speculation (adopt its in-flight run) or
+    # cancel it. Either way the agent stage below sees one uniform run handle.
+    # ``aclose`` then drains any *abandoned* (cancelled / superseded) speculative
+    # tasks so asyncio never warns about an un-retrieved exception — it leaves the
+    # committed run (if any) untouched for the agent stage to consume.
+    if speculator is not None:
+        committed = speculator.resolve(final_transcript)
+        await speculator.aclose()
 
     # ── Stage 2+3 (streaming, opt-in): overlap synthesis with generation ──
     if tts_streaming:
@@ -354,6 +570,7 @@ async def run_voice_pipeline(
             cancel=cancel,
             text_filter=text_filter,
             agent_timeout=agent_timeout,
+            committed=committed,
             stamp=_stamp,
         ):
             yield streamed_event
@@ -362,22 +579,19 @@ async def run_voice_pipeline(
     # ── Stage 2: the agent stage (an AgentTurn), with token streaming (D11) ──
     # Decouple the agent's *sync* on_token callback from our *async* generator
     # with a queue — the agent streams deltas as it produces them, we forward.
-    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    # A committed speculation (ADR 070) hands us an already-running queue/task on
+    # the SAME shape, so adoption is a one-line swap; otherwise start fresh.
+    if committed is not None:
+        queue, task = committed
+    else:
+        queue, task = _start_agent_run(
+            agent,
+            final_transcript,
+            language=language,
+            session_id=session_id,
+            agent_timeout=agent_timeout,
+        )
 
-    async def _drive() -> None:
-        try:
-            run = agent.run(
-                final_transcript,
-                on_token=lambda delta: queue.put_nowait(("token", delta)),
-                language=language,
-                session_id=session_id,
-            )
-            result = await (asyncio.wait_for(run, agent_timeout) if agent_timeout else run)
-            await queue.put(("result", result))
-        except Exception as exc:  # surface ANY failure (incl. timeout) as an error
-            await queue.put(("exc", exc))
-
-    task = asyncio.create_task(_drive())
     token_parts: list[str] = []
     answer_text = ""
     run_id = ""
@@ -504,6 +718,7 @@ async def _run_streaming_turn(
     cancel: asyncio.Event | None,
     text_filter: Callable[[str], str] | None,
     agent_timeout: float | None,
+    committed: tuple[asyncio.Queue[tuple[str, Any]], asyncio.Task[None]] | None = None,
     stamp: Any,
 ) -> AsyncIterator[VoiceEvent]:
     """Run the agent and TTS concurrently, streaming sentences as they complete.
@@ -526,24 +741,22 @@ async def _run_streaming_turn(
     }
 
     async def _agent_phase() -> None:
-        token_q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         chunker = SentenceChunker()
         token_parts: list[str] = []
 
-        async def _drive() -> None:
-            try:
-                run = agent.run(
-                    transcript,
-                    on_token=lambda d: token_q.put_nowait(("token", d)),
-                    language=language,
-                    session_id=session_id,
-                )
-                res = await (asyncio.wait_for(run, agent_timeout) if agent_timeout else run)
-                await token_q.put(("result", res))
-            except Exception as exc:
-                await token_q.put(("exc", exc))
-
-        drive_task = asyncio.create_task(_drive())
+        # Adopt a committed speculation (ADR 070) — its queue already carries the
+        # buffered early tokens; we drain it exactly like a fresh run. Otherwise
+        # start the agent now on the endpointed transcript.
+        if committed is not None:
+            token_q, drive_task = committed
+        else:
+            token_q, drive_task = _start_agent_run(
+                agent,
+                transcript,
+                language=language,
+                session_id=session_id,
+                agent_timeout=agent_timeout,
+            )
         try:
             while True:
                 kind, payload = await token_q.get()

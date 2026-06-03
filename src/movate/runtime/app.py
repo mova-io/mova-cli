@@ -622,6 +622,12 @@ class _VoiceTurnConfig:
     # false`` in its config frame to fall back to the strictly-sequential turn.
     # The WS event protocol is unchanged either way (consumers key off ``kind``).
     tts_streaming: bool = True
+    # Speculative agent kickoff (ADR 070): start the agent on a stable interim,
+    # before STT endpoints, to recover the ~1.5s endpointing wait. Defaults OFF
+    # (opt-in) because it changes the cost profile (cancelled speculative runs);
+    # a client enables it per-turn via ``speculative: true`` in the config frame.
+    # Only takes effect when the agent is cancel-safe (``speculatable``).
+    speculative: bool = False
 
 
 async def _collect_voice_turn(
@@ -657,6 +663,7 @@ async def _collect_voice_turn(
             config.voice_id = str(ctrl.get("voice_id") or config.voice_id)
             config.mock = bool(ctrl.get("mock", config.mock))
             config.tts_streaming = bool(ctrl.get("tts_streaming", config.tts_streaming))
+            config.speculative = bool(ctrl.get("speculative", config.speculative))
         elif ctrl_type == "end":
             return audio_frames, False
         elif ctrl_type == "close":
@@ -818,6 +825,7 @@ async def _stream_voice_pipeline_turn(
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
             tts_streaming=config.tts_streaming,
+            speculative=config.speculative,
             cancel=cancel,
         ):
             latency_events.append(event)

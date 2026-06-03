@@ -106,6 +106,11 @@ class LangGraphAgentTurn:
 
     name = "langgraph"
     version = "1"
+    # ADR 070 D3: NOT speculatable by default — a LangGraph graph may run tools
+    # or write checkpoints inside the turn, which a discarded speculation would
+    # leave behind. A graph that is provably side-effect-free before its first
+    # token can override this to True per deployment.
+    speculatable = False
 
     def __init__(
         self,

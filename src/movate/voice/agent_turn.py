@@ -80,10 +80,22 @@ class AgentTurn(Protocol):
 
     A new agent backend is a **new class implementing this Protocol** — the same
     extension story as adding a speech adapter (:mod:`movate.voice.base`).
+
+    ``speculatable`` (ADR 070 D3, optional, default-read as ``False``) declares
+    that a ``run`` started *speculatively* on a stable interim transcript is safe
+    to **cancel and discard** before completion — i.e. it performs no
+    irreversible side effect (committed memory write, non-idempotent tool call)
+    before the first token, and treats cancellation as "this turn did not
+    happen." The pipeline only speculates (``speculative=True``) on an agent that
+    sets this to ``True``; an agent with eager side effects leaves it ``False``
+    and is never speculated on. Read defensively via ``getattr(agent,
+    "speculatable", False)`` so existing implementations that predate this field
+    are correctly treated as non-speculatable.
     """
 
     name: str
     version: str
+    speculatable: bool
 
     def run(
         self,

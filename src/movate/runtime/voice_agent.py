@@ -47,6 +47,11 @@ class ExecutorAgentTurn(AgentTurn):
 
     name = "mdk-executor"
     version = "1"
+    # ADR 070 D3: a speculative run is cancel-safe here — the Executor's per-turn
+    # work (LLM call + token stream) has no irreversible side effect before the
+    # first token, and mdk session/memory state is committed out-of-band, not
+    # inside this turn. So a discarded speculation leaves nothing behind.
+    speculatable = True
 
     def __init__(
         self,

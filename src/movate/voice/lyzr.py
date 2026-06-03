@@ -61,6 +61,11 @@ class LyzrAgentTurn:
 
     name = "lyzr-adk"
     version = "1"
+    # ADR 070 D3: NOT speculatable. ``agent.run`` is synchronous (run in a
+    # thread, which can't be truly cancelled) and commits Lyzr-side session
+    # memory inside the turn — a discarded speculation would leave state behind
+    # and keep burning a thread. So the pipeline never speculates on a Lyzr turn.
+    speculatable = False
 
     def __init__(self, agent: Any, *, to_thread: ToThread | None = None) -> None:
         self._agent = agent

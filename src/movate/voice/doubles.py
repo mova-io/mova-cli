@@ -42,6 +42,7 @@ class FakeAgentTurn:
 
     name = "fake_agent"
     version = "0.0.1"
+    speculatable = False
 
     def __init__(
         self,
@@ -51,12 +52,19 @@ class FakeAgentTurn:
         error: AgentTurnError | None = None,
         answer_in_result: bool = True,
         run_id: str = "run-fake",
+        speculatable: bool = False,
+        run_delay_s: float = 0.0,
     ) -> None:
         self._answer = answer
         self._stream = stream
         self._error = error
         self._answer_in_result = answer_in_result
         self._run_id = run_id
+        # ADR 070: per-instance opt-in for speculative kickoff, and an optional
+        # per-run delay so a test can keep a speculative run in flight while it
+        # drives more interims (to exercise commit vs cancel).
+        self.speculatable = speculatable
+        self._run_delay_s = run_delay_s
         self.prompts: list[str] = []
         self.session_ids: list[str | None] = []
         self.languages: list[str | None] = []
@@ -72,6 +80,10 @@ class FakeAgentTurn:
         self.prompts.append(text)
         self.session_ids.append(session_id)
         self.languages.append(language)
+        if self._run_delay_s:
+            import asyncio  # noqa: PLC0415
+
+            await asyncio.sleep(self._run_delay_s)
         if self._error is not None:
             return AgentTurnResult(run_id=self._run_id, status="error", error=self._error)
         if self._stream and on_token is not None and self._answer:
@@ -95,9 +107,20 @@ class FakeSTT:
     name = "fake_stt"
     version = "0.0.1"
 
-    def __init__(self, transcript: str = "hello", *, partials: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        transcript: str = "hello",
+        *,
+        partials: list[str] | None = None,
+        partial_delay_s: float = 0.0,
+        final_delay_s: float = 0.0,
+    ) -> None:
         self.transcript = transcript
         self._partials = partials or []
+        # ADR 070: pace partials / the final so a test can let the speculator's
+        # quiet-gap debounce fire and keep a speculation in flight across the gap.
+        self._partial_delay_s = partial_delay_s
+        self._final_delay_s = final_delay_s
         self.received: list[bytes] = []
         self.languages: list[str | None] = []
         self.api_keys: list[str | None] = []
@@ -109,12 +132,18 @@ class FakeSTT:
         language: str | None = None,
         api_key: str | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
+        import asyncio  # noqa: PLC0415
+
         self.languages.append(language)
         self.api_keys.append(api_key)
         async for chunk in audio:
             self.received.append(chunk.data)
         for partial in self._partials:
+            if self._partial_delay_s:
+                await asyncio.sleep(self._partial_delay_s)
             yield TranscriptChunk(text=partial, is_final=False)
+        if self._final_delay_s:
+            await asyncio.sleep(self._final_delay_s)
         yield TranscriptChunk(text=self.transcript, is_final=True, confidence=1.0)
 
 

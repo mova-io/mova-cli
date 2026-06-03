@@ -1,6 +1,6 @@
 # ADR 070 — Speculative agent kickoff: beat the endpointing latency floor in pipeline mode
 
-**Status:** Proposed
+**Status:** Accepted (2026-06-02) — implemented opt-in (`speculative=False` default) behind the quiet-gap gate, per the D7 verdict. Default-on pending live A/B against badge telemetry.
 **Date:** 2026-06-02
 **Deciders:** Engineering + Deva (Movate)
 **Context window:** the single largest fixed cost in a pipeline-mode voice turn
