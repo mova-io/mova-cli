@@ -80,6 +80,18 @@ VOICE_KEY_ENV_VARS: tuple[str, ...] = (
     "AZURE_SPEECH_REGION",
 )
 
+# Enterprise connector env vars (ADR 052 Phase 1 — Action Fabric).
+# Set via ``mdk auth login servicenow`` / ``msgraph`` (or by hand) and
+# consumed by the HTTP skill backend when dispatching connector skills.
+# ServiceNow needs an API key + instance URL; Microsoft Graph needs an
+# access token + tenant ID.
+CONNECTOR_KEY_ENV_VARS: tuple[str, ...] = (
+    "SERVICENOW_API_KEY",
+    "SERVICENOW_INSTANCE_URL",
+    "MSGRAPH_ACCESS_TOKEN",
+    "MSGRAPH_TENANT_ID",
+)
+
 # Temporal connection (ADR 054) — host + namespace + optional TLS cert/key for
 # Temporal Cloud; reads from ~/.movate/credentials via ``mdk auth login
 # temporal``. Same BYOK seam as every other provider credential (ADR 054 D8) —
@@ -106,6 +118,7 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
     *VOICE_KEY_ENV_VARS,
+    *CONNECTOR_KEY_ENV_VARS,
     *TEMPORAL_KEY_ENV_VARS,
 )
 
