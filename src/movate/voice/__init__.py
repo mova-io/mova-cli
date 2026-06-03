@@ -99,7 +99,7 @@ from movate.voice.pipeline import (
 from movate.voice.realtime_azure import AzureOpenAIRealtime
 from movate.voice.realtime_openai import OpenAIRealtime
 from movate.voice.speakify import speakify
-from movate.voice.stt_wrappers import ConfidenceGatedSTT, SilenceGatedSTT
+from movate.voice.stt_wrappers import ConfidenceGatedSTT, SilenceGatedSTT, warm_stt
 from movate.voice.telephony import (
     mulaw_to_pcm16,
     pcm16_to_mulaw,
@@ -203,5 +203,6 @@ __all__ = [
     "voice_agent",
     "voice_agent_langgraph",
     "warm_cache",
+    "warm_stt",
     "word_error_rate",
 ]

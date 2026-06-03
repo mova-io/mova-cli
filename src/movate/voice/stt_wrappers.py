@@ -27,6 +27,23 @@ def _engine_name(provider: Any) -> str:
     return getattr(provider, "effective_provider", "") or getattr(provider, "name", "stt")
 
 
+async def warm_stt(provider: Any, api_key: str | None = None) -> bool:
+    """Best-effort: warm ``provider`` if it (or its inner provider) supports it.
+
+    The ADR 073 Phase 5 entry point a transport calls once at session start.
+    Returns True if any underlying adapter warmed a reusable client. Duck-typed
+    (an adapter without ``warm`` is simply skipped) and never raises — warming is
+    an optimization, not a precondition for the session.
+    """
+    warm = getattr(provider, "warm", None)
+    if warm is None:
+        return False
+    try:
+        return bool(await warm(api_key))
+    except Exception:
+        return False
+
+
 class SilenceGatedSTT:
     """Drops silent frames before delegating to ``inner`` (cost; ADR 048 D8 edge).
 
@@ -86,6 +103,10 @@ class SilenceGatedSTT:
             keyterms=keyterms,
             endpointing_ms=endpointing_ms,
         )
+
+    async def warm(self, api_key: str | None = None) -> bool:
+        """Forward warm() to the wrapped provider (ADR 073 Phase 5)."""
+        return await warm_stt(self._inner, api_key)
 
 
 class ConfidenceGatedSTT:
@@ -176,3 +197,9 @@ class ConfidenceGatedSTT:
             self.effective_provider = _engine_name(self._primary)
             self._observer.on_event("stt_engine", provider=self.effective_provider, escalated=False)
             yield primary_final
+
+    async def warm(self, api_key: str | None = None) -> bool:
+        """Warm both the cheap + escalation providers (ADR 073 Phase 5)."""
+        warmed = await warm_stt(self._primary, api_key)
+        warmed = await warm_stt(self._escalation, api_key) or warmed
+        return warmed

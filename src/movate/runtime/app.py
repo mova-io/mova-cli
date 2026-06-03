@@ -15358,6 +15358,15 @@ def build_app(
         stt_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, stt)
         tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts)
 
+        # ADR 073 Phase 5 — warm the STT client/connector once at session start
+        # (while the caller is still being greeted) so the FIRST turn skips
+        # client cold-start. Best-effort: a no-op for adapters that don't support
+        # warming, and never fatal to the session.
+        from movate.voice import warm_stt  # noqa: PLC0415
+
+        with contextlib.suppress(Exception):
+            await warm_stt(stt, stt_api_key)
+
         # Config persists across turns in a session; a per-turn ``config`` frame
         # can override it before that turn's ``end``. Seed from the agent's
         # ``voice`` block first (ADR 071 D1-D3) so per-agent voice_id / language /

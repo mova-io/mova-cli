@@ -60,6 +60,11 @@ _DEEPGRAM_SAMPLE_RATE = 24_000
 # pass one ``keyterms`` list and the adapter wires it correctly either way.
 _KEYTERM_MODEL_PREFIXES = ("nova-3",)
 
+# Upper bound on the per-key client cache (ADR 073 Phase 5). One process rarely
+# serves more than a handful of distinct BYOK keys at once; this just stops a
+# pathological churn of keys from growing the cache without bound.
+_CLIENT_CACHE_MAX = 32
+
 
 def _require_deepgram() -> Any:
     """Import the ``deepgram`` SDK lazily, with a clear install hint.
@@ -160,6 +165,7 @@ class DeepgramSTT:
         utterance_end_ms: int | None = 2500,
         keyterms: Sequence[str] | None = None,
         client: deepgram.DeepgramClient | None = None,
+        reuse_client: bool = True,
     ) -> None:
         """``client`` is for tests — pass a fake exposing the live-transcription
         connection shape (``listen.asyncwebsocket.v("1")`` →
@@ -195,6 +201,15 @@ class DeepgramSTT:
         earlier they fall back to the legacy ``keywords`` param. ``None`` (the
         default) sends no boosting and is byte-for-byte the prior behavior.
         This is the cheapest accuracy win for enterprise vocabularies.
+
+        ``reuse_client`` (default True, ADR 073 Phase 5) caches the constructed
+        ``DeepgramClient`` per resolved key and reuses it across turns, instead
+        of building a fresh one (and its connector / DNS / TLS setup) on every
+        ``transcribe`` call. The SDK client is a connection-pooling factory — one
+        per session, opening a new socket per turn, is the intended usage — so
+        this removes per-turn client cold-start with no behavior change. Call
+        :meth:`warm` once at session start to also skip it on the *first* turn.
+        Set ``False`` to restore the old construct-per-call behavior.
         """
         self._model = model
         self._finish_grace_seconds = max(0.0, finish_grace_seconds)
@@ -204,6 +219,11 @@ class DeepgramSTT:
         )
         self._keyterms = [t for t in (keyterms or []) if t and t.strip()]
         self._client = client
+        # ADR 073 Phase 5 — per-key client cache so turns 2..N skip client
+        # construction (connector/DNS/TLS setup). Bounded so a churn of BYOK keys
+        # can't grow it unbounded. An injected ``client`` bypasses it entirely.
+        self._reuse_client = reuse_client
+        self._client_cache: dict[str, Any] = {}
 
     def _uses_keyterm_prompting(self) -> bool:
         """Whether the configured model takes ``keyterm`` (vs legacy ``keywords``)."""
@@ -218,7 +238,39 @@ class DeepgramSTT:
         # Per-call client when a tenant BYOK key is supplied (ADR 018); else fall
         # back to the SDK's own env (DEEPGRAM_API_KEY) for the local/dev path.
         key = api_key or os.environ.get("DEEPGRAM_API_KEY", "")
-        return deepgram_mod.DeepgramClient(key)
+        if not self._reuse_client:
+            return deepgram_mod.DeepgramClient(key)
+        # ADR 073 Phase 5: reuse the client (and its connector) across turns.
+        cached = self._client_cache.get(key)
+        if cached is None:
+            cached = deepgram_mod.DeepgramClient(key)
+            if len(self._client_cache) >= _CLIENT_CACHE_MAX:
+                self._client_cache.clear()  # crude bound — keys are few per process
+            self._client_cache[key] = cached
+        return cached
+
+    async def warm(self, api_key: str | None = None) -> bool:
+        """Pre-construct + cache the Deepgram client (ADR 073 Phase 5).
+
+        Call once at session start (while the user is being greeted) so the
+        *first* turn doesn't pay client cold-start. Best-effort: returns True if
+        it warmed a reusable client, False if warming doesn't apply (an injected
+        client, or ``reuse_client=False``) or the construction failed — warming
+        is an optimization and must never break the session.
+
+        Note: this warms the *client/connector*, not a live recognition socket.
+        Deepgram binds per-utterance options (sample rate, language, keyterms,
+        endpointing) at ``connection.start()`` and closes idle sockets, so a
+        pre-opened socket can't be reused for the next turn — pooling live
+        sockets is deliberately out of scope.
+        """
+        if self._client is not None or not self._reuse_client:
+            return False
+        try:
+            self._resolve_client(api_key)
+            return True
+        except Exception:
+            return False
 
     async def transcribe(
         self,
