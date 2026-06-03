@@ -1,0 +1,2345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mova-iO Voice Playground</title>
+<style>
+:root {
+  /* DARK MODE — default. Light mode below via [data-theme="light"]. */
+  --bg:#0f1117; --panel:#161a23;
+  --muted:#aab2c5; --soft:#c8cfdc; --text:#ffffff;
+  --accent:#7ab1ff; --ok:#34d058; --warn:#ffb454; --err:#ff6b6b;
+  /* Chart palette — distinct, colorblind-friendly, work in both themes. */
+  --c1:#7ab1ff; --c2:#34d058; --c3:#ffb454; --c4:#d186ff; --c5:#ff6b6b;
+  /* Surface tokens used by inputs, dropdowns, badges — abstracted from
+     raw hex so light mode swaps cleanly. */
+  --surface:#1f2533; --surface-2:#262d3f; --border:#2a3142;
+  --shadow-color:0,0,0; --shadow-alpha:0.3;
+  --grid:#222a3a;  /* chart gridlines */
+  --gate-bg:rgba(15,17,23,0.92);
+}
+/* LIGHT MODE — toggle via header button; persists in localStorage. Chart
+   colors stay vivid (darker accent shades for contrast on the lighter bg);
+   text + surfaces flip. Keeps the dot/badge/chart APIs identical so JS
+   doesn't have to branch — only CSS vars change. */
+[data-theme="light"] {
+  --bg:#f7f9fc; --panel:#ffffff;
+  --muted:#5a6478; --soft:#3a4256; --text:#0e1320;
+  --accent:#1f6dd1; --ok:#1c8f3c; --warn:#b56a06; --err:#c43030;
+  --c1:#1f6dd1; --c2:#1c8f3c; --c3:#b56a06; --c4:#7a3ec0; --c5:#c43030;
+  --surface:#eef1f6; --surface-2:#e2e7ef; --border:#cdd4de;
+  --shadow-color:30,40,60; --shadow-alpha:0.12;
+  --grid:#dfe4ec;
+  --gate-bg:rgba(247,249,252,0.92);
+}
+* { box-sizing: border-box; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
+       background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased; }
+/* Header strip — Movate-navy background in both themes so the white logo
+   pops without needing its own pill, and the brand zone reads as a unified
+   bar at the top of the page. Text + dim labels inside the header are
+   white-with-alpha so they're readable on navy regardless of the page
+   theme below. */
+header { padding:14px 24px; border-bottom:1px solid rgba(255,255,255,0.08);
+         display:flex; align-items:center; gap:12px;
+         background:#0c1a3d; color:#ffffff; }
+header h1 { color:#ffffff; }
+header .muted { color:rgba(255,255,255,0.72); }
+header .dot { background:rgba(255,255,255,0.35); }
+header .view-tabs { border-color:rgba(255,255,255,0.25); }
+header .view-tabs button { color:rgba(255,255,255,0.78); }
+header .view-tabs button:hover { background:rgba(255,255,255,0.10); }
+header .view-tabs button.active { background:var(--accent); color:white; }
+/* Header chips (parity / dial / sync / BYOK / theme toggle / recording /
+   export) — give them a subtle dark-glass background so they're visible
+   on the navy without losing their text color. The !important is needed
+   because several chips have inline `style="color:var(--text)"` which
+   resolves to near-black in light theme. */
+header .badge,
+header #theme-toggle,
+header #export-group button,
+header #twilio-dial,
+header #twilio-sync,
+header #byok-badge,
+header #parity-badge,
+header #recording-link {
+  background:rgba(255,255,255,0.12) !important;
+  color:#ffffff !important;
+}
+header .badge:hover,
+header #theme-toggle:hover,
+header #twilio-dial:hover,
+header #twilio-sync:hover,
+header #byok-badge:hover { background:rgba(255,255,255,0.20) !important; }
+/* Mic meter container — slightly lighter strip than the header bg. */
+header .meter { background:rgba(255,255,255,0.12); }
+/* Movate brand mark — transparent background. The header strip itself is
+   navy now, so the white logo pops without needing its own pill. */
+.brand-link { display:inline-flex; align-items:center; justify-content:center;
+              padding:2px 0; transition:opacity .15s; }
+.brand-link:hover { opacity:0.85; }
+.brand-logo { height:32px; width:auto; display:block; }
+/* View tabs — Simple/Detailed split. Simple = curated subset for a
+   non-technical audience; Detailed = everything (the engineer view). */
+.view-tabs { display:inline-flex; border:1px solid var(--border); border-radius:6px;
+             overflow:hidden; margin-left:4px; }
+.view-tabs button { background:transparent; color:var(--soft); padding:5px 10px;
+                    font-size:12px; border:0; border-radius:0; cursor:pointer; }
+.view-tabs button:hover { background:var(--surface); }
+.view-tabs button.active { background:var(--accent); color:white; }
+/* All controls flagged .detailed-only are hidden in Simple view via
+   display:none !important. Talk button + Lyzr picker + This-turn panel +
+   Live-activity strip-chart stay visible (no class on them = always shown). */
+[data-view="simple"] .detailed-only { display:none !important; }
+/* Move the controls bar (Voice / Agent / Talk) to the TOP, right under the
+   BYOK panel, in BOTH views. Was previously Simple-only via flex order; per
+   user feedback Detailed also wants it at the top. Single rule set, applied
+   on body (default flex column when an explicit view is selected). */
+body                  { display:flex; flex-direction:column; min-height:100vh; }
+header                { order: 1; }
+#byok-panel           { order: 2; }
+.controls             { order: 3; border-top:0; border-bottom:1px solid var(--border); }
+#lyzr-agent-meta      { order: 4; }
+main                  { order: 5; }
+#gate                 { order: 0; }
+/* Simple view: hide the entire agent-toggle (Streaming/Standard moved to
+   Detailed-only per user request). Simple users always run Streaming.
+   Detailed view still shows all four tier buttons. */
+[data-view="simple"] #agent-toggle,
+[data-view="simple"] #agent-label { display:none !important; }
+/* Currently-voicing collapse/expand: body hides when .collapsed; caret
+   rotates 90° when expanded. When collapsed, shrink the panel to a single
+   header-line height by killing the shared .panel min-height + tightening
+   vertical padding — otherwise the empty 160 px panel chrome stays. */
+#lyzr-agent-meta.collapsed { min-height:0; padding:8px 16px; }
+#lyzr-agent-meta.collapsed #lyzr-meta-body { display:none; }
+#lyzr-agent-meta:not(.collapsed) #lyzr-meta-caret { transform:rotate(90deg); }
+h1 { font-size:16px; font-weight:600; margin:0; letter-spacing:0.2px; }
+.dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+.dot.ok { background:var(--ok); }
+.dot.warn { background:var(--warn); }
+.dot.err { background:var(--err); }
+main { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:16px; padding:16px; max-width:1280px; margin:0 auto; }
+@media (max-width: 980px) { main { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 700px) { main { grid-template-columns: 1fr; } }
+/* Subtle helpers used in the new pipeline panel. */
+.chain { font-family:'SF Mono',Menlo,monospace; font-size:12px; line-height:1.55;
+         color:var(--text); word-break:break-word; }
+.chain .arr { color:var(--muted); margin:0 4px; }
+.chain .active-prov { color:var(--ok); font-weight:600; }
+.chain .fault-prov { color:var(--err); text-decoration:line-through; }
+.chain .hedge { color:var(--warn); font-style:italic; }
+.dim { color:var(--muted); font-size:11px; }
+.kv { display:flex; gap:4px; align-items:baseline; }
+.kv .lbl { color:var(--muted); font-size:11px; min-width:64px; }
+.kv .val { font-size:12px; font-family:'SF Mono',Menlo,monospace; word-break:break-word; }
+.panel { background:var(--panel); border-radius:10px; padding:14px 16px; min-height:160px; }
+.panel h2 { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:1px;
+            color:var(--muted); margin:0 0 10px; }
+.row { display:flex; justify-content:space-between; align-items:center; padding:4px 0; font-size:13px; }
+.row .k { color:var(--muted); }
+.row .v { font-variant-numeric:tabular-nums; font-weight:500; }
+.transcript, .answer { font-size:15px; line-height:1.5; min-height:48px; white-space:pre-wrap; }
+.muted { color:var(--muted); font-style:italic; }
+/* "Thinking…" pulse — shown between STT final and first agent token so
+   the 1-6 second agent-side gap doesn't feel like dead air. */
+.thinking { color:var(--accent); font-style:italic;
+            animation: thinking-pulse 1.2s ease-in-out infinite; }
+.thinking .td::after { content:''; display:inline-block; width:0;
+                       animation: thinking-dots 1.4s steps(4,end) infinite;
+                       overflow:hidden; vertical-align:bottom; }
+@keyframes thinking-pulse { 0%,100% { opacity:.55; } 50% { opacity:1; } }
+@keyframes thinking-dots { 0%{width:0;}25%{width:.4em;}50%{width:.8em;}75%{width:1.2em;}100%{width:0;} }
+/* Inline charts — minimalist SVG, no third-party lib. Bars + lines + a legend. */
+.chart { width:100%; height:120px; display:block; }
+.chart-legend { display:flex; gap:12px; font-size:11px; color:var(--soft); margin-top:6px;
+                flex-wrap:wrap; }
+.chart-legend .lg { display:inline-flex; align-items:center; gap:4px; }
+.chart-legend .sw { display:inline-block; width:10px; height:10px; border-radius:2px; }
+.chart-axis { fill:var(--soft); font-size:11px; font-family:'SF Mono',Menlo,monospace; font-weight:500; }
+.chart-axis-sm { fill:var(--muted); font-size:10px; font-family:'SF Mono',Menlo,monospace; }
+.chart-grid { stroke:var(--grid); stroke-width:1; }
+.chart-bar { transition:opacity .15s; }
+.chart-bar:hover { opacity:.75; }
+.chart-empty { display:flex; align-items:center; justify-content:center; height:120px;
+               color:var(--muted); font-style:italic; font-size:12px; }
+/* Make the description / instructions blocks in the metadata panel actually readable. */
+#lyzr-meta-desc, #lyzr-meta-instructions { color:var(--soft) !important; }
+.badge { display:inline-block; padding:2px 8px; border-radius:6px; background:var(--surface); font-size:12px;
+         color:var(--accent); font-variant-numeric:tabular-nums; }
+.events { font-family:'SF Mono',Menlo,monospace; font-size:11px; line-height:1.55;
+          max-height:240px; overflow:auto; color:var(--soft); }
+.events .e { padding:1px 0; }
+.events .e.err { color:var(--err); }
+.events .e.final { color:var(--text); }
+.events .e.warn { color:var(--warn); }
+.controls { padding:18px 24px; border-top:1px solid var(--border); }
+.controls-row { display:flex; gap:12px; justify-content:center; align-items:center; flex-wrap:wrap; }
+button { font-size:13px; font-weight:500; padding:8px 14px; border:0; border-radius:6px;
+         background:var(--surface); color:var(--text); cursor:pointer; }
+button:hover { background:var(--surface-2); }
+button:disabled { opacity:0.4; cursor:not-allowed; }
+button.primary { background:var(--accent); color:white; font-weight:600; padding:14px 28px; border-radius:999px;
+                 box-shadow:0 2px 8px rgba(91,155,255,0.3); font-size:14px; }
+button.primary.live { background:var(--err); box-shadow:0 0 0 6px rgba(239,68,68,0.2); }
+button.warn { background:var(--surface-2); color:var(--warn); }
+button.active { background:var(--accent); color:white; }
+.hint { color:var(--muted); font-size:12px; margin-top:8px; text-align:center; }
+.error { color:var(--err); font-size:13px; padding:8px 0; text-align:center; }
+.meter { width:160px; height:8px; background:var(--surface-2); border-radius:4px; overflow:hidden; position:relative; }
+.meter > .bar { height:100%; width:0%; background:linear-gradient(90deg, var(--ok) 0%, var(--warn) 70%, var(--err) 100%);
+                transition: width 60ms linear; }
+.toggle-group { display:flex; gap:0; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+.toggle-group button { border-radius:0; padding:6px 12px; background:transparent; }
+.toggle-group button.active { background:var(--accent); color:white; }
+.gate { position:fixed; inset:0; background:var(--gate-bg); display:flex; align-items:center;
+        justify-content:center; flex-direction:column; gap:18px; z-index:100; }
+.gate.hidden { display:none; }
+.gate h2 { font-size:18px; margin:0; }
+.gate .start { font-size:16px; padding:16px 32px; border-radius:8px; background:var(--accent); color:white;
+               cursor:pointer; border:0; font-weight:600; }
+</style>
+</head>
+<body>
+
+<!-- #11: audio-unlock gate (Safari/Chrome autoplay block). Branded with
+     the Mova-iO logo + title so the first thing a visitor sees is the
+     product, not internal tooling names. -->
+<div id="gate" class="gate">
+  <div style="padding:14px 22px;background:#0c1a3d;border-radius:10px;
+              display:inline-flex;align-items:center;">
+    <img src="/static/movate-logo.png" alt="Mova-iO" style="height:42px;width:auto;display:block;" />
+  </div>
+  <h2 style="font-size:22px;">Mova-iO Voice Playground</h2>
+  <div class="muted" style="max-width:380px;text-align:center;">
+    Click to enable microphone and audio playback in this browser.
+  </div>
+  <button class="start" id="gate-start">▶ Start</button>
+</div>
+
+<header>
+  <!-- Movate brand mark — white logo on a navy pill. Same in both themes
+       (the navy gives enough contrast in light mode where a white-on-white
+       logo otherwise vanishes). -->
+  <a href="https://www.movate.com/" target="_blank" rel="noopener noreferrer"
+     title="Movate" class="brand-link">
+    <img src="/static/movate-logo.png" class="brand-logo" alt="Movate" />
+  </a>
+  <span id="status" class="dot"></span>
+  <h1>Mova-iO Voice Playground</h1>
+  <span id="status-text" class="muted" style="font-size:12px;"></span>
+  <!-- View tabs — Simple (curated minimal UI for a demo audience) vs
+       Detailed (full engineering view). Persists in localStorage. -->
+  <div class="view-tabs" id="view-tabs">
+    <button data-view="simple"   class="active">Simple</button>
+    <button data-view="detailed">Detailed</button>
+  </div>
+  <div style="flex:1"></div>
+  <!-- Live Mova-iO parity badge — hits /parity on load, shows "N/M of Lyzr's
+       voice menu"; click to expand the gap list. Updated dynamically when
+       new adapters land (Cartesia STT, Deepgram Aura, etc.) -->
+  <span class="badge detailed-only" id="parity-badge" title="Click for details"
+        style="cursor:pointer;display:none;">Mova-iO parity …</span>
+  <!-- Light/dark mode toggle — persists in localStorage (key: "mdk-theme").
+       JS at the very bottom of <body> applies the saved theme on load. -->
+  <button id="theme-toggle" class="badge"
+          title="Toggle light/dark mode"
+          style="cursor:pointer;color:var(--text);padding:2px 8px;border:0;">🌙</button>
+  <!-- B4: per-call recording download. Hidden until the server emits
+       `recording_ready` (Azure Blob SAS URL, 24h). Off entirely unless
+       RECORD_CALLS=1 + AZURE_STORAGE_CONNECTION_STRING are set server-side. -->
+  <a id="recording-link" href="#" target="_blank" rel="noopener"
+     class="badge" title="Download this call's WAV (caller=L, agent=R)"
+     style="display:none;text-decoration:none;color:inherit;">📥 Recording</a>
+  <!-- Twilio dial-this-number chip — visible in BOTH views when the server
+       has TWILIO_NUMBER configured. Click to copy on desktop, or tel: handoff
+       on mobile. Hidden when no number is configured. -->
+  <button id="twilio-dial" class="badge"
+          title="Dial this number to reach the agent (click to copy / tap to call on mobile)"
+          style="cursor:pointer;color:var(--text);padding:2px 8px;border:0;display:none;">📞 …</button>
+  <!-- 📞 Sync-to-phone button — pushes the playground's current settings
+       (agent tier, Mova-iO agent_id, TTS tier, voice, hedge, budget) to the
+       module-level config the next inbound Twilio call will use. -->
+  <button id="twilio-sync" class="badge detailed-only"
+          title="Copy current playground settings to the Twilio phone number — the NEXT call to this number will use these"
+          style="cursor:pointer;color:var(--text);padding:2px 8px;border:0;">📞 Sync to phone</button>
+  <!-- BYOK header badge — click to paste your own Mova-iO API key.
+       Shows "Lyzr: demo key" by default, "Lyzr: your key" when BYOK active. -->
+  <span class="badge" id="byok-badge"
+        title="Click to use your own Mova-iO API key (per-session, never persisted)"
+        style="cursor:pointer;background:var(--surface);color:var(--muted);">🔑 Mova-iO: demo key</span>
+  <!-- B3: client-side transcript export. Enabled once at least one turn has
+       completed; clicking offers MD (human-readable) + JSON (machine) downloads.
+       No server roundtrip — the UI already receives every turn's transcript,
+       cost, latency, and tier via WS events. -->
+  <span id="export-group" class="detailed-only" style="display:none;">
+    <button id="export-md"   title="Download conversation as Markdown"
+            style="font-size:11px;padding:4px 8px;">📄 MD</button>
+    <button id="export-json" title="Download full session as JSON (turns, costs, latencies, metrics)"
+            style="font-size:11px;padding:4px 8px;">{ } JSON</button>
+  </span>
+  <!-- #3: mic activity meter -->
+  <span class="muted" style="font-size:11px;">mic</span>
+  <div class="meter" title="mic input level"><div class="bar" id="meter"></div></div>
+</header>
+
+<!-- BYOK (Lyzr only): collapsible panel that lets a user voice their OWN
+     Mova-iO account's agents without the demo operator sharing a Lyzr key.
+     STT/TTS/OpenAI stay on the server's infrastructure keys — only Lyzr is
+     BYOK because that's the one where each user has their own agents. -->
+<div id="byok-panel" class="panel"
+     style="display:none;margin:8px 16px;border-left:3px solid var(--warn);">
+  <h2 style="margin:0 0 8px 0;">Your Mova-iO API key (per-session, BYOK)</h2>
+  <p class="muted" style="margin:0 0 12px 0;font-size:12px;font-style:normal;">
+    Paste your own Mova-iO API key to voice <em>your</em> agents from this
+    browser session. Your key is sent to Lyzr's API only —
+    <strong>never logged, never persisted, never shared</strong>. Close the
+    tab and it's gone. Server log only records that a user key was set, not
+    the value. Leave empty to use the demo's default Mova-iO key.
+    <br/><br/>
+    STT (Deepgram), TTS (Cartesia), and the OpenAI Chat agent all use the
+    demo's keys — only Mova-iO is bring-your-own because it's where each user
+    has their own agents.
+  </p>
+  <div style="display:grid;grid-template-columns:90px 1fr;gap:8px;align-items:center;font-size:12px;">
+    <span class="muted" style="font-style:normal;">Mova-iO key</span>
+    <input id="byok-lyzr" type="password" placeholder="sk-default-… (your Mova-iO API key)"
+           autocomplete="off" spellcheck="false"
+           style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;
+                  padding:6px 8px;font-family:'SF Mono',Menlo,monospace;font-size:11px;" />
+  </div>
+  <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <button id="byok-apply" class="active" style="font-size:12px;">Apply for this session</button>
+    <button id="byok-clear" style="font-size:12px;">Clear (revert to demo key)</button>
+    <button id="byok-show" style="font-size:11px;padding:4px 8px;" title="Toggle visibility of entered key">👁 Show</button>
+    <span id="byok-active" class="muted" style="font-size:11px;margin-left:auto;font-style:normal;">Using demo Mova-iO key</span>
+  </div>
+  <p class="muted" style="margin:8px 0 0 0;font-size:11px;font-style:normal;">
+    Tip: once your key is applied, the Mova-iO agent dropdown reloads with
+    <em>your</em> account's agents.
+  </p>
+</div>
+
+<!-- L2: "Currently voicing" — Mova-iO agent metadata panel. Shows when an agent
+     is selected from the picker, so the audience sees what they're talking to:
+     the agent's own name, role, tools, RAG corpus, instructions snippet. -->
+<!-- Currently voicing — collapsible. Header is the click target; the body
+     (#lyzr-meta-body) toggles via the .collapsed class. Collapsed by default
+     (only the agent name remains visible inline as a summary). -->
+<div id="lyzr-agent-meta" class="panel collapsed"
+     style="display:none;margin:8px 16px;border-left:3px solid #5b9bff;">
+  <h2 id="lyzr-meta-toggle"
+      style="margin:0;display:flex;align-items:center;gap:8px;cursor:pointer;
+             user-select:none;">
+    <span id="lyzr-meta-caret" style="font-size:10px;transition:transform .15s;">▶</span>
+    <span>Currently voicing:</span>
+    <span id="lyzr-meta-name-inline" style="color:var(--text);font-weight:600;
+          text-transform:none;letter-spacing:0;font-size:13px;">—</span>
+  </h2>
+  <div id="lyzr-meta-body" style="margin-top:10px;">
+    <div class="row">
+      <span class="k">Agent</span>
+      <span class="v" id="lyzr-meta-name" style="font-weight:600;">—</span>
+    </div>
+    <div class="row" id="lyzr-meta-role-row" style="display:none;">
+      <span class="k">Role</span>
+      <span class="v" id="lyzr-meta-role">—</span>
+    </div>
+    <div class="row" id="lyzr-meta-desc-row" style="display:none;">
+      <span class="k">Description</span>
+      <span class="v" id="lyzr-meta-desc" style="text-align:right;font-style:italic;color:var(--soft);">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Tools</span>
+      <span class="v" id="lyzr-meta-tools">—</span>
+    </div>
+    <div class="row" id="lyzr-meta-features-row" style="display:none;">
+      <span class="k">Features</span>
+      <span class="v" id="lyzr-meta-features">—</span>
+    </div>
+    <div style="margin-top:8px;padding:8px;background:var(--surface);border-radius:6px;
+                font-size:11px;color:var(--soft);line-height:1.45;white-space:pre-wrap;
+                max-height:140px;overflow:auto;" id="lyzr-meta-instructions">—</div>
+  </div>
+</div>
+
+<!-- Expandable parity detail panel. Hidden by default; toggled by clicking
+     the header badge. Renders the covered/gap lists from /parity. -->
+<div id="parity-panel" class="panel detailed-only" style="display:none;margin:8px 16px;">
+  <h2 style="margin:0 0 8px 0;">Mova-iO voice-provider parity</h2>
+  <p class="muted" style="margin:0 0 8px 0;font-size:12px;">
+    Every provider Mova-iO lists in
+    <code>/v1/config/{pipeline,realtime}-options</code> against our adapter table —
+    <em>covered</em> = we have an adapter (or, for LLMs, route through Lyzr's
+    OpenAI-compatible <code>/v4/chat/completions</code>); <em>gap</em> = adapter
+    not shipped yet. Failover composites across the covered set are something
+    a single-pick form can't express — that's the differentiator.
+  </p>
+  <div id="parity-body" class="muted">loading…</div>
+</div>
+
+<main>
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>This turn</h2>
+    <div class="row">
+      <span class="k">You said</span>
+      <span class="v">
+        <span class="badge detailed-only" id="cost-badge" title="estimated turn cost (STT + LLM + TTS)"></span>
+        <span class="badge" id="badge"></span>
+      </span>
+    </div>
+    <div class="transcript" id="transcript"><span class="muted">click the mic and start talking — silence ends the turn…</span></div>
+    <hr style="border:0; border-top:1px solid var(--border); margin:14px 0;" />
+    <div class="row">
+      <span class="k">Agent answer</span>
+      <span class="v">
+        <button id="interrupt" class="warn" style="display:none;">⏹ Interrupt</button>
+        <span class="badge detailed-only" id="tts-badge"></span>
+      </span>
+    </div>
+    <div class="answer" id="answer"><span class="muted">—</span></div>
+  </section>
+
+  <section class="panel detailed-only">
+    <h2>Latency (this turn)</h2>
+    <div class="row"><span class="k">STT final</span><span class="v" id="lat-stt">—</span></div>
+    <div class="row"><span class="k">Agent first token</span><span class="v" id="lat-agent">—</span></div>
+    <div class="row"><span class="k">TTS first audio</span><span class="v" id="lat-tts">—</span></div>
+    <div class="row"><span class="k">Responded in</span><span class="v" id="lat-headline">—</span></div>
+    <div class="row"><span class="k">Mode</span><span class="v" id="lat-mode">—</span></div>
+  </section>
+
+  <!-- PIPELINE: live, configuration-side view of what's wired RIGHT NOW
+       (not a per-turn aggregate). Shows the actual chains, which provider
+       is primary vs fallback, hedge state, agent backend, budget, recording
+       status. This is what answers "what's serving me when I talk?" -->
+  <section class="panel detailed-only">
+    <h2>Pipeline (live config)</h2>
+    <div class="kv"><span class="lbl">Agent</span><span class="val" id="cfg-agent">—</span></div>
+    <div class="kv" style="margin-top:6px;"><span class="lbl">STT chain</span>
+      <span class="val chain" id="cfg-stt">—</span></div>
+    <div class="kv" style="margin-top:6px;"><span class="lbl">TTS chain</span>
+      <span class="val chain" id="cfg-tts">—</span></div>
+    <div class="kv" style="margin-top:6px;"><span class="lbl">Hedge</span>
+      <span class="val" id="cfg-hedge">off</span></div>
+    <div class="kv" style="margin-top:6px;"><span class="lbl">Budget</span>
+      <span class="val" id="cfg-budget">—</span></div>
+    <div class="kv" style="margin-top:6px;"><span class="lbl">Recording</span>
+      <span class="val" id="cfg-recording">—</span></div>
+    <div class="kv" style="margin-top:6px;"><span class="lbl">Session</span>
+      <span class="val" id="cfg-session">—</span></div>
+  </section>
+
+  <section class="panel detailed-only">
+    <h2>Router metrics (session total)</h2>
+    <div class="row"><span class="k">Turns served</span><span class="v" id="m-turns">0</span></div>
+    <div class="row"><span class="k">STT engines</span><span class="v" id="m-stt">—</span></div>
+    <div class="row"><span class="k">TTS providers</span><span class="v" id="m-tts">—</span></div>
+    <div class="row"><span class="k">Failovers</span><span class="v" id="m-fo">—</span></div>
+    <div class="row"><span class="k">Cache hits</span><span class="v" id="m-cache">0</span></div>
+    <div class="row"><span class="k">Hedge wins</span><span class="v" id="m-hedge">—</span></div>
+    <div class="row"><span class="k">Circuit opens</span><span class="v" id="m-circuit">—</span></div>
+    <div class="row"><span class="k">Silence dropped / kept</span><span class="v" id="m-sil">—</span></div>
+    <div class="row"><span class="k">Total cost</span><span class="v" id="m-cost">$0.00000</span></div>
+  </section>
+
+  <!-- Analytics: SVG charts over the session's turns. Three small panels —
+       latency trend (stt/agent/tts), cost per turn (with cumulative line),
+       and provider distribution (horizontal bars by served-by). All driven
+       by sessionLog which is already accumulated for the transcript export. -->
+  <!-- Real-time activity monitor — heart-monitor-style scrolling strip.
+       Top trace = mic input level. Bottom trace = agent TTS output level.
+       Vertical tick markers along the top edge mark events as they happen
+       (transcript partial/final, agent token, TTS frame). 60-second window,
+       updates at requestAnimationFrame cadence. -->
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>Live activity (last 60 sec)</h2>
+    <canvas id="monitor-canvas" style="width:100%;height:140px;display:block;
+      background:var(--surface);border-radius:6px;"></canvas>
+    <div class="chart-legend" style="margin-top:6px;">
+      <span class="lg"><span class="sw" style="background:var(--c1);"></span>Mic input</span>
+      <span class="lg"><span class="sw" style="background:var(--c4);"></span>Agent / TTS output</span>
+      <span class="lg"><span class="sw" style="background:var(--c2);"></span>● transcript</span>
+      <span class="lg"><span class="sw" style="background:var(--c3);"></span>● agent token</span>
+      <span class="lg"><span class="sw" style="background:var(--accent);"></span>● TTS frame</span>
+      <span style="margin-left:auto;color:var(--muted);" id="monitor-now">—</span>
+    </div>
+  </section>
+
+  <section class="panel detailed-only" style="grid-column: 1 / -1;">
+    <h2>Latency breakdown per turn</h2>
+    <div id="chart-latency-host"><div class="chart-empty">no turns yet — talk to populate</div></div>
+    <div class="chart-legend">
+      <span class="lg"><span class="sw" style="background:var(--c1);"></span>STT (your speech + endpoint wait)</span>
+      <span class="lg"><span class="sw" style="background:var(--c2);"></span>Agent (LLM thinking)</span>
+      <span class="lg"><span class="sw" style="background:var(--c3);"></span>TTS (synth + first audio)</span>
+      <span style="margin-left:auto;color:var(--muted);">total = full bar height · hover a segment for ms</span>
+    </div>
+  </section>
+
+  <section class="panel detailed-only">
+    <h2>Cost per turn ($)</h2>
+    <div id="chart-cost-host"><div class="chart-empty">no turns yet</div></div>
+    <div class="chart-legend">
+      <span class="lg"><span class="sw" style="background:var(--c4);"></span>Per-turn</span>
+      <span class="lg"><span class="sw" style="background:var(--warn);"></span>Cumulative</span>
+      <span id="chart-cost-summary" style="margin-left:auto;color:var(--text);"></span>
+    </div>
+  </section>
+
+  <section class="panel detailed-only">
+    <h2>Provider distribution</h2>
+    <div id="chart-providers-host"><div class="chart-empty">no turns yet</div></div>
+    <div class="chart-legend">
+      <span class="lg"><span class="sw" style="background:var(--c1);"></span>STT</span>
+      <span class="lg"><span class="sw" style="background:var(--c3);"></span>TTS</span>
+      <span class="lg"><span class="sw" style="background:var(--c4);"></span>Agent</span>
+    </div>
+  </section>
+
+  <section class="panel detailed-only" style="grid-column: 1 / -1;">
+    <h2>Event stream (raw)</h2>
+    <div class="events" id="events"></div>
+  </section>
+</main>
+
+<div class="controls">
+  <div class="controls-row" style="margin-bottom:14px;">
+    <!-- Agent tier toggle. In Simple view, only the two Mova-iO tiers
+         (Streaming / Standard) are visible — CSS hides the rest via
+         [data-view="simple"] #agent-toggle button:not(.tier-mova). In
+         Detailed all 4 buttons show. -->
+    <span class="muted" style="font-size:11px;" id="agent-label">Mova-iO API</span>
+    <div class="toggle-group" id="agent-toggle">
+      <button data-tier="openai" class="detailed-only">OpenAI Chat</button>
+      <button data-tier="lyzr" id="agent-lyzr" class="tier-mova"
+              title="Mova-iO via OpenAI-compatible streaming endpoint — replies word-by-word, lower latency, sentence-by-sentence TTS">Streaming</button>
+      <!-- L6: alternative Mova-iO path — uses movate.voice.LyzrAgentTurn (SDK
+           binding) wrapping the /v3/inference/chat/ endpoint. Buffered
+           (full answer at once) but uses the SDK's full pipeline. -->
+      <button data-tier="lyzr_sdk" id="agent-lyzr-sdk" class="tier-mova"
+              title="Mova-iO via the SDK binding — full answer at once, deeper SDK lifecycle (memory/RAI)">Standard</button>
+      <!-- B1: full-duplex realtime mode (OpenAI Realtime). Detailed only. -->
+      <button data-tier="realtime" id="agent-realtime" class="detailed-only"
+              title="Full-duplex realtime — sub-second turns; OpenAI Realtime owns STT+LLM+TTS server-side">Realtime</button>
+    </div>
+    <!-- L1: Mova-iO agent picker — visible only when Lyzr tier is selected.
+         Populated from /lyzr/agents (cached server-side). Selecting an option
+         immediately routes the next turn to that agent. -->
+    <span class="muted" id="lyzr-id-label" style="font-size:11px;display:none;">Mova-iO agent</span>
+    <select id="lyzr-agent-select" style="display:none;background:var(--surface);color:var(--text);
+            border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:12px;
+            min-width:240px;max-width:320px;">
+      <option value="">loading…</option>
+    </select>
+    <!-- Manual refresh — force a re-fetch of the agent list (e.g. after
+         creating a new agent in Mova-iO Studio, or after pasting a different
+         BYOK key if the auto-refresh missed). Bypasses the server-side cache. -->
+    <button id="lyzr-refresh" style="display:none;font-size:11px;padding:4px 8px;"
+            title="Refresh agent list from Lyzr">🔄</button>
+    <!-- Free-text fallback for an agent_id that isn't in your account list
+         (e.g. testing someone else's public agent). Hidden by default; click
+         the ✎ button to swap. -->
+    <button id="lyzr-id-toggle" style="display:none;font-size:11px;padding:4px 8px;"
+            title="Type a different agent_id manually">✎</button>
+    <input id="lyzr-id" type="text" placeholder="24-char Mova-iO agent_id"
+           spellcheck="false" autocomplete="off"
+           style="display:none;background:var(--surface);color:var(--text);border:1px solid var(--border);
+                  border-radius:6px;padding:6px 10px;font-family:'SF Mono',Menlo,monospace;
+                  font-size:11px;width:240px;" />
+    <button id="lyzr-id-save" style="display:none;" title="Use this agent_id for the next turn">Use</button>
+    <!-- L5: validation indicator — green ✓ if /v3/agents/{id} found it, red ✗ else. -->
+    <span id="lyzr-id-status" class="badge" style="display:none;"></span>
+    <!-- #4: A/B TTS toggle — Detailed only. Simple view stays on Cartesia. -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:8px;">TTS primary</span>
+    <div class="toggle-group detailed-only" id="tts-toggle">
+      <button data-tier="cartesia" class="active">Cartesia (fast)</button>
+      <button data-tier="openai">OpenAI</button>
+    </div>
+    <!-- Voice picker — kept visible in BOTH views so users can pick a voice
+         that matches their use case in either mode. -->
+    <span class="muted" style="font-size:11px;margin-left:8px;">Voice</span>
+    <select id="voice-select"
+            title="Pick a TTS voice — description and best-fit use case in parens"
+            style="background:var(--surface);color:var(--text);border:1px solid var(--border);
+                   border-radius:6px;padding:6px 8px;font-size:11px;
+                   min-width:300px;max-width:380px;">
+      <option value="">— default —</option>
+    </select>
+    <!-- #5: fault injection (detailed only — failover demo is a deep feature) -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;">Inject fault next turn</span>
+    <button class="warn detailed-only" id="fault-stt">⚡ break STT</button>
+    <button class="warn detailed-only" id="fault-tts">⚡ break TTS</button>
+    <!-- VAD on/off — Detailed only. Simple view is push-to-talk only. -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;">VAD endpoint</span>
+    <div class="toggle-group detailed-only" id="vad-toggle">
+      <button data-vad="1" class="active">auto</button>
+      <button data-vad="0">push-to-talk</button>
+    </div>
+    <button id="reset-mem" class="detailed-only">↻ Reset memory</button>
+    <button id="reset-metrics" class="detailed-only">↻ Reset metrics</button>
+    <!-- B2 hedging — Detailed only -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;">Hedge</span>
+    <div class="toggle-group detailed-only" id="hedge-toggle">
+      <button data-hedge="off" class="active" title="No hedging (default)">off</button>
+      <button data-hedge="stt" title="Race 2 STT providers, take first">STT</button>
+      <button data-hedge="tts" title="Race 2 TTS providers, take first">TTS</button>
+      <button data-hedge="both" title="Hedge both STT and TTS (2x cost, lowest p99 latency)">both</button>
+    </div>
+    <!-- A4 cost-bounded routing — Detailed only -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;">Budget</span>
+    <input id="budget-input" type="number" step="0.01" min="0" value="5.00" class="detailed-only"
+           title="Per-session $ ceiling; 0 = unbounded. Default $5 = thousands of turns. Lower to demo the auto-demote behavior."
+           style="background:var(--surface);color:var(--text);border:1px solid var(--border);
+                  border-radius:6px;padding:4px 6px;font-size:12px;width:72px;
+                  font-family:'SF Mono',Menlo,monospace;" />
+    <button id="budget-apply" class="detailed-only" style="font-size:11px;padding:4px 8px;">Apply</button>
+    <span id="budget-spent" class="badge detailed-only"
+          title="cumulative spend / budget"></span>
+  </div>
+  <div class="controls-row">
+    <button id="talk" class="primary" disabled>🎙️ Talk</button>
+  </div>
+  <div class="hint" id="hint">click Talk · auto-endpoints on silence · or hold space (push-to-talk mode)</div>
+  <div class="error" id="err"></div>
+</div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────
+let ws, ac, micStream, micNode, micAnalyser, playCtx, playAt = 0, lastAudioHeader = null;
+let talking = false, vad = true, ttsTier = 'cartesia', agentTier = 'openai', audioUnlocked = false;
+let monitorMic = false;  // keep mic open during agent/TTS for auto-barge-in
+let meterRaf = 0;
+let activeSources = [];  // outstanding AudioBufferSourceNodes for barge-in cancel
+let speaking = false;
+
+const $ = (id) => document.getElementById(id);
+const status = (text, cls) => { $('status').className = 'dot ' + (cls || ''); $('status-text').textContent = text || ''; };
+const logEvent = (text, cls) => {
+  const d = $('events'); const row = document.createElement('div');
+  row.className = 'e' + (cls ? ' ' + cls : ''); row.textContent = text;
+  // Only auto-scroll to the newest event if the user is ALREADY at the
+  // bottom. If they've scrolled up to read history, leave them where they
+  // are — yanking the scroll back to the bottom mid-read is hostile.
+  const atBottom = (d.scrollHeight - d.scrollTop - d.clientHeight) < 24;
+  d.appendChild(row);
+  if (atBottom) d.scrollTop = d.scrollHeight;
+  // Cap log
+  while (d.children.length > 200) d.removeChild(d.firstChild);
+};
+const fmt = (ms) => ms == null ? '—' : `${Math.round(ms)} ms`;
+
+// ─── #11: audio-unlock gate (Safari/Chrome autoplay block workaround) ────
+$('gate-start').addEventListener('click', async () => {
+  audioUnlocked = true;
+  // Unlock the playback AudioContext with a user-gesture-bound resume()
+  ensurePlayCtx();
+  $('gate').classList.add('hidden');
+  connect();
+});
+
+// ─── WebSocket ─────────────────────────────────────────────────────────────
+// connectionMode picks which endpoint to attach to. 'pipeline' is the
+// default STT→agent→TTS path (/ws/voice); 'realtime' switches to the
+// OpenAI Realtime full-duplex path (/ws/voice/realtime) — different transport,
+// same UI events (transcript.*, tts.audio, done, error) so the rendering code
+// doesn't need a parallel branch.
+let connectionMode = 'pipeline';
+
+function connect() {
+  const path = connectionMode === 'realtime' ? '/ws/voice/realtime' : '/ws/voice';
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + path;
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { status(`connected (${connectionMode})`, 'ok'); $('talk').disabled = false; };
+  ws.onclose = () => { status('disconnected', 'err'); $('talk').disabled = true; if (audioUnlocked) setTimeout(connect, 2000); };
+  ws.onerror = () => status('connection error', 'err');
+  ws.onmessage = (e) => (typeof e.data === 'string') ? handleJson(e.data) : handleAudio(e.data);
+}
+
+// Switch transport mode and reconnect. Disables/enables the TTS A/B toggle
+// (greyed out in realtime — the model owns synthesis).
+function switchMode(mode) {
+  if (mode === connectionMode) return;
+  connectionMode = mode;
+  pipelineState.mode = mode;
+  renderPipeline();
+  $('lat-mode').textContent = (mode === 'realtime')
+    ? 'realtime (full-duplex)' : 'pipeline (STT→agent→TTS)';
+  // Reflect the switch in the agent-toggle button states.
+  document.querySelectorAll('#agent-toggle button').forEach(b => {
+    b.classList.toggle('active',
+      (mode === 'realtime') ? (b.dataset.tier === 'realtime')
+                            : (b.dataset.tier === agentTier));
+  });
+  // Grey out TTS toggle in realtime — synthesis is server-side.
+  document.querySelectorAll('#tts-toggle button').forEach(b => {
+    b.disabled = (mode === 'realtime');
+    b.style.opacity = (mode === 'realtime') ? '0.45' : '';
+  });
+  logEvent(`mode → ${mode}`, mode === 'realtime' ? 'final' : '');
+  try { ws.close(); } catch (e) {}
+  setTimeout(connect, 100);  // small delay so onclose fires cleanly
+}
+
+function handleJson(s) {
+  const m = JSON.parse(s);
+  const ev = m.event;
+  if (ev === 'ready') {
+    const required = ['openai', 'cartesia', 'deepgram'];
+    const missing = required.filter(k => !m.keys?.[k]);
+    if (missing.length) logEvent(`⚠ missing keys: ${missing.join(', ')}`, 'err');
+    ttsTier = m.tts_tier || 'cartesia';
+    agentTier = m.agent_tier || 'openai';
+    updateToggle('tts-toggle', 'tier', ttsTier);
+    updateToggle('agent-toggle', 'tier', agentTier);
+    // Race-free Simple-view enforcement: the moment we know the server's
+    // current tier, push Streaming + PTT if we're in Simple. Without this,
+    // there's a brief window where Simple users see the OpenAI default
+    // before applyView's setTimeout fires.
+    if (document.documentElement.getAttribute('data-view') === 'simple') {
+      if (agentTier !== 'lyzr') {
+        ws.send(JSON.stringify({ event: 'set_agent_tier', tier: 'lyzr' }));
+      }
+      if (vad) {
+        ws.send(JSON.stringify({ event: 'set_vad', enabled: false }));
+      }
+    }
+    // Seed pipeline panel from the ready event (the server's source of truth).
+    pipelineState.tts_tier = ttsTier;
+    pipelineState.agent_tier = agentTier;
+    pipelineState.hedge_stt = !!m.hedge_stt;
+    pipelineState.hedge_tts = !!m.hedge_tts;
+    pipelineState.budget_usd = m.budget_usd ?? null;
+    pipelineState.spent_usd = m.spent_usd ?? 0;
+    pipelineState.recording = !!m.recording;
+    pipelineState.session_id = m.session_id || '';
+    pipelineState.mode = m.mode || (connectionMode || 'pipeline');
+    renderPipeline();
+    // Initial latency-panel "Mode" cell so the user sees pipeline vs realtime.
+    $('lat-mode').textContent = pipelineState.mode === 'realtime'
+      ? 'realtime (full-duplex)' : 'pipeline (STT→agent→TTS)';
+    // Dial-this-number chip — show only when server has Twilio configured.
+    // Pretty-format the number "(xxx) xxx-xxxx"; dataset keeps the raw form
+    // for the tel: handoff so dialers still get the right digits.
+    const dialBtn = $('twilio-dial');
+    if (dialBtn) {
+      if (m.twilio_number) {
+        dialBtn.textContent = `📞 Call ${formatPhone(m.twilio_number)}`;
+        dialBtn.style.display = 'inline-block';
+        dialBtn.dataset.number = m.twilio_number;
+      } else {
+        dialBtn.style.display = 'none';
+      }
+    }
+    // BYOK badge — reflect whatever the server reports at session start.
+    // We only surface Lyzr (USER_KEY_PROVIDERS narrowed to "lyzr").
+    if (m.user_keys_active && m.user_keys_active.lyzr) {
+      $('byok-badge').textContent = '🔑 Mova-iO: your key';
+      $('byok-badge').style.color = 'var(--warn)';
+    }
+    // Disable the Lyzr button if SDK/key isn't ready (server falls back gracefully).
+    const lyzrBtn = $('agent-lyzr');
+    if (lyzrBtn) {
+      const lyzrKeyOnly = m.keys?.lyzr && !m.lyzr_available;
+      lyzrBtn.disabled = !m.keys?.lyzr;  // disabled only if no key at all
+      lyzrBtn.title = m.lyzr_available
+        ? 'Use Mova-iO as the agent backend'
+        : lyzrKeyOnly
+          ? 'Key found but no agent_id — paste one in the field once you click Mova-iO'
+          : 'set LYZR_API_KEY to enable';
+    }
+    // Pre-populate the agent_id input from whatever the server loaded.
+    $('lyzr-id').value = m.lyzr_agent_id || '';
+    showLyzrIdInput((agentTier === 'lyzr' || agentTier === 'lyzr_sdk'));
+    return;
+  }
+  if (ev === 'lyzr_agent_id') {
+    $('lyzr-id').value = m.agent_id || '';
+    logEvent(`lyzr agent → ${m.agent_id.slice(0, 8)}…`);
+    return;
+  }
+  if (ev === 'transcript.partial') {
+    $('transcript').textContent = m.text;
+    pushMonEvent('transcript.partial',
+      getComputedStyle(document.documentElement).getPropertyValue('--c2').trim() || '#34d058');
+    return;
+  }
+  if (ev === 'transcript.final')   {
+    $('transcript').textContent = m.text;
+    if (currentTurn) currentTurn.user = m.text;  // B3: record for export
+    pushMonEvent('transcript.final',
+      getComputedStyle(document.documentElement).getPropertyValue('--c2').trim() || '#34d058');
+    // Perceived-latency tweak: show "thinking…" pulse the moment STT finals,
+    // so the agent-thinking gap doesn't feel like dead air. Cleared on the
+    // first agent.token arrival.
+    $('answer').innerHTML = '<span class="thinking">thinking<span class="td">…</span></span>';
+    logEvent(`heard: ${m.text}`, 'final'); return;
+  }
+  if (ev === 'agent.token') {
+    // First token clears the "thinking…" pulse and starts streaming the answer.
+    if ($('answer').querySelector('.muted') || $('answer').querySelector('.thinking')) {
+      $('answer').textContent = '';
+    }
+    $('answer').textContent += m.text;
+    if (currentTurn) currentTurn.agent = (currentTurn.agent || '') + m.text;  // B3: record
+    pushMonEvent('agent.token',
+      getComputedStyle(document.documentElement).getPropertyValue('--c3').trim() || '#ffb454');
+    // First token from this turn → the agent has started speaking, show interrupt.
+    if (!speaking) {
+      speaking = true;
+      $('interrupt').style.display = 'inline-block';
+    }
+    return;
+  }
+  if (ev === 'tts.audio') { lastAudioHeader = m; return; }
+  if (ev === 'agent_tier') {
+    agentTier = m.tier; updateToggle('agent-toggle', 'tier', agentTier);
+    showLyzrIdInput((agentTier === 'lyzr' || agentTier === 'lyzr_sdk'));
+    pipelineState.agent_tier = agentTier;
+    renderPipeline();
+    logEvent(`agent → ${agentTier}`);
+    return;
+  }
+  if (ev === 'barged_in') {
+    logEvent(m.auto ? '⏹ auto barge-in (server VAD)' : '⏹ caller interrupted', 'warn');
+    stopPlayback();
+    speaking = false;
+    monitorMic = false;
+    stopMic();
+    $('interrupt').style.display = 'none';
+    return;
+  }
+  if (ev === 'endpoint') {
+    // VAD ended the listening turn server-side. Stop the "talking" mode but
+    // KEEP the mic open in monitor mode so the server can detect auto-barge-in.
+    if (talking) {
+      talking = false;
+      $('talk').classList.remove('live');
+      monitorMic = true;  // mic stays open; audio frames feed auto-VAD on server
+    }
+    logEvent('· endpoint (silence)', 'warn');
+    return;
+  }
+  if (ev === 'tts_tier') {
+    ttsTier = m.tier; updateToggle('tts-toggle', 'tier', ttsTier);
+    pipelineState.tts_tier = ttsTier;
+    renderPipeline();
+    repopulateVoiceSelect();  // voice list is tier-specific
+    logEvent(`tts primary → ${ttsTier}`);
+    return;
+  }
+  if (ev === 'twilio_config') {
+    const c = m.config || {};
+    const desc = `${c.agent_tier || '—'}/${c.tts_tier || '—'}` +
+                 (c.voice_id ? ` · voice ${c.voice_id.slice(0,8)}…` : '') +
+                 (c.lyzr_agent_id ? ` · agent ${c.lyzr_agent_id.slice(0,8)}…` : '');
+    logEvent(`📞 phone config updated → ${desc} (next call uses these)`, 'final');
+    return;
+  }
+  if (ev === 'voice_id') {
+    // Server echoed our voice_id change — keep the select in sync.
+    if ($('voice-select').value !== (m.voice_id || '')) {
+      $('voice-select').value = m.voice_id || '';
+    }
+    return;
+  }
+  if (ev === 'trail') {
+    // A1: live failover-router trail — every selection, failover, breaker
+    // trip, cache hit, or hedge surfaces here. Compact, color-coded so a
+    // viewer can see the resilience working in real time.
+    const k = m.kind || '';
+    const f = m.fields || {};
+    const provider = f.provider || f.from || '';
+    const kind = f.kind || '';
+    if (k === 'provider_selected') {
+      // Highlight the active provider in the pipeline chain.
+      if (kind === 'stt') pipelineState.last_stt = provider;
+      else if (kind === 'tts') pipelineState.last_tts = provider;
+      renderPipeline();
+      logEvent(`✓ ${kind || 'stage'} served by ${provider}`, 'final');
+    } else if (k === 'failover') {
+      logEvent(`→ ${f.kind || 'stage'} failover from ${f.from}`, 'warn');
+    } else if (k === 'circuit_open') {
+      logEvent(`⚠ circuit open · ${provider} (skipping until cool-down)`, 'err');
+    } else if (k === 'circuit_close') {
+      logEvent(`✓ circuit recovered · ${provider}`, 'final');
+    } else if (k === 'cache_hit') {
+      logEvent(`⚡ cache hit · ${kind || 'tts'} (0ms · $0)`, 'final');
+    } else if (k === 'exhausted') {
+      logEvent(`✗ ${kind || 'stage'} exhausted — all providers failed`, 'err');
+    } else if (k === 'hedge') {
+      const providers = Array.isArray(f.providers) ? f.providers.join(' + ') : '';
+      logEvent(`⤳ ${kind} hedge: ${providers}`, 'warn');
+    } else if (k === 'hedge_won') {
+      logEvent(`⤳ ${kind} hedge won by ${provider}`, 'final');
+    } else if (k === 'budget_demote') {
+      // A4: per-session cost ceiling tripped; router auto-flipped to cheaper TTS.
+      logEvent(`💰 budget $${(f.budget_usd ?? 0).toFixed(2)} exceeded ` +
+               `(spent $${(f.spent_usd ?? 0).toFixed(5)}) — demoted tts → ${f.to_tier}`, 'warn');
+    } else {
+      logEvent(`· ${k}${provider ? ' (' + provider + ')' : ''}`);
+    }
+    return;
+  }
+  if (ev === 'fault_armed') {
+    logEvent(`⚡ fault armed: ${m.stage} (next turn)`, 'warn');
+    return;
+  }
+  if (ev === 'vad') {
+    vad = m.enabled; updateToggle('vad-toggle', 'vad', vad ? '1' : '0');
+    $('hint').textContent = vad
+      ? 'click Talk · auto-endpoints on silence · or hold space (push-to-talk mode)'
+      : 'hold Talk (or space) — release to send';
+    return;
+  }
+  if (ev === 'memory_reset') { logEvent('↻ agent memory cleared'); return; }
+  if (ev === 'metrics_reset') {
+    renderMetrics({}, 0);
+    $('cost-badge').textContent = '';
+    logEvent('↻ session metrics cleared');
+    return;
+  }
+  if (ev === 'error') {
+    $('err').textContent = `${m.stage || ''} ${m.message}`;
+    logEvent(`✗ ${m.stage}: ${m.message}`, 'err');
+    return;
+  }
+  if (ev === 'twilio_event') {
+    // Live mirror of a Twilio phone call. Server broadcasts these to every
+    // open browser WS so the Detailed-view event stream shows the live
+    // conversation while a caller is dialed in.
+    const k = m.kind || '';
+    const t = m.turn ? `t${m.turn} ` : '';
+    if (k === 'call_start') {
+      logEvent(`📞 incoming call · ${(m.call_sid || '').slice(0, 8)}…`, 'final');
+    } else if (k === 'call_end') {
+      logEvent(`📞 call ended · ${m.turns ?? 0} turn${m.turns === 1 ? '' : 's'}`, 'final');
+    } else if (k === 'transcript.final') {
+      logEvent(`📞 ${t}caller: ${m.text || ''}`, 'final');
+    } else if (k === 'transcript.partial') {
+      // Partials are noisy — skip in the log; could enable for verbose debug.
+    } else if (k === 'agent.token') {
+      // Stream tokens into a per-turn rolling buffer; too noisy to log each.
+    } else if (k === 'done') {
+      logEvent(`📞 ${t}done · ${m.badge || ''}`, 'final');
+    } else if (k === 'error') {
+      logEvent(`📞 ${t}error · ${m.stage || ''}: ${m.message || ''}`, 'err');
+    }
+    return;
+  }
+  if (ev === 'tool_call') {
+    // L3: Lyzr (or OpenAI) agent invoked a tool — surface it before the audio
+    // arrives so the audience isn't confused by the silence during tool exec.
+    const name = m.name || '(unnamed)';
+    let args = (m.arguments || '').trim();
+    if (args.length > 80) args = args.slice(0, 77) + '…';
+    logEvent(`🔧 calling ${name}(${args})`, 'warn');
+    if (currentTurn) {
+      currentTurn.tool_calls = currentTurn.tool_calls || [];
+      // Dedup-by-index since we emit on each arg-delta arrival.
+      const i = currentTurn.tool_calls.findIndex(t => t.index === m.index);
+      if (i >= 0) currentTurn.tool_calls[i] = m;
+      else currentTurn.tool_calls.push(m);
+    }
+    return;
+  }
+  if (ev === 'extras') {
+    // L4: provider extras (RAG citations, sources, search results).
+    // Render compactly under the answer.
+    const parts = [];
+    if (m.citations) {
+      const cs = Array.isArray(m.citations) ? m.citations : [];
+      parts.push(`📚 ${cs.length} citation${cs.length === 1 ? '' : 's'}`);
+    }
+    if (m.sources) {
+      const ss = Array.isArray(m.sources) ? m.sources : [];
+      parts.push(`📖 ${ss.length} source${ss.length === 1 ? '' : 's'}`);
+    }
+    if (m.search_results) {
+      const rs = Array.isArray(m.search_results) ? m.search_results : [];
+      parts.push(`🔍 ${rs.length} search result${rs.length === 1 ? '' : 's'}`);
+    }
+    if (parts.length) logEvent(parts.join(' · '), 'final');
+    if (currentTurn) currentTurn.extras = Object.assign(currentTurn.extras || {}, m);
+    return;
+  }
+  if (ev === 'user_keys') {
+    // BYOK: server echoed whether the user's Lyzr key is now active.
+    const lyzrOn = !!(m.active && m.active.lyzr);
+    const badge = $('byok-badge');
+    const statusEl = $('byok-active');
+    if (lyzrOn) {
+      badge.textContent = '🔑 Mova-iO: your key';
+      badge.style.color = 'var(--warn)';
+      badge.title = 'Voicing YOUR Mova-iO account';
+      statusEl.textContent = 'Using your Mova-iO key';
+      statusEl.style.color = 'var(--warn)';
+      logEvent('🔑 byok: now using YOUR Mova-iO key', 'warn');
+    } else {
+      badge.textContent = '🔑 Mova-iO: demo key';
+      badge.style.color = 'var(--muted)';
+      badge.title = 'Click to use your own Mova-iO API key';
+      statusEl.textContent = 'Using demo Mova-iO key';
+      statusEl.style.color = '';
+      logEvent('🔑 byok cleared — using demo Mova-iO key', 'final');
+    }
+    return;
+  }
+  if (ev === 'hedge') {
+    // B2: server echoed our hedge change.
+    const mode = (m.stt && m.tts) ? 'both' : (m.stt ? 'stt' : (m.tts ? 'tts' : 'off'));
+    updateToggle('hedge-toggle', 'hedge', mode);
+    pipelineState.hedge_stt = !!m.stt;
+    pipelineState.hedge_tts = !!m.tts;
+    renderPipeline();
+    logEvent(`⤳ hedge → ${mode}`, mode === 'off' ? '' : 'warn');
+    return;
+  }
+  if (ev === 'budget') {
+    // A4: server echoed our budget change.
+    const inp = $('budget-input');
+    if (inp && m.budget_usd != null) inp.value = m.budget_usd;
+    pipelineState.budget_usd = m.budget_usd ?? null;
+    pipelineState.spent_usd = m.spent_usd ?? pipelineState.spent_usd;
+    renderPipeline();
+    logEvent(`💰 budget set: ${m.budget_usd ? '$' + m.budget_usd.toFixed(2) : 'unbounded'}`, 'final');
+    return;
+  }
+  if (ev === 'recording_ready') {
+    pipelineState.recording = true; renderPipeline();
+    // B4: server finished uploading the per-call WAV; surface the link.
+    const a = $('recording-link');
+    if (a && m.url) {
+      a.href = m.url;
+      a.style.display = 'inline-block';
+      logEvent(`📥 recording ready · ${m.session_id?.slice(0, 8) ?? ''}`, 'final');
+    }
+    return;
+  }
+  if (ev === 'done') {
+    $('badge').textContent = m.badge || '';
+    $('tts-badge').textContent = `served by ${m.tts_tier}`;
+    $('cost-badge').textContent = m.cost_usd != null ? `$${m.cost_usd.toFixed(5)}` : '';
+    // A4: refresh spent / budget readout in the controls bar.
+    if (m.spent_usd != null) {
+      const spentEl = $('budget-spent');
+      const budget = m.budget_usd;
+      if (spentEl) {
+        spentEl.textContent = budget
+          ? `$${m.spent_usd.toFixed(5)} / $${budget.toFixed(2)}`
+          : `$${m.spent_usd.toFixed(5)}`;
+        spentEl.style.color = (budget && m.spent_usd > budget) ? 'var(--warn)' : '';
+      }
+      pipelineState.spent_usd = m.spent_usd;
+      if (m.budget_usd != null) pipelineState.budget_usd = m.budget_usd;
+    }
+    // Reflect the tier-change-on-demote in the pipeline panel (A4 may have
+    // swapped tts_tier in the server's record_turn_cost).
+    if (m.tts_tier) { pipelineState.tts_tier = m.tts_tier; }
+    if (m.agent_tier) { pipelineState.agent_tier = m.agent_tier; }
+    renderPipeline();
+    $('lat-stt').textContent = fmt(m.latency.stt_final_ms);
+    $('lat-agent').textContent = fmt(m.latency.agent_first_token_ms);
+    $('lat-tts').textContent = fmt(m.latency.tts_first_audio_ms);
+    $('lat-headline').textContent = fmt(m.latency.responded_in_ms);
+    renderMetrics(m.metrics, m.turn);
+    speaking = false;
+    monitorMic = false;
+    stopMic();
+    $('interrupt').style.display = 'none';
+    logEvent(`done · turn ${m.turn} · ${m.agent_tier}/${m.tts_tier} · ${m.badge} · $${(m.cost_usd ?? 0).toFixed(5)}`, 'final');
+    // B3: record the turn for export. We accumulated `currentTurn.user` from
+    // transcript.final and `currentTurn.agent` from the agent.token deltas;
+    // now we close it out with the cost/latency/tier from the done event.
+    if (currentTurn) {
+      sessionLog.push({
+        turn: m.turn,
+        ts: new Date().toISOString(),
+        user: currentTurn.user || '',
+        agent: currentTurn.agent || '',
+        agent_tier: m.agent_tier,
+        tts_tier: m.tts_tier,
+        cost_usd: m.cost_usd,
+        badge: m.badge,
+        latency_ms: m.latency || {},
+        mode: m.mode || connectionMode,
+      });
+      currentTurn = { user: '', agent: '' };
+      $('export-group').style.display = 'inline-block';
+    }
+    // Stash STT engines from the metrics snapshot for the provider-distribution chart.
+    if (m.metrics) {
+      window._lastSttEngines = m.metrics.engines || {};
+    }
+    // Re-render all charts. Cheap (pure SVG, capped at 15 turns).
+    renderAllCharts();
+    return;
+  }
+}
+
+// ── B3: transcript export ──────────────────────────────────────────────────
+// Accumulators populated by the existing event handlers so the export is
+// zero-server-roundtrip — the UI already receives everything it needs.
+let sessionLog = [];          // Array of completed-turn objects (pushed on `done`).
+let currentTurn = { user: '', agent: '' };  // Building during a turn.
+
+function exportMarkdown() {
+  if (!sessionLog.length) { logEvent('nothing to export yet', 'warn'); return; }
+  const totalCost = sessionLog.reduce((s, t) => s + (t.cost_usd || 0), 0);
+  const lines = [
+    `# mdk-voice conversation`,
+    ``,
+    `**Exported:** ${new Date().toISOString()}`,
+    `**Turns:** ${sessionLog.length}`,
+    `**Total cost:** $${totalCost.toFixed(5)}`,
+    `**Mode:** ${sessionLog[0]?.mode || 'pipeline'}`,
+    ``,
+    `---`,
+    ``,
+  ];
+  sessionLog.forEach((t, i) => {
+    lines.push(`## Turn ${t.turn ?? (i+1)}  ·  ${t.ts}`);
+    lines.push(``);
+    lines.push(`**You:** ${t.user || '_(empty)_'}`);
+    lines.push(``);
+    lines.push(`**Agent (${t.agent_tier}/${t.tts_tier}):** ${t.agent || '_(empty)_'}`);
+    lines.push(``);
+    const lat = t.latency_ms || {};
+    const latParts = [];
+    if (lat.stt_final_ms != null)         latParts.push(`STT ${Math.round(lat.stt_final_ms)}ms`);
+    if (lat.agent_first_token_ms != null) latParts.push(`agent ${Math.round(lat.agent_first_token_ms)}ms`);
+    if (lat.tts_first_audio_ms != null)   latParts.push(`TTS ${Math.round(lat.tts_first_audio_ms)}ms`);
+    if (lat.responded_in_ms != null)      latParts.push(`total ${Math.round(lat.responded_in_ms)}ms`);
+    lines.push(`> ${latParts.join(' · ')}  ·  $${(t.cost_usd ?? 0).toFixed(5)}  ·  ${t.badge || ''}`);
+    lines.push(``);
+  });
+  triggerDownload(lines.join('\n'), `mdk-voice-${stamp()}.md`, 'text/markdown');
+}
+
+function exportJSON() {
+  if (!sessionLog.length) { logEvent('nothing to export yet', 'warn'); return; }
+  const payload = {
+    exported_at: new Date().toISOString(),
+    schema_version: 1,
+    turn_count: sessionLog.length,
+    total_cost_usd: sessionLog.reduce((s, t) => s + (t.cost_usd || 0), 0),
+    turns: sessionLog,
+  };
+  triggerDownload(JSON.stringify(payload, null, 2),
+                  `mdk-voice-${stamp()}.json`, 'application/json');
+}
+
+function triggerDownload(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  logEvent(`📥 exported ${filename}`, 'final');
+}
+
+function stamp() {
+  return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Inline SVG charts — minimalist, no third-party lib. Three views over
+// sessionLog (the same accumulator that drives transcript export):
+//   1. Latency over turns (3 lines: stt/agent/tts + total)
+//   2. Cost per turn (bars + cumulative line)
+//   3. Provider distribution (horizontal bars by served-by)
+// All re-render on each `done` event. Empty-state messages render until
+// the first turn lands.
+// ──────────────────────────────────────────────────────────────────────────
+const CHART_W = 600;   // viewBox width; CSS scales to 100% panel width
+const CHART_H = 120;
+const PAD_L = 30, PAD_R = 8, PAD_T = 8, PAD_B = 18;
+
+function _xy(i, count, val, maxVal) {
+  const w = CHART_W - PAD_L - PAD_R;
+  const h = CHART_H - PAD_T - PAD_B;
+  const x = PAD_L + (count <= 1 ? w / 2 : (i / (count - 1)) * w);
+  const y = PAD_T + h - (maxVal > 0 ? (val / maxVal) * h : 0);
+  return [x, y];
+}
+
+function _ticks(maxVal, n = 4) {
+  if (maxVal <= 0) return [0];
+  const step = maxVal / n;
+  return Array.from({ length: n + 1 }, (_, i) => Math.round(step * i));
+}
+
+// Round a max value up to a "nice" round number so y-axis ticks aren't ugly
+// (e.g. 21774 → 25000, 6144 → 8000). Picks the smallest of {1, 2, 2.5, 5, 10}
+// × 10^k that's >= value. Tick count = `n` evenly-spaced labels.
+function _niceTicks(maxVal, n = 4) {
+  if (!isFinite(maxVal) || maxVal <= 0) return { ticks: [0], max: 1 };
+  const k = Math.floor(Math.log10(maxVal));
+  const base = Math.pow(10, k);
+  const m = maxVal / base;  // 1..10
+  let niceM;
+  if (m <= 1) niceM = 1;
+  else if (m <= 2) niceM = 2;
+  else if (m <= 2.5) niceM = 2.5;
+  else if (m <= 5) niceM = 5;
+  else niceM = 10;
+  const niceMax = niceM * base;
+  return {
+    max: niceMax,
+    ticks: Array.from({ length: n + 1 }, (_, i) => (niceMax / n) * i),
+  };
+}
+
+// Format a millisecond value as a compact human-readable string:
+//   42 → "42ms", 1234 → "1.2s", 21774 → "21.8s", 60000 → "60s".
+function _fmtMs(ms) {
+  if (ms == null) return '—';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const s = ms / 1000;
+  return s < 10 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`;
+}
+
+function renderLatencyChart() {
+  // Stacked-bar latency view: one bar per turn, segmented by stage.
+  //
+  //   ▓ STT       (mic-on → STT final) — the user-talking + endpointing time
+  //   ▓ Agent     (STT final → agent first token) — LLM thinking
+  //   ▓ TTS       (agent first token → TTS first audio) — synth setup
+  //
+  // Stack height = "responded in" (user-visible latency). Hover any segment
+  // for its exact ms value. Much more readable than 4 overlapping lines —
+  // shows WHERE each turn's time went, not just the total.
+  const host = $('chart-latency-host');
+  if (!sessionLog.length) {
+    host.innerHTML = '<div class="chart-empty">no turns yet — talk to populate</div>';
+    return;
+  }
+  const turns = sessionLog.slice(-15);
+  // Per-turn segments. Compute incremental deltas so the stack equals the
+  // total responded_in_ms (each stage takes time on top of the previous).
+  const seg = turns.map(t => {
+    const L = t.latency_ms || {};
+    const stt = Math.max(0, L.stt_final_ms || 0);
+    const agentDelta = Math.max(0, (L.agent_first_token_ms || 0) - stt);
+    const ttsDelta = Math.max(0, (L.tts_first_audio_ms || 0) - (stt + agentDelta));
+    const total = L.responded_in_ms || (stt + agentDelta + ttsDelta);
+    return { stt, agent: agentDelta, tts: ttsDelta, total, turn: t.turn };
+  });
+  const maxTotal = Math.max(...seg.map(s => s.total), 1000);
+  const { ticks, max: yMax } = _niceTicks(maxTotal, 4);
+  // Generous left padding for the (now larger) axis labels.
+  const PAD_L2 = 56, PAD_R2 = 16, PAD_T2 = 12, PAD_B2 = 28;
+  const innerW = CHART_W - PAD_L2 - PAD_R2;
+  const innerH = CHART_H - PAD_T2 - PAD_B2;
+  const slotW = innerW / turns.length;
+  const barW = Math.min(48, slotW * 0.7);  // cap so single bars look bar-ish
+
+  const y = (v) => PAD_T2 + innerH - (v / yMax) * innerH;
+  const grid = ticks.map(t => {
+    const yy = y(t);
+    return `<line class="chart-grid" x1="${PAD_L2}" x2="${CHART_W - PAD_R2}" y1="${yy.toFixed(1)}" y2="${yy.toFixed(1)}"/>` +
+           `<text class="chart-axis" x="${PAD_L2 - 8}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${_fmtMs(t)}</text>`;
+  }).join('');
+
+  // Three stacked rects per turn + the total label on top.
+  const bars = seg.map((s, i) => {
+    const cx = PAD_L2 + slotW * (i + 0.5);
+    const x = cx - barW / 2;
+    let topY = y(s.total);
+    const parts = [
+      { k: 'STT',   v: s.stt,   color: 'var(--c1)' },
+      { k: 'Agent', v: s.agent, color: 'var(--c2)' },
+      { k: 'TTS',   v: s.tts,   color: 'var(--c3)' },
+    ];
+    let cursorY = y(0);  // start at the baseline; build upward
+    const rects = parts.map(p => {
+      const h = (p.v / yMax) * innerH;
+      const yy = cursorY - h;
+      cursorY = yy;
+      if (h < 0.5) return '';
+      return `<rect class="chart-bar" x="${x.toFixed(1)}" y="${yy.toFixed(1)}"
+                width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${p.color}"
+                rx="1"><title>${p.k}: ${_fmtMs(p.v)}</title></rect>`;
+    }).join('');
+    // Total label above the stack.
+    const labelY = Math.max(PAD_T2 + 9, topY - 4);
+    const totalLabel = `<text class="chart-axis" x="${cx.toFixed(1)}" y="${labelY.toFixed(1)}"
+                             text-anchor="middle" fill="var(--text)">${_fmtMs(s.total)}</text>`;
+    // Turn label below the bar.
+    const turnLabel = `<text class="chart-axis-sm" x="${cx.toFixed(1)}" y="${(CHART_H - 8).toFixed(1)}"
+                            text-anchor="middle">t${s.turn ?? i + 1}</text>`;
+    return rects + totalLabel + turnLabel;
+  }).join('');
+
+  // Baseline.
+  const baseline = `<line class="chart-grid" x1="${PAD_L2}" x2="${CHART_W - PAD_R2}"
+                          y1="${y(0).toFixed(1)}" y2="${y(0).toFixed(1)}"/>`;
+
+  host.innerHTML = `<svg class="chart" viewBox="0 0 ${CHART_W} ${CHART_H}" preserveAspectRatio="none">
+    ${grid}${baseline}${bars}
+  </svg>`;
+}
+
+function renderCostChart() {
+  const host = $('chart-cost-host');
+  if (!sessionLog.length) {
+    host.innerHTML = '<div class="chart-empty">no turns yet</div>';
+    $('chart-cost-summary').textContent = '';
+    return;
+  }
+  const turns = sessionLog.slice(-15);
+  const costs = turns.map(t => t.cost_usd || 0);
+  const cum = costs.reduce((acc, v) => {
+    acc.push((acc[acc.length - 1] || 0) + v);
+    return acc;
+  }, []);
+  const maxCost = Math.max(...costs, 0.00001);
+  const maxCum = Math.max(...cum, 0.00001);
+  const ticks = _ticks(maxCost, 3);
+  // Bars for per-turn costs.
+  const barW = ((CHART_W - PAD_L - PAD_R) / turns.length) * 0.7;
+  const bars = turns.map((t, i) => {
+    const cVal = costs[i];
+    const [x, y] = _xy(i, turns.length, cVal, maxCost);
+    const h = (CHART_H - PAD_T - PAD_B) * (cVal / maxCost);
+    return `<rect class="chart-bar" x="${(x - barW / 2).toFixed(1)}" y="${y.toFixed(1)}"
+                  width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="var(--c4)" rx="1">
+              <title>turn ${t.turn ?? i + 1}: $${cVal.toFixed(5)}</title></rect>`;
+  }).join('');
+  // Cumulative line on right axis (using maxCum scale).
+  const cumPath = cum.map((v, i) => {
+    const [x, y] = _xy(i, cum.length, v, maxCum);
+    return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const grid = ticks.map(t => {
+    const [, y] = _xy(0, 2, t, maxCost);
+    return `<line class="chart-grid" x1="${PAD_L}" x2="${CHART_W - PAD_R}" y1="${y}" y2="${y}"/>` +
+           `<text class="chart-axis" x="${PAD_L - 4}" y="${y + 3}" text-anchor="end">$${t.toFixed(5)}</text>`;
+  }).join('');
+  host.innerHTML = `<svg class="chart" viewBox="0 0 ${CHART_W} ${CHART_H}" preserveAspectRatio="none">
+    ${grid}${bars}
+    <path d="${cumPath}" fill="none" stroke="var(--warn)" stroke-width="1.5"/>
+  </svg>`;
+  const total = cum[cum.length - 1] || 0;
+  const avg = total / turns.length;
+  $('chart-cost-summary').textContent = `total $${total.toFixed(5)} · avg $${avg.toFixed(5)}/turn`;
+}
+
+function renderProviderChart() {
+  const host = $('chart-providers-host');
+  if (!sessionLog.length) {
+    host.innerHTML = '<div class="chart-empty">no turns yet</div>';
+    return;
+  }
+  // Tally STT/TTS/Agent providers across all turns. STT/TTS come from the
+  // failover trail's `provider_selected` events — we don't store those per-turn,
+  // so use the metrics observer snapshot when available; otherwise fall back
+  // to the tier label per turn.
+  const ttsCount = {};
+  const agentCount = {};
+  sessionLog.forEach(t => {
+    if (t.tts_tier)   ttsCount[t.tts_tier]    = (ttsCount[t.tts_tier]    || 0) + 1;
+    if (t.agent_tier) agentCount[t.agent_tier] = (agentCount[t.agent_tier] || 0) + 1;
+  });
+  // STT from the most recent metrics snapshot (s.engines or s.provider_selected).
+  // Stored on window for simplicity — last `done` event updates it.
+  const sttCount = window._lastSttEngines || {};
+  const rows = [];
+  Object.entries(sttCount).forEach(([k, v]) => rows.push({ stage: 'STT', name: k, count: v, color: 'var(--c1)' }));
+  Object.entries(ttsCount).forEach(([k, v]) => rows.push({ stage: 'TTS', name: k, count: v, color: 'var(--c3)' }));
+  Object.entries(agentCount).forEach(([k, v]) => rows.push({ stage: 'Agent', name: k, count: v, color: 'var(--c4)' }));
+  if (!rows.length) {
+    host.innerHTML = '<div class="chart-empty">no provider data yet</div>';
+    return;
+  }
+  const maxCount = Math.max(...rows.map(r => r.count));
+  const rowH = 16;
+  const labelW = 130;
+  const chartH = Math.max(CHART_H, rows.length * rowH + PAD_T + PAD_B);
+  const barAreaW = CHART_W - labelW - PAD_R;
+  const bars = rows.map((r, i) => {
+    const y = PAD_T + i * rowH;
+    const w = (r.count / maxCount) * barAreaW;
+    return `<text class="chart-axis" x="${labelW - 6}" y="${y + 11}" text-anchor="end" fill="var(--soft)">${r.stage} · ${escapeHtml(r.name)}</text>
+            <rect class="chart-bar" x="${labelW}" y="${y + 2}" width="${w.toFixed(1)}" height="${rowH - 4}" fill="${r.color}" rx="2">
+              <title>${r.stage} ${r.name}: ${r.count} turn${r.count === 1 ? '' : 's'}</title>
+            </rect>
+            <text class="chart-axis" x="${labelW + w + 4}" y="${y + 11}" fill="var(--text)">${r.count}</text>`;
+  }).join('');
+  host.innerHTML = `<svg class="chart" style="height:${chartH}px;" viewBox="0 0 ${CHART_W} ${chartH}" preserveAspectRatio="none">
+    ${bars}
+  </svg>`;
+}
+
+function renderAllCharts() {
+  renderLatencyChart();
+  renderCostChart();
+  renderProviderChart();
+}
+
+function updateToggle(groupId, attr, value) {
+  document.querySelectorAll(`#${groupId} button`).forEach(b => {
+    b.classList.toggle('active', b.dataset[attr] === String(value));
+  });
+}
+
+// L1: which inputs are visible for the Lyzr tier. Picker dropdown is the
+// default; the ✎ button swaps to the free-text input for one-off agent_ids
+// not in the user's account list.
+let lyzrManualMode = false;
+
+function showLyzrIdInput(show) {
+  // Header label + ✎ toggle + status badge are always visible together with
+  // either the dropdown OR the manual input.
+  $('lyzr-id-label').style.display = show ? 'inline-block' : 'none';
+  $('lyzr-id-toggle').style.display = show ? 'inline-block' : 'none';
+  $('lyzr-id-status').style.display = show ? 'inline-block' : 'none';
+  // Mutually exclusive: dropdown vs manual.
+  $('lyzr-agent-select').style.display = (show && !lyzrManualMode) ? 'inline-block' : 'none';
+  $('lyzr-refresh').style.display = (show && !lyzrManualMode) ? 'inline-block' : 'none';
+  $('lyzr-id').style.display = (show && lyzrManualMode) ? 'inline-block' : 'none';
+  $('lyzr-id-save').style.display = (show && lyzrManualMode) ? 'inline-block' : 'none';
+  // L2: metadata panel only when Lyzr is the active tier AND we know an agent.
+  $('lyzr-agent-meta').style.display = (show && currentLyzrAgentId) ? '' : 'none';
+  if (show) loadLyzrAgents();
+}
+
+// L1: fetch /lyzr/agents once per page load and populate the dropdown.
+// Subsequent calls within the cache TTL are cheap (server caches too).
+// BYOK: when the user has pasted their own Lyzr key, we pass it as the
+// X-Lyzr-Api-Key header so the dropdown shows THEIR agents (the server
+// keys the cache on the key value, so flipping BYOK on/off doesn't return
+// stale results).
+let lyzrAgentsLoaded = false;
+let currentLyzrAgentId = '';
+
+function _lyzrHeaders() {
+  const k = ($('byok-lyzr') && $('byok-lyzr').value || '').trim();
+  return k ? { 'X-Lyzr-Api-Key': k } : {};
+}
+
+async function loadLyzrAgents(force = false) {
+  if (lyzrAgentsLoaded && !force) return;
+  const sel = $('lyzr-agent-select');
+  sel.innerHTML = '<option value="">loading agents…</option>';
+  sel.disabled = true;
+  try {
+    // Cache-bust on force so the server's per-key cache TTL doesn't return
+    // stale results after a BYOK swap. Server's cache lookup uses the
+    // api-key string; this query param is ignored server-side.
+    const path = '/lyzr/agents' + (force ? `?t=${Date.now()}` : '');
+    const r = await fetch(path, { headers: _lyzrHeaders() });
+    const d = await r.json();
+    sel.innerHTML = '';
+    if (!d.ok) {
+      sel.innerHTML = `<option value="">${d.error || 'no agents'}</option>`;
+      sel.disabled = true;
+      return;
+    }
+    if (!d.agents.length) {
+      sel.innerHTML = '<option value="">(no agents in account)</option>';
+      sel.disabled = true;
+      return;
+    }
+    sel.disabled = false;
+    // Add a "choose…" placeholder if no agent yet selected.
+    sel.innerHTML = '<option value="">— choose an agent —</option>' +
+      d.agents.map(a => `<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('');
+    // If a currentLyzrAgentId was already set (server-side default), select it.
+    if (currentLyzrAgentId) sel.value = currentLyzrAgentId;
+    lyzrAgentsLoaded = true;
+  } catch (e) {
+    sel.innerHTML = `<option value="">err: ${String(e)}</option>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+// L5: validate + L2: render metadata for a selected agent_id.
+async function selectLyzrAgent(agentId) {
+  if (!agentId) return;
+  currentLyzrAgentId = agentId;
+  // Tell the server (drives the next turn).
+  ws.send(JSON.stringify({ event: 'set_lyzr_agent_id', agent_id: agentId }));
+  // Fetch metadata + render. /lyzr/agents/{id} hits cache when warm.
+  const status = $('lyzr-id-status');
+  status.textContent = '…';
+  status.style.color = 'var(--muted)';
+  try {
+    const r = await fetch(`/lyzr/agents/${encodeURIComponent(agentId)}`,
+                          { headers: _lyzrHeaders() });
+    const d = await r.json();
+    if (!d.ok) {
+      status.textContent = '✗ not found';
+      status.style.color = 'var(--err)';
+      status.title = d.error || 'invalid agent_id';
+      $('lyzr-agent-meta').style.display = 'none';
+      return;
+    }
+    status.textContent = `✓ ${d.source}`;
+    status.style.color = 'var(--ok)';
+    status.title = `Validated via /v3/agents/{id} (${d.source})`;
+    renderLyzrAgentMeta(d.agent);
+  } catch (e) {
+    status.textContent = '✗ err';
+    status.style.color = 'var(--err)';
+    status.title = String(e);
+  }
+}
+
+function renderLyzrAgentMeta(a) {
+  $('lyzr-agent-meta').style.display = '';
+  $('lyzr-meta-name').textContent = a.name || '(unnamed)';
+  // Also populate the inline summary in the collapsed header.
+  const inline = $('lyzr-meta-name-inline');
+  if (inline) inline.textContent = a.name || '(unnamed)';
+  if (a.role) {
+    $('lyzr-meta-role-row').style.display = '';
+    $('lyzr-meta-role').textContent = a.role;
+  } else {
+    $('lyzr-meta-role-row').style.display = 'none';
+  }
+  if (a.description) {
+    $('lyzr-meta-desc-row').style.display = '';
+    $('lyzr-meta-desc').textContent = a.description;
+  } else {
+    $('lyzr-meta-desc-row').style.display = 'none';
+  }
+  $('lyzr-meta-tools').textContent = (a.tools && a.tools.length)
+    ? a.tools.join(', ')
+    : 'none';
+  if (a.features && a.features.length) {
+    $('lyzr-meta-features-row').style.display = '';
+    $('lyzr-meta-features').textContent = a.features.join(', ');
+  } else {
+    $('lyzr-meta-features-row').style.display = 'none';
+  }
+  $('lyzr-meta-instructions').textContent = a.instructions_snippet || '(no instructions)';
+}
+
+function submitLyzrAgentId() {
+  const v = $('lyzr-id').value.trim();
+  if (!v) return;
+  selectLyzrAgent(v);  // L5 path: same validation + metadata fetch
+}
+
+// Classify a provider name into the stage it belongs to. Centralized so the
+// regex stays correct as we add adapters (cartesia_stt, deepgram_aura, etc.).
+function providerStage(name) {
+  const n = String(name);
+  if (/_with_fault$/.test(n)) {
+    // Fault-injection wrapper — classify by the underlying name (cartesia_with_fault → tts).
+    return providerStage(n.replace(/_with_fault$/, ''));
+  }
+  if (/whisper|deepgram(?!_aura)|assemblyai|cartesia_stt|sarvam|azure_speech_stt/.test(n)) return 'stt';
+  if (/cartesia\b|openai_tts|openai\b(?!_realtime|_whisper|_chat)|elevenlabs|deepgram_aura|inworld|rime|azure_neural/.test(n)) return 'tts';
+  if (/realtime/.test(n)) return 'realtime';
+  return 'other';
+}
+
+function renderMetrics(s, turns) {
+  s = s || {};
+  $('m-turns').textContent = turns ?? 0;
+  // Engines: prefer the ConfidenceGatedSTT-aware `engines` map (it carries
+  // the *real* serving engine through the wrapper); fall back to filtering
+  // provider_selected for stage='stt'.
+  const fmtMap = (obj) => Object.entries(obj || {})
+    .sort((a, b) => b[1] - a[1])  // descending by count
+    .map(([k, v]) => `${k}:${v}`)
+    .join('  ');
+  let sttText = fmtMap(s.engines);
+  if (!sttText) {
+    sttText = fmtMap(Object.fromEntries(
+      Object.entries(s.provider_selected || {}).filter(([k]) => providerStage(k) === 'stt')
+    ));
+  }
+  $('m-stt').textContent = sttText || '—';
+  $('m-tts').textContent = fmtMap(Object.fromEntries(
+    Object.entries(s.provider_selected || {}).filter(([k]) => providerStage(k) === 'tts')
+  )) || '—';
+  $('m-fo').textContent  = fmtMap(s.failovers) || '—';
+  $('m-cache').textContent = s.cache_hits ?? 0;
+  $('m-hedge').textContent = fmtMap(s.hedge_wins) || '—';
+  $('m-circuit').textContent = fmtMap(s.circuit_opens) || '—';
+  $('m-sil').textContent = `${s.silence_frames_dropped ?? 0} / ${s.silence_frames_kept ?? 0}`;
+  // Cumulative cost lives on the session (A4), not the metrics observer.
+  if (sessionLog.length) {
+    const total = sessionLog.reduce((t, x) => t + (x.cost_usd || 0), 0);
+    $('m-cost').textContent = `$${total.toFixed(5)}`;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Pipeline (live config) panel — what's wired RIGHT NOW. Updates on ready /
+// set_tts_tier / set_agent_tier / set_hedge / budget / recording_ready /
+// done events. Mirrors the server's session state so the audience can SEE
+// what they're about to talk to before pressing the mic.
+// ──────────────────────────────────────────────────────────────────────────
+const pipelineState = {
+  agent_tier: 'openai',
+  tts_tier: 'cartesia',
+  hedge_stt: false,
+  hedge_tts: false,
+  budget_usd: null,
+  spent_usd: 0,
+  recording: false,
+  session_id: '',
+  mode: 'pipeline',
+  last_stt: '',
+  last_tts: '',
+};
+
+// Pre-built provider chains the server uses (mirrors Session._build_stt / _build_tts).
+// Kept here so the UI can render the chain WITHOUT a round-trip — the server
+// doesn't ship its chain definitions over the wire today, and a per-deploy
+// override could change them but the demo doesn't.
+const STT_CHAINS = {
+  default: ['deepgram', 'openai_whisper'],
+};
+const TTS_CHAINS = {
+  cartesia: ['cartesia', 'openai'],
+  openai:   ['openai',   'cartesia'],
+};
+const AGENT_LABELS = {
+  openai:     'OpenAI Chat (gpt-4o-mini)',
+  lyzr:       'Mova-iO Streaming (real-time, word-by-word)',
+  lyzr_sdk:   'Mova-iO Standard (full-answer, deeper reasoning)',
+  realtime:   'OpenAI Realtime (full-duplex)',
+};
+
+function renderChain(stage, members, lastUsed, hedge) {
+  // Render "deepgram → openai_whisper" with the last-used one bolded green.
+  // When hedging is on, both first two are shown in italic-warn ("hedge").
+  const html = members.map((p, i) => {
+    let cls = 'prov';
+    if (hedge && i < 2) cls = 'hedge';
+    else if (lastUsed && p === lastUsed) cls = 'active-prov';
+    return `<span class="${cls}">${escapeHtml(p)}</span>`;
+  }).join('<span class="arr">→</span>');
+  return html || '—';
+}
+
+function renderPipeline() {
+  const s = pipelineState;
+  $('cfg-agent').textContent = AGENT_LABELS[s.agent_tier] || s.agent_tier;
+  if (s.mode === 'realtime') {
+    $('cfg-stt').innerHTML = '<span class="dim">(realtime owns STT server-side)</span>';
+    $('cfg-tts').innerHTML = '<span class="dim">(realtime owns TTS server-side)</span>';
+  } else {
+    $('cfg-stt').innerHTML = renderChain('stt',
+      STT_CHAINS.default, s.last_stt, s.hedge_stt);
+    $('cfg-tts').innerHTML = renderChain('tts',
+      TTS_CHAINS[s.tts_tier] || ['—'], s.last_tts, s.hedge_tts);
+  }
+  let hedge = 'off';
+  if (s.hedge_stt && s.hedge_tts) hedge = 'STT + TTS';
+  else if (s.hedge_stt) hedge = 'STT only';
+  else if (s.hedge_tts) hedge = 'TTS only';
+  $('cfg-hedge').textContent = hedge;
+  const budget = s.budget_usd
+    ? `$${s.spent_usd.toFixed(5)} / $${s.budget_usd.toFixed(2)}`
+    : `$${(s.spent_usd || 0).toFixed(5)} (unbounded)`;
+  $('cfg-budget').textContent = budget;
+  $('cfg-budget').style.color =
+    (s.budget_usd && s.spent_usd > s.budget_usd) ? 'var(--warn)' : '';
+  $('cfg-recording').textContent = s.recording
+    ? '🔴 on (uploads on disconnect)' : 'off';
+  $('cfg-session').textContent = (s.session_id || '—').slice(0, 8) +
+    (s.session_id ? '…' : '');
+}
+
+// ─── Audio playback (queue PCM16 frames into AudioContext) ────────────────
+function ensurePlayCtx() {
+  if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+  if (playCtx.state === 'suspended') playCtx.resume();
+  return playCtx;
+}
+
+function handleAudio(buf) {
+  const header = lastAudioHeader || { sample_rate: 24000 };
+  lastAudioHeader = null;
+  const ctx = ensurePlayCtx();
+  const i16 = new Int16Array(buf);
+  if (!i16.length) return;
+  const f32 = new Float32Array(i16.length);
+  // Compute peak as we convert — feed the heart-monitor's agent trace.
+  let peak = 0;
+  for (let i = 0; i < i16.length; i++) {
+    f32[i] = i16[i] / 32768;
+    const a = Math.abs(f32[i]);
+    if (a > peak) peak = a;
+  }
+  if (peak > currentAgentLevel) currentAgentLevel = Math.min(1, peak * 1.4);
+  pushMonEvent('tts.audio', getComputedStyle(document.documentElement)
+                              .getPropertyValue('--accent').trim() || '#7ab1ff');
+  const ab = ctx.createBuffer(1, f32.length, header.sample_rate || 24000);
+  ab.copyToChannel(f32, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = ab; src.connect(ctx.destination);
+  // Prebuffer ~80ms so streaming TTS doesn't crackle when frames arrive late.
+  const start = Math.max(playAt, ctx.currentTime + 0.08);
+  src.start(start);
+  playAt = start + ab.duration;
+  activeSources.push(src);
+  src.onended = () => {
+    activeSources = activeSources.filter(s => s !== src);
+  };
+}
+
+function stopPlayback() {
+  // Barge-in: stop every scheduled / playing buffer right now.
+  for (const s of activeSources) {
+    try { s.stop(); s.disconnect(); } catch (_) {}
+  }
+  activeSources = [];
+  if (playCtx) playAt = playCtx.currentTime;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Real-time activity monitor — scrolling strip-chart ("heart monitor" style).
+// Two waveforms (mic input top, TTS output bottom) over a rolling 60 sec
+// window + vertical event markers (partial/final/token/audio frame) at the
+// very top edge. Canvas-based at requestAnimationFrame cadence (~60fps);
+// SVG would re-render the DOM tree every frame and is too expensive here.
+// Theme-adaptive: reads CSS var values at draw time so a theme flip
+// instantly reskins the colors.
+// ──────────────────────────────────────────────────────────────────────────
+const MON_WINDOW_S = 60;           // chart spans the last 60 sec
+const MON_FPS = 30;                // sample / draw rate (independent of rAF cadence)
+const MON_N = MON_WINDOW_S * MON_FPS;  // 1800 samples
+const monMic = new Float32Array(MON_N);     // 0..1 mic peak
+const monAgent = new Float32Array(MON_N);   // 0..1 agent (TTS) peak, decays
+let monIdx = 0;                    // current write position (ring)
+let monLastSampleAt = 0;
+let monRaf = 0;
+let monStartTime = performance.now();
+let currentAgentLevel = 0;         // latest TTS-out sample peak; decays per tick
+// Event markers ring — small array of {idx, color, kind}; capped to last MON_N
+const monEvents = [];
+
+function pushMonEvent(kind, color) {
+  monEvents.push({ idx: monIdx, color, kind, ts: performance.now() });
+  // Trim entries that have scrolled off the chart.
+  while (monEvents.length && (monIdx - monEvents[0].idx + MON_N) % MON_N > MON_N - 30) {
+    monEvents.shift();
+  }
+  if (monEvents.length > 300) monEvents.splice(0, monEvents.length - 300);
+}
+
+// ── Sampling sources ─────────────────────────────────────────────────────
+// Mic level: read peak from the existing micAnalyser when available.
+function sampleMicLevel() {
+  if (!micAnalyser) return 0;
+  const buf = new Uint8Array(micAnalyser.fftSize);
+  micAnalyser.getByteTimeDomainData(buf);
+  let peak = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = Math.abs(buf[i] - 128);
+    if (v > peak) peak = v;
+  }
+  return Math.min(1, (peak / 128) * 2.2);  // same scale as the bar meter
+}
+
+// Agent level: track each tts.audio Int16 chunk's peak in handleAudio() and
+// store as currentAgentLevel. Decay it ~0.92 per sample so the trace looks
+// like a real envelope, not a square wave.
+function decayAgentLevel() {
+  currentAgentLevel *= 0.85;
+  if (currentAgentLevel < 0.01) currentAgentLevel = 0;
+  return currentAgentLevel;
+}
+
+function tickMonitor(now) {
+  monRaf = requestAnimationFrame(tickMonitor);
+  if (now - monLastSampleAt < 1000 / MON_FPS) return;
+  monLastSampleAt = now;
+  monMic[monIdx] = sampleMicLevel();
+  monAgent[monIdx] = decayAgentLevel();
+  monIdx = (monIdx + 1) % MON_N;
+  drawMonitor();
+}
+
+function drawMonitor() {
+  const c = $('monitor-canvas');
+  if (!c) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = c.clientWidth || 800;
+  const cssH = c.clientHeight || 140;
+  if (c.width !== cssW * dpr || c.height !== cssH * dpr) {
+    c.width = cssW * dpr; c.height = cssH * dpr;
+  }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  // Pull live theme-color values.
+  const cs = getComputedStyle(document.documentElement);
+  const colGrid = cs.getPropertyValue('--grid').trim() || '#222a3a';
+  const colMic = cs.getPropertyValue('--c1').trim() || '#7ab1ff';
+  const colAgent = cs.getPropertyValue('--c4').trim() || '#d186ff';
+  const colMid = cs.getPropertyValue('--muted').trim() || '#7c8497';
+
+  // Grid: vertical lines every 5 sec; horizontal midline.
+  ctx.strokeStyle = colGrid; ctx.lineWidth = 1;
+  ctx.beginPath();
+  const stepPx = cssW / (MON_WINDOW_S / 5);  // px per 5-sec block
+  for (let s = 0; s <= MON_WINDOW_S / 5; s++) {
+    const x = Math.round(s * stepPx) + 0.5;
+    ctx.moveTo(x, 0); ctx.lineTo(x, cssH);
+  }
+  ctx.moveTo(0, cssH / 2 + 0.5); ctx.lineTo(cssW, cssH / 2 + 0.5);
+  ctx.stroke();
+
+  // Sec labels at the bottom every 10s.
+  ctx.fillStyle = colMid; ctx.font = '9px "SF Mono", Menlo, monospace';
+  for (let s = 0; s <= MON_WINDOW_S; s += 10) {
+    const x = (s / MON_WINDOW_S) * cssW;
+    ctx.fillText(`-${MON_WINDOW_S - s}s`, x + 2, cssH - 2);
+  }
+
+  // Plot the ring as two strokes — mic above midline, agent below.
+  // Newest sample (monIdx-1) is rightmost; oldest (monIdx) is leftmost.
+  const midY = cssH / 2;
+  const half = midY - 4;
+
+  function plotTrace(buf, color, sign) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < MON_N; i++) {
+      const readIdx = (monIdx + i) % MON_N;  // oldest → newest
+      const x = (i / MON_N) * cssW;
+      const v = buf[readIdx];
+      const y = midY + sign * v * half;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    // Subtle fill underneath the line for that "monitor" feel.
+    ctx.fillStyle = color + (color.startsWith('#') ? '22' : '');  // ~13% alpha
+    ctx.lineTo(cssW, midY); ctx.lineTo(0, midY);
+    ctx.fill();
+  }
+  plotTrace(monMic, colMic, -1);     // mic above midline
+  plotTrace(monAgent, colAgent, +1); // agent below midline
+
+  // Event markers along the very top edge.
+  for (const ev of monEvents) {
+    // Position relative to current write pointer (monIdx is "now").
+    const delta = (monIdx - ev.idx + MON_N) % MON_N;  // samples ago
+    if (delta >= MON_N) continue;
+    const x = ((MON_N - delta) / MON_N) * cssW;
+    ctx.fillStyle = ev.color;
+    ctx.fillRect(x - 1, 0, 2, 8);
+  }
+
+  // "Now" line at the right edge.
+  ctx.strokeStyle = colMid; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(cssW - 1, 0); ctx.lineTo(cssW - 1, cssH);
+  ctx.stroke();
+
+  // Update the "elapsed" footer text — integer seconds only (the chart
+  // redraws ~30× per second; a tenths-of-a-second counter looked jittery).
+  // Only mutate the DOM when the integer actually changes to avoid layout
+  // shifts from variable-width digits in the right-aligned "samples" suffix.
+  const elapsedSec = Math.floor((performance.now() - monStartTime) / 1000);
+  const monNow = $('monitor-now');
+  if (monNow && monNow.dataset.lastSec !== String(elapsedSec)) {
+    monNow.dataset.lastSec = String(elapsedSec);
+    monNow.textContent = `elapsed ${elapsedSec}s · samples ${MON_FPS}/s`;
+  }
+}
+
+function startMonitor() {
+  monStartTime = performance.now();
+  monLastSampleAt = 0;
+  monIdx = 0;
+  monMic.fill(0); monAgent.fill(0);
+  monEvents.length = 0;
+  cancelAnimationFrame(monRaf);
+  monRaf = requestAnimationFrame(tickMonitor);
+}
+function stopMonitor() {
+  cancelAnimationFrame(monRaf);
+}
+// Kick the monitor as soon as the page loads — runs continuously, mic level
+// reads 0 when the mic isn't open (so it just shows a flat line until you talk).
+window.addEventListener('load', startMonitor);
+
+// ─── #3: mic level meter ─────────────────────────────────────────────────
+function startMeter() {
+  cancelAnimationFrame(meterRaf);
+  if (!micAnalyser) return;
+  const data = new Uint8Array(micAnalyser.fftSize);
+  const tick = () => {
+    micAnalyser.getByteTimeDomainData(data);
+    let peak = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = Math.abs(data[i] - 128);
+      if (v > peak) peak = v;
+    }
+    const pct = Math.min(100, (peak / 128) * 220);  // scale to be visible
+    $('meter').style.width = pct + '%';
+    meterRaf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+function stopMeter() {
+  cancelAnimationFrame(meterRaf);
+  $('meter').style.width = '0%';
+}
+
+// ─── Mic capture (PCM16 16kHz mono) ───────────────────────────────────────
+async function startMic() {
+  if (!micStream) {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } });
+  }
+  ac = ac || new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  if (ac.state === 'suspended') await ac.resume();
+  const src = ac.createMediaStreamSource(micStream);
+  micAnalyser = ac.createAnalyser();
+  micAnalyser.fftSize = 1024;
+  src.connect(micAnalyser);
+  // ScriptProcessor: deprecated but works everywhere with no worklet file.
+  micNode = ac.createScriptProcessor(4096, 1, 1);
+  micNode.onaudioprocess = (e) => {
+    if (!ws || ws.readyState !== 1) return;
+    // Keep streaming during the answer so the server can auto-detect barge-in.
+    if (!talking && !monitorMic) return;
+    const f32 = e.inputBuffer.getChannelData(0);
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    ws.send(i16.buffer);
+    // PTT tail diagnostic — count frames sent during the tail-capture window.
+    if (pendingEndTimer) tailFramesSent++;
+  };
+  src.connect(micNode); micNode.connect(ac.destination);
+  startMeter();
+}
+
+function stopMic() {
+  if (micNode) { micNode.disconnect(); micNode = null; }
+  if (micAnalyser) { micAnalyser.disconnect(); micAnalyser = null; }
+  stopMeter();
+}
+
+// ─── Talk control (click = VAD, hold space = push-to-talk) ────────────────
+async function beginTurn() {
+  // A pending PTT tail-capture close from the previous press? Cancel it —
+  // the user is starting a new turn (or extending the current one). The
+  // mic / talking flag is still in the post-release tail window.
+  if (pendingEndTimer) { clearTimeout(pendingEndTimer); pendingEndTimer = 0; }
+  if (talking || ws.readyState !== 1) return;
+  talking = true;
+  $('err').textContent = '';
+  $('transcript').textContent = '…listening';
+  $('answer').innerHTML = '<span class="muted">—</span>';
+  $('tts-badge').textContent = '';
+  $('talk').classList.add('live');
+  await startMic();
+  // Report the browser's ACTUAL sample rate so the server (and Deepgram) decode
+  // the bytes correctly — many browsers ignore the requested 16kHz and deliver
+  // 48kHz, which silently breaks STT if the server assumes 16kHz.
+  const rate = ac ? ac.sampleRate : 16000;
+  ws.send(JSON.stringify({ event: 'start', sample_rate: rate }));
+}
+// Push-to-talk users were losing the trailing word — the moment they release
+// the button we'd stopMic() and send "stop", so any audio still in flight
+// (and the last syllable still in their mouth) got dropped. New behavior:
+// in PTT mode endTurn() with a delay keeps the mic OPEN for `delayMs` so the
+// tail audio reaches STT before we shut the stream. VAD mode passes delay=0
+// (the server's own endpointing handles tail capture there).
+let pendingEndTimer = 0;
+let tailFramesSent = 0;     // counts ws.send(i16.buffer) calls during the tail window
+let tailStartedAt = 0;      // performance.now() at tail-window open
+function endTurn(sendStop = true, delayMs = 0) {
+  if (!talking) return;
+  if (delayMs > 0) {
+    // Schedule the actual close; clear any prior pending close first so a
+    // rapid release→press→release sequence doesn't pile up timers.
+    clearTimeout(pendingEndTimer);
+    tailFramesSent = 0;
+    tailStartedAt = performance.now();
+    logEvent(`⏱ PTT tail-capture: keeping mic open ${delayMs}ms`, '');
+    pendingEndTimer = setTimeout(() => {
+      pendingEndTimer = 0;
+      const ms = Math.round(performance.now() - tailStartedAt);
+      logEvent(`✓ PTT tail done · ${tailFramesSent} frames sent over ${ms}ms`, 'final');
+      _endTurnNow(sendStop);
+    }, delayMs);
+    return;
+  }
+  if (pendingEndTimer) { clearTimeout(pendingEndTimer); pendingEndTimer = 0; }
+  _endTurnNow(sendStop);
+}
+function _endTurnNow(sendStop) {
+  if (!talking) return;
+  talking = false;
+  $('talk').classList.remove('live');
+  stopMic();
+  if (sendStop && ws.readyState === 1) ws.send(JSON.stringify({ event: 'stop' }));
+}
+
+const talkBtn = $('talk');
+// Prevent the browser from scroll-anchoring the page to the Talk button
+// when it takes focus on mousedown — user reported the page jumping to
+// the button area when they clicked while scrolled elsewhere.
+talkBtn.addEventListener('mousedown', (e) => {
+  // preventDefault() on mousedown blocks the default focus behavior, so
+  // the button doesn't grab focus and the browser doesn't scroll to it.
+  e.preventDefault();
+});
+talkBtn.addEventListener('click', (e) => {
+  // Belt-and-suspenders: if focus did land here, drop it.
+  e.currentTarget.blur();
+  if (vad) {
+    // VAD mode = click to start, server endpoints on silence.
+    if (talking) endTurn();
+    else beginTurn();
+  }
+});
+// Push-to-talk path (mousedown + space) — only when VAD is off. We attach
+// a SEPARATE non-preventDefault'd handler here so push-to-talk still works.
+talkBtn.addEventListener('mousedown', (e) => { if (!vad) beginTurn(); });
+// PTT release / leave / spacebar-up: end with a 1-second tail-capture window
+// so the trailing syllable reaches STT before the mic closes.
+talkBtn.addEventListener('mouseup',   (e) => { if (!vad) { endTurn(true, 2000); e.currentTarget.blur(); } });
+talkBtn.addEventListener('mouseleave',(e) => { if (!vad) endTurn(true, 2000); });
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !e.repeat && !vad) { e.preventDefault(); beginTurn(); }
+});
+document.addEventListener('keyup',   (e) => {
+  if (e.code === 'Space' && !vad) { e.preventDefault(); endTurn(true, 2000); }
+});
+
+// ─── Toggle wiring ────────────────────────────────────────────────────────
+document.querySelectorAll('#tts-toggle button').forEach(b => {
+  b.addEventListener('click', () => ws.send(JSON.stringify({ event: 'set_tts_tier', tier: b.dataset.tier })));
+});
+document.querySelectorAll('#agent-toggle button').forEach(b => {
+  b.addEventListener('click', () => {
+    if (b.disabled) return;
+    const tier = b.dataset.tier;
+    if (tier === 'realtime') {
+      // B1: realtime owns transport — reconnect to /ws/voice/realtime.
+      switchMode('realtime');
+      return;
+    }
+    if (connectionMode === 'realtime') {
+      // Switching FROM realtime back to a pipeline tier: reconnect first,
+      // then the new tier sticks via ready event's agent_tier.
+      switchMode('pipeline');
+      // Defer the set_agent_tier until after the new ws connects.
+      setTimeout(() => {
+        try { ws.send(JSON.stringify({ event: 'set_agent_tier', tier })); } catch (e) {}
+      }, 600);
+      return;
+    }
+    ws.send(JSON.stringify({ event: 'set_agent_tier', tier }));
+  });
+});
+document.querySelectorAll('#vad-toggle button').forEach(b => {
+  b.addEventListener('click', () => ws.send(JSON.stringify({ event: 'set_vad', enabled: b.dataset.vad === '1' })));
+});
+$('fault-stt').addEventListener('click', () => ws.send(JSON.stringify({ event: 'inject_fault', stage: 'stt' })));
+$('fault-tts').addEventListener('click', () => ws.send(JSON.stringify({ event: 'inject_fault', stage: 'tts' })));
+$('reset-mem').addEventListener('click', () => ws.send(JSON.stringify({ event: 'reset_memory' })));
+$('reset-metrics').addEventListener('click', () => ws.send(JSON.stringify({ event: 'reset_metrics' })));
+$('lyzr-id-save').addEventListener('click', submitLyzrAgentId);
+$('lyzr-id').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitLyzrAgentId(); });
+// L1: dropdown change → pick agent + validate + render metadata (L2/L5).
+$('lyzr-agent-select').addEventListener('change', (e) => {
+  if (e.target.value) selectLyzrAgent(e.target.value);
+});
+// L1: ✎ toggle between dropdown (default) and free-text input (advanced).
+$('lyzr-id-toggle').addEventListener('click', () => {
+  lyzrManualMode = !lyzrManualMode;
+  showLyzrIdInput((agentTier === 'lyzr' || agentTier === 'lyzr_sdk'));
+  if (lyzrManualMode) $('lyzr-id').focus();
+});
+// 🔄 manual refresh — force a fresh fetch (bypass server cache via cache-bust).
+$('lyzr-refresh').addEventListener('click', () => {
+  logEvent('🔄 refreshing agent list…');
+  loadLyzrAgents(true);
+});
+// B3: transcript export — pure client-side, no server roundtrip.
+$('export-md').addEventListener('click', exportMarkdown);
+$('export-json').addEventListener('click', exportJSON);
+// A4: cost-bounded routing — push the user's chosen ceiling to the server.
+$('budget-apply').addEventListener('click', () => {
+  const v = parseFloat($('budget-input').value);
+  ws.send(JSON.stringify({ event: 'set_budget', usd: isFinite(v) ? v : null }));
+});
+// B2: latency hedging — translate {off,stt,tts,both} into {stt,tts} bools.
+document.querySelectorAll('#hedge-toggle button').forEach(b => {
+  b.addEventListener('click', () => {
+    const mode = b.dataset.hedge;
+    const stt = (mode === 'stt' || mode === 'both');
+    const tts = (mode === 'tts' || mode === 'both');
+    ws.send(JSON.stringify({ event: 'set_hedge', stt, tts }));
+  });
+});
+// Currently-voicing collapse toggle — click the h2 to expand / collapse.
+$('lyzr-meta-toggle').addEventListener('click', () => {
+  $('lyzr-agent-meta').classList.toggle('collapsed');
+});
+// Format a raw phone number (e.g. "+12179195393" or "12179195393") as
+// "(217) 919-5393" for display. Falls back to the original string when the
+// number doesn't have the expected 10-digit shape (e.g. international).
+function formatPhone(num) {
+  const digits = String(num || '').replace(/\D/g, '');
+  const last10 = digits.slice(-10);
+  if (last10.length === 10) {
+    return `(${last10.slice(0, 3)}) ${last10.slice(3, 6)}-${last10.slice(6)}`;
+  }
+  return String(num || '');
+}
+// 📞 Dial chip: click to copy the number (and tap-to-call on mobile).
+$('twilio-dial').addEventListener('click', (e) => {
+  const num = e.currentTarget.dataset.number || '';
+  if (!num) return;
+  // Mobile / Safari → trigger tel: handoff. On desktop, copy to clipboard.
+  const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+  if (isMobile) {
+    window.location.href = `tel:${num.replace(/[^+0-9]/g, '')}`;
+  } else if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(num);
+    const orig = e.currentTarget.textContent;
+    e.currentTarget.textContent = '📞 copied ✓';
+    setTimeout(() => { e.currentTarget.textContent = orig; }, 1200);
+  }
+});
+// 📞 Sync-to-phone: snapshot the current playground settings into the
+// server's _twilio_config so the next phone call uses the same agent /
+// voice / hedge / budget. Server logs which session pushed; here we
+// surface the echo in the event stream so the operator sees confirmation.
+$('twilio-sync').addEventListener('click', () => {
+  ws.send(JSON.stringify({ event: 'push_to_twilio' }));
+  $('twilio-sync').textContent = '📞 Syncing…';
+  setTimeout(() => { $('twilio-sync').textContent = '📞 Sync to phone'; }, 1500);
+});
+// BYOK: panel toggle + apply/clear/show controls. Keys are kept in DOM only
+// (no localStorage by default — opt-in could be a future enhancement) and
+// sent to the server inside one set_user_keys WS message.
+$('byok-badge').addEventListener('click', () => {
+  const p = $('byok-panel');
+  p.style.display = p.style.display === 'none' ? '' : 'none';
+});
+$('byok-apply').addEventListener('click', () => {
+  const keyEntered = $('byok-lyzr').value.trim();
+  // BYOK (Lyzr only) — server ignores other provider entries (USER_KEY_PROVIDERS).
+  ws.send(JSON.stringify({
+    event: 'set_user_keys',
+    keys: { lyzr: keyEntered },
+  }));
+  // After applying, ALWAYS refresh the agent dropdown so it shows the USER'S
+  // agents instead of the demo's — even if they're not on the Lyzr tier
+  // right now (so when they DO switch, the dropdown is already accurate).
+  lyzrAgentsLoaded = false;
+  currentLyzrAgentId = '';  // force re-select on the new account
+  logEvent('🔄 reloading agent list with your key…', 'final');
+  loadLyzrAgents(true);  // force = cache-bust
+  // Auto-collapse the modal once a real key was entered — the user is done
+  // with this panel and the dropdown / Talk button below it become the focus.
+  // We still keep it open for empty submissions so the user sees feedback.
+  if (keyEntered) {
+    $('byok-panel').style.display = 'none';
+  }
+});
+$('byok-clear').addEventListener('click', () => {
+  $('byok-lyzr').value = '';
+  ws.send(JSON.stringify({ event: 'set_user_keys', keys: { lyzr: '' } }));
+  lyzrAgentsLoaded = false;
+  currentLyzrAgentId = '';
+  logEvent('🔄 reloading agent list with demo key…', 'final');
+  loadLyzrAgents(true);
+});
+$('byok-show').addEventListener('click', () => {
+  const showing = $('byok-lyzr').type === 'text';
+  $('byok-lyzr').type = showing ? 'password' : 'text';
+  $('byok-show').textContent = showing ? '👁 Show' : '🙈 Hide';
+});
+$('interrupt').addEventListener('click', () => {
+  // Stop local playback IMMEDIATELY for snappy feel; server confirms with barged_in.
+  stopPlayback();
+  ws.send(JSON.stringify({ event: 'barge_in' }));
+});
+
+status('click ▶ to start');
+
+// ── Voice picker (TTS voice selection) ─────────────────────────────────────
+// Voices are tier-specific: switching the TTS primary repopulates the dropdown
+// for that provider. Empty value = adapter default voice.
+let voicesByTier = null;  // populated once on first /tts/voices fetch
+
+async function loadVoices() {
+  if (voicesByTier) return voicesByTier;
+  try {
+    const r = await fetch('/tts/voices');
+    const d = await r.json();
+    voicesByTier = (d && d.ok) ? d.voices : {};
+  } catch (e) {
+    voicesByTier = {};
+    logEvent(`🎙️ voice catalog err: ${e}`, 'err');
+  }
+  return voicesByTier;
+}
+
+function repopulateVoiceSelect() {
+  const sel = $('voice-select');
+  if (!sel || !voicesByTier) return;
+  const list = voicesByTier[ttsTier] || [];
+  sel.innerHTML = '<option value="">— provider default —</option>' +
+    list.map(v =>
+      `<option value="${escapeHtml(v.id)}">` +
+      `${escapeHtml(v.label)} — ${escapeHtml(v.description)} (${escapeHtml(v.use_case)})` +
+      `</option>`
+    ).join('');
+}
+
+(async function initVoices() {
+  await loadVoices();
+  repopulateVoiceSelect();
+})();
+
+$('voice-select').addEventListener('change', (e) => {
+  ws.send(JSON.stringify({ event: 'set_voice_id', voice_id: e.target.value }));
+  const label = e.target.options[e.target.selectedIndex]?.textContent || '—';
+  logEvent(`🎙️ voice → ${label}`, 'final');
+});
+
+// ── Light / dark mode toggle ──────────────────────────────────────────────
+// Persists in localStorage. All colors flow through CSS custom properties so
+// the SVG charts auto-recolor (var() values resolve live on attribute change).
+const THEME_KEY = 'mdk-theme';
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  $('theme-toggle').textContent = theme === 'light' ? '☀️' : '🌙';
+  $('theme-toggle').title = theme === 'light'
+    ? 'Switch to dark mode' : 'Switch to light mode';
+  try { localStorage.setItem(THEME_KEY, theme); } catch (e) {}
+  // Charts use var(--soft) / var(--c1)..--c5 for strokes/fills — but the
+  // values were baked into the SVG strings at render time. Re-render so the
+  // new var() values take effect.
+  if (typeof renderAllCharts === 'function') renderAllCharts();
+}
+$('theme-toggle').addEventListener('click', () => {
+  // No data-theme attr means we're on the CSS-default (dark) — toggle to light.
+  const cur = document.documentElement.getAttribute('data-theme') || 'light';
+  applyTheme(cur === 'dark' ? 'light' : 'dark');
+});
+// Apply the saved theme on load. If nothing is saved, default to LIGHT —
+// per-user preference still wins (saved value overrides the default).
+try {
+  const saved = localStorage.getItem(THEME_KEY);
+  applyTheme((saved === 'light' || saved === 'dark') ? saved : 'light');
+} catch (e) {
+  applyTheme('light');
+}
+
+// ── View tabs: Simple / Detailed ──────────────────────────────────────────
+// Simple = curated subset for a non-technical audience (Lyzr-focused).
+// Detailed = full engineering view (everything we shipped this week).
+// Persists in localStorage. CSS rules under [data-view="simple"] hide all
+// elements tagged .detailed-only. Default = Simple for a clean first-load.
+const VIEW_KEY = 'mdk-view';
+function applyView(view) {
+  document.documentElement.setAttribute('data-view', view);
+  document.querySelectorAll('#view-tabs button').forEach(b => {
+    b.classList.toggle('active', b.dataset.view === view);
+  });
+  try { localStorage.setItem(VIEW_KEY, view); } catch (e) {}
+  // In Simple view, lock the agent backend to Lyzr (/v4) AND force
+  // push-to-talk (no VAD auto-endpointing — Simple users hold the button).
+  if (view === 'simple') {
+    const enforceSimpleDefaults = () => {
+      if (!ws || ws.readyState !== 1) return;
+      if (agentTier !== 'lyzr') {
+        ws.send(JSON.stringify({ event: 'set_agent_tier', tier: 'lyzr' }));
+      }
+      if (vad) {
+        ws.send(JSON.stringify({ event: 'set_vad', enabled: false }));
+      }
+    };
+    if (ws && ws.readyState === 1) enforceSimpleDefaults();
+    else setTimeout(enforceSimpleDefaults, 800);
+    // Also auto-open the BYOK panel if no Mova-iO key is set yet — Simple view
+    // calls out that "the user needs to add a Mova-iO API key, no other keys".
+    if (!($('byok-lyzr').value || '').trim()) {
+      $('byok-panel').style.display = '';
+    }
+  }
+  // Re-render the live activity chart after layout shifts (canvas dims change).
+  if (typeof drawMonitor === 'function') setTimeout(drawMonitor, 50);
+}
+document.querySelectorAll('#view-tabs button').forEach(b => {
+  b.addEventListener('click', () => applyView(b.dataset.view));
+});
+try {
+  const savedView = localStorage.getItem(VIEW_KEY);
+  applyView((savedView === 'simple' || savedView === 'detailed') ? savedView : 'simple');
+} catch (e) {
+  applyView('simple');
+}
+
+// ── Live Mova-iO parity badge (A2) ─────────────────────────────────────────────
+// On page load, hit /parity and render the coverage as a header badge with an
+// expandable detail panel. Demo proof of the "we cover Lyzr's voice menu plus
+// add failover composites" pitch — and it updates automatically when new
+// adapters land (Cartesia STT, Deepgram Aura TTS, etc.) without any UI work.
+(async function loadParity() {
+  const badge = $('parity-badge');
+  const panel = $('parity-panel');
+  const body  = $('parity-body');
+  try {
+    const r = await fetch('/parity');
+    const d = await r.json();
+    if (!d.ok) {
+      badge.textContent = 'Mova-iO parity n/a';
+      badge.title = d.error || 'unavailable';
+      badge.style.display = 'inline-block';
+      badge.style.background = '#3a2a2a';
+      body.textContent = d.tip || d.error || 'No data.';
+    } else {
+      badge.textContent = `Mova-iO parity ${d.covered_count}/${d.total} (${d.coverage_pct}%)`;
+      badge.style.background = d.is_parity ? '#234d2e' : '#1f2533';
+      badge.style.display = 'inline-block';
+      // Render the covered + gaps detail.
+      const renderGroup = (title, items, accent) => {
+        if (!items || !items.length) return '';
+        const rows = items.map(p => `
+          <div class="row" style="border-top:1px solid #1c2330;padding:4px 0;">
+            <span class="k" style="text-transform:uppercase;font-size:11px;">${p.kind}</span>
+            <span class="v" style="font-family:monospace;">${p.provider_id}</span>
+            <span class="muted" style="margin-left:8px;font-size:12px;">${p.display_name} · ${p.model_count} model${p.model_count===1?'':'s'}</span>
+          </div>`).join('');
+        return `<div style="margin-top:12px;">
+          <strong style="color:${accent};">${title} (${items.length})</strong>
+          ${rows}
+        </div>`;
+      };
+      body.innerHTML =
+        renderGroup('Covered', d.covered, '#7dd58c') +
+        renderGroup('Gaps',    d.gaps,    '#e6a86a');
+    }
+    badge.addEventListener('click', () => {
+      panel.style.display = panel.style.display === 'none' ? '' : 'none';
+    });
+  } catch (e) {
+    badge.textContent = 'Mova-iO parity err';
+    badge.title = String(e);
+    badge.style.display = 'inline-block';
+  }
+})();
+</script>
+</body>
+</html>

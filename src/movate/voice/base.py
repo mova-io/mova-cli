@@ -2,7 +2,7 @@
 
 ADR 048 (D3) defines voice as **a transport + two adapter seams that wrap
 the unchanged text Executor**. This module is those seams, in *exactly* the
-shape of :mod:`movate.providers.base` (the ``BaseLLMProvider`` seam):
+shape of the ``AgentTurn``/provider seam (the ``BaseLLMProvider`` seam):
 
 * streaming-friendly **async generators** of audio / text chunks,
 * ``api_key=``-style BYOK injection (resolved through the ADR 018 key store

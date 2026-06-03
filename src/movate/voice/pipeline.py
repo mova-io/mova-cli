@@ -1,16 +1,18 @@
-"""The voice pipeline driver — STT → unchanged Executor → TTS.
+"""The voice pipeline driver — STT → an ``AgentTurn`` → TTS.
 
-This is the modality-blind orchestration ADR 048 D1 describes:
+This is the modality-blind orchestration ADR 048 D1 describes, generalized per
+ADR 067 D3:
 
-    audio ──▶ STT ──▶ [ the existing text agent, run by the UNCHANGED Executor ] ──▶ TTS ──▶ audio
+    audio ──▶ STT ──▶ [ the agent stage — any ``AgentTurn`` ] ──▶ TTS ──▶ audio
 
-It is the *logic* the WS ``/voice`` route (and the pipeline tests) wrap. The
-key architectural property — and the thing the tests assert — is that the
-agent stage is the **existing run path, untouched**: this module calls
-``executor.execute(bundle, run_request, on_token=...)`` exactly as
-``_sse_run_stream`` does in ``runtime/app.py``. It does **not** import,
-subclass, or modify ``core/executor.py``; the Executor never learns the text
-arrived as speech (CLAUDE.md rule 6 / ADR 048 R2).
+It is the *logic* the transport (a WS ``/voice`` route, a Lyzr deployment, the
+pipeline tests) wraps. The key architectural property is that the agent stage is
+an **injected seam**, not a hard-coded engine: this module awaits
+``agent.run(transcript, on_token=...)`` against the :class:`~movate.voice.agent_turn.AgentTurn`
+Protocol. It does **not** import, subclass, or know about the mdk ``Executor``
+(or Lyzr, or any framework); the agent never learns the text arrived as speech
+(CLAUDE.md rule 6 / ADR 048 R2 / ADR 067). The mapping from transcript to a
+concrete agent run lives in the ``AgentTurn`` implementation, not here.
 
 The driver is transport-agnostic: it consumes an async stream of inbound
 :class:`~movate.voice.base.AudioChunk` and emits a stream of
@@ -37,19 +39,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
+from movate.voice.agent_turn import AgentTurn
 from movate.voice.base import (
     AudioChunk,
     AudioCodec,
     SpeechToTextProvider,
     TextToSpeechProvider,
 )
-
-if TYPE_CHECKING:
-    from movate.core.loader import AgentBundle
+from movate.voice.chunking import SentenceChunker
 
 # Event "kinds" the driver emits — the wire protocol's server→client events
 # (ADR 048 D4), expressed as a typed envelope so the transport is a thin
@@ -211,29 +212,32 @@ async def run_voice_pipeline(
     audio_in: AsyncIterator[AudioChunk],
     stt: SpeechToTextProvider,
     tts: TextToSpeechProvider,
-    executor: Any,
-    bundle: AgentBundle,
-    tenant_id: str,
-    input_key: str = "text",
+    agent: AgentTurn,
     language: str | None = None,
     voice_id: str = "",
     codec: AudioCodec = "pcm16",
     stt_api_key: str | None = None,
     tts_api_key: str | None = None,
+    session_id: str | None = None,
     cancel: asyncio.Event | None = None,
+    tts_streaming: bool = False,
+    text_filter: Callable[[str], str] | None = None,
+    pii_redactor: Callable[[str], str] | None = None,
+    agent_timeout: float | None = None,
     clock: Any = None,
 ) -> AsyncIterator[VoiceEvent]:
-    """Drive one voice turn: audio → STT → the unchanged agent → TTS → audio.
+    """Drive one voice turn: audio → STT → the agent stage → TTS → audio.
 
-    Yields :class:`VoiceEvent`s in pipeline order. The agent stage reuses the
-    Executor exactly (``execute(..., on_token=...)``) — the same call the SSE
-    streaming route makes — so the zero-change-to-existing-agents promise
-    holds (ADR 048 R1/R2).
+    Yields :class:`VoiceEvent`s in pipeline order. The agent stage is the
+    injected :class:`~movate.voice.agent_turn.AgentTurn` seam (ADR 067 D3) — the
+    pipeline awaits ``agent.run(transcript, on_token=...)`` and knows nothing
+    about *which* framework runs the turn. The streamed ``on_token`` deltas
+    become ``agent.token`` events, so the answer streams as it is produced.
 
-    ``input_key`` is the agent-input field the transcript is bound to
-    (default ``"text"`` — the common single-text-field convention). It is the
-    one knob the transport may pass through from the connect handshake so a
-    differently-shaped agent still works without editing its ``agent.yaml``.
+    The transcript-to-agent-input binding (an mdk ``input_key``, a Lyzr message)
+    is the ``AgentTurn`` implementation's concern, not the pipeline's.
+    ``session_id`` is an optional pass-through for adapters that thread
+    multi-turn state (mdk/Lyzr keep their own session/memory).
 
     ``cancel`` is the **barge-in** signal (additive, opt-in): an
     :class:`asyncio.Event` the transport sets when the user starts speaking
@@ -246,12 +250,38 @@ async def run_voice_pipeline(
     or the agent run — is the realtime path's job; this seam interrupts the part
     a pipeline turn can actually still cancel: the spoken answer.)
 
+    ``tts_streaming`` (opt-in, default off) overlaps synthesis with generation:
+    the agent token stream is split into sentences
+    (:class:`~movate.voice.chunking.SentenceChunker`)
+    and fed to TTS *as they complete*, so the first sentence is spoken while the
+    agent is still producing the rest — the biggest time-to-first-audio win. It
+    runs the agent and TTS concurrently, so ``agent.token`` and ``tts.audio``
+    events interleave (consumers already key off ``kind``). The default
+    (``False``) path is the strictly-sequential agent-then-TTS turn, byte-for-byte
+    unchanged. In streaming mode an agent that errors *after* emitting tokens may
+    have already spoken them (a live turn cannot be un-spoken); terminal errors
+    (auth/schema) emit no tokens, so nothing is spoken before the error.
+
+    ``pii_redactor`` (opt-in) masks PII in the **emitted** ``transcript.*`` events
+    (captions / logs / observability) while the agent stage still runs on the raw
+    transcript — compliance on the observability surface without starving the
+    agent (e.g. :func:`~movate.voice.pii.redact_pii`).
+
+    ``agent_timeout`` (opt-in) bounds the agent stage: if ``agent.run`` doesn't
+    finish within it, the run is cancelled and a ``stage="agent"`` error is
+    emitted (STT/TTS already have their own timeouts via the failover composites;
+    this closes the one stage that otherwise could hang forever).
+
+    ``text_filter`` (opt-in) reshapes the agent's text *just before* synthesis —
+    e.g. :func:`~movate.voice.speakify.speakify` strips Markdown so a text agent's
+    ``**bold**`` / bullet lists don't get read aloud literally. It is applied to
+    the answer (sequential) or to each sentence (streaming); ``None`` leaves the
+    text untouched.
+
     ``clock`` is an injectable ``() -> float`` monotonic-seconds source (defaults
     to :func:`time.monotonic`) used to stamp each event's ``at_ms`` offset; a
     test passes a deterministic clock to assert exact latency numbers.
     """
-    from movate.core.models import RunRequest  # noqa: PLC0415 - lazy: keep import light
-
     _now = clock if clock is not None else time.monotonic
     _t0 = _now()
 
@@ -272,14 +302,20 @@ async def run_voice_pipeline(
         )
 
     # ── Stage 1: STT (audio → text), streaming partials + a final transcript ──
+    # ``pii_redactor`` masks the EMITTED transcript text (captions/logs/obs) while
+    # the agent still runs on the RAW transcript — compliance on the observability
+    # surface without crippling the agent (ADR: redact at the edge, not the input).
+    def _shown(text: str) -> str:
+        return pii_redactor(text) if pii_redactor is not None else text
+
     final_transcript: str | None = None
     try:
         async for tchunk in stt.transcribe(audio_in, language=language, api_key=stt_api_key):
             if tchunk.is_final:
                 final_transcript = tchunk.text
-                yield _stamp(VoiceEvent(kind="transcript.final", text=tchunk.text))
+                yield _stamp(VoiceEvent(kind="transcript.final", text=_shown(tchunk.text)))
             else:
-                yield _stamp(VoiceEvent(kind="transcript.partial", text=tchunk.text))
+                yield _stamp(VoiceEvent(kind="transcript.partial", text=_shown(tchunk.text)))
     except Exception as exc:  # provider down mid-stream → degrade (D8)
         yield _stamp(
             VoiceEvent(
@@ -304,22 +340,41 @@ async def run_voice_pipeline(
         )
         return
 
-    # ── Stage 2: the UNCHANGED text Executor, with token streaming (D11) ──
-    # Decouple the executor's *sync* on_token callback from our *async*
-    # generator with a queue — the exact pattern ``_sse_run_stream`` uses.
+    # ── Stage 2+3 (streaming, opt-in): overlap synthesis with generation ──
+    if tts_streaming:
+        async for streamed_event in _run_streaming_turn(
+            agent=agent,
+            tts=tts,
+            transcript=final_transcript,
+            language=language,
+            session_id=session_id,
+            voice_id=voice_id,
+            codec=codec,
+            tts_api_key=tts_api_key,
+            cancel=cancel,
+            text_filter=text_filter,
+            agent_timeout=agent_timeout,
+            stamp=_stamp,
+        ):
+            yield streamed_event
+        return
+
+    # ── Stage 2: the agent stage (an AgentTurn), with token streaming (D11) ──
+    # Decouple the agent's *sync* on_token callback from our *async* generator
+    # with a queue — the agent streams deltas as it produces them, we forward.
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-    run_request = RunRequest(agent=bundle.spec.name, input={input_key: final_transcript})
 
     async def _drive() -> None:
         try:
-            response = await executor.execute(
-                bundle,
-                run_request,
+            run = agent.run(
+                final_transcript,
                 on_token=lambda delta: queue.put_nowait(("token", delta)),
-                tenant_id_override=tenant_id,
+                language=language,
+                session_id=session_id,
             )
-            await queue.put(("result", response))
-        except Exception as exc:  # surface ANY failure as an error event
+            result = await (asyncio.wait_for(run, agent_timeout) if agent_timeout else run)
+            await queue.put(("result", result))
+        except Exception as exc:  # surface ANY failure (incl. timeout) as an error
             await queue.put(("exc", exc))
 
     task = asyncio.create_task(_drive())
@@ -337,24 +392,24 @@ async def run_voice_pipeline(
                     yield _stamp(VoiceEvent(kind="agent.token", text=payload))
                 continue
             if kind == "result":
-                response = payload
-                run_id = response.run_id
-                status = response.status
-                if response.status == "error":
-                    err = response.error
+                result = payload
+                run_id = result.run_id
+                status = result.status
+                if result.error is not None:
+                    err = result.error
                     agent_failed = True
                     yield _stamp(
                         VoiceEvent(
                             kind="error",
-                            message=err.message if err is not None else "run failed",
-                            code=err.type if err is not None else "agent_error",
+                            message=err.message or "agent run failed",
+                            code=err.code or "agent_error",
                             stage="agent",
                         )
                     )
                 else:
-                    # Prefer the agent's human-readable answer for speech; fall
-                    # back to the concatenated streamed tokens.
-                    answer_text = response.human_readable or "".join(token_parts)
+                    # Prefer the agent's answer text for speech; fall back to the
+                    # concatenated streamed tokens.
+                    answer_text = result.answer_text or "".join(token_parts)
                 break
             if kind == "exc":
                 agent_exc = payload
@@ -378,6 +433,9 @@ async def run_voice_pipeline(
         return
 
     # ── Stage 3: TTS (text → audio), streaming the answer back as audio ──
+    if text_filter is not None and answer_text:
+        answer_text = text_filter(answer_text)
+
     async def _answer_text_stream() -> AsyncIterator[str]:
         # Feed the whole answer as one delta. (A streaming-native TTS would
         # benefit from the per-token stream; the buffered OpenAI adapter
@@ -427,3 +485,228 @@ async def run_voice_pipeline(
     # as an error. A plain successful turn keeps its original run status.
     done_status = "interrupted" if interrupted else status
     yield _stamp(VoiceEvent(kind="done", run_id=run_id, status=done_status))
+
+
+# Sentinel marking both concurrent phases finished (drained from the event queue).
+_PHASES_DONE = object()
+
+
+async def _run_streaming_turn(
+    *,
+    agent: AgentTurn,
+    tts: TextToSpeechProvider,
+    transcript: str,
+    language: str | None,
+    session_id: str | None,
+    voice_id: str,
+    codec: AudioCodec,
+    tts_api_key: str | None,
+    cancel: asyncio.Event | None,
+    text_filter: Callable[[str], str] | None,
+    agent_timeout: float | None,
+    stamp: Any,
+) -> AsyncIterator[VoiceEvent]:
+    """Run the agent and TTS concurrently, streaming sentences as they complete.
+
+    The agent phase forwards ``agent.token`` events and splits the token stream
+    into sentences (:class:`~movate.voice.chunking.SentenceChunker`), pushing each to
+    a sentence queue. The TTS phase synthesizes that sentence stream and forwards
+    ``tts.audio`` events. Both funnel into one event queue so the caller yields
+    them interleaved, in real-time order — the overlap that buys time-to-first-
+    audio. A ``done`` is emitted at the end unless the agent failed (mirroring the
+    sequential path, which ends on the agent error with no ``done``).
+    """
+    sentence_q: asyncio.Queue[str | None] = asyncio.Queue()
+    event_q: asyncio.Queue[Any] = asyncio.Queue()
+    state: dict[str, Any] = {
+        "run_id": "",
+        "status": "",
+        "agent_failed": False,
+        "interrupted": False,
+    }
+
+    async def _agent_phase() -> None:
+        token_q: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        chunker = SentenceChunker()
+        token_parts: list[str] = []
+
+        async def _drive() -> None:
+            try:
+                run = agent.run(
+                    transcript,
+                    on_token=lambda d: token_q.put_nowait(("token", d)),
+                    language=language,
+                    session_id=session_id,
+                )
+                res = await (asyncio.wait_for(run, agent_timeout) if agent_timeout else run)
+                await token_q.put(("result", res))
+            except Exception as exc:
+                await token_q.put(("exc", exc))
+
+        drive_task = asyncio.create_task(_drive())
+        try:
+            while True:
+                kind, payload = await token_q.get()
+                if kind == "token":
+                    if payload:
+                        token_parts.append(payload)
+                        await event_q.put(stamp(VoiceEvent(kind="agent.token", text=payload)))
+                        for sentence in chunker.feed(payload):
+                            await sentence_q.put(sentence)
+                    continue
+                if kind == "result":
+                    res = payload
+                    state["run_id"] = res.run_id
+                    state["status"] = res.status
+                    if res.error is not None:
+                        state["agent_failed"] = True
+                        await event_q.put(
+                            stamp(
+                                VoiceEvent(
+                                    kind="error",
+                                    message=res.error.message or "agent run failed",
+                                    code=res.error.code or "agent_error",
+                                    stage="agent",
+                                )
+                            )
+                        )
+                    else:
+                        tail = chunker.flush()
+                        if tail:
+                            await sentence_q.put(tail)
+                        # A non-streaming agent (no on_token) → speak its answer_text.
+                        if not token_parts and res.answer_text:
+                            await sentence_q.put(res.answer_text)
+                    break
+                if kind == "exc":
+                    state["agent_failed"] = True
+                    await event_q.put(
+                        stamp(
+                            VoiceEvent(
+                                kind="error",
+                                message=str(payload) or payload.__class__.__name__,
+                                code="agent_error",
+                                stage="agent",
+                            )
+                        )
+                    )
+                    break
+        finally:
+            if not drive_task.done():
+                drive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await drive_task
+            await sentence_q.put(None)  # close the sentence stream
+
+    async def _tts_phase() -> None:
+        # Barge-in before synthesis even starts → speak nothing (don't invoke TTS).
+        if cancel is not None and cancel.is_set():
+            state["interrupted"] = True
+            return
+
+        # Synthesize ONE sentence at a time: sentence N is spoken while the agent
+        # is still generating sentence N+1. (A single synthesize() fed the whole
+        # sentence stream would only overlap for streaming-native adapters; a
+        # per-sentence call overlaps for buffered adapters too — the real win.)
+        while True:
+            sentence = await sentence_q.get()
+            if sentence is None:
+                return  # agent finished, no more sentences
+            if cancel is not None and cancel.is_set():
+                state["interrupted"] = True
+                return
+
+            # Voice-shape each sentence just before synthesis (strip Markdown,
+            # etc.); a chunk that filters down to nothing is skipped.
+            if text_filter is not None:
+                sentence = text_filter(sentence)
+                if not sentence:
+                    continue
+
+            async def _one(_text: str = sentence) -> AsyncIterator[str]:
+                yield _text
+
+            audio_stream = tts.synthesize(
+                _one(), voice_id=voice_id, codec=codec, api_key=tts_api_key
+            )
+            try:
+                async for achunk in audio_stream:
+                    if cancel is not None and cancel.is_set():
+                        state["interrupted"] = True
+                        return
+                    await event_q.put(stamp(VoiceEvent(kind="tts.audio", audio=achunk)))
+            except Exception as exc:
+                await event_q.put(
+                    stamp(
+                        VoiceEvent(
+                            kind="error",
+                            message=str(exc) or exc.__class__.__name__,
+                            code="tts_error",
+                            stage="tts",
+                        )
+                    )
+                )
+                return  # stop speaking further sentences after a TTS failure
+            finally:
+                aclose = getattr(audio_stream, "aclose", None)
+                if aclose is not None:
+                    with contextlib.suppress(Exception):
+                        await aclose()
+
+    async def _both() -> None:
+        # Run the agent and TTS concurrently, but race them against the barge-in
+        # signal so a cancel fired while a phase is *idle* (e.g. TTS waiting on
+        # the next sentence while the agent is still thinking) still interrupts
+        # promptly — and cancels the agent so we don't burn tokens generating an
+        # answer the caller cut off (and ``done`` doesn't wait for it).
+        agent_task = asyncio.create_task(_agent_phase())
+        tts_task = asyncio.create_task(_tts_phase())
+        phases: asyncio.Future[Any] = asyncio.gather(agent_task, tts_task)
+        cancel_task: asyncio.Future[Any] | None = (
+            asyncio.ensure_future(cancel.wait()) if cancel is not None else None
+        )
+        try:
+            if cancel_task is None:
+                await phases
+            else:
+                done, _pending = await asyncio.wait(
+                    {phases, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if cancel_task in done:
+                    state["interrupted"] = True
+        except Exception:
+            pass
+        finally:
+            for task in (agent_task, tts_task):
+                if not task.done():
+                    task.cancel()
+            if cancel_task is not None and not cancel_task.done():
+                cancel_task.cancel()
+            # Drain BOTH the inner tasks AND the outer `phases` Gather so
+            # asyncio doesn't surface a "_GatheringFuture exception was never
+            # retrieved" warning when barge-in cancels mid-flight.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.gather(agent_task, tts_task, return_exceptions=True)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await phases
+            if cancel_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await cancel_task
+            await event_q.put(_PHASES_DONE)
+
+    orchestrator = asyncio.create_task(_both())
+    try:
+        while True:
+            item = await event_q.get()
+            if item is _PHASES_DONE:
+                break
+            yield item
+    finally:
+        if not orchestrator.done():
+            orchestrator.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await orchestrator
+
+    if not state["agent_failed"]:
+        done_status = "interrupted" if state["interrupted"] else state["status"]
+        yield stamp(VoiceEvent(kind="done", run_id=state["run_id"], status=done_status))

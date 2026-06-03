@@ -782,21 +782,29 @@ async def _stream_voice_pipeline_turn(
     Returns ``True`` when the session should end (the watcher saw a ``close``
     during the turn), else ``False`` to run the next turn.
     """
+    from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
     from movate.voice import run_voice_pipeline  # noqa: PLC0415
 
     cancel = asyncio.Event()
     buffered: list[dict[str, Any]] = []
     watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
     latency_events: list[Any] = []
+    # ADR 067 D4: the mdk Executor enters the framework-neutral pipeline as an
+    # ``AgentTurn`` adapter — the only place the runtime threads bundle /
+    # tenant / input_key into the voice path. The pipeline sees the seam, not
+    # the executor.
+    agent = ExecutorAgentTurn(
+        executor=executor,
+        bundle=bundle,
+        tenant_id=tenant_id,
+        input_key=config.input_key,
+    )
     try:
         async for event in run_voice_pipeline(
             audio_in=audio_in,
             stt=stt,
             tts=tts,
-            executor=executor,
-            bundle=bundle,
-            tenant_id=tenant_id,
-            input_key=config.input_key,
+            agent=agent,
             language=config.language,
             voice_id=config.voice_id,
             stt_api_key=stt_api_key,

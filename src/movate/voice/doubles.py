@@ -7,16 +7,79 @@ against them, and capture what they were fed in plain lists so a test can
 assert directly (``assert stt.received == [...]``). No network, no SDK, no
 audio libs — usable from a default install with no ``mdk[voice]`` extra.
 
-These live in ``movate.voice`` (not ``tests/``) so an agent author writing
+These live in ``mdk_voice`` (not ``tests/``) so an agent author writing
 voice tests for their own deployment can import them too, same as
-:class:`movate.testing.InMemoryStorage`.
+an in-memory storage double.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
+from movate.voice.agent_turn import AgentTurnError, AgentTurnResult
 from movate.voice.base import AudioChunk, AudioCodec, RealtimeChunk, TranscriptChunk
+
+
+class FakeAgentTurn:
+    """Scripted :class:`~movate.voice.agent_turn.AgentTurn` for pipeline tests.
+
+    Replaces a real agent framework (the mdk ``Executor``, a Lyzr agent) in the
+    voice pipeline so the package is testable with no framework present. It
+    records every transcript it was asked to run in :attr:`prompts`, streams its
+    configured ``answer`` through ``on_token`` (one token per whitespace word,
+    so a test sees ``agent.token`` events), and returns an
+    :class:`~movate.voice.agent_turn.AgentTurnResult`.
+
+    * ``answer`` — the human-readable answer the pipeline speaks via TTS.
+    * ``stream`` — when ``True`` (default) the answer is emitted word-by-word via
+      ``on_token``; set ``False`` to model a non-streaming agent (e.g. Lyzr's
+      buffered ``agent.run``) that returns the whole answer at once.
+    * ``error`` — when set, the turn returns a failed result (no answer), which
+      the pipeline surfaces as a ``stage="agent"`` error.
+    * ``answer_in_result`` — when ``False``, the result's ``answer_text`` is left
+      empty so the pipeline's fall-back-to-streamed-tokens path is exercised.
+    """
+
+    name = "fake_agent"
+    version = "0.0.1"
+
+    def __init__(
+        self,
+        answer: str = "spoken answer",
+        *,
+        stream: bool = True,
+        error: AgentTurnError | None = None,
+        answer_in_result: bool = True,
+        run_id: str = "run-fake",
+    ) -> None:
+        self._answer = answer
+        self._stream = stream
+        self._error = error
+        self._answer_in_result = answer_in_result
+        self._run_id = run_id
+        self.prompts: list[str] = []
+        self.session_ids: list[str | None] = []
+        self.languages: list[str | None] = []
+
+    async def run(
+        self,
+        text: str,
+        *,
+        on_token: Callable[[str], None] | None = None,
+        language: str | None = None,
+        session_id: str | None = None,
+    ) -> AgentTurnResult:
+        self.prompts.append(text)
+        self.session_ids.append(session_id)
+        self.languages.append(language)
+        if self._error is not None:
+            return AgentTurnResult(run_id=self._run_id, status="error", error=self._error)
+        if self._stream and on_token is not None and self._answer:
+            words = self._answer.split(" ")
+            for i, word in enumerate(words):
+                on_token(word if i == 0 else " " + word)
+        answer_text = self._answer if self._answer_in_result else ""
+        return AgentTurnResult(answer_text=answer_text, run_id=self._run_id, status="ok")
 
 
 class FakeSTT:

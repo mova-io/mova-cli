@@ -10,7 +10,7 @@ hard-coded here. One provider, both directions: STT streams partial→final
 transcripts, TTS synthesizes the agent's streamed answer back to audio.
 
 The ``azure.cognitiveservices.speech`` SDK import is **lazy + guarded** exactly
-like :mod:`movate.voice.openai_speech` / :mod:`movate.providers.openai_native`:
+like :mod:`movate.voice.openai_speech`:
 nothing here imports the SDK at module scope, so a runtime/CLI installed
 without ``mdk[voice]`` is wholly unaffected (ADR 048 D9). The SDK objects are
 constructed on first use; tests inject fakes via the ``recognizer_factory=`` /
@@ -87,7 +87,7 @@ def _require_azure_speech() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised via the import-guard test
         raise ImportError(
             "the 'azure-cognitiveservices-speech' package is required for the "
-            "Azure Speech voice adapters. Install with: uv add 'movate-cli[voice]'"
+            "Azure Speech voice adapters. Install with: pip install 'mdk-voice[azure]'"
         ) from exc
     return _speechsdk
 
