@@ -732,7 +732,7 @@ async def _send_voice_event(websocket: WebSocket, event: Any) -> None:
         await websocket.send_json(_voice_ctrl(event.kind, text=event.text))
 
 
-async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
+async def _send_voice_latency(websocket: WebSocket, events: list[Any], metrics: Any = None) -> None:
     """Emit one ``latency`` control frame for a finished pipeline turn.
 
     Derives per-stage latencies from the ``at_ms`` offsets stamped on the
@@ -741,6 +741,12 @@ async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
     UI renders as the "responded in {X}ms" badge. Additive (a client that
     doesn't know the frame ignores it); silent when there's nothing to report
     (e.g. an STT-stage error produced no milestones).
+
+    When ``metrics`` (a :class:`~movate.voice.observer.MetricsObserver`) is
+    given and a speculation fired this turn, a ``speculation`` block
+    (started / committed / cancelled / commit_ratio / avg_head_start_ms) rides
+    along — the ADR 070/073 A/B signal the demo perf panel + runbook aggregate
+    to decide the ``speculative`` default-flip. Omitted when nothing speculated.
     """
     from movate.voice.pipeline import (  # noqa: PLC0415 - lazy, voice-only path
         compute_turn_latency,
@@ -751,16 +757,18 @@ async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
     badge = format_latency_badge(latency)
     if not badge:
         return
-    await websocket.send_json(
-        _voice_ctrl(
-            "latency",
-            badge=badge,
-            responded_in_ms=latency.responded_in_ms,
-            stt_final_ms=latency.stt_final_ms,
-            agent_first_token_ms=latency.agent_first_token_ms,
-            tts_first_audio_ms=latency.tts_first_audio_ms,
-        )
+    fields: dict[str, Any] = dict(
+        badge=badge,
+        responded_in_ms=latency.responded_in_ms,
+        stt_final_ms=latency.stt_final_ms,
+        agent_first_token_ms=latency.agent_first_token_ms,
+        tts_first_audio_ms=latency.tts_first_audio_ms,
     )
+    if metrics is not None:
+        spec = metrics.speculation_snapshot()
+        if spec["started"]:
+            fields["speculation"] = spec
+    await websocket.send_json(_voice_ctrl("latency", **fields))
 
 
 async def _watch_voice_barge_in(
@@ -832,11 +840,17 @@ async def _stream_voice_pipeline_turn(
     """
     from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
     from movate.voice import run_voice_pipeline  # noqa: PLC0415
+    from movate.voice.observer import MetricsObserver  # noqa: PLC0415
 
     cancel = asyncio.Event()
     buffered: list[dict[str, Any]] = []
     watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
     latency_events: list[Any] = []
+    # Per-turn observer: tallies this turn's speculation outcomes (started /
+    # committed / cancelled + head-start) so the latency badge can carry the
+    # ADR 070/073 A/B signal alongside the per-stage timings. Off-path for any
+    # non-speculative turn (counts stay zero).
+    metrics = MetricsObserver()
     # ADR 067 D4: the mdk Executor enters the framework-neutral pipeline as an
     # ``AgentTurn`` adapter — the only place the runtime threads bundle /
     # tenant / input_key into the voice path. The pipeline sees the seam, not
@@ -860,13 +874,14 @@ async def _stream_voice_pipeline_turn(
             keyterms=config.keyterms or None,
             tts_streaming=config.tts_streaming,
             speculative=config.speculative,
+            observer=metrics,
             cancel=cancel,
         ):
             latency_events.append(event)
             if event.kind == "done":
                 # Emit the latency badge just BEFORE done so it lands inside the
                 # turn (a client draining to ``done`` still sees it).
-                await _send_voice_latency(websocket, latency_events)
+                await _send_voice_latency(websocket, latency_events, metrics)
             await _send_voice_event(websocket, event)
     finally:
         watcher.cancel()

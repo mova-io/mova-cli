@@ -100,6 +100,16 @@ async def test_speculation_commits_when_interim_matches_final() -> None:
     assert obs.events["speculation_started"] == 1
     assert obs.events["speculation_committed"] == 1
     assert obs.events.get("speculation_cancelled", 0) == 0
+    # The A/B snapshot (ADR 070/073): one started, one committed → ratio 1.0,
+    # with a measured (non-negative) head-start the commit bought.
+    snap = obs.speculation_snapshot()
+    assert snap["started"] == 1
+    assert snap["committed"] == 1
+    assert snap["cancelled"] == 0
+    assert snap["commit_ratio"] == 1.0
+    assert snap["avg_head_start_ms"] >= 0.0
+    # The full snapshot embeds the same block under "speculation".
+    assert obs.snapshot()["speculation"] == snap
 
 
 async def test_speculation_cancels_when_caller_keeps_talking() -> None:
@@ -132,6 +142,10 @@ async def test_speculation_cancels_when_caller_keeps_talking() -> None:
     assert obs.events["speculation_started"] == 1
     assert obs.events["speculation_cancelled"] == 1
     assert obs.events.get("speculation_committed", 0) == 0
+    # A cancelled-only turn → commit_ratio 0.0, no head-start booked.
+    snap = obs.speculation_snapshot()
+    assert snap["commit_ratio"] == 0.0
+    assert snap["avg_head_start_ms"] == 0.0
 
 
 async def test_no_speculation_when_agent_not_speculatable() -> None:

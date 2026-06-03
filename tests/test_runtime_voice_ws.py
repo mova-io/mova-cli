@@ -29,9 +29,11 @@ from movate.core.auth import ALL_SCOPES, SCOPE_READ, ApiKeyEnv, mint_api_key
 from movate.core.models import VoiceConfig
 from movate.core.provider_keys import ENV_PROVIDER_KEY_SECRET, mint_tenant_provider_key
 from movate.runtime import build_app
-from movate.runtime.app import _seed_voice_turn_config, _VoiceTurnConfig
+from movate.runtime.app import _seed_voice_turn_config, _send_voice_latency, _VoiceTurnConfig
 from movate.testing import InMemoryStorage
 from movate.voice import AudioChunk, FakeRealtime, FakeSTT, FakeTTS
+from movate.voice.observer import MetricsObserver
+from movate.voice.pipeline import VoiceEvent
 
 
 @pytest.fixture
@@ -200,6 +202,56 @@ async def test_voice_ws_emits_latency_frame_before_done(
     assert "responded in" in latency["badge"]
     # The per-stage fields are present for the trace/observability consumer.
     assert "responded_in_ms" in latency
+    # A non-speculative turn carries NO speculation block (back-compat).
+    assert "speculation" not in latency
+
+
+class _FakeWS:
+    """Minimal WebSocket double capturing ``send_json`` payloads."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_json(self, obj: dict) -> None:
+        self.sent.append(obj)
+
+
+async def test_send_voice_latency_carries_speculation_block_when_fired() -> None:
+    """ADR 070/073 A/B signal: when a speculation fired, the latency frame
+    carries a ``speculation`` block (committed / commit_ratio / head-start) the
+    demo perf panel + runbook aggregate. Gated on ``started`` so a
+    non-speculative turn stays byte-for-byte unchanged."""
+    events = [
+        VoiceEvent(kind="transcript.final", text="hi", at_ms=100.0),
+        VoiceEvent(kind="agent.token", text="he", at_ms=300.0),
+    ]
+    metrics = MetricsObserver()
+    metrics.on_event("speculation_started", chars=2)
+    metrics.on_event("speculation_committed", head_start_ms=420)
+
+    ws = _FakeWS()
+    await _send_voice_latency(ws, events, metrics)
+
+    assert len(ws.sent) == 1
+    frame = ws.sent[0]
+    assert frame["type"] == "latency"
+    spec = frame["speculation"]
+    assert spec["committed"] == 1
+    assert spec["commit_ratio"] == 1.0
+    assert spec["avg_head_start_ms"] == 420.0
+
+
+async def test_send_voice_latency_omits_speculation_when_idle() -> None:
+    """No speculation fired → no ``speculation`` key (additive, opt-in)."""
+    events = [
+        VoiceEvent(kind="transcript.final", text="hi", at_ms=100.0),
+        VoiceEvent(kind="agent.token", text="he", at_ms=300.0),
+    ]
+    ws = _FakeWS()
+    await _send_voice_latency(ws, events, MetricsObserver())
+
+    assert len(ws.sent) == 1
+    assert "speculation" not in ws.sent[0]
 
 
 class _SlowTTS:
