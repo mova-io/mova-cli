@@ -292,37 +292,6 @@ class WorkflowSpec(BaseModel):
     entrypoint: str = Field(..., description="ID of the starting node")
     evals: WorkflowEvalsSpec | None = None
 
-    # Workflow runner — picks which backend executes the IR (ADR 054 D2).
-    #
-    # The patterns x runners matrix (default: ``native``):
-    #
-    # * ``native``    — the in-process linear runner that ships in core.
-    #                   Default; preserves the v0.3 behavior for every existing
-    #                   workflow (no flag = no change). Linear graphs only.
-    # * ``langgraph`` — export target for the LangGraph runtime (ADR 030).
-    #                   Selected when an operator runs ``mdk export langgraph``
-    #                   or runs the workflow inside a LangGraph host. Admits
-    #                   the wider graph shapes the IR already models
-    #                   (conditional / fan-out / fan-in).
-    # * ``temporal``  — durable backend (ADR 054). Per-workflow opt-in;
-    #                   requires the ``[temporal]`` extra. The compiler
-    #                   (Phase 1 Track B) lowers the IR to a Temporal workflow
-    #                   + activities; ``mdk worker --backend temporal``
-    #                   (Phase 1 Track C / D12) runs the worker pool. Default
-    #                   stays ``native`` so existing workflows are wholly
-    #                   unaffected (zero behavior change, ADR 054 D2).
-    #
-    # Adding a value here is the additive seam new backends extend; consumers
-    # MUST match exhaustively (mypy + the compiler dispatch enforce it).
-    runtime: Literal["native", "langgraph", "temporal"] = Field(
-        "native",
-        description=(
-            "Workflow runner: 'native' (default, in-process linear), "
-            "'langgraph' (ADR 030 export target), or 'temporal' (ADR 054 "
-            "durable backend, opt-in via mdk[temporal])."
-        ),
-    )
-
     nodes: list[NodeSpec] = Field(..., min_length=1)
     edges: list[EdgeSpec] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
