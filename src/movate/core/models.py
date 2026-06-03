@@ -473,6 +473,13 @@ class SkillImplementationKind(StrEnum):
     up in the runtime registry and called synchronously. Enables
     cross-agent orchestration without the v1.1 LangGraph machinery."""
 
+    EXEC = "exec"
+    """Run any executable as a tool via subprocess + JSON stdin/stdout.
+    The raw-script escape hatch per ADR 052 D2 -- how a Node CLI, a Java
+    jar, a Go binary, or a bare Python script becomes a tool without an
+    MCP server or an HTTP service. Sandboxed: configurable timeout,
+    resource limits."""
+
 
 class SkillImplementation(BaseModel):
     """Backend declaration for a skill.
@@ -1562,12 +1569,34 @@ class AgentSpec(BaseModel):
             result.append(SkillRef._from_raw(item))
         return result
 
+    # ---- ADR 052: shared tool registry references ----
+    # Optional ``tools: [name@version]`` block for the tool registry.
+    # Each entry is a ``name@version`` string (or bare name for any
+    # version) that the ToolResolver late-binds to a ToolDescriptor at
+    # agent-load time. Resolved descriptors are converted to SkillBundles
+    # the executor can dispatch alongside the per-agent skills.
+    # SCHEMA FLAG (additive, backward-compatible): empty list is the
+    # default; existing agent.yaml files that omit this block load
+    # unchanged.
+
+    tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tool registry references this agent depends on (ADR 052). "
+            "Each entry is a ``name@version`` string (e.g. "
+            "``'jira.create-issue@^1.2.0'``) or a bare name (any version). "
+            "Resolved at agent-load time via the ToolResolver against the "
+            "tenant's tool registry. Empty list (the default) means no "
+            "registry tools; the agent uses only its per-agent skills."
+        ),
+    )
+
     # ---- v0.6 shared contexts (ADR 002) ----
     # Names referencing `contexts/<name>.md` files in the project's
     # contexts/ folder. Each named context's body is prepended to the
     # rendered prompt at execution time, in declaration order, with a
     # `\n\n---\n\n` separator. Solves the "stop copy-pasting the style
-    # guide into every prompt.md" pain. Pure markdown — no templating,
+    # guide into every prompt.md" pain. Pure markdown -- no templating,
     # no Python, no Jinja side effects. See docs/adr/002-skills-and-contexts.md.
 
     contexts: list[str] = Field(

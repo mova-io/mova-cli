@@ -169,6 +169,9 @@ class InMemoryStorage:
         # Claude-orchestrated audit records (read-only audit pipeline).
         # Empty by default — populated only when an audit job completes.
         self.audits: list[AuditRecord] = []
+        # ADR 052: tool registry descriptors. Keyed by
+        # (name, version, scope, tenant_id) for upsert dedup.
+        self.tool_descriptors: list[Any] = []
 
     async def init(self) -> None:
         return None
@@ -2427,6 +2430,83 @@ class InMemoryStorage:
             # from a missing record.
             return None
         return row
+
+    # ------------------------------------------------------------------
+    # Tool registry (ADR 052)
+    # ------------------------------------------------------------------
+
+    async def save_tool_descriptor(self, descriptor: Any) -> None:
+        # Upsert on (name, version, scope, tenant_id).
+        for i, existing in enumerate(self.tool_descriptors):
+            if (
+                existing.name == descriptor.name
+                and existing.version == descriptor.version
+                and existing.scope == descriptor.scope
+                and existing.tenant_id == descriptor.tenant_id
+            ):
+                self.tool_descriptors[i] = descriptor
+                return
+        self.tool_descriptors.append(descriptor)
+
+    async def get_tool_descriptor(
+        self,
+        name: str,
+        version: str | None,
+        scope: str,
+        tenant_id: str,
+    ) -> Any | None:
+        matches = [
+            d
+            for d in self.tool_descriptors
+            if d.name == name and d.scope == scope and d.tenant_id == tenant_id
+        ]
+        if not matches:
+            return None
+        if version is not None:
+            exact = [d for d in matches if d.version == version]
+            return exact[0] if exact else None
+        # Return latest by updated_at (or first if no timestamp).
+        matches.sort(
+            key=lambda d: d.updated_at or d.created_at or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        return matches[0]
+
+    async def list_tool_descriptors(
+        self,
+        scope: str | None,
+        tenant_id: str,
+        tags: list[str] | None,
+    ) -> list[Any]:
+        result = []
+        for d in self.tool_descriptors:
+            if d.tenant_id != tenant_id and d.scope != "movate":
+                continue
+            if scope is not None and d.scope != scope:
+                continue
+            if tags and not all(t in d.tags for t in tags):
+                continue
+            result.append(d)
+        result.sort(key=lambda d: (d.name, d.version))
+        return result
+
+    async def delete_tool_descriptor(
+        self,
+        name: str,
+        version: str,
+        scope: str,
+        tenant_id: str,
+    ) -> bool:
+        for i, d in enumerate(self.tool_descriptors):
+            if (
+                d.name == name
+                and d.version == version
+                and d.scope == scope
+                and d.tenant_id == tenant_id
+            ):
+                self.tool_descriptors.pop(i)
+                return True
+        return False
 
     async def close(self) -> None:
         return None
