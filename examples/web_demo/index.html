@@ -595,7 +595,25 @@ button.active { background:var(--accent); color:white; }
       <button data-speculate="on" title="Speculatively start the agent on a stable interim; recovers endpointing latency, may cancel + re-run">on</button>
     </div>
     <span class="muted detailed-only" id="speculate-stats" style="font-size:11px;margin-left:8px;"
-          title="Live commit/cancel ratio for speculative kickoff this session"></span>
+          title="Live commit/cancel ratio + avg head-start for speculative kickoff this session"></span>
+    <!-- ADR 073 D3 endpointing override — Detailed only -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;"
+          title="STT silence-hold (ms) before the turn is declared finished — the dominant fixed latency. Lower it for snappy back-and-forth (risk: barge-in on a pause); raise it for deliberate speakers. Blank = adapter default (1500 ms).">Endpointing</span>
+    <input id="endpointing-input" type="number" step="100" min="0" max="10000" placeholder="1500"
+           class="detailed-only"
+           title="Silence-hold in ms (blank = 1500 default). Applies to the next turn."
+           style="background:var(--surface);color:var(--text);border:1px solid var(--border);
+                  border-radius:6px;padding:4px 6px;font-size:12px;width:72px;
+                  font-family:'SF Mono',Menlo,monospace;" />
+    <!-- ADR 071 D4 keyterm boosting — Detailed only -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;"
+          title="Domain terms to boost at recognition (names, acronyms, jargon a general model mis-hears). Comma-separated. Blank = the curated demo list.">Keyterms</span>
+    <input id="keyterms-input" type="text" placeholder="VPN, Okta, Mova-iO"
+           class="detailed-only"
+           title="Comma-separated keyterm-boost vocabulary. Applies to the next turn. Blank resets to the demo default."
+           style="background:var(--surface);color:var(--text);border:1px solid var(--border);
+                  border-radius:6px;padding:4px 6px;font-size:12px;width:200px;
+                  font-family:'SF Mono',Menlo,monospace;" />
     <!-- A4 cost-bounded routing — Detailed only -->
     <span class="muted detailed-only" style="font-size:11px;margin-left:16px;">Budget</span>
     <input id="budget-input" type="number" step="0.01" min="0" value="5.00" class="detailed-only"
@@ -1596,7 +1614,11 @@ function renderMetrics(s, turns) {
   const specStats = $('speculate-stats');
   if (specStats && (committed + cancelled) > 0) {
     const rate = Math.round((committed / (committed + cancelled)) * 100);
-    specStats.textContent = `${committed}✓ / ${cancelled}✗ (${rate}% commit)`;
+    // ADR 073 telemetry: avg head-start = the latency each committed speculation
+    // saved (the agent already ran this long when the STT final landed).
+    const headMs = Math.round((s.speculation && s.speculation.avg_head_start_ms) || 0);
+    const head = headMs > 0 ? `, ~${headMs}ms saved/turn` : '';
+    specStats.textContent = `${committed}✓ / ${cancelled}✗ (${rate}% commit${head})`;
   }
   $('m-circuit').textContent = fmtMap(s.circuit_opens) || '—';
   $('m-sil').textContent = `${s.silence_frames_dropped ?? 0} / ${s.silence_frames_kept ?? 0}`;
@@ -2125,6 +2147,19 @@ document.querySelectorAll('#speculate-toggle button').forEach(b => {
     ws.send(JSON.stringify({ event: 'set_speculative', enabled: b.dataset.speculate === 'on' }));
   });
 });
+// ADR 073 D3 endpointing override — push on change/Enter (blank = adapter default).
+function sendEndpointing() {
+  const v = $('endpointing-input').value.trim();
+  ws.send(JSON.stringify({ event: 'set_endpointing', endpointing_ms: v === '' ? null : Number(v) }));
+}
+$('endpointing-input').addEventListener('change', sendEndpointing);
+$('endpointing-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendEndpointing(); });
+// ADR 071 D4 keyterm boosting — push the comma-separated list (blank = demo default).
+function sendKeyterms() {
+  ws.send(JSON.stringify({ event: 'set_keyterms', keyterms: $('keyterms-input').value }));
+}
+$('keyterms-input').addEventListener('change', sendKeyterms);
+$('keyterms-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendKeyterms(); });
 // Currently-voicing collapse toggle — click the h2 to expand / collapse.
 $('lyzr-meta-toggle').addEventListener('click', () => {
   $('lyzr-agent-meta').classList.toggle('collapsed');

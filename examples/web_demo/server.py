@@ -144,14 +144,22 @@ class _FaultSTT:
     def arm(self) -> None:
         self._armed = True
 
-    async def transcribe(self, audio, *, language=None, api_key=None):  # noqa: ANN001,ANN201
+    async def transcribe(  # noqa: ANN001,ANN201
+        self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
+    ):
         if self._armed:
             self._armed = False
             # Drain the buffer so the failover composite can replay it cleanly.
             async for _ in audio:
                 pass
             raise RuntimeError("fault injected (demo)")
-        async for c in self._inner.transcribe(audio, language=language, api_key=api_key):  # type: ignore[attr-defined]
+        async for c in self._inner.transcribe(  # type: ignore[attr-defined]
+            audio,
+            language=language,
+            api_key=api_key,
+            keyterms=keyterms,
+            endpointing_ms=endpointing_ms,
+        ):
             yield c
 
 
@@ -444,9 +452,15 @@ class _KeyedSTT:
         self.name = inner.name
         self.version = getattr(inner, "version", "0")
 
-    async def transcribe(self, audio, *, language=None, api_key=None):  # noqa: ANN001,ANN201
+    async def transcribe(  # noqa: ANN001,ANN201
+        self, audio, *, language=None, api_key=None, keyterms=None, endpointing_ms=None
+    ):
         async for c in self._inner.transcribe(
-            audio, language=language, api_key=self._fixed_key or api_key
+            audio,
+            language=language,
+            api_key=self._fixed_key or api_key,
+            keyterms=keyterms,
+            endpointing_ms=endpointing_ms,
         ):
             yield c
 
@@ -747,6 +761,13 @@ class Session:
         # set_speculative WS event so the demo can A/B it and the dashboard can
         # watch the real commit/cancel ratio (speculation_* events → metrics).
         self.speculative: bool = False
+        # ADR 071 D4 / ADR 073 D3 — per-session voice tuning, editable live from
+        # the UI so the audience can A/B it. Keyterms default to the curated demo
+        # list (merged, de-duped, with the DeepgramSTT constructor list);
+        # endpointing_ms None keeps the adapter default (1500 ms). Both passed
+        # per-turn to run_voice_pipeline; set via set_keyterms / set_endpointing.
+        self.keyterms: list[str] = list(_demo_keyterms())
+        self.endpointing_ms: int | None = None
         # Wrap the failover chain in SilenceGatedSTT so we don't pay per-minute
         # to transcribe dead air — and so the silence-trimmed metric shows up in
         # the dashboard. The observer captures both gate + failover events.
@@ -827,6 +848,39 @@ class Session:
         self.speculative = bool(enabled)
         effective = self.speculative and bool(getattr(self.agent, "speculatable", False))
         return {"enabled": self.speculative, "effective": effective}
+
+    def set_keyterms(self, raw: object) -> dict[str, list[str]]:
+        """ADR 071 D4: replace this session's STT keyterm-boost vocabulary.
+
+        Accepts a list or a comma/newline-separated string. Empty resets to the
+        curated demo list. Returns ``{keyterms}`` so the UI can echo the
+        effective set. Applied per-turn (no adapter rebuild).
+        """
+        if isinstance(raw, str):
+            terms = [t.strip() for t in raw.replace("\n", ",").split(",")]
+        elif isinstance(raw, list):
+            terms = [str(t).strip() for t in raw]
+        else:
+            terms = []
+        cleaned = [t for t in terms if t]
+        self.keyterms = cleaned or list(_demo_keyterms())
+        return {"keyterms": self.keyterms}
+
+    def set_endpointing(self, raw: object) -> dict[str, int | None]:
+        """ADR 073 D3: override the STT silence-hold (ms) for this session.
+
+        ``None``/empty resets to the adapter default (1500 ms). Clamped to
+        [0, 10000]. Returns ``{endpointing_ms}`` for the UI to echo. Applied
+        per-turn (no adapter rebuild) — the audience can A/B the latency floor.
+        """
+        if raw is None or raw == "":
+            self.endpointing_ms = None
+        else:
+            try:
+                self.endpointing_ms = max(0, min(10_000, int(raw)))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                self.endpointing_ms = None
+        return {"endpointing_ms": self.endpointing_ms}
 
     def set_user_keys(self, keys: dict[str, str | None]) -> dict[str, bool]:
         """BYOK — per-session API key overrides. Rebuilds adapter chains.
@@ -2050,6 +2104,16 @@ async def voice(ws: WebSocket) -> None:
                 spec = session.set_speculative(bool(data.get("enabled")))
                 await _send_event(ws, event="speculative", **spec)
                 continue
+            if ev_name == "set_keyterms":
+                # ADR 071 D4: live STT keyterm-boost vocabulary (accuracy A/B).
+                applied = session.set_keyterms(data.get("keyterms"))
+                await _send_event(ws, event="keyterms", **applied)
+                continue
+            if ev_name == "set_endpointing":
+                # ADR 073 D3: live STT silence-hold override (latency-floor A/B).
+                applied = session.set_endpointing(data.get("endpointing_ms"))
+                await _send_event(ws, event="endpointing", **applied)
+                continue
             if ev_name == "set_budget":
                 # A4: per-session cost ceiling. None / 0 / negative → unbounded.
                 raw = data.get("usd")
@@ -2166,6 +2230,12 @@ async def voice(ws: WebSocket) -> None:
                     # speculation_started/committed/cancelled events flow to the
                     # metrics + trail (the live cancel-ratio the dashboard shows).
                     speculative=session.speculative,
+                    # ADR 071 D4 / ADR 073 D3 — per-session keyterm boosting +
+                    # endpointing override, both editable live from the UI so the
+                    # audience can A/B accuracy (keyterms) and the silence-wait
+                    # latency floor (endpointing) without a redeploy.
+                    keyterms=session.keyterms or None,
+                    endpointing_ms=session.endpointing_ms,
                     observer=session.observer,
                 ):
                     events.append(ev)
