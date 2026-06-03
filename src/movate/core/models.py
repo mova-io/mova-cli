@@ -1324,6 +1324,66 @@ class VoiceConfig(BaseModel):
             "``None`` → auto-detect / provider default."
         ),
     )
+    # ---- ADR 071 — per-agent latency/cost tuning (ADDITIVE, OPTIONAL) ----
+    tts_streaming: bool | None = Field(
+        default=None,
+        description=(
+            "Sentence-level TTS overlap for this agent (ADR 048 D7) — speak "
+            "sentence one while the agent is still generating sentence two, the "
+            "biggest time-to-first-audio win.  ``None`` (default / absent block) "
+            "uses the runtime default; ``true``/``false`` pins it for this agent. "
+            "The WS event protocol is unchanged either way (consumers key off the "
+            "event ``kind``)."
+        ),
+    )
+    speculative: bool = Field(
+        default=False,
+        description=(
+            "Speculative agent kickoff for this agent (ADR 070) — start the agent "
+            "on a stable interim transcript, before STT endpoints, to recover the "
+            "~1.5s endpointing wait; commit if the final matches, else cancel and "
+            "re-run.  Off by default (it changes the cost profile via cancelled "
+            "runs).  Only fires when the agent stage is cancel-safe — the mdk "
+            "Executor is, so an mdk agent honors this flag."
+        ),
+    )
+    keyterms: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Domain vocabulary to **boost** at recognition time for this agent "
+            "(ADR 071 D4) — names, acronyms, jargon a general STT model mis-hears "
+            "(e.g. ``['VPN', 'Okta', 'Mova-iO']``).  Passed per-turn to the STT "
+            "provider; boosting-capable providers (Deepgram) honor it, others "
+            "ignore it.  Empty (the default) sends no boosting."
+        ),
+    )
+    endpointing_ms: int | None = Field(
+        default=None,
+        ge=0,
+        le=10_000,
+        description=(
+            "Silence-hold (ms) this agent waits before declaring the speaker's "
+            "turn finished (ADR 073 D3) — the dominant fixed latency of a "
+            "pipeline turn.  Raise it for deliberate speakers (fewer mid-pause "
+            "barge-ins), lower it for snappy command-style agents.  Passed "
+            "per-turn to the STT provider; endpointing-capable providers "
+            "(Deepgram) honor it, others ignore it.  ``None`` (the default) "
+            "keeps the runtime/adapter default (1500 ms) — byte-for-byte "
+            "unchanged."
+        ),
+    )
+    endpointing_adaptive: bool = Field(
+        default=False,
+        description=(
+            "Adaptively tune the silence-hold within a session from observed "
+            "turn cadence (ADR 073 Phase 3) — shorten it when speakers finish "
+            "cleanly (high speculation commit-ratio), lengthen it when they run "
+            "past their interims.  Seeded from ``endpointing_ms`` (or 1500) and "
+            "bounded.  Off by default; requires the streaming/speculatable path "
+            "to have a cadence signal.  When off, ``endpointing_ms`` is used "
+            "verbatim — byte-for-byte unchanged."
+        ),
+    )
 
 
 class AgentSpec(BaseModel):

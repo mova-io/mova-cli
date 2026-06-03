@@ -122,14 +122,29 @@ class _FakeDeepgramClient:
         self.listen = _FakeListen(connection)
 
 
-def _dg_event(transcript: str, *, is_final: bool, confidence: float | None = None) -> dict:
-    """Build a Deepgram-shaped transcript event (channel.alternatives[0])."""
+def _dg_event(
+    transcript: str,
+    *,
+    is_final: bool,
+    speech_final: bool | None = None,
+    confidence: float | None = None,
+) -> dict:
+    """Build a Deepgram-shaped transcript event (channel.alternatives[0]).
+
+    Deepgram emits TWO independent flags:
+      - ``is_final``: this segment's text won't be revised (mid-stream commits).
+      - ``speech_final``: VAD decided the speaker finished the turn.
+
+    Default ``speech_final = is_final`` keeps existing tests' semantics — the
+    short-utterance case where the two coincide. Pass speech_final=False with
+    is_final=True to model a mid-stream commit during continuous speech.
+    """
     alt: dict[str, Any] = {"transcript": transcript}
     if confidence is not None:
         alt["confidence"] = confidence
     return {
         "is_final": is_final,
-        "speech_final": is_final,
+        "speech_final": is_final if speech_final is None else speech_final,
         "channel": {"alternatives": [alt]},
     }
 
@@ -142,7 +157,7 @@ async def test_deepgram_streams_partials_then_final_and_sends_audio() -> None:
             _dg_event("the full utterance", is_final=True, confidence=0.97),
         ]
     )
-    stt = DeepgramSTT(client=_FakeDeepgramClient(conn))
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
     chunks = [
         c async for c in stt.transcribe(_audio_stream(b"aa", b"bb"), language="en-US", api_key="k")
     ]
@@ -154,6 +169,163 @@ async def test_deepgram_streams_partials_then_final_and_sends_audio() -> None:
     assert conn.sent == [b"aa", b"bb"]
     # The language hint reached the socket options.
     assert conn.started_with["language"] == "en-US"
+    # Endpointing defaults (regression — Deepgram's stock ~10 ms cuts speech
+    # off on mid-sentence pauses; we ship 1500 + utterance_end backstop 2500
+    # which tolerates natural pauses without adding multi-sec turn-end lag).
+    assert conn.started_with["endpointing"] == 1500
+    assert conn.started_with["utterance_end_ms"] == 2500
+
+
+async def test_deepgram_mid_stream_is_final_does_not_end_turn() -> None:
+    """Regression: continuous speech with Deepgram per-segment commits.
+
+    User speaks a long multi-clause prompt with no real pause. Deepgram
+    commits the first clause (``is_final=True, speech_final=False``) while
+    the user is still talking, then continues with partials, then the full
+    end-of-turn (``speech_final=True``).
+
+    Before the fix, the adapter yielded ``is_final=True`` on the first
+    commit and the single-turn voice pipeline ran the agent on that
+    partial — chopping the prompt at a comma. After the fix, the only
+    ``is_final=True`` we yield is the speech_final at the end, with the
+    full accumulated transcript.
+    """
+    conn = _FakeDeepgramConnection(
+        [
+            _dg_event("One of the VIP users", is_final=False),
+            # Mid-stream commit — Deepgram is sure of these words, but the
+            # user is STILL TALKING (no silence → no speech_final).
+            _dg_event(
+                "One of the VIP users reported that his VPN connects",
+                is_final=True,
+                speech_final=False,
+            ),
+            _dg_event(
+                "One of the VIP users reported that his VPN connects but no",
+                is_final=False,
+            ),
+            _dg_event(
+                "but no network access help me resolve this",
+                is_final=True,
+                speech_final=True,
+                confidence=0.96,
+            ),
+        ]
+    )
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
+    chunks = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    # Exactly ONE is_final=True yielded — the speech_final one. Mid-stream
+    # commit must NOT have been forwarded as final.
+    finals = [c for c in chunks if c.is_final]
+    assert len(finals) == 1, f"expected 1 final, got {len(finals)}: {[c.text for c in finals]}"
+    # And it carries the FULL accumulated utterance, not just the last segment.
+    assert "VIP users" in finals[0].text
+    assert "network access" in finals[0].text
+    assert "help me resolve this" in finals[0].text
+
+
+async def test_deepgram_custom_endpointing_kwargs_reach_socket() -> None:
+    """A caller wanting snappy back-and-forth can dial endpointing down."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        endpointing_ms=400,
+        utterance_end_ms=None,  # disable backstop
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert conn.started_with["endpointing"] == 400
+    assert "utterance_end_ms" not in conn.started_with
+
+
+async def test_deepgram_per_call_endpointing_overrides_constructor() -> None:
+    """ADR 073 D3: a per-call ``endpointing_ms`` wins over the constructor value
+    for that turn (a deliberate-speaker agent holds longer)."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        endpointing_ms=1500,  # session/adapter default
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k", endpointing_ms=800)]
+    assert conn.started_with["endpointing"] == 800
+
+
+async def test_deepgram_per_call_endpointing_none_keeps_constructor() -> None:
+    """``endpointing_ms=None`` (the default) keeps the adapter value — byte-for-
+    byte the prior behavior."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        endpointing_ms=1500,
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert conn.started_with["endpointing"] == 1500
+
+
+async def test_deepgram_keyterms_reach_socket_as_keyterm_on_nova3() -> None:
+    """Domain vocab is boosted via nova-3 ``keyterm`` prompting (accuracy win)."""
+    conn = _FakeDeepgramConnection([_dg_event("VPN for the VIP", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        keyterms=["VPN", "VIP", "Mova-iO"],
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert conn.started_with["keyterm"] == ["VPN", "VIP", "Mova-iO"]
+    assert "keywords" not in conn.started_with
+
+
+async def test_deepgram_keyterms_fall_back_to_keywords_on_nova2() -> None:
+    """On nova-2 the same list rides the legacy ``keywords`` boosting param."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        model="nova-2",
+        keyterms=["Okta", "SSO"],
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert conn.started_with["keywords"] == ["Okta", "SSO"]
+    assert "keyterm" not in conn.started_with
+
+
+async def test_deepgram_no_keyterms_sends_neither_param() -> None:
+    """Default (no keyterms) is byte-for-byte the prior behavior."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k")]
+    assert "keyterm" not in conn.started_with
+    assert "keywords" not in conn.started_with
+
+
+async def test_deepgram_per_call_keyterms_merge_with_constructor() -> None:
+    """ADR 071 D4: per-call keyterms union with the constructor list, de-duped."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        keyterms=["VPN", "Okta"],  # tenant/default level
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [
+        c
+        async for c in stt.transcribe(
+            _audio_stream(b"a"),
+            api_key="k",
+            keyterms=["Okta", "Mova-iO"],  # per-agent
+        )
+    ]
+    # Union, order-preserving, de-duped (Okta appears once).
+    assert conn.started_with["keyterm"] == ["VPN", "Okta", "Mova-iO"]
+
+
+async def test_deepgram_per_call_keyterms_only() -> None:
+    """Per-call keyterms work with no constructor list (the runtime's path)."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k", keyterms=["SSO"])]
+    assert conn.started_with["keyterm"] == ["SSO"]
 
 
 async def test_deepgram_promotes_last_partial_when_no_final() -> None:
@@ -166,7 +338,7 @@ async def test_deepgram_promotes_last_partial_when_no_final() -> None:
             _dg_event("hello world", is_final=False),
         ]
     )
-    stt = DeepgramSTT(client=_FakeDeepgramClient(conn))
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
     chunks = [c async for c in stt.transcribe(_audio_stream(b"x"))]
     assert chunks[-1].is_final is True
     assert chunks[-1].text == "hello world"
@@ -175,7 +347,7 @@ async def test_deepgram_promotes_last_partial_when_no_final() -> None:
 async def test_deepgram_empty_stream_yields_empty_final() -> None:
     # No transcript events at all → one empty final chunk (never hang).
     conn = _FakeDeepgramConnection([])
-    stt = DeepgramSTT(client=_FakeDeepgramClient(conn))
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
     chunks = [c async for c in stt.transcribe(_audio_stream())]
     assert len(chunks) == 1
     assert chunks[0].is_final is True
@@ -192,7 +364,7 @@ async def test_deepgram_error_event_raises() -> None:
                 await handler(error="socket blew up")
 
     conn = _ErroringConnection([])
-    stt = DeepgramSTT(client=_FakeDeepgramClient(conn))
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
     with pytest.raises(RuntimeError, match="socket blew up"):
         _ = [c async for c in stt.transcribe(_audio_stream(b"x"))]
 
