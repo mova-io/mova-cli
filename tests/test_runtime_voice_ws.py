@@ -741,7 +741,7 @@ async def test_voice_turn_persisted_as_run_record_with_modality(
     """A voice turn writes a RunRecord with ``modality='voice'`` and voice-
     specific metrics (stt_latency_ms, tts_latency_ms, audio_duration_s,
     stt_cost_usd, tts_cost_usd)."""
-    token, tenant_id = auth_setup
+    token, _tenant_id = auth_setup
     _create_agent(client, token)
 
 
@@ -760,7 +760,7 @@ async def test_voice_ws_threads_agent_endpointing_to_stt(storage, agents_path, a
     stt = FakeSTT("turn the lights on")
     app.state.voice_stt_factory = lambda: stt
     app.state.voice_tts_factory = FakeTTS
-    token, _ = auth_setup
+    token, tenant_id = auth_setup
     client = TestClient(app)
     agent_yaml = _AGENT_YAML.replace(
         b"description: demo agent for the voice WS transport",
@@ -783,7 +783,7 @@ async def test_voice_ws_threads_agent_endpointing_to_stt(storage, agents_path, a
         ws.send_json({"type": "config", "mock": True})
         ws.send_bytes(b"\x00\x01\x02\x03")
         ws.send_json({"type": "end"})
-        _drain_turn(ws)
+        frames = _drain_turn(ws)
         ws.send_json({"type": "close"})
 
     assert stt.endpointing_seen == [700]
