@@ -929,17 +929,24 @@ async def _run_voice_pipeline_oneshot(
     No ``cancel`` event is passed — a one-shot REST turn has no live barge-in
     (there is no concurrent mic stream); the turn runs to its natural end.
     """
+    from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
     from movate.voice import run_voice_pipeline  # noqa: PLC0415
 
+    # ADR 067 D4: the Executor enters the framework-neutral pipeline as an
+    # ``AgentTurn`` — the same seam the streaming WS turn uses, so the one-shot
+    # path stays a single execution path (ADR 050 D1), now behind the seam.
+    agent = ExecutorAgentTurn(
+        executor=executor,
+        bundle=bundle,
+        tenant_id=tenant_id,
+        input_key=input_key,
+    )
     result = _OneShotVoiceResult()
     async for event in run_voice_pipeline(
         audio_in=audio_in,
         stt=stt,
         tts=tts,
-        executor=executor,
-        bundle=bundle,
-        tenant_id=tenant_id,
-        input_key=input_key,
+        agent=agent,
         language=language,
         voice_id=voice_id,
         stt_api_key=stt_api_key,
@@ -1000,6 +1007,7 @@ class _PrefilledSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Any = None,  # ADR 071 D4: accepted; no recognition happens here
     ) -> AsyncIterator[Any]:
         from movate.voice.base import TranscriptChunk  # noqa: PLC0415
 
