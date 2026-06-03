@@ -865,6 +865,12 @@ _PROVIDERS_PROMPT_NAME = {
     # has its own multi-value login path (like telegram). DISTINCT from the
     # `azure` (Azure OpenAI) provider above — different Azure resource + key.
     "azure-speech": "Azure Speech (voice STT + TTS)",
+    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). Each needs
+    # two values (API key/token + routing URL) — handled via a dedicated
+    # multi-value code path like telegram/azure-speech.
+    "workday": "Workday (enterprise connector)",
+    "salesforce": "Salesforce (enterprise connector)",
+    "sap": "SAP (enterprise connector)",
 }
 
 _PROVIDER_TO_ENV_VAR = {
@@ -890,6 +896,11 @@ _TELEGRAM_PROVIDERS = frozenset({"telegram"})
 # provider the picker should live-verify against an LLM endpoint.
 _VOICE_PROVIDERS = frozenset({"azure-speech"})
 
+# Enterprise connector providers that need TWO values — same multi-value
+# pattern as telegram/azure-speech. Dispatched to their own code paths
+# in login(). Kept out of _PROVIDER_TO_ENV_VAR for the same reason.
+_CONNECTOR_PROVIDERS = frozenset({"workday", "salesforce", "sap"})
+
 
 @auth_app.command("login")
 def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
@@ -901,7 +912,9 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "[bold]azure[/bold], [bold]gemini[/bold], [bold]lyzr[/bold], "
             "[bold]deepgram[/bold], [bold]cartesia[/bold], "
             "[bold]elevenlabs[/bold], "
-            "[bold]azure-speech[/bold] (voice), or [bold]telegram[/bold]. "
+            "[bold]azure-speech[/bold] (voice), "
+            "[bold]workday[/bold], [bold]salesforce[/bold], [bold]sap[/bold] (connectors), "
+            "or [bold]telegram[/bold]. "
             "Omit to pick interactively."
         ),
     ),
@@ -1022,9 +1035,19 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_azure_speech(key=key, save_to=save_to)
         return
 
+    # Enterprise connectors (ADR 052 Phase 1) — each needs two values.
+    if provider in _CONNECTOR_PROVIDERS:
+        _login_connector(provider, key=key, save_to=save_to)
+        return
+
     if provider not in _PROVIDER_TO_ENV_VAR:
         valid = ", ".join(
-            sorted(set(_PROVIDER_TO_ENV_VAR) | _TELEGRAM_PROVIDERS | _VOICE_PROVIDERS)
+            sorted(
+                set(_PROVIDER_TO_ENV_VAR)
+                | _TELEGRAM_PROVIDERS
+                | _VOICE_PROVIDERS
+                | _CONNECTOR_PROVIDERS
+            )
         )
         error(f"unknown provider {provider!r}. Valid: {valid}")
         raise typer.Exit(code=2)
@@ -2690,6 +2713,106 @@ def _login_azure_speech(*, key: str | None, save_to: str) -> None:
         with dotenv.open("a") as fh:
             fh.write(f"AZURE_SPEECH_KEY={speech_key}\n")
             fh.write(f"AZURE_SPEECH_REGION={region}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_connector(provider: str, *, key: str | None, save_to: str) -> None:
+    """Guided enterprise-connector setup (ADR 052 Phase 1 — Action Fabric).
+
+    Each connector needs TWO values — an API key/token and a routing value
+    (instance URL or base URL). Same multi-value pattern as azure-speech.
+    No live verification: the HTTP skill backend surfaces a clear error at
+    first use if the credentials are wrong.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    if key is not None and not key.strip():
+        error("empty key -- aborted.")
+        raise typer.Exit(code=2)
+
+    # Connector-specific prompts and env var names.
+    connector_config: dict[str, dict[str, str]] = {
+        "workday": {
+            "key_var": "WORKDAY_ACCESS_TOKEN",
+            "extra_var": "WORKDAY_BASE_URL",
+            "key_prompt": "Workday access token",
+            "extra_prompt": "Workday REST API base URL (e.g. https://wd3-impl-services1.workday.com)",
+            "hint_text": (
+                "[dim]Workday connector setup:\n"
+                "  1. Create an Integration System User (ISU) in Workday\n"
+                "  2. Register an API client and generate a bearer token\n"
+                "  3. Note your REST API base URL[/dim]"
+            ),
+        },
+        "salesforce": {
+            "key_var": "SALESFORCE_ACCESS_TOKEN",
+            "extra_var": "SALESFORCE_INSTANCE_URL",
+            "key_prompt": "Salesforce access token",
+            "extra_prompt": "Salesforce instance URL (e.g. https://mycompany.my.salesforce.com)",
+            "hint_text": (
+                "[dim]Salesforce connector setup:\n"
+                "  1. Create a Connected App in Setup > App Manager\n"
+                "  2. Enable OAuth and select the [bold]api[/bold] scope\n"
+                "  3. Obtain a bearer token via OAuth 2.0\n"
+                "  4. Note your instance URL from the login response[/dim]"
+            ),
+        },
+        "sap": {
+            "key_var": "SAP_API_KEY",
+            "extra_var": "SAP_BASE_URL",
+            "key_prompt": "SAP API key",
+            "extra_prompt": "SAP S/4HANA base URL (e.g. https://my-s4hana.sap-api.com)",
+            "hint_text": (
+                "[dim]SAP connector setup:\n"
+                "  1. Set up a Communication Arrangement (Cloud) or enable "
+                "OData services (on-premise)\n"
+                "  2. Create a communication user with the required authorizations\n"
+                "  3. Note your system base URL and API key[/dim]"
+            ),
+        },
+    }
+
+    cfg = connector_config.get(provider)
+    if cfg is None:
+        error(f"unknown connector provider {provider!r}.")
+        raise typer.Exit(code=2)
+
+    hint(cfg["hint_text"])
+
+    api_key = (
+        key.strip()
+        if key is not None
+        else typer.prompt(cfg["key_prompt"], hide_input=True, confirmation_prompt=False).strip()
+    )
+    if not api_key:
+        error("empty key -- aborted.")
+        raise typer.Exit(code=2)
+
+    extra_value = typer.prompt(cfg["extra_prompt"]).strip()
+    if not extra_value:
+        error(f"empty {cfg['extra_var']} -- aborted.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set(cfg["key_var"], api_key)
+        store.set(cfg["extra_var"], extra_value)
+        success(
+            f"saved [bold]{cfg['key_var']}[/bold] + "
+            f"[bold]{cfg['extra_var']}[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"{cfg['key_var']}={api_key}\n")
+            fh.write(f"{cfg['extra_var']}={extra_value}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")

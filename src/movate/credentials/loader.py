@@ -80,6 +80,19 @@ VOICE_KEY_ENV_VARS: tuple[str, ...] = (
     "AZURE_SPEECH_REGION",
 )
 
+# Enterprise connector env vars (ADR 052 Phase 1 — Action Fabric).
+# Set via ``mdk auth login workday`` / ``salesforce`` / ``sap`` (or by hand)
+# and consumed by the HTTP skill backend when dispatching connector skills.
+# Each connector needs a bearer token/API key + a routing URL.
+CONNECTOR_KEY_ENV_VARS: tuple[str, ...] = (
+    "WORKDAY_ACCESS_TOKEN",
+    "WORKDAY_BASE_URL",
+    "SALESFORCE_ACCESS_TOKEN",
+    "SALESFORCE_INSTANCE_URL",
+    "SAP_API_KEY",
+    "SAP_BASE_URL",
+)
+
 # Every env var the credentials store should autoload. Union of the
 # groups above; surfaced as a constant so `autoload_credentials`
 # and any future "what does mdk track?" enumeration agree on the
@@ -89,6 +102,7 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
     *VOICE_KEY_ENV_VARS,
+    *CONNECTOR_KEY_ENV_VARS,
 )
 
 
