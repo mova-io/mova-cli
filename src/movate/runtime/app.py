@@ -8872,7 +8872,17 @@ def build_app(
             fallback=request.app.state.agents,
         )
         if bundle is None:
-            raise not_found("agent", f"{original.agent}@{version or 'published'}")
+            # Clearer than a bare id: name the version target + the fix.
+            label = (
+                f"{original.agent} version {version!r}"
+                if version is not None
+                else f"{original.agent} (published)"
+            )
+            raise not_found(
+                "agent",
+                f"{label} - not found for this tenant; "
+                "publish it or pick an existing --against version",
+            )
 
         provider: BaseLLMProvider = MockProvider() if mock else LiteLLMProvider()
         executor = Executor(
@@ -8897,6 +8907,10 @@ def build_app(
             replayed=RunView.from_record(replayed),
             against=against,
             changed=(original.output != replayed.output),
+            # Economics delta (replayed minus original): negative = the chosen version
+            # is cheaper / faster on this case (ADR 045 D13 — "is the edit better?").
+            cost_delta_usd=replayed.metrics.cost_usd - original.metrics.cost_usd,
+            latency_delta_ms=float(replayed.metrics.latency_ms - original.metrics.latency_ms),
         )
 
     @v1.get(

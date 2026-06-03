@@ -142,6 +142,9 @@ async def test_replay_full_turn(client, storage, auth_setup) -> None:
     assert body["replayed"]["input"] == {"text": "turn the lights on"}  # same input
     assert body["against"] == "published"
     assert isinstance(body["changed"], bool)
+    # Economics delta surfaced (replayed minus original); present + numeric.
+    assert isinstance(body["cost_delta_usd"], (int, float))
+    assert isinstance(body["latency_delta_ms"], (int, float))
 
     # The original run is immutable — still present and unchanged in storage.
     again = await storage.get_run(run_id, tenant_id=tenant_id)

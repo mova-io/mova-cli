@@ -306,6 +306,8 @@ def test_replay_remote_target_calls_endpoint(monkeypatch) -> None:
         replayed=RunView.from_record(_run_record("r-new", {"message": "NEW"})),
         against="published",
         changed=True,
+        cost_delta_usd=-0.0012,
+        latency_delta_ms=-340.0,
     )
     mock_replay = AsyncMock(return_value=view)
     monkeypatch.setattr("movate.core.client.MovateClient.replay_run", mock_replay)
@@ -316,12 +318,17 @@ def test_replay_remote_target_calls_endpoint(monkeypatch) -> None:
     monkeypatch.setattr("movate.core.user_config.resolve_bearer_token", lambda cfg: "tok")
     monkeypatch.setattr("movate.cli._console.get_global_target", lambda: "prod")
 
-    result = runner.invoke(app, ["replay", "r-old", "--target", "prod", "--against", "published"])
+    result = runner.invoke(
+        app, ["replay", "r-old", "--target", "prod", "--against", "published", "--diff"]
+    )
     assert result.exit_code == 0, result.output + result.stderr
     mock_replay.assert_awaited_once()
     # The recorded run id + the replay id + the changed verdict surface.
     assert "r-old" in result.output and "r-new" in result.output
     assert "changed" in result.output
+    # The cost/latency delta line + the unified output diff render.
+    assert "cost" in result.output and "latency" in result.output
+    assert "output diff" in result.output
 
 
 def test_replay_remote_json_output(monkeypatch) -> None:

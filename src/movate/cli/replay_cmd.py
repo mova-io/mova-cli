@@ -159,6 +159,38 @@ def _outputs_equal(a: dict[str, Any] | None, b: dict[str, Any] | None) -> bool:
     return json.dumps(a or {}, sort_keys=True) == json.dumps(b or {}, sort_keys=True)
 
 
+def _fmt_delta(value: float, unit: str, places: int) -> str:
+    """Format a replayed-minus-original delta: green if better (lower), red if worse."""
+    if value == 0:
+        return f"[dim]±0{unit}[/dim]"
+    better = value < 0
+    sign = "" if better else "+"
+    style = "green" if better else "red"
+    return f"[{style}]{sign}{value:.{places}f}{unit}[/{style}]"
+
+
+def _render_output_diff(original: dict[str, Any] | None, replayed: dict[str, Any] | None) -> None:
+    """Render a unified diff of the two outputs (replaces two raw JSON panels)."""
+    import difflib  # noqa: PLC0415
+
+    a = json.dumps(original or {}, indent=2, sort_keys=True).splitlines()
+    b = json.dumps(replayed or {}, indent=2, sort_keys=True).splitlines()
+    diff_lines = list(
+        difflib.unified_diff(a, b, fromfile="original", tofile="replayed", lineterm="")
+    )
+    if not diff_lines:
+        console.print("[dim]outputs identical.[/dim]")
+        return
+    console.print(
+        Panel(
+            Syntax("\n".join(diff_lines), "diff", theme="ansi_dark", line_numbers=False),
+            title="output diff (original → replayed)",
+            title_align="left",
+            border_style="cyan",
+        )
+    )
+
+
 def _replay_remote(
     run_id: str,
     *,
@@ -205,11 +237,14 @@ def _replay_remote(
         f"[dim](against[/dim] [cyan]{view.against}[/cyan][dim],[/dim] "
         f"[{state_style}]{state}[/{state_style}][dim])[/dim]"
     )
-    # Default to side-by-side for a remote replay (the whole point is the diff);
-    # without --diff, show just the replayed output.
+    console.print(
+        f"  [dim]cost[/dim] {_fmt_delta(view.cost_delta_usd, ' USD', 6)}   "
+        f"[dim]latency[/dim] {_fmt_delta(view.latency_delta_ms, ' ms', 0)}"
+    )
+    # With --diff, render a true unified diff (output reads far better than two
+    # JSON panels); without it, just the replayed output.
     if diff:
-        _render_output("original", view.original.output)
-        _render_output("replayed", view.replayed.output)
+        _render_output_diff(view.original.output, view.replayed.output)
     else:
         _render_output("replayed", view.replayed.output)
 

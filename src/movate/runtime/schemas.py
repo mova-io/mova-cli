@@ -219,6 +219,11 @@ class RunReplayView(BaseModel):
     """The version target the replay ran against: ``"published"`` or ``"version:X"``."""
     changed: bool
     """``True`` when the replayed output differs from the original's."""
+    cost_delta_usd: float = 0.0
+    """Replayed cost minus original cost (USD). Negative = the new version is
+    cheaper on this case — the at-a-glance "did my edit save money?" number."""
+    latency_delta_ms: float = 0.0
+    """Replayed latency minus original (ms). Negative = the new version is faster."""
 
 
 class RunEstimatePredictionView(BaseModel):
