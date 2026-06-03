@@ -11,7 +11,7 @@ is synthesized (the latency story, ADR 048 D7) — what OpenAI's buffered speech
 API can't do.
 
 The ``elevenlabs`` SDK import is **lazy + guarded** exactly like
-:mod:`movate.voice.cartesia` / :mod:`movate.providers.openai_native`: nothing
+:mod:`movate.voice.cartesia`: nothing
 here imports ``elevenlabs`` at module scope, so a runtime/CLI installed without
 ``mdk[voice]`` is wholly unaffected (ADR 048 D9). The SDK client is constructed
 on first use from the BYOK key; tests inject a fake via the ``client=`` kwarg.
@@ -78,7 +78,7 @@ def _require_elevenlabs() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised via the import-guard test
         raise ImportError(
             "the 'elevenlabs' package is required for the ElevenLabs voice adapter. "
-            "Install with: uv add 'movate-cli[voice]'"
+            "Install with: pip install 'mdk-voice[elevenlabs]'"
         ) from exc
     return _elevenlabs
 

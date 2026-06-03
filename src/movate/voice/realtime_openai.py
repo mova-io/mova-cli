@@ -9,7 +9,7 @@ speech recognition + synthesis, and there is **no intermediate text Executor**
 the ``?mode=realtime`` transport mode (ADR 050 D12).
 
 The ``openai`` SDK import is **lazy + guarded** exactly like
-:mod:`movate.voice.openai_speech` / :mod:`movate.providers.openai_native`:
+:mod:`movate.voice.openai_speech`:
 nothing here imports ``openai`` at module scope, so a runtime/CLI installed
 without ``mdk[voice]`` is wholly unaffected (ADR 048 D9). The SDK connection is
 opened on first use; tests inject a fake via the ``connect=`` kwarg (a callable
@@ -77,7 +77,7 @@ def _require_openai() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised via the import-guard test
         raise ImportError(
             "the 'openai' package is required for the OpenAI Realtime voice adapter. "
-            "Install with: uv add 'movate-cli[voice]'"
+            "Install with: pip install 'mdk-voice[realtime]'"
         ) from exc
     return _openai
 
