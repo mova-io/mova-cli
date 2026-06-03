@@ -630,6 +630,29 @@ class _VoiceTurnConfig:
     speculative: bool = False
 
 
+def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
+    """Seed the per-turn config from the agent's ``voice`` block (ADR 071 D1-D3).
+
+    The ``agent.yaml`` voice block (:class:`movate.core.models.VoiceConfig`) used
+    to be parsed but **ignored** by the runtime — this closes that gap. The block
+    is the *default* for the session; a client ``config`` frame still overrides
+    per-turn (handled in :func:`_collect_voice_turn`). Absent block / unset
+    fields leave the runtime defaults untouched, byte-for-byte today's behavior.
+    """
+    voice = getattr(getattr(bundle, "spec", None), "voice", None)
+    if voice is None:
+        return
+    if getattr(voice, "voice_id", ""):
+        config.voice_id = voice.voice_id
+    if getattr(voice, "language", None) is not None:
+        config.language = voice.language
+    # ADR 071 D2: tri-state — None means "keep the runtime default".
+    if getattr(voice, "tts_streaming", None) is not None:
+        config.tts_streaming = bool(voice.tts_streaming)
+    # ADR 071 D3: speculative is a plain bool (default False).
+    config.speculative = bool(getattr(voice, "speculative", False))
+
+
 async def _collect_voice_turn(
     websocket: WebSocket, config: _VoiceTurnConfig
 ) -> tuple[list[bytes], bool]:
@@ -14930,8 +14953,11 @@ def build_app(
         tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts)
 
         # Config persists across turns in a session; a per-turn ``config`` frame
-        # can override it before that turn's ``end``.
+        # can override it before that turn's ``end``. Seed from the agent's
+        # ``voice`` block first (ADR 071 D1-D3) so per-agent voice_id / language /
+        # tts_streaming / speculative apply without a client frame.
         config = _VoiceTurnConfig()
+        _seed_voice_turn_config(config, bundle)
         try:
             while True:
                 audio_frames, closed = await _collect_voice_turn(websocket, config)

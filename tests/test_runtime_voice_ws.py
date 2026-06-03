@@ -26,8 +26,10 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from movate.core.auth import ALL_SCOPES, SCOPE_READ, ApiKeyEnv, mint_api_key
+from movate.core.models import VoiceConfig
 from movate.core.provider_keys import ENV_PROVIDER_KEY_SECRET, mint_tenant_provider_key
 from movate.runtime import build_app
+from movate.runtime.app import _seed_voice_turn_config, _VoiceTurnConfig
 from movate.testing import InMemoryStorage
 from movate.voice import AudioChunk, FakeRealtime, FakeSTT, FakeTTS
 
@@ -539,3 +541,45 @@ async def test_voice_ws_realtime_uses_tenant_byok_key(
                 break
 
     assert rt.api_keys == ["sk-rt"]
+
+
+# ── ADR 071 — per-agent voice block seeds the per-turn config ──────────────────
+
+
+def _bundle_with_voice(**voice_fields):
+    """A minimal stand-in bundle exposing ``.spec.voice`` (a VoiceConfig)."""
+    from types import SimpleNamespace  # noqa: PLC0415 - test-local helper
+
+    voice = VoiceConfig(**voice_fields) if voice_fields else None
+    return SimpleNamespace(spec=SimpleNamespace(voice=voice))
+
+
+def test_seed_voice_turn_config_applies_agent_block() -> None:
+    """ADR 071 D1-D3: voice_id/language/tts_streaming/speculative seed from the block."""
+    cfg = _VoiceTurnConfig()
+    _seed_voice_turn_config(
+        cfg,
+        _bundle_with_voice(
+            voice_id="rachel", language="fr-FR", tts_streaming=False, speculative=True
+        ),
+    )
+    assert cfg.voice_id == "rachel"
+    assert cfg.language == "fr-FR"
+    assert cfg.tts_streaming is False
+    assert cfg.speculative is True
+
+
+def test_seed_voice_turn_config_absent_block_keeps_defaults() -> None:
+    """No voice block → runtime defaults untouched (byte-for-byte today)."""
+    cfg = _VoiceTurnConfig()
+    before = (cfg.voice_id, cfg.language, cfg.tts_streaming, cfg.speculative)
+    _seed_voice_turn_config(cfg, _bundle_with_voice())  # voice is None
+    assert (cfg.voice_id, cfg.language, cfg.tts_streaming, cfg.speculative) == before
+
+
+def test_seed_voice_turn_config_tts_streaming_none_keeps_default() -> None:
+    """tts_streaming unset (None) leaves the runtime default (True) in place."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.tts_streaming is True  # runtime default
+    _seed_voice_turn_config(cfg, _bundle_with_voice(voice_id="x"))  # no tts_streaming
+    assert cfg.tts_streaming is True  # unchanged

@@ -1324,6 +1324,29 @@ class VoiceConfig(BaseModel):
             "``None`` → auto-detect / provider default."
         ),
     )
+    # ---- ADR 071 — per-agent latency/cost tuning (ADDITIVE, OPTIONAL) ----
+    tts_streaming: bool | None = Field(
+        default=None,
+        description=(
+            "Sentence-level TTS overlap for this agent (ADR 048 D7) — speak "
+            "sentence one while the agent is still generating sentence two, the "
+            "biggest time-to-first-audio win.  ``None`` (default / absent block) "
+            "uses the runtime default; ``true``/``false`` pins it for this agent. "
+            "The WS event protocol is unchanged either way (consumers key off the "
+            "event ``kind``)."
+        ),
+    )
+    speculative: bool = Field(
+        default=False,
+        description=(
+            "Speculative agent kickoff for this agent (ADR 070) — start the agent "
+            "on a stable interim transcript, before STT endpoints, to recover the "
+            "~1.5s endpointing wait; commit if the final matches, else cancel and "
+            "re-run.  Off by default (it changes the cost profile via cancelled "
+            "runs).  Only fires when the agent stage is cancel-safe — the mdk "
+            "Executor is, so an mdk agent honors this flag."
+        ),
+    )
 
 
 class AgentSpec(BaseModel):
