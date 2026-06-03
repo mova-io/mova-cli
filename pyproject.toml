@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.6.3.11"
+version = "2026.6.3.12"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -611,5 +611,6 @@ markers = [
     "postgres: tests that require a real Postgres at MOVATE_PG_TEST_URL",
     "no_preflight_stub: opts out of the eval-scorecard preflight autouse no-op",
     "acceptance: hermetic end-to-end slice guards (run in the normal suite)",
+    "temporal: Temporal integration tests requiring `temporal server start-dev` (opt-in, run with pytest -m temporal)",
 ]
 addopts = "-ra --strict-markers"
