@@ -596,6 +596,22 @@ button.active { background:var(--accent); color:white; }
     </div>
     <span class="muted detailed-only" id="speculate-stats" style="font-size:11px;margin-left:8px;"
           title="Live commit/cancel ratio + avg head-start for speculative kickoff this session"></span>
+    <!-- ADR 072 semantic turn-detection — Detailed only -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;"
+          title="Fire the speculation the moment the utterance is semantically complete (heuristic detector) instead of waiting the quiet-gap — raises the commit rate. Pairs with Speculate.">Turn-detect</span>
+    <div class="toggle-group detailed-only" id="turndetect-toggle">
+      <button data-turndetect="off" class="active" title="Quiet-gap debounce only (default)">off</button>
+      <button data-turndetect="on" title="Fire speculation on semantic completeness (ADR 072)">on</button>
+    </div>
+    <!-- ADR 073 Phase 3 adaptive endpointing — Detailed only -->
+    <span class="muted detailed-only" style="font-size:11px;margin-left:16px;"
+          title="Move the silence-hold within the session from observed cadence: clean turn-ends shorten it, speakers running long lengthen it (commit-ratio driven).">Adaptive</span>
+    <div class="toggle-group detailed-only" id="adaptive-toggle">
+      <button data-adaptive="off" class="active" title="Fixed hold (default)">off</button>
+      <button data-adaptive="on" title="Adapt the endpointing hold from turn cadence (ADR 073 Phase 3)">on</button>
+    </div>
+    <span class="muted detailed-only" id="adaptive-stats" style="font-size:11px;margin-left:8px;"
+          title="The current adaptive endpointing hold (ms)"></span>
     <!-- ADR 073 D3 endpointing override — Detailed only -->
     <span class="muted detailed-only" style="font-size:11px;margin-left:16px;"
           title="STT silence-hold (ms) before the turn is declared finished — the dominant fixed latency. Lower it for snappy back-and-forth (risk: barge-in on a pause); raise it for deliberate speakers. Blank = adapter default (1500 ms).">Endpointing</span>
@@ -1035,6 +1051,35 @@ function handleJson(s) {
       stats.textContent = '';
       logEvent(`⤳ speculate → ${m.enabled ? 'on' : 'off'}`, m.enabled ? 'warn' : '');
     }
+    return;
+  }
+  if (ev === 'turn_detection') {
+    // ADR 072: server echoed the turn-detection toggle.
+    updateToggle('turndetect-toggle', 'turndetect', m.enabled ? 'on' : 'off');
+    logEvent(`⤳ turn-detect → ${m.enabled ? 'on' : 'off'}`, m.enabled ? 'warn' : '');
+    return;
+  }
+  if (ev === 'adaptive_endpointing') {
+    // ADR 073 Phase 3: server echoed the adaptive toggle (+ seeded hold).
+    updateToggle('adaptive-toggle', 'adaptive', m.enabled ? 'on' : 'off');
+    const a = $('adaptive-stats');
+    if (a) a.textContent = m.enabled && m.endpointing_ms != null ? `hold ${m.endpointing_ms}ms` : '';
+    logEvent(`⤳ adaptive endpointing → ${m.enabled ? 'on' : 'off'}`, m.enabled ? 'warn' : '');
+    return;
+  }
+  if (ev === 'endpointing_adapted') {
+    // ADR 073 Phase 3: the controller moved the hold this turn.
+    const a = $('adaptive-stats');
+    if (a && m.endpointing_ms != null) a.textContent = `hold ${m.endpointing_ms}ms`;
+    logEvent(`⤳ endpointing adapted → ${m.endpointing_ms}ms`, 'warn');
+    return;
+  }
+  if (ev === 'speculation_disabled') {
+    // ADR 073 cost-guard tripped — speculation auto-disabled this session.
+    updateToggle('speculate-toggle', 'speculate', 'off');
+    const stats = $('speculate-stats');
+    if (stats) stats.textContent = `auto-off (commit ${Math.round((m.commit_ratio || 0) * 100)}%)`;
+    logEvent(`⤳ speculation auto-disabled — low commit-ratio (${Math.round((m.commit_ratio || 0) * 100)}%)`, 'warn');
     return;
   }
   if (ev === 'budget') {
@@ -2145,6 +2190,18 @@ document.querySelectorAll('#hedge-toggle button').forEach(b => {
 document.querySelectorAll('#speculate-toggle button').forEach(b => {
   b.addEventListener('click', () => {
     ws.send(JSON.stringify({ event: 'set_speculative', enabled: b.dataset.speculate === 'on' }));
+  });
+});
+// ADR 072 semantic turn-detection toggle.
+document.querySelectorAll('#turndetect-toggle button').forEach(b => {
+  b.addEventListener('click', () => {
+    ws.send(JSON.stringify({ event: 'set_turn_detection', enabled: b.dataset.turndetect === 'on' }));
+  });
+});
+// ADR 073 Phase 3 adaptive endpointing toggle.
+document.querySelectorAll('#adaptive-toggle button').forEach(b => {
+  b.addEventListener('click', () => {
+    ws.send(JSON.stringify({ event: 'set_adaptive_endpointing', enabled: b.dataset.adaptive === 'on' }));
   });
 });
 // ADR 073 D3 endpointing override — push on change/Enter (blank = adapter default).

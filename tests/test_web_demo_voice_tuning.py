@@ -55,3 +55,25 @@ def test_defaults_seed_demo_keyterms_and_no_endpointing_override() -> None:
     s = Session()
     assert s.keyterms == list(_demo_keyterms())
     assert s.endpointing_ms is None
+
+
+def test_set_turn_detection_toggle() -> None:
+    s = Session()
+    assert s.turn_detection is False
+    assert s.set_turn_detection(True) == {"enabled": True}
+    assert s.turn_detection is True
+    assert s.set_turn_detection(False) == {"enabled": False}
+
+
+def test_set_adaptive_endpointing_reseeds_from_static_hold() -> None:
+    s = Session()
+    assert s.adaptive_endpointing is False
+    # Enabling seeds the controller from the current static hold (default 1500).
+    out = s.set_adaptive_endpointing(True)
+    assert out["enabled"] is True
+    assert out["endpointing_ms"] == 1500
+    # A custom static hold reseeds the band's base.
+    s.set_endpointing(900)
+    out2 = s.set_adaptive_endpointing(True)
+    assert out2["endpointing_ms"] == 900
+    assert s.set_adaptive_endpointing(False)["enabled"] is False

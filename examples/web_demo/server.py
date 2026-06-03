@@ -35,17 +35,20 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from movate.voice import (
+    AdaptiveEndpointing,
     AudioChunk,
     CartesiaTTS,
     DeepgramSTT,
     FailoverSTT,
     FailoverTTS,
+    HeuristicTurnDetector,
     InMemoryVoiceCache,
     MetricsObserver,
     OpenAIRealtime,
     OpenAITTS,
     OpenAIWhisperSTT,
     SilenceGatedSTT,
+    SpeculationGuard,
     check_lyzr_parity,
     compute_turn_latency,
     format_latency_badge,
@@ -768,6 +771,18 @@ class Session:
         # per-turn to run_voice_pipeline; set via set_keyterms / set_endpointing.
         self.keyterms: list[str] = list(_demo_keyterms())
         self.endpointing_ms: int | None = None
+        # ADR 072 / ADR 073 Phase 3 — the two endpointing levers, opt-in + live:
+        # * turn_detection: fire speculation on semantic completeness (a
+        #   HeuristicTurnDetector), not just the quiet-gap → higher commit rate;
+        # * adaptive_endpointing: move the silence-hold within the session from
+        #   the commit-ratio (clean ends → shorten; runs-long → lengthen).
+        # Plus the ADR 073 cost-guard that auto-disables speculation when its
+        # commit-ratio proves too low to repay the cancelled-run cost.
+        self.turn_detection: bool = False
+        self.adaptive_endpointing: bool = False
+        self._turn_detector = HeuristicTurnDetector()
+        self._spec_guard = SpeculationGuard()
+        self._adaptive = AdaptiveEndpointing(base_ms=1500)
         # Wrap the failover chain in SilenceGatedSTT so we don't pay per-minute
         # to transcribe dead air — and so the silence-trimmed metric shows up in
         # the dashboard. The observer captures both gate + failover events.
@@ -881,6 +896,19 @@ class Session:
             except (TypeError, ValueError):
                 self.endpointing_ms = None
         return {"endpointing_ms": self.endpointing_ms}
+
+    def set_turn_detection(self, enabled: bool) -> dict[str, bool]:
+        """ADR 072: toggle semantic turn-detection (speculation trigger)."""
+        self.turn_detection = bool(enabled)
+        return {"enabled": self.turn_detection}
+
+    def set_adaptive_endpointing(self, enabled: bool) -> dict[str, object]:
+        """ADR 073 Phase 3: toggle adaptive endpointing. Reseeds the controller
+        from the current static hold so the band brackets the right base."""
+        self.adaptive_endpointing = bool(enabled)
+        if self.adaptive_endpointing:
+            self._adaptive = AdaptiveEndpointing(base_ms=self.endpointing_ms or 1500)
+        return {"enabled": self.adaptive_endpointing, "endpointing_ms": self._adaptive.current_ms}
 
     def set_user_keys(self, keys: dict[str, str | None]) -> dict[str, bool]:
         """BYOK — per-session API key overrides. Rebuilds adapter chains.
@@ -2114,6 +2142,16 @@ async def voice(ws: WebSocket) -> None:
                 applied = session.set_endpointing(data.get("endpointing_ms"))
                 await _send_event(ws, event="endpointing", **applied)
                 continue
+            if ev_name == "set_turn_detection":
+                # ADR 072: semantic turn-detection as the speculation trigger.
+                applied = session.set_turn_detection(bool(data.get("enabled")))
+                await _send_event(ws, event="turn_detection", **applied)
+                continue
+            if ev_name == "set_adaptive_endpointing":
+                # ADR 073 Phase 3: adaptively move the silence-hold from cadence.
+                applied = session.set_adaptive_endpointing(bool(data.get("enabled")))
+                await _send_event(ws, event="adaptive_endpointing", **applied)
+                continue
             if ev_name == "set_budget":
                 # A4: per-session cost ceiling. None / 0 / negative → unbounded.
                 raw = data.get("usd")
@@ -2207,6 +2245,21 @@ async def voice(ws: WebSocket) -> None:
 
             barge_in_task = asyncio.create_task(_watch_for_barge_in())
 
+            # ADR 072 / ADR 073 — resolve this turn's effective levers:
+            # * speculation fires only if requested AND the cost-guard hasn't
+            #   tripped (low commit-ratio auto-disables it mid-session);
+            # * the turn-detector is supplied only when enabled (fires the
+            #   speculation on semantic completeness, not just the quiet-gap);
+            # * adaptive endpointing, when on, supplies the moved hold.
+            eff_speculative = session.speculative and session._spec_guard.should_speculate()
+            eff_turn_detector = session._turn_detector if session.turn_detection else None
+            eff_endpointing = session.endpointing_ms
+            if session.adaptive_endpointing:
+                eff_endpointing = session._adaptive.current_ms
+            # The session observer is cumulative; snapshot before the turn so we
+            # can feed the guard/adaptive controller this turn's delta after it.
+            _spec_before = session.metrics.speculation_snapshot()
+
             try:
                 async for ev in run_voice_pipeline(
                     audio_in=_audio_from_ws(
@@ -2229,13 +2282,16 @@ async def voice(ws: WebSocket) -> None:
                     # ADR 070: opt-in speculative kickoff + observer so the
                     # speculation_started/committed/cancelled events flow to the
                     # metrics + trail (the live cancel-ratio the dashboard shows).
-                    speculative=session.speculative,
+                    speculative=eff_speculative,
+                    # ADR 072 — semantic turn-detection as the speculation trigger
+                    # (None when the toggle is off → quiet-gap debounce alone).
+                    turn_detector=eff_turn_detector,
                     # ADR 071 D4 / ADR 073 D3 — per-session keyterm boosting +
                     # endpointing override, both editable live from the UI so the
                     # audience can A/B accuracy (keyterms) and the silence-wait
                     # latency floor (endpointing) without a redeploy.
                     keyterms=session.keyterms or None,
-                    endpointing_ms=session.endpointing_ms,
+                    endpointing_ms=eff_endpointing,
                     observer=session.observer,
                 ):
                     events.append(ev)
@@ -2275,6 +2331,26 @@ async def voice(ws: WebSocket) -> None:
                 barge_in_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await barge_in_task
+
+            # ADR 073 — feed this turn's speculation delta to the cost-guard +
+            # adaptive controller; surface a trip / an adapted hold to the UI.
+            _after = session.metrics.speculation_snapshot()
+            _delta = {
+                "started": _after["started"] - _spec_before["started"],
+                "committed": _after["committed"] - _spec_before["committed"],
+                "cancelled": _after["cancelled"] - _spec_before["cancelled"],
+            }
+            if eff_speculative and session._spec_guard.record(_delta):
+                await _send_event(
+                    ws,
+                    event="speculation_disabled",
+                    reason="low_commit_ratio",
+                    commit_ratio=round(session._spec_guard.commit_ratio, 3),
+                )
+            if session.adaptive_endpointing:
+                _moved = session._adaptive.record(_delta)
+                if _moved is not None:
+                    await _send_event(ws, event="endpointing_adapted", endpointing_ms=_moved)
 
             # Per-turn summary the browser dashboard renders.
             latency = compute_turn_latency(events)  # type: ignore[arg-type]
