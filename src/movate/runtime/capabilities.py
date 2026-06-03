@@ -158,6 +158,14 @@ _FEATURE_PREDICATES: dict[str, Callable[[FastAPI], bool]] = {
     # scans APIRoute), so detect by the route-builder's app-state factory hook
     # (``voice_stt_factory``) set when the route is wired.
     "voice": lambda app: getattr(app.state, "voice_stt_factory", None) is not None,
+    # One-shot / batch voice over REST (ADR 050 D2) — the non-streaming POST
+    # sibling of the WS transport: synthesize an answer to typed text or a
+    # recorded utterance in a single request/response (``mdk voice say`` /
+    # ``transcribe``). Unlike the WS route it IS an APIRoute, so detect it by the
+    # live route table — the flag tracks the deployed surface.
+    "voice_rest": lambda app: _has_route(
+        app, "/agents/{name}/voice", "/api/v1/agents/{name}/voice"
+    ),
     # Realtime (speech↔speech) voice — advertised ONLY when a realtime provider
     # is actually configured on this runtime (ADR 048 D2b / ADR 050 D12). The
     # route exists for every build, but realtime is opt-in: the factory is
