@@ -10,7 +10,7 @@ hard-coded here. One provider, both directions: STT streams partial→final
 transcripts, TTS synthesizes the agent's streamed answer back to audio.
 
 The ``azure.cognitiveservices.speech`` SDK import is **lazy + guarded** exactly
-like :mod:`movate.voice.openai_speech` / :mod:`movate.providers.openai_native`:
+like :mod:`movate.voice.openai_speech`:
 nothing here imports the SDK at module scope, so a runtime/CLI installed
 without ``mdk[voice]`` is wholly unaffected (ADR 048 D9). The SDK objects are
 constructed on first use; tests inject fakes via the ``recognizer_factory=`` /
@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
 
 from movate.voice.base import AudioChunk, AudioCodec, TranscriptChunk
@@ -87,7 +87,7 @@ def _require_azure_speech() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised via the import-guard test
         raise ImportError(
             "the 'azure-cognitiveservices-speech' package is required for the "
-            "Azure Speech voice adapters. Install with: uv add 'movate-cli[voice]'"
+            "Azure Speech voice adapters. Install with: pip install 'mdk-voice[azure]'"
         ) from exc
     return _speechsdk
 
@@ -202,6 +202,8 @@ class AzureSpeechSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,  # ADR 071 D4: accepted; Azure phrase-lists TBD
+        endpointing_ms: int | None = None,  # ADR 073 D3: accepted; Azure segmentation TBD
     ) -> AsyncIterator[TranscriptChunk]:
         key, region = _resolve_key_region(
             api_key=api_key, ctor_key=self._ctor_key, region=self._region

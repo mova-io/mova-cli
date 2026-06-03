@@ -73,7 +73,7 @@ def _require_cartesia() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised via the import-guard test
         raise ImportError(
             "the 'cartesia' package is required for the Cartesia voice adapter. "
-            "Install with: uv add 'movate-cli[voice]'"
+            "Install with: pip install 'mdk-voice[cartesia]'"
         ) from exc
     return _cartesia
 
@@ -137,16 +137,34 @@ class CartesiaTTS:
             return  # nothing to say → no audio frames
 
         client = self._resolve_client(api_key)
-        stream = client.tts.bytes(
-            model_id=self._model,
-            transcript=utterance,
-            voice={"mode": "id", "id": voice_id or self._default_voice},
-            output_format={
-                "container": _CARTESIA_CONTAINER,
-                "encoding": _CARTESIA_ENCODING,
-                "sample_rate": _CARTESIA_SAMPLE_RATE,
-            },
-        )
+        # Use SSE (streaming) not bytes (buffered REST) — bytes waits for the
+        # whole utterance server-side, killing Cartesia's first-byte advantage.
+        # SSE yields typed chunks as audio is generated (~80ms first-byte vs
+        # ~2.5s for bytes; verified live in examples/live_streaming_demo.py).
+        # Fall back to bytes for fakes/older SDKs that don't expose sse.
+        streamer = getattr(client.tts, "sse", None)
+        if streamer is not None:
+            stream = streamer(
+                model_id=self._model,
+                transcript=utterance,
+                voice={"mode": "id", "id": voice_id or self._default_voice},
+                output_format={
+                    "container": _CARTESIA_CONTAINER,
+                    "encoding": _CARTESIA_ENCODING,
+                    "sample_rate": _CARTESIA_SAMPLE_RATE,
+                },
+            )
+        else:
+            stream = client.tts.bytes(
+                model_id=self._model,
+                transcript=utterance,
+                voice={"mode": "id", "id": voice_id or self._default_voice},
+                output_format={
+                    "container": _CARTESIA_CONTAINER,
+                    "encoding": _CARTESIA_ENCODING,
+                    "sample_rate": _CARTESIA_SAMPLE_RATE,
+                },
+            )
         async for frame in _iter_audio_frames(stream):
             if not frame:
                 continue
@@ -194,13 +212,23 @@ def _frame_bytes(frame: Any) -> bytes:
     """Extract the raw audio bytes from one Cartesia frame.
 
     A frame is either raw ``bytes`` or an object/dict that nests them under
-    ``audio`` (the SDK's field) or ``data``. Returns ``b""`` for a non-audio
-    frame (e.g. a timestamps/metadata event), which the caller filters out.
+    ``audio`` (the SDK's field) or ``data``. The SSE path (``tts.sse``) returns
+    ``WebSocketResponse_Chunk(type='chunk', data='<base64>')`` — the ``data``
+    field is a **base64 str**, not bytes; decode it. Returns ``b""`` for a
+    non-audio frame (e.g. timestamps / done / metadata), which the caller
+    filters out.
     """
+    import base64  # noqa: PLC0415 - stdlib, lazy-loaded to keep top of module clean
+
     if isinstance(frame, (bytes, bytearray)):
         return bytes(frame)
     for name in ("audio", "data"):
         value = frame.get(name) if isinstance(frame, dict) else getattr(frame, name, None)
         if isinstance(value, (bytes, bytearray)):
             return bytes(value)
+        if isinstance(value, str) and value:
+            try:
+                return base64.b64decode(value)
+            except (ValueError, TypeError):
+                continue
     return b""
