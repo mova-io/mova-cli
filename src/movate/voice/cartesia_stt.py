@@ -44,7 +44,7 @@ landscape moves fast — see the ``cartesia`` SDK's ``stt/_async_websocket.py``)
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 from movate.voice.base import AudioChunk, TranscriptChunk
@@ -131,6 +131,7 @@ class CartesiaSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,  # ADR 071 D4: accepted, not used by Cartesia STT
     ) -> AsyncIterator[TranscriptChunk]:
         # PEEK the first audio chunk so we can declare the correct sample rate
         # to Cartesia. The Deepgram adapter learned this the hard way — a

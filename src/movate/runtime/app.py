@@ -27,7 +27,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
@@ -628,6 +628,10 @@ class _VoiceTurnConfig:
     # a client enables it per-turn via ``speculative: true`` in the config frame.
     # Only takes effect when the agent is cancel-safe (``speculatable``).
     speculative: bool = False
+    # Per-agent STT keyterm boosting (ADR 071 D4): domain vocab passed to
+    # ``stt.transcribe(keyterms=...)``. Empty → no boosting. Seeded from the
+    # agent's voice block; boosting-capable providers (Deepgram) honor it.
+    keyterms: list[str] = field(default_factory=list)
 
 
 def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
@@ -651,6 +655,10 @@ def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
         config.tts_streaming = bool(voice.tts_streaming)
     # ADR 071 D3: speculative is a plain bool (default False).
     config.speculative = bool(getattr(voice, "speculative", False))
+    # ADR 071 D4: per-agent STT keyterm boosting (empty list = no boosting).
+    keyterms = getattr(voice, "keyterms", None)
+    if keyterms:
+        config.keyterms = list(keyterms)
 
 
 async def _collect_voice_turn(
@@ -847,6 +855,7 @@ async def _stream_voice_pipeline_turn(
             voice_id=config.voice_id,
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
+            keyterms=config.keyterms or None,
             tts_streaming=config.tts_streaming,
             speculative=config.speculative,
             cancel=cancel,

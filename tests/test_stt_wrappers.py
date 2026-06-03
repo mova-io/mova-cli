@@ -78,7 +78,7 @@ class _ConfSTT:
         self.calls = 0
 
     async def transcribe(
-        self, audio, *, language=None, api_key=None
+        self, audio, *, language=None, api_key=None, keyterms=None
     ) -> AsyncIterator[TranscriptChunk]:
         self.calls += 1
         async for _ in audio:

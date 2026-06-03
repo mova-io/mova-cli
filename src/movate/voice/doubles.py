@@ -14,7 +14,7 @@ an in-memory storage double.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 
 from movate.voice.agent_turn import AgentTurnError, AgentTurnResult
 from movate.voice.base import AudioChunk, AudioCodec, RealtimeChunk, TranscriptChunk
@@ -124,6 +124,8 @@ class FakeSTT:
         self.received: list[bytes] = []
         self.languages: list[str | None] = []
         self.api_keys: list[str | None] = []
+        # ADR 071 D4: record per-call keyterms so a test can assert they threaded.
+        self.keyterms_seen: list[list[str] | None] = []
 
     async def transcribe(
         self,
@@ -131,11 +133,13 @@ class FakeSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         import asyncio  # noqa: PLC0415
 
         self.languages.append(language)
         self.api_keys.append(api_key)
+        self.keyterms_seen.append(list(keyterms) if keyterms is not None else None)
         async for chunk in audio:
             self.received.append(chunk.data)
         for partial in self._partials:

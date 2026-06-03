@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, Protocol
 
 from movate.voice.base import AudioChunk, AudioCodec, TranscriptChunk
@@ -202,6 +202,7 @@ class AzureSpeechSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,  # ADR 071 D4: accepted; Azure phrase-lists TBD
     ) -> AsyncIterator[TranscriptChunk]:
         key, region = _resolve_key_region(
             api_key=api_key, ctor_key=self._ctor_key, region=self._region

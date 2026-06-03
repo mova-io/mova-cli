@@ -56,6 +56,7 @@ class _ScriptedSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms=None,
     ) -> AsyncIterator[TranscriptChunk]:
         async for _ in audio:
             pass

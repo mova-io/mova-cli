@@ -226,9 +226,16 @@ class DeepgramSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         import asyncio  # noqa: PLC0415
         import contextlib  # noqa: PLC0415
+
+        # ADR 071 D4: per-call keyterms (e.g. an agent's domain vocab) merge with
+        # the constructor list — union, de-duped, order-preserving — so a tenant
+        # default + a per-agent set both apply.
+        call_keyterms = [t for t in (keyterms or []) if t and t.strip()]
+        effective_keyterms = list(dict.fromkeys([*self._keyterms, *call_keyterms]))
 
         # PEEK the first audio chunk so we can declare the correct sample rate
         # to Deepgram (mismatch yields empty transcripts — verified live with
@@ -282,7 +289,7 @@ class DeepgramSTT:
             connection.on(getattr(events, "Close", "Close"), _on_close)
             connection.on(getattr(events, "Error", "Error"), _on_error)
 
-        await connection.start(self._build_options(language, sample_rate))
+        await connection.start(self._build_options(language, sample_rate, effective_keyterms))
 
         async def _pump() -> None:
             # Rate-limit OUTBOUND to real-time: Deepgram needs at least
@@ -379,7 +386,9 @@ class DeepgramSTT:
             tail = " ".join(committed + ([last_partial] if last_partial else []))
             yield TranscriptChunk(text=tail, is_final=True)
 
-    def _build_options(self, language: str | None, sample_rate: int) -> Any:
+    def _build_options(
+        self, language: str | None, sample_rate: int, keyterms: Sequence[str] | None = None
+    ) -> Any:
         """Build Deepgram ``LiveOptions`` for the socket.
 
         ``sample_rate`` MUST match the rate of the bytes being sent — Deepgram
@@ -407,11 +416,14 @@ class DeepgramSTT:
             opts["utterance_end_ms"] = self._utterance_end_ms
         if language:
             opts["language"] = language
-        if self._keyterms:
+        # Effective keyterms = constructor + per-call (resolved in transcribe);
+        # fall back to the constructor list when called directly (e.g. tests).
+        effective = list(keyterms) if keyterms is not None else list(self._keyterms)
+        if effective:
             # nova-3 → keyterm prompting; nova-2/earlier → legacy keyword boost.
             # Deepgram accepts a list for both; the SDK serializes each as a
             # repeated query param.
-            opts["keyterm" if self._uses_keyterm_prompting() else "keywords"] = list(self._keyterms)
+            opts["keyterm" if self._uses_keyterm_prompting() else "keywords"] = effective
         if self._client is not None:
             # Test path: hand the fake the raw option dict.
             return opts

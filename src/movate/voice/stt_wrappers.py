@@ -13,7 +13,7 @@ drop into the pipeline (or inside a ``FailoverSTT`` chain) transparently:
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from movate.voice.base import AudioChunk, SpeechToTextProvider, TranscriptChunk
@@ -57,6 +57,7 @@ class SilenceGatedSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         async def _gated() -> AsyncIterator[AudioChunk]:
             silence_run = 0
@@ -77,7 +78,9 @@ class SilenceGatedSTT:
             # Quantify the savings so ops can see how much audio the gate trimmed.
             self._observer.on_event("audio_gated", dropped=dropped, kept=kept)
 
-        return self._inner.transcribe(_gated(), language=language, api_key=api_key)
+        return self._inner.transcribe(
+            _gated(), language=language, api_key=api_key, keyterms=keyterms
+        )
 
 
 class ConfidenceGatedSTT:
@@ -113,6 +116,7 @@ class ConfidenceGatedSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         # Buffer so the same audio can be replayed to the escalation provider.
         buffered: list[AudioChunk] = [chunk async for chunk in audio]
@@ -122,7 +126,9 @@ class ConfidenceGatedSTT:
                 yield chunk
 
         primary_final: TranscriptChunk | None = None
-        async for chunk in self._primary.transcribe(_replay(), language=language, api_key=api_key):
+        async for chunk in self._primary.transcribe(
+            _replay(), language=language, api_key=api_key, keyterms=keyterms
+        ):
             if chunk.is_final:
                 primary_final = chunk
             else:
@@ -138,7 +144,7 @@ class ConfidenceGatedSTT:
             )
             escalated_final: TranscriptChunk | None = None
             async for chunk in self._escalation.transcribe(
-                _replay(), language=language, api_key=api_key
+                _replay(), language=language, api_key=api_key, keyterms=keyterms
             ):
                 if chunk.is_final:
                     escalated_final = chunk

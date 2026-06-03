@@ -1347,6 +1347,16 @@ class VoiceConfig(BaseModel):
             "Executor is, so an mdk agent honors this flag."
         ),
     )
+    keyterms: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Domain vocabulary to **boost** at recognition time for this agent "
+            "(ADR 071 D4) — names, acronyms, jargon a general STT model mis-hears "
+            "(e.g. ``['VPN', 'Okta', 'Mova-iO']``).  Passed per-turn to the STT "
+            "provider; boosting-capable providers (Deepgram) honor it, others "
+            "ignore it.  Empty (the default) sends no boosting."
+        ),
+    )
 
 
 class AgentSpec(BaseModel):

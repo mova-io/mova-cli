@@ -31,7 +31,7 @@ class _FailingSTT:
     version = "0"
 
     async def transcribe(
-        self, audio, *, language=None, api_key=None
+        self, audio, *, language=None, api_key=None, keyterms=None
     ) -> AsyncIterator[TranscriptChunk]:
         async for _ in audio:
             pass

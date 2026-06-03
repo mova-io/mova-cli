@@ -626,3 +626,52 @@ def test_seed_voice_turn_config_tts_streaming_none_keeps_default() -> None:
     assert cfg.tts_streaming is True  # runtime default
     _seed_voice_turn_config(cfg, _bundle_with_voice(voice_id="x"))  # no tts_streaming
     assert cfg.tts_streaming is True  # unchanged
+
+
+def test_seed_voice_turn_config_keyterms() -> None:
+    """ADR 071 D4: keyterms seed from the agent block; empty list = no boosting."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.keyterms == []  # default
+    _seed_voice_turn_config(cfg, _bundle_with_voice(keyterms=["VPN", "Okta"]))
+    assert cfg.keyterms == ["VPN", "Okta"]
+    # Empty keyterms list leaves the (empty) default untouched.
+    cfg2 = _VoiceTurnConfig()
+    _seed_voice_turn_config(cfg2, _bundle_with_voice(voice_id="x"))
+    assert cfg2.keyterms == []
+
+
+async def test_voice_ws_threads_agent_keyterms_to_stt(storage, agents_path, auth_setup) -> None:
+    """End-to-end: an agent's voice.keyterms reach stt.transcribe(keyterms=...)."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("turn the lights on")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = FakeTTS
+    token, _ = auth_setup
+    client = TestClient(app)
+    # Create an agent whose voice block carries keyterms.
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice WS transport",
+        b"description: demo agent for the voice WS transport\n"
+        b"voice:\n  enabled: true\n  keyterms: ['VPN', 'Okta']",
+    )
+    r = client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "end"})
+        _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    # The FakeSTT recorded the keyterms the pipeline passed it.
+    assert stt.keyterms_seen == [["VPN", "Okta"]]

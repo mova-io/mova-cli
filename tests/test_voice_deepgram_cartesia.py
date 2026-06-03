@@ -274,6 +274,34 @@ async def test_deepgram_no_keyterms_sends_neither_param() -> None:
     assert "keywords" not in conn.started_with
 
 
+async def test_deepgram_per_call_keyterms_merge_with_constructor() -> None:
+    """ADR 071 D4: per-call keyterms union with the constructor list, de-duped."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(
+        finish_grace_seconds=0,
+        keyterms=["VPN", "Okta"],  # tenant/default level
+        client=_FakeDeepgramClient(conn),
+    )
+    _ = [
+        c
+        async for c in stt.transcribe(
+            _audio_stream(b"a"),
+            api_key="k",
+            keyterms=["Okta", "Mova-iO"],  # per-agent
+        )
+    ]
+    # Union, order-preserving, de-duped (Okta appears once).
+    assert conn.started_with["keyterm"] == ["VPN", "Okta", "Mova-iO"]
+
+
+async def test_deepgram_per_call_keyterms_only() -> None:
+    """Per-call keyterms work with no constructor list (the runtime's path)."""
+    conn = _FakeDeepgramConnection([_dg_event("hi", is_final=True)])
+    stt = DeepgramSTT(finish_grace_seconds=0, client=_FakeDeepgramClient(conn))
+    _ = [c async for c in stt.transcribe(_audio_stream(b"a"), api_key="k", keyterms=["SSO"])]
+    assert conn.started_with["keyterm"] == ["SSO"]
+
+
 async def test_deepgram_promotes_last_partial_when_no_final() -> None:
     # Socket emits only interims (no endpointed final). The adapter must
     # promote the last partial to is_final=True so the pipeline's

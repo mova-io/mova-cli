@@ -1,6 +1,6 @@
 # ADR 071 — Per-agent voice tuning in the `agent.yaml` voice block
 
-**Status:** Accepted (2026-06-02) for D1–D3 (implemented, additive). D4 (keyterms at the STT seam) is **Proposed** — needs sign-off before the Protocol change.
+**Status:** Accepted (2026-06-02) — D1–D3 and **D4** all implemented. D4's additive `transcribe(keyterms=)` Protocol extension landed with sign-off (default `None`, every adapter accepts it; only Deepgram honors it).
 **Date:** 2026-06-02
 **Deciders:** Engineering + Deva (Movate)
 **Builds on / composes with (changes nothing in their wire contracts):**
@@ -66,19 +66,24 @@ opt-in posture + cost profile). Threads into
 `run_voice_pipeline(speculative=...)`; still only fires when the agent stage is
 cancel-safe (`AgentTurn.speculatable` — `ExecutorAgentTurn` is). No seam change.
 
-### D4 — `keyterms` per agent (Proposed — needs sign-off; NOT in this PR)
+### D4 — `keyterms` per agent (Accepted — implemented)
 
-Add `keyterms: list[str]` to the block AND an additive
+Adds `keyterms: list[str]` to the block AND an additive
 `keyterms: Sequence[str] | None = None` kwarg to
 `SpeechToTextProvider.transcribe(...)`, defaulting to `None` so every existing
-adapter/caller is unaffected. `DeepgramSTT.transcribe` would merge it with its
-constructor list; other adapters ignore it. The pipeline passes
-`stt.transcribe(..., keyterms=...)`. This is the only change that touches the
-**ADR 048 D3 seam** (and the failover composite + `SilenceGatedSTT` wrapper +
-test doubles), so per CLAUDE.md rules 1/7 it is held as **Proposed** for explicit
-agreement before implementation. Until then, per-agent keyterms is documented as
-unsupported in production (demo-only); the curated `DEEPGRAM_KEYTERMS` env on the
-runtime STT factory is the interim lever.
+adapter/caller is unaffected. `DeepgramSTT.transcribe` **merges** it with its
+constructor list (union, de-duped, order-preserving); OpenAI Whisper / Cartesia
+STT / Azure accept-and-ignore it. The failover composite (`FailoverSTT`) and the
+`SilenceGatedSTT` / `ConfidenceGatedSTT` wrappers thread it through to the inner
+provider; the pipeline passes `stt.transcribe(..., keyterms=...)`, seeded from
+the agent's block via `_VoiceTurnConfig.keyterms`. The runtime's
+`DEEPGRAM_KEYTERMS` env (the demo's curated list) remains a complementary
+tenant-level default — the two unions at the Deepgram adapter.
+
+This touches the **ADR 048 D3 seam**, but additively (optional kwarg, default
+`None`): no existing implementation or call site changes behavior. The change is
+wide (every adapter + composite + wrappers + doubles) but mechanical, and the
+boosting-capable-honors / others-ignore contract keeps it provider-agnostic.
 
 ### D5 — Validation + surfacing
 

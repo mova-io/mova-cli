@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -373,6 +373,7 @@ async def run_voice_pipeline(
     codec: AudioCodec = "pcm16",
     stt_api_key: str | None = None,
     tts_api_key: str | None = None,
+    keyterms: Sequence[str] | None = None,
     session_id: str | None = None,
     cancel: asyncio.Event | None = None,
     tts_streaming: bool = False,
@@ -419,6 +420,11 @@ async def run_voice_pipeline(
     unchanged. In streaming mode an agent that errors *after* emitting tokens may
     have already spoken them (a live turn cannot be un-spoken); terminal errors
     (auth/schema) emit no tokens, so nothing is spoken before the error.
+
+    ``keyterms`` (opt-in, ADR 071 D4) is a per-turn domain vocabulary passed
+    straight to ``stt.transcribe(keyterms=...)`` — an agent-specific boost list
+    (names, acronyms, jargon) that a boosting-capable provider (Deepgram) honors
+    and others ignore. ``None`` (default) sends no boosting.
 
     ``pii_redactor`` (opt-in) masks PII in the **emitted** ``transcript.*`` events
     (captions / logs / observability) while the agent stage still runs on the raw
@@ -511,7 +517,9 @@ async def run_voice_pipeline(
 
     final_transcript: str | None = None
     try:
-        async for tchunk in stt.transcribe(audio_in, language=language, api_key=stt_api_key):
+        async for tchunk in stt.transcribe(
+            audio_in, language=language, api_key=stt_api_key, keyterms=keyterms
+        ):
             if tchunk.is_final:
                 final_transcript = tchunk.text
                 yield _stamp(VoiceEvent(kind="transcript.final", text=_shown(tchunk.text)))

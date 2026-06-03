@@ -52,7 +52,7 @@ class _FailingSTT:
         self.calls = 0
 
     async def transcribe(
-        self, audio, *, language=None, api_key=None
+        self, audio, *, language=None, api_key=None, keyterms=None
     ) -> AsyncIterator[TranscriptChunk]:
         self.calls += 1
         async for _ in audio:
@@ -72,7 +72,7 @@ class _FlakySTT:
         self.calls = 0
 
     async def transcribe(
-        self, audio, *, language=None, api_key=None
+        self, audio, *, language=None, api_key=None, keyterms=None
     ) -> AsyncIterator[TranscriptChunk]:
         self.calls += 1
         async for _ in audio:

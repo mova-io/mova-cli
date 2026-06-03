@@ -33,7 +33,7 @@ provider landscape moves fast):
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 from movate.voice.base import AudioChunk, AudioCodec, TranscriptChunk
@@ -108,6 +108,7 @@ class OpenAIWhisperSTT:
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,  # ADR 071 D4: accepted, not supported by Whisper
     ) -> AsyncIterator[TranscriptChunk]:
         # Drain the inbound stream into one buffer, tracking the codec/sample
         # rate so we can build a real container (Whisper rejects header-less
