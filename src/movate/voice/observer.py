@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -167,3 +168,101 @@ class MetricsObserver:
             "silence_frames_kept": self.silence_frames_kept,
             "speculation": self.speculation_snapshot(),
         }
+
+
+# ----------------------------------------------------------------------
+# Speculation A/B verdict (ADR 070/073 Phase 1) — turn the live telemetry
+# into a flip/no-flip recommendation for the ``speculative`` default.
+# ----------------------------------------------------------------------
+
+# Defaults for the verdict thresholds. Speculation is worth defaulting ON when it
+# commits often enough that wasted (cancelled) compute is acceptable AND each
+# commit buys back meaningful latency — measured, not assumed (ADR 073 D1).
+_AB_MIN_SAMPLES = 20  # too few speculations → "insufficient-data", don't decide
+_AB_MIN_COMMIT_RATIO = 0.5  # below this, cancelled runs dominate → not worth it
+_AB_MIN_HEAD_START_MS = 200.0  # below this, the latency saved is in the noise
+
+
+@dataclass(frozen=True)
+class SpeculationABVerdict:
+    """The flip/no-flip recommendation for the ``speculative`` default.
+
+    ``recommendation`` is one of:
+
+    * ``"enable"`` — commit-ratio + head-start both clear the bar over enough
+      samples → default speculation ON pays off.
+    * ``"hold"`` — enough data, but the ratio or the head-start is too low →
+      keep it opt-in (the cancelled-run cost isn't repaid).
+    * ``"insufficient-data"`` — fewer than ``min_samples`` speculations fired →
+      gather more before deciding.
+    """
+
+    started: int
+    committed: int
+    cancelled: int
+    commit_ratio: float
+    avg_head_start_ms: float
+    recommendation: str
+    rationale: str
+
+
+def speculation_ab_report(
+    snapshot: dict[str, Any],
+    *,
+    min_samples: int = _AB_MIN_SAMPLES,
+    min_commit_ratio: float = _AB_MIN_COMMIT_RATIO,
+    min_head_start_ms: float = _AB_MIN_HEAD_START_MS,
+) -> SpeculationABVerdict:
+    """Turn a speculation snapshot into a default-flip verdict (ADR 073 Phase 1).
+
+    ``snapshot`` is either a :meth:`MetricsObserver.speculation_snapshot` dict or
+    a full :meth:`MetricsObserver.snapshot` (the ``speculation`` block is read if
+    present). The decision is deliberately conservative: it only says
+    ``"enable"`` when there is *enough* data AND both the commit-ratio and the
+    head-start clear their bars — the cancelled-run compute (ADR 070's risk) must
+    be repaid by real latency saved.
+    """
+    spec = snapshot.get("speculation", snapshot)
+    started = int(spec.get("started", 0))
+    committed = int(spec.get("committed", 0))
+    cancelled = int(spec.get("cancelled", 0))
+    commit_ratio = float(spec.get("commit_ratio", (committed / started) if started else 0.0))
+    avg_head_start_ms = float(spec.get("avg_head_start_ms", 0.0))
+
+    if started < min_samples:
+        rec = "insufficient-data"
+        rationale = (
+            f"only {started} speculation(s) observed (need ≥{min_samples}); "
+            "gather more turns before deciding."
+        )
+    elif commit_ratio >= min_commit_ratio and avg_head_start_ms >= min_head_start_ms:
+        rec = "enable"
+        rationale = (
+            f"{commit_ratio:.0%} commit-ratio (≥{min_commit_ratio:.0%}) and "
+            f"~{round(avg_head_start_ms)}ms saved/turn (≥{round(min_head_start_ms)}ms) — "
+            "the latency saved repays the cancelled-run cost; default it ON."
+        )
+    else:
+        reasons = []
+        if commit_ratio < min_commit_ratio:
+            reasons.append(
+                f"commit-ratio {commit_ratio:.0%} < {min_commit_ratio:.0%} "
+                "(too many cancelled runs)"
+            )
+        if avg_head_start_ms < min_head_start_ms:
+            reasons.append(
+                f"head-start ~{round(avg_head_start_ms)}ms < {round(min_head_start_ms)}ms "
+                "(latency saved is marginal)"
+            )
+        rec = "hold"
+        rationale = "keep opt-in: " + "; ".join(reasons) + "."
+
+    return SpeculationABVerdict(
+        started=started,
+        committed=committed,
+        cancelled=cancelled,
+        commit_ratio=commit_ratio,
+        avg_head_start_ms=avg_head_start_ms,
+        recommendation=rec,
+        rationale=rationale,
+    )

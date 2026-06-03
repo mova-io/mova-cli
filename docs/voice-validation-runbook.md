@@ -28,9 +28,19 @@ human speech** (the bench's 83% was clean TTS — a ceiling, not a forecast).
    - some clean, complete sentences;
    - some with mid-sentence pauses ("um… let me think…");
    - a few where you stop, then add more ("turn on the… the lights").
-3. Read the **Speculate chip**: `N✓ / M✗ (P% commit)`.
+3. Read the **Speculate chip**: `N✓ / M✗ (P% commit, ~Hms saved/turn)` — the
+   commit rate **and** the avg head-start (the latency each commit bought) now
+   show live (ADR 073 Phase-1 telemetry).
 4. Watch the **latency badge** ("responded in X ms") with Speculate on vs off on
    similar utterances — note the typical delta.
+
+The same flip/no-flip logic the chip implies is available programmatically:
+`movate.voice.speculation_ab_report(snapshot)` turns a session's speculation
+snapshot into a verdict (`enable` / `hold` / `insufficient-data`) with a
+rationale — the runtime/bench can print it directly so the decision isn't a
+hand-eyeballed ratio. `scripts/voice_bench.py` prints an *offline-proxy* verdict
+(synthetic TTS speech — a ceiling); the **live** verdict over real human turns is
+the binding one.
 
 **Decision thresholds**
 | Commit rate (human speech) | Action |

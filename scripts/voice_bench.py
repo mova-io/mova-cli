@@ -39,6 +39,7 @@ from pathlib import Path
 from movate.voice import DeepgramSTT, OpenAITTS
 from movate.voice.base import AudioChunk
 from movate.voice.bench import word_error_rate
+from movate.voice.observer import speculation_ab_report
 
 # Enterprise IT-support utterances seeded with the exact vocab the keyterm list
 # boosts (VPN/VIP/Okta/MFA/SSO/...). These are the words a general model fumbles.
@@ -178,6 +179,26 @@ async def main() -> int:
         f"- Interim==final (optimistic commit rate): "
         f"{matched}/{len(corpus)} = {matched / len(corpus):.0%}  "
         f"(→ ~{(1 - matched / len(corpus)):.0%} would cancel; HIGHER on human speech)"
+    )
+    # ADR 073 Phase 1 — run the SAME flip/no-flip verdict logic the live runtime
+    # uses, fed by this offline run's proxy snapshot (interim==final → committed,
+    # mean headroom → head-start). Live telemetry (MetricsObserver over real
+    # turns) is the real input; this is the synthetic ceiling.
+    proxy = {
+        "started": len(corpus),
+        "committed": matched,
+        "cancelled": len(corpus) - matched,
+        "commit_ratio": matched / len(corpus) if corpus else 0.0,
+        "avg_head_start_ms": _mean(headrooms),
+    }
+    verdict = speculation_ab_report(proxy, min_samples=1)
+    print(
+        f"- Speculation A/B verdict (offline proxy): "
+        f"{verdict.recommendation.upper()} — {verdict.rationale}"
+    )
+    print(
+        "  (offline proxy uses synthetic TTS speech; the binding decision is the "
+        "LIVE verdict over real human turns — run the validation runbook.)"
     )
     print("=" * 64)
     return 0
