@@ -141,6 +141,35 @@ acceptable cancel ratio (proposed bar: ≥300 ms p50 improvement at ≤25% cance
 ratio on the bench set). This keeps us honest — speculation can *lose* for fast
 back-and-forth speakers, and we want data, not vibes.
 
+#### Measured baseline (2026-06-02)
+
+First pass via [`scripts/voice_bench.py`](../../scripts/voice_bench.py) — n=6
+enterprise IT-support utterances, OpenAI-TTS-synthesized and **real-time-paced**
+into Deepgram nova-3, keyterms on/off. Caveat up front: the corpus is *synthetic*
+speech, so these are a **ceiling** on stability and a **floor** on the keyterm
+win; the real distribution must come from production telemetry (the demo's
+latency badge already records `stt_final` per turn).
+
+- **Endpointing headroom ≈ 1662 ms mean** (range 1221–2152). This is the dead
+  time between the transcript reaching its final text and the endpointed
+  `speech_final` — i.e. the latency speculation recovers. It tracks
+  `endpointing_ms` (1500) plus VAD lag, as predicted. **This is the win's
+  ceiling and it is large** — comfortably above the ≥300 ms bar.
+- **Interim==final 83%** (≈17% would have cancelled) on clean audio — *clears*
+  the ≤25% cancel bar here, but human speech (disfluencies, mid-sentence pauses)
+  will push the cancel rate up. So the quiet-gap gate (D1) is the load-bearing
+  knob, not an afterthought.
+- **Keyterm WER 4.4% → 4.4%** (no change). On studio-clean TTS the base model
+  already gets the words; keyterms only corrected *casing*, which WER ignores.
+  **Conclusion: keyterms are insurance for noisy/accented human audio, not a
+  measured win on clean audio** — keep them (zero downside, default-on in the
+  demo) but measure the real win on a human corpus before claiming it.
+
+**Verdict:** the headroom justifies building speculation; the cancel-rate risk
+justifies shipping it **opt-in and behind the quiet-gap gate**, then A/B-ing it
+live against the badge telemetry before defaulting it on. Proceeding to
+implement on exactly those terms (opt-in, `speculative=False` default).
+
 ## Consequences
 
 **Positive**
