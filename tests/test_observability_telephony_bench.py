@@ -10,6 +10,8 @@ from movate.voice import (
     FailoverSTT,
     FakeSTT,
     MetricsObserver,
+    STTBenchItem,
+    STTBenchReport,
     TranscriptChunk,
     bench_stt,
     mulaw_to_pcm16,
@@ -125,4 +127,21 @@ async def test_bench_stt_reports_wer_and_latency() -> None:
     assert report.items[1].wer > 0.0
     assert 0.0 <= report.mean_wer <= 1.0
     assert report.p50_latency_ms >= 0.0
+    # p95 is also defined and >= p50 (percentile is monotonic) — the regression
+    # gate reads both, so pin the aggregate that was previously uncovered.
+    assert report.p95_latency_ms >= report.p50_latency_ms
     assert "WER" in report.format()
+
+
+def test_bench_percentile_interpolates_across_items() -> None:
+    """STTBenchReport percentiles interpolate over the per-item latencies
+    (the eval's regression-gate numbers), not just echo a single value."""
+    items = [
+        STTBenchItem(reference="x", hypothesis="x", wer=0.0, latency_ms=float(ms))
+        for ms in (10, 20, 30, 40, 50)
+    ]
+    report = STTBenchReport(provider="fake", items=items)
+    assert report.p50_latency_ms == 30.0  # median of 10..50
+    # 95th percentile sits between 40 and 50 (linear interp), strictly above p50.
+    assert 40.0 < report.p95_latency_ms <= 50.0
+    assert report.mean_wer == 0.0
