@@ -287,6 +287,15 @@ class FailoverSTT(_FailoverBase):
 
         return cls([DeepgramSTT(), OpenAIWhisperSTT()], **kwargs)
 
+    async def warm(self, api_key: str | None = None) -> bool:
+        """Warm every provider in the chain that supports it (ADR 073 Phase 5)."""
+        from movate.voice.stt_wrappers import warm_stt  # noqa: PLC0415 - avoid cycle
+
+        warmed = False
+        for provider in self._providers:
+            warmed = await warm_stt(provider, api_key) or warmed
+        return warmed
+
     async def transcribe(
         self,
         audio: AsyncIterator[AudioChunk],

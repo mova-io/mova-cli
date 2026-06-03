@@ -57,6 +57,7 @@ from movate.voice import (
     resample_pcm16,
     run_voice_pipeline,
     speakify,
+    warm_stt,
 )
 
 # Make the demo dir importable so this script runs the same whether you launch
@@ -164,6 +165,9 @@ class _FaultSTT:
             endpointing_ms=endpointing_ms,
         ):
             yield c
+
+    async def warm(self, api_key: str | None = None) -> bool:  # ADR 073 Phase 5
+        return await warm_stt(self._inner, api_key)
 
 
 class _FaultTTS:
@@ -466,6 +470,9 @@ class _KeyedSTT:
             endpointing_ms=endpointing_ms,
         ):
             yield c
+
+    async def warm(self, api_key: str | None = None) -> bool:  # ADR 073 Phase 5
+        return await warm_stt(self._inner, self._fixed_key or api_key)
 
 
 class _KeyedTTS:
@@ -1287,7 +1294,9 @@ async def health() -> dict[str, object]:
     return {
         "ok": has_stt and has_tts,
         "service": "mdk-voice-demo",
-        "version": getattr(__import__("movate.voice", fromlist=["__version__"]), "__version__", "unknown"),
+        "version": getattr(
+            __import__("movate.voice", fromlist=["__version__"]), "__version__", "unknown"
+        ),
         "uptime_s": (
             round(_time.monotonic() - _started_at_monotonic, 1) if _started_at_monotonic else None
         ),
@@ -1966,6 +1975,10 @@ async def voice(ws: WebSocket) -> None:
             extras_q.put_nowait(ex)
 
     session = Session(on_trail=_on_trail, on_tool_call=_on_tool_call, on_extras=_on_extras)
+    # ADR 073 Phase 5 — warm the STT client now (while the page is still wiring
+    # up) so the caller's FIRST turn skips Deepgram client cold-start. Best-effort.
+    with contextlib.suppress(Exception):
+        await warm_stt(session.stt)
 
     async def _forward_trail() -> None:
         """Drain the trail queue onto the WS until the session ends."""
