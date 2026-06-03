@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.5.30.3"
+version = "2026.6.3.1"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -522,6 +522,10 @@ module = [
     "azure.cognitiveservices.speech.*",
     "azure.cognitiveservices.*",
     "azure.*",
+    # Temporal Python SDK — optional ``[temporal]`` extra (ADR 054). Imported
+    # LAZILY inside movate.core.workflow.temporal_activities (Phase 1 Track C)
+    # so mypy on `src` stays clean whether or not the extra is installed.
+    "temporalio.*",
 ]
 ignore_missing_imports = true
 
