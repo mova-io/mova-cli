@@ -276,6 +276,7 @@ class _Speculator:
         session_id: str | None,
         agent_timeout: float | None,
         observer: Any,
+        turn_detector: Any = None,
     ) -> None:
         self._agent = agent
         self._quiet_gap_s = max(0.0, quiet_gap_s)
@@ -283,6 +284,11 @@ class _Speculator:
         self._session_id = session_id
         self._agent_timeout = agent_timeout
         self._observer = observer
+        # ADR 072: optional semantic trigger. When the detector calls an interim
+        # complete, fire the speculation immediately instead of waiting out the
+        # quiet-gap debounce — a semantically-complete interim is far likelier to
+        # match the final, so this raises the commit rate (ADR 072 ↔ ADR 070).
+        self._turn_detector = turn_detector
         self._loop = asyncio.get_event_loop()
         self._armed: asyncio.TimerHandle | None = None
         self._spec_text: str | None = None  # normalized text of the in-flight run
@@ -311,6 +317,19 @@ class _Speculator:
         self._cancel_running()
         if self._armed is not None:
             self._armed.cancel()
+            self._armed = None
+        # ADR 072: if the detector says this interim is already a complete turn,
+        # fire now (no debounce) — the speaker is semantically done. Best-effort:
+        # a detector that raises falls through to the quiet-gap path.
+        if self._turn_detector is not None:
+            try:
+                complete = self._turn_detector.is_complete(text)
+            except Exception:
+                complete = False
+            if complete:
+                self._emit("turn_detected", chars=len(text))
+                self._fire(text)
+                return
         self._armed = self._loop.call_later(self._quiet_gap_s, self._fire, text)
 
     def _fire(self, text: str) -> None:
@@ -392,6 +411,7 @@ async def run_voice_pipeline(
     agent_timeout: float | None = None,
     speculative: bool = False,
     speculation_quiet_gap_s: float = 0.3,
+    turn_detector: Any = None,
     observer: Any = None,
     clock: Any = None,
 ) -> AsyncIterator[VoiceEvent]:
@@ -478,6 +498,13 @@ async def run_voice_pipeline(
     don't start-and-cancel on every mid-utterance word (the knob that keeps the
     cancel/waste rate down — ADR 070 D1).
 
+    ``turn_detector`` (optional, ADR 072) is a semantic completeness check
+    (:class:`~movate.voice.turn_detection.TurnDetector`). When set and it calls
+    an interim complete, the speculation fires *immediately* (skipping the
+    quiet-gap), since the speaker is semantically done — which raises the commit
+    rate vs a fixed gap. ``None`` (default) leaves the quiet-gap debounce in
+    sole charge — byte-for-byte the prior behavior.
+
     ``observer`` (optional :class:`~movate.voice.observer.VoiceObserver`) receives
     ``speculation_started`` / ``speculation_committed`` / ``speculation_cancelled``
     events so the win and its cost (cancel ratio) are measurable live (ADR 070
@@ -525,6 +552,7 @@ async def run_voice_pipeline(
             session_id=session_id,
             agent_timeout=agent_timeout,
             observer=observer,
+            turn_detector=turn_detector,
         )
         if speculative and _agent_is_speculatable(agent)
         else None

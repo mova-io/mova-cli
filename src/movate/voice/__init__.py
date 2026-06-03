@@ -108,6 +108,11 @@ from movate.voice.telephony import (
     telephony_inbound,
     telephony_outbound,
 )
+from movate.voice.turn_detection import (
+    HeuristicTurnDetector,
+    NullTurnDetector,
+    TurnDetector,
+)
 from movate.voice.vad import frame_rms, is_silent
 
 __all__ = [
@@ -138,12 +143,14 @@ __all__ = [
     "FakeRealtime",
     "FakeSTT",
     "FakeTTS",
+    "HeuristicTurnDetector",
     "InMemoryVoiceCache",
     "LangGraphAgentTurn",
     "LyzrAgentTurn",
     "LyzrProvider",
     "MetricsObserver",
     "NullObserver",
+    "NullTurnDetector",
     "OpenAIRealtime",
     "OpenAITTS",
     "OpenAIWhisperSTT",
@@ -162,6 +169,7 @@ __all__ = [
     "StderrObserver",
     "TextToSpeechProvider",
     "TranscriptChunk",
+    "TurnDetector",
     "VoiceCache",
     "VoiceEvent",
     "VoiceFailureType",
