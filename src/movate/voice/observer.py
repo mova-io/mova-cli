@@ -15,6 +15,13 @@ The event names are a small, stable vocabulary:
 * ``circuit_open`` / ``circuit_close`` — ``provider`` (breaker state changed).
 * ``exhausted`` — ``kind``, ``failure`` (every provider failed; the caller's
   error path / ADR 048 text degrade takes over).
+
+The pipeline's speculative-kickoff stage (ADR 070) reuses the same hook:
+
+* ``speculation_started`` — ``chars`` (an agent turn fired on a stable interim).
+* ``speculation_committed`` — ``head_start_ms`` (the interim matched the final;
+  the agent had already run this long → the latency the speculation saved).
+* ``speculation_cancelled`` — (the interim was superseded; the run is discarded).
 """
 
 from __future__ import annotations
@@ -66,6 +73,14 @@ class MetricsObserver:
         self.cache_hits = 0
         self.silence_frames_dropped = 0
         self.silence_frames_kept = 0
+        # Speculative-kickoff outcomes (ADR 070/073): how often a speculation
+        # fired, committed (paid off), or was cancelled (wasted compute), plus
+        # the total head-start the commits bought. The A/B signal for the
+        # ``speculative`` default-flip decision.
+        self.speculations_started = 0
+        self.speculations_committed = 0
+        self.speculations_cancelled = 0
+        self.speculation_head_start_ms_total = 0
 
     def on_event(self, event: str, /, **fields: Any) -> None:
         self.events[event] += 1
@@ -90,6 +105,13 @@ class MetricsObserver:
         elif event == "audio_gated":
             self.silence_frames_dropped += int(fields.get("dropped", 0))
             self.silence_frames_kept += int(fields.get("kept", 0))
+        elif event == "speculation_started":
+            self.speculations_started += 1
+        elif event == "speculation_committed":
+            self.speculations_committed += 1
+            self.speculation_head_start_ms_total += int(fields.get("head_start_ms", 0))
+        elif event == "speculation_cancelled":
+            self.speculations_cancelled += 1
 
     def reset(self) -> None:
         """Zero every counter (useful between demo scenarios)."""
@@ -104,6 +126,30 @@ class MetricsObserver:
         self.cache_hits = 0
         self.silence_frames_dropped = 0
         self.silence_frames_kept = 0
+        self.speculations_started = 0
+        self.speculations_committed = 0
+        self.speculations_cancelled = 0
+        self.speculation_head_start_ms_total = 0
+
+    def speculation_snapshot(self) -> dict[str, Any]:
+        """Just the speculative-kickoff outcomes + the derived A/B metrics.
+
+        ``commit_ratio`` — committed ÷ started (how often a speculation paid
+        off; the lever's hit rate). ``avg_head_start_ms`` — mean latency saved
+        per committed turn (how much it bought when it did). Both are ``0.0``
+        when nothing speculated, so a caller can render them unconditionally.
+        """
+        started = self.speculations_started
+        committed = self.speculations_committed
+        return {
+            "started": started,
+            "committed": committed,
+            "cancelled": self.speculations_cancelled,
+            "commit_ratio": (committed / started) if started else 0.0,
+            "avg_head_start_ms": (
+                (self.speculation_head_start_ms_total / committed) if committed else 0.0
+            ),
+        }
 
     def snapshot(self) -> dict[str, Any]:
         """A plain-dict view of the counters (safe to serialize/log)."""
@@ -119,4 +165,5 @@ class MetricsObserver:
             "cache_hits": self.cache_hits,
             "silence_frames_dropped": self.silence_frames_dropped,
             "silence_frames_kept": self.silence_frames_kept,
+            "speculation": self.speculation_snapshot(),
         }

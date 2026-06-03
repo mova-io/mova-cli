@@ -1,14 +1,21 @@
-# mdk-voice — architecture
+# `movate.voice` — architecture
 
 A 10-minute tour for new contributors (or a partner team kicking the tires).
 Read this once and the rest of the codebase reads itself.
 
+> **History.** This started as a standalone `mdk-voice` package; ADR 067 records
+> the **consolidation pivot** — voice now lives **in `movate-cli` at
+> `src/movate/voice/`**. The package is still **framework-neutral**: the pipeline
+> imports nothing from `movate.core`; mdk plugs in via an `ExecutorAgentTurn`
+> adapter (ADR 067 D4). Anything below referring to "standalone" means *that
+> framework-neutrality*, not a separate distribution.
+
 > **Defining fact.** Voice here is **not a new kind of agent.** It is a
 > transport + adapter seams that wrap *any* text agent:
 > `audio → STT → your agent → TTS → audio`. The agent stage is the small
-> `AgentTurn` seam, so the same pipeline voices an mdk agent, a Lyzr ADK
-> agent, a LangGraph graph, or a bare async function — with **zero
-> dependency on mdk**.
+> `AgentTurn` seam, so the same pipeline voices an mdk agent (via
+> `ExecutorAgentTurn`), a Lyzr ADK agent, a LangGraph graph, or a bare async
+> function — the pipeline never imports a framework.
 
 ## The layer map
 
@@ -53,9 +60,9 @@ Protocol**, never by subclassing. That is the whole architectural posture.
 | `breaker.py` | `CircuitBreaker` (closed → open → half-open → closed). Used by the failover composites to skip dead providers. |
 | `cache.py` | `InMemoryVoiceCache` + `VoiceCache` Protocol + `warm_cache(...)`. Re-used phrases serve at $0, 0ms. |
 | `observer.py` | `VoiceObserver` Protocol + `MetricsObserver` / `StderrObserver` / `NullObserver`. The hook the router emits structured events through. |
-| `failures.py` | `VoiceFailureType` + `classify(exc)` + `DEFAULT_RETRY`. Tiny in-package failure taxonomy — mirrors mdk's shape but does **not** import from it (keeps standalone). |
+| `failures.py` | `VoiceFailureType` + `classify(exc)` + `DEFAULT_RETRY`. Tiny in-package failure taxonomy — mirrors mdk's shape but does **not** import `movate.core` (keeps the pipeline framework-neutral). |
 | `manifest.py` | `VoiceManifest` per provider (latency tier, $/min, $/char, sovereignty). Drives the router's latency-first, cost-bounded ordering. |
-| `lyzr_parity.py` | Live discovery-endpoint parity check vs Lyzr's voice menu. Strategic: every provider Lyzr lists → mdk-voice adapter (or covered via `/v4` OpenAI-compat). |
+| `lyzr_parity.py` | Live discovery-endpoint parity check vs Lyzr's voice menu. Strategic: every provider Lyzr lists → movate.voice adapter (or covered via `/v4` OpenAI-compat). |
 | `chunking.py` | `SentenceChunker`. Splits an agent token stream into sentences so streaming TTS can start synthesizing before the agent finishes. |
 | `telephony.py` | μ-law ↔ PCM16 codec + anti-aliased resampling + 20 ms frame rechunker (`telephony_inbound` / `telephony_outbound`). |
 | `vad.py` | `frame_rms(...)` / `is_silent(...)` — energy-based VAD primitives. |
@@ -77,12 +84,15 @@ class SpeechToTextProvider(Protocol):
         audio: AsyncIterator[AudioChunk],
         *, language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,
     ) -> AsyncIterator[TranscriptChunk]: ...
 ```
 
 Yield `TranscriptChunk(is_final=False)` for partial hypotheses and
 `TranscriptChunk(is_final=True)` for the endpointed final. The pipeline runs
-the agent when the first `is_final=True` arrives.
+the agent when the first `is_final=True` arrives. `keyterms` (ADR 071 D4,
+additive, default `None`) is a per-call domain-vocab boost list — Deepgram
+honors it, other adapters accept-and-ignore it.
 
 **Reference impls:** `DeepgramSTT` (T1 streaming), `CartesiaSTT` (T1
 streaming, Ink Whisper), `OpenAIWhisperSTT` (T2 buffered), `AzureSpeechSTT`
@@ -128,13 +138,18 @@ class AgentTurn(Protocol):
 
 Transcript in → text out. The pipeline awaits this; it does not import,
 subclass, or know about any specific framework. **This is what makes
-mdk-voice framework-neutral.**
+`movate.voice` framework-neutral.** An optional `speculatable: bool` class attr
+(ADR 070 D3) marks a turn as cancel-safe so the pipeline may start it
+speculatively on a stable interim.
 
 **Reference impls:**
 
-* `LyzrAgentTurn` (`mdk_voice.lyzr`) — wraps a Lyzr ADK `Agent.run(text)`.
-  Duck-typed: never imports the `lyzr` SDK.
-* `LangGraphAgentTurn` (`mdk_voice.langgraph_adapter`) — wraps a compiled
+* `ExecutorAgentTurn` (`movate.runtime.voice_agent`) — wraps the **mdk
+  Executor**; the *only* place the voice path touches `RunRequest`/`AgentBundle`
+  (ADR 067 D4). `speculatable = True`.
+* `LyzrAgentTurn` (`movate.voice.lyzr`) — wraps a Lyzr ADK `Agent.run(text)`.
+  Duck-typed: never imports the `lyzr` SDK. `speculatable = False` (sync + memory).
+* `LangGraphAgentTurn` (`movate.voice.langgraph_adapter`) — wraps a compiled
   LangGraph `.ainvoke(state)`. Duck-typed: never imports `langgraph`.
 * Your own — implement `name`, `version`, and `async def run(text, ...)`.
   That is the whole contract.
@@ -244,11 +259,11 @@ inheritance, no framework lock-in.
 
 ## Lyzr-parity story
 
-`mdk_voice.lyzr_parity.check_lyzr_parity(api_key=...)` hits Lyzr's two
+`movate.voice.lyzr_parity.check_lyzr_parity(api_key=...)` hits Lyzr's two
 voice-discovery endpoints (`/v1/config/{pipeline,realtime}-options`) and maps
 each provider against `LYZR_PROVIDER_MAP`. The web demo surfaces the result
-as a header badge — literal proof that every provider Lyzr lists is either an
-mdk-voice adapter (STT/TTS/realtime) or reachable via `/v4/chat/completions`
+as a header badge — literal proof that every provider Lyzr lists is either a
+`movate.voice` adapter (STT/TTS/realtime) or reachable via `/v4/chat/completions`
 through `OpenAIChatAgent` (every LLM).
 
 What this enables strategically: Movate can claim *provider-parity-plus*
@@ -272,19 +287,42 @@ Three layers, all green at every commit (`pytest -q`):
 
 No test touches the network. Tests run in under a second.
 
+## Transports
+
+The pipeline is transport-agnostic (it emits `VoiceEvent`s). Two runtime
+transports wrap it over the same `/api/v1/agents/{name}/voice` resource
+(ADR 050 D2):
+
+| Transport | Path | Use |
+|---|---|---|
+| **WS** (streaming) | `WS /agents/{name}/voice` | Full-duplex live turn: partial transcripts, streaming tokens + TTS, barge-in. `?mode=realtime` selects the `RealtimeVoiceProvider` path. |
+| **REST** (one-shot) | `POST /agents/{name}/voice` | Request/response parity: audio (multipart or `audio_url`) in → `{transcript, response, audio}` out (or streamed audio body). Telephony turns, file transcription, testing. Same pipeline, drained to one response — never a second engine. CLI: `mdk voice say` / `transcribe` / `ask`. |
+
+Both seed per-turn config from the agent's `agent.yaml` `voice` block
+(`voice_id`/`language`/`tts_streaming`/`speculative`/`keyterms`, ADR 071), with a
+client `config` frame / request param overriding per turn.
+
 ## Cross-references — the ADRs
 
 The architectural intent (and the things this codebase deliberately is NOT)
-lives in three ADRs in the parent movate-cli repo:
+lives in the ADRs in `docs/adr/`:
 
-* **[ADR 067 — Standalone voice SDK + AgentTurn seam](https://github.com/mova-io/mova-cli/tree/main/docs/adr/067-standalone-voice-sdk.md)** —
-  why we have an `AgentTurn` Protocol and what it costs to add a new one.
-* **[ADR 068 — Resilient voice router (standalone)](https://github.com/mova-io/mova-cli/tree/main/docs/adr/068-resilient-voice-router-standalone.md)** —
-  why the router is a composite that *is* a provider, and why the cost-bounded
-  latency-first ordering is the default policy.
-* **[ADR 069 — Lyzr ADK voice binding](https://github.com/mova-io/mova-cli/tree/main/docs/adr/069-lyzr-adk-voice-binding.md)** —
-  the first cross-framework consumer of the standalone SDK, plus the
-  documented decision *against* embedding inside Lyzr's hosted LiveKit
-  runtime (it would bypass everything ADR 068 buys us).
+* **[ADR 067 — Voice SDK + `AgentTurn` seam](adr/067-standalone-voice-sdk.md)** —
+  the `AgentTurn` Protocol; D4 records the consolidation into `movate.voice` and
+  the `ExecutorAgentTurn` adapter (Accepted with consolidation note).
+* **[ADR 068 — Resilient voice router](adr/068-resilient-voice-router-standalone.md)** —
+  why the router is a composite that *is* a provider; cost-bounded latency-first
+  default ordering.
+* **[ADR 069 — Lyzr ADK voice binding](adr/069-lyzr-adk-voice-binding.md)** —
+  cross-framework consumer; the decision *against* embedding in Lyzr's hosted
+  LiveKit runtime (it would bypass everything ADR 068 buys us).
+* **[ADR 050 — Voice CLI↔API parity](adr/050-voice-api-parity.md)** —
+  the WS + REST transport pair and the `mdk voice` verb set.
+* **[ADR 070 — Speculative agent kickoff](adr/070-speculative-agent-kickoff.md)** —
+  start the agent on a stable interim to beat the endpointing latency floor;
+  opt-in, cancel-safe via `AgentTurn.speculatable`.
+* **[ADR 071 — Per-agent voice tuning](adr/071-per-agent-voice-tuning.md)** —
+  the `agent.yaml` voice block (`tts_streaming`/`speculative`/`keyterms`) + the
+  additive `transcribe(keyterms=)` seam extension.
 
 When in doubt about why a boundary exists, the ADR is the source of truth.

@@ -288,6 +288,11 @@ class _Speculator:
         self._spec_text: str | None = None  # normalized text of the in-flight run
         self._queue: asyncio.Queue[tuple[str, Any]] | None = None
         self._task: asyncio.Task[None] | None = None
+        # Monotonic clock at which the in-flight speculation fired, so a commit
+        # can report ``head_start_ms`` — how long the agent had already been
+        # running when the STT final landed (i.e. the latency speculation saved
+        # on this turn; the A/B signal ADR 070/073 gate the default-flip on).
+        self._fired_at: float | None = None
         # Tasks we cancelled (or that were superseded) — drained in aclose() so
         # asyncio never warns about an un-retrieved exception (cancel-safety).
         self._abandoned: list[asyncio.Task[None]] = []
@@ -311,6 +316,7 @@ class _Speculator:
     def _fire(self, text: str) -> None:
         self._armed = None
         self._spec_text = _norm_text(text)
+        self._fired_at = time.monotonic()
         self._queue, self._task = _start_agent_run(
             self._agent,
             text,
@@ -332,9 +338,12 @@ class _Speculator:
             and self._queue is not None
             and self._spec_text == _norm_text(final_text)
         ):
-            self._emit("speculation_committed")
+            head_start_ms = (
+                int((time.monotonic() - self._fired_at) * 1000) if self._fired_at is not None else 0
+            )
+            self._emit("speculation_committed", head_start_ms=head_start_ms)
             committed = (self._queue, self._task)
-            self._queue = self._task = self._spec_text = None
+            self._queue = self._task = self._spec_text = self._fired_at = None
             return committed
         if self._task is not None:
             self._emit("speculation_cancelled")
@@ -346,7 +355,7 @@ class _Speculator:
             if not self._task.done():
                 self._task.cancel()
             self._abandoned.append(self._task)
-        self._task = self._queue = self._spec_text = None
+        self._task = self._queue = self._spec_text = self._fired_at = None
 
     async def aclose(self) -> None:
         """Cancel + drain any abandoned speculative tasks (cancel-safety)."""
