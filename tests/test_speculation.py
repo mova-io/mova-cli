@@ -20,7 +20,7 @@ import pytest
 
 from movate.voice.base import AudioChunk, TranscriptChunk
 from movate.voice.doubles import FakeAgentTurn, FakeTTS
-from movate.voice.observer import MetricsObserver, speculation_ab_report
+from movate.voice.observer import MetricsObserver, SpeculationGuard, speculation_ab_report
 from movate.voice.pipeline import run_voice_pipeline
 
 pytestmark = pytest.mark.asyncio
@@ -294,3 +294,58 @@ async def test_ab_verdict_reads_nested_full_snapshot() -> None:
     v = speculation_ab_report(obs.snapshot())
     assert v.recommendation == "enable"
     assert v.started == 30 and v.committed == 30
+
+
+# ---------------------------------------------------------------------------
+# SpeculationGuard (ADR 073) — session-scoped cost-guard.
+# ---------------------------------------------------------------------------
+
+
+async def test_guard_trips_on_low_commit_ratio() -> None:
+    """Below the ratio floor, after enough samples, the guard trips off (sticky)."""
+    g = SpeculationGuard(min_samples=4, min_commit_ratio=0.5)
+    assert g.should_speculate() is True
+    tripped = False
+    # 4 turns, all cancelled (ratio 0) → should trip once min_samples reached.
+    for _ in range(4):
+        tripped = g.record({"started": 1, "committed": 0, "cancelled": 1}) or tripped
+    assert tripped is True
+    assert g.tripped is True
+    assert g.should_speculate() is False
+
+
+async def test_guard_stays_on_with_healthy_ratio() -> None:
+    """A good commit-ratio never trips the guard."""
+    g = SpeculationGuard(min_samples=4, min_commit_ratio=0.5)
+    for _ in range(10):
+        assert g.record({"started": 1, "committed": 1, "cancelled": 0}) is False
+    assert g.tripped is False
+    assert g.should_speculate() is True
+    assert g.commit_ratio == 1.0
+
+
+async def test_guard_waits_for_min_samples() -> None:
+    """Even an all-cancel start won't trip before min_samples is reached."""
+    g = SpeculationGuard(min_samples=8, min_commit_ratio=0.5)
+    for _ in range(7):
+        assert g.record({"started": 1, "committed": 0, "cancelled": 1}) is False
+    assert g.should_speculate() is True  # still under the sample floor
+    assert g.record({"started": 1, "committed": 0, "cancelled": 1}) is True  # 8th → trips
+
+
+async def test_guard_record_returns_true_only_on_transition() -> None:
+    """record() returns True once (the trip), False on subsequent calls."""
+    g = SpeculationGuard(min_samples=2, min_commit_ratio=0.5)
+    g.record({"started": 1, "committed": 0, "cancelled": 1})
+    assert g.record({"started": 1, "committed": 0, "cancelled": 1}) is True  # trips
+    assert g.record({"started": 1, "committed": 0, "cancelled": 1}) is False  # already tripped
+
+
+async def test_guard_accepts_full_snapshot() -> None:
+    """record() reads the nested 'speculation' block of a full snapshot."""
+    g = SpeculationGuard(min_samples=2, min_commit_ratio=0.5)
+    obs = MetricsObserver()
+    obs.on_event("speculation_started")
+    obs.on_event("speculation_cancelled")
+    g.record(obs.snapshot())
+    assert g.record(obs.snapshot()) is True

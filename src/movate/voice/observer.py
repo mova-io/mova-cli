@@ -266,3 +266,72 @@ def speculation_ab_report(
         recommendation=rec,
         rationale=rationale,
     )
+
+
+# Cost-guard defaults: a session must run at least this many speculations before
+# the guard will trip, and it trips when the running commit-ratio is below this.
+# Looser than the A/B *enable* bar — the guard exists to stop pathological waste
+# mid-session, not to make the default-flip call.
+_GUARD_MIN_SAMPLES = 8
+_GUARD_MIN_COMMIT_RATIO = 0.35
+
+
+class SpeculationGuard:
+    """Session-scoped cost-guard for speculative kickoff (ADR 070 risk / ADR 073).
+
+    Speculation costs a wasted agent run every time it cancels. On a speech
+    profile where it rarely commits, that cost isn't repaid — so this guard
+    watches the *running* commit-ratio across a session and, once it has seen
+    enough speculations, **trips off** (sticky) when the ratio is too low. The
+    caller gates each turn on :meth:`should_speculate` and feeds each turn's
+    speculation snapshot to :meth:`record`.
+
+    It is a no-op until it trips: a session that never speculates (the default)
+    or that commits well never disables anything. Tripping is one-way within a
+    session — once a profile shows speculation loses, stop paying for it.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_samples: int = _GUARD_MIN_SAMPLES,
+        min_commit_ratio: float = _GUARD_MIN_COMMIT_RATIO,
+    ) -> None:
+        self._min_samples = max(1, min_samples)
+        self._min_commit_ratio = min_commit_ratio
+        self._started = 0
+        self._committed = 0
+        self._tripped = False
+
+    @property
+    def tripped(self) -> bool:
+        return self._tripped
+
+    @property
+    def commit_ratio(self) -> float:
+        return (self._committed / self._started) if self._started else 0.0
+
+    def should_speculate(self) -> bool:
+        """Whether the next turn should still speculate (False once tripped)."""
+        return not self._tripped
+
+    def record(self, snapshot: dict[str, Any]) -> bool:
+        """Absorb one turn's speculation snapshot; return True if it tripped now.
+
+        ``snapshot`` is a per-turn :meth:`MetricsObserver.speculation_snapshot`
+        (or full ``snapshot``). Accumulates into the running totals and, once
+        ``min_samples`` speculations have been seen, trips if the running ratio
+        is below ``min_commit_ratio``. Returns True **only on the transition**
+        so the caller can emit a one-time "speculation disabled" signal.
+        """
+        spec = snapshot.get("speculation", snapshot)
+        self._started += int(spec.get("started", 0))
+        self._committed += int(spec.get("committed", 0))
+        if (
+            not self._tripped
+            and self._started >= self._min_samples
+            and self.commit_ratio < self._min_commit_ratio
+        ):
+            self._tripped = True
+            return True
+        return False
