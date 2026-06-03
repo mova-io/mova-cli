@@ -146,6 +146,12 @@ _FEATURE_PREDICATES: dict[str, Callable[[FastAPI], bool]] = {
     "threads": lambda app: _has_route(app, "/threads", "/api/v1/threads"),
     # Cron-style scheduled jobs.
     "schedules": lambda app: _has_route(app, "/schedules", "/api/v1/schedules"),
+    # Run replay / time-travel (ADR 045 D13) — re-execute a historical run's
+    # recorded input against a chosen agent version (``mdk replay --target``).
+    # Route-detected, so the flag tracks whether the endpoint is deployed here.
+    "run_replay": lambda app: _has_route(
+        app, "/runs/{run_id}/replay", "/api/v1/runs/{run_id}/replay"
+    ),
     # Optional OIDC JWT bearer acceptance (ADR 012) — import-detected: the
     # auth path only validates JWTs when PyJWT is importable AND an issuer is
     # configured. We surface the *capability* (the dep is present); the

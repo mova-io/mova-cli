@@ -104,6 +104,8 @@ REMOTE_VERB_ROUTES: dict[str, list[tuple[str, str]]] = {
     ],
     "jobs dead-letter purge": [("POST", "/api/v1/jobs/dead-letter/purge")],
     "runs show": [("GET", "/runs/{run_id}")],
+    # run replay / time-travel (ADR 045 D13) — remote via --target
+    "replay": [("POST", "/api/v1/runs/{run_id}/replay")],
     # batch inference
     "batch submit": [("POST", "/api/v1/agents/{name}/batch")],
     "batch status": [("GET", "/api/v1/batches/{batch_id}")],
@@ -407,17 +409,12 @@ def test_mapped_routes_exist_in_runtime(app) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "ADR 045 D13 designed POST /api/v1/runs/{id}/replay (run replay / "
-        "time-travel) but it was never built — `mdk replay` is local-only "
-        "today. When the endpoint ships, delete this xfail and add a "
-        "`replay` entry to REMOTE_VERB_ROUTES."
-    ),
-    strict=True,
-)
-def test_known_gap_replay_endpoint_built(app) -> None:
-    """ADR 045 D13 — ``POST /api/v1/runs/{id}/replay`` (designed, unbuilt)."""
+def test_replay_endpoint_built(app) -> None:
+    """ADR 045 D13 — ``POST /api/v1/runs/{run_id}/replay`` is now built.
+
+    (Was a strict-xfail "known gap" until the run-replay endpoint shipped; the
+    matching remote CLI verb + its REMOTE_VERB_ROUTES entry land alongside it.)
+    """
     index = _route_index(app)
     assert GAP_REPLAY_ROUTE in index
 

@@ -199,6 +199,33 @@ class RunView(BaseModel):
         return view
 
 
+class RunReplayView(BaseModel):
+    """``POST /runs/{id}/replay`` response — original vs replayed, side-by-side.
+
+    ADR 045 D13. ``original`` is the immutable historical run (unchanged by the
+    replay). ``replayed`` is a NEW run that re-executed ``original.input`` against
+    the agent version selected by ``against`` (``"published"`` = latest, or
+    ``"version:X"``). ``changed`` is a quick "did the output differ?" flag so a
+    caller can triage at a glance; the full before/after is in the two
+    :class:`RunView`s. The replay is a normal run (persisted, metered) — it never
+    mutates the original.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    original: RunView
+    replayed: RunView
+    against: str
+    """The version target the replay ran against: ``"published"`` or ``"version:X"``."""
+    changed: bool
+    """``True`` when the replayed output differs from the original's."""
+    cost_delta_usd: float = 0.0
+    """Replayed cost minus original cost (USD). Negative = the new version is
+    cheaper on this case — the at-a-glance "did my edit save money?" number."""
+    latency_delta_ms: float = 0.0
+    """Replayed latency minus original (ms). Negative = the new version is faster."""
+
+
 class RunEstimatePredictionView(BaseModel):
     """The numeric prediction band of a :class:`RunEstimateView`."""
 

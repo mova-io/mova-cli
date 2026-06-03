@@ -362,6 +362,7 @@ from movate.runtime.schemas import (
     RunEstimateView,
     RunExplainLlmCallView,
     RunExplainView,
+    RunReplayView,
     RunSubmission,
     RunTraceView,
     RunView,
@@ -9274,6 +9275,97 @@ def build_app(
         ``read`` scope, ``RunView`` response (including ``output``), and
         tenant-scoping (404 on cross-tenant access, never 403)."""
         return await get_run(run_id, request, ctx)
+
+    @v1.post(
+        "/runs/{run_id}/replay",
+        response_model=RunReplayView,
+        tags=["runs-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_replay_run(
+        run_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        against: str = "published",
+        mock: bool = False,
+    ) -> RunReplayView:
+        """Re-run a historical run's recorded input against a chosen agent
+        version, side-by-side (ADR 045 D13 — run replay / time-travel).
+
+        ``against`` selects the version: ``"published"`` (default → latest) or
+        ``"version:X"`` (a pinned published version; 404 if that version doesn't
+        exist for this agent/tenant). The original run is **immutable** — this
+        only reads it; the replay is a brand-new run (persisted + metered like
+        any other). Returns the original and replayed :class:`RunView`s plus a
+        ``changed`` flag. ``mock=true`` drives the agent with ``MockProvider``
+        for offline / test use (mirrors the run-stream + voice routes).
+
+        Errors: **404** original run (or the requested ``version:X``) not found
+        for this tenant; **403** token lacks ``run`` scope.
+        """
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.core.models import RunRequest  # noqa: PLC0415
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        original = await store.get_run(run_id, tenant_id=ctx.tenant_id)
+        if original is None:
+            raise not_found("run", run_id)
+
+        # Resolve the target version: "published" → latest; "version:X" → exact.
+        version = against.split("version:", 1)[1] if against.startswith("version:") else None
+        bundle = await resolve_agent_bundle(
+            store,
+            original.agent,
+            tenant_id=ctx.tenant_id,
+            version=version,
+            fallback=request.app.state.agents,
+        )
+        if bundle is None:
+            # Clearer than a bare id: name the version target + the fix.
+            label = (
+                f"{original.agent} version {version!r}"
+                if version is not None
+                else f"{original.agent} (published)"
+            )
+            raise not_found(
+                "agent",
+                f"{label} - not found for this tenant; "
+                "publish it or pick an existing --against version",
+            )
+
+        provider: BaseLLMProvider = MockProvider() if mock else LiteLLMProvider()
+        executor = Executor(
+            provider=provider,
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=ctx.tenant_id,
+            cache=request.app.state.llm_cache,
+        )
+        # Re-execute the ORIGINAL recorded input (verbatim) at the target
+        # version — a single-case re-run, not a parallel exec path (ADR 045 D13).
+        response = await executor.execute(
+            bundle, RunRequest(agent=original.agent, input=original.input)
+        )
+        replayed = await store.get_run(response.run_id, tenant_id=ctx.tenant_id)
+        if replayed is None:  # pragma: no cover - the executor just persisted it
+            raise not_found("run", response.run_id)
+
+        return RunReplayView(
+            original=RunView.from_record(original),
+            replayed=RunView.from_record(replayed),
+            against=against,
+            changed=(original.output != replayed.output),
+            # Economics delta (replayed minus original): negative = the chosen version
+            # is cheaper / faster on this case (ADR 045 D13 — "is the edit better?").
+            cost_delta_usd=replayed.metrics.cost_usd - original.metrics.cost_usd,
+            latency_delta_ms=float(replayed.metrics.latency_ms - original.metrics.latency_ms),
+        )
 
     @v1.get(
         "/runs/{run_id}/trace",
