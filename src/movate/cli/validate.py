@@ -275,7 +275,19 @@ def _validate_all(*, strict: bool, run_linter: bool, json_output: bool = False) 
     if failed < len(rows):
         _check_orphaned_assets(project_root, agent_dirs)
 
-    passed = len(rows) - failed
+    # Skills-compatibility check — piggybacks on the existing validate
+    # pass. Reuses the logic in ``mdk skills validate`` so the same
+    # checks run both standalone and as part of ``mdk validate``. A
+    # non-zero return means at least one agent x skill pair failed; we
+    # increment the overall failure counter so the final summary exit
+    # code reflects skill failures too.
+    failed += _run_skill_validate(project_root, agent_dirs)
+
+    # ``passed`` counts the agent/workflow rows that validated OK.
+    # Skill-compatibility failures are folded into ``failed`` above but
+    # don't add extra rows to the summary table, so we derive passed
+    # from the original row count (before skill-compat was added).
+    passed = max(0, len(rows) - failed)
 
     if json_output:
         payload = {
@@ -1152,3 +1164,83 @@ def _validate_workflow(path: Path) -> None:
             "this workflow cannot be evaluated with [bold]mdk eval[/bold]. "
             "[dim]Add an evals: block with a dataset: path.[/dim]"
         )
+
+
+# ---------------------------------------------------------------------------
+# Skills-compatibility check (called from ``_validate_all``)
+# ---------------------------------------------------------------------------
+
+
+def _run_skill_validate(project_root: Path, agent_dirs: list[Path]) -> int:
+    """Run agent x skill compatibility checks and return the failure count.
+
+    Called from ``_validate_all`` so ``mdk validate`` includes skill-
+    compatibility automatically. Mirrors the logic in
+    ``mdk skills validate``, but returns an int rather than raising
+    typer.Exit so the caller can fold the result into its own totals.
+
+    Checks:
+      (a) declared skill names resolve in the registry.
+      (b) output schema has every field the prompt references via
+          ``{{ skill_name.field }}`` patterns (best-effort parse).
+
+    Soft — advisory messages only; the count returned is folded into
+    the mdk-validate summary's ``failed`` counter.
+    """
+    import re as _re  # noqa: PLC0415
+
+    import yaml  # noqa: PLC0415
+
+    from movate.core.skill_loader import SkillLoadError, load_skill_registry  # noqa: PLC0415
+
+    try:
+        registry = load_skill_registry(project_root)
+    except SkillLoadError as exc:
+        console.print(f"  [yellow]![/yellow] skill registry load failed: {exc}")
+        return 0  # don't double-count; _validate_agent caught individual skill errors
+
+    failures = 0
+    for agent_dir in agent_dirs:
+        yaml_path = agent_dir / "agent.yaml"
+        if not yaml_path.is_file():
+            continue
+
+        try:
+            raw = yaml.safe_load(yaml_path.read_text())
+        except Exception:  # broad — YAML raises many exception types; agent handled it
+            continue  # YAML errors surfaced by _validate_agent already.
+
+        declared_skills: list[str] = raw.get("skills", []) if isinstance(raw, dict) else []
+        if not declared_skills:
+            continue
+
+        # Load prompt text for field-reference checks.
+        prompt_text = ""
+        if isinstance(raw, dict) and "prompt" in raw:
+            prompt_file = agent_dir / raw["prompt"]
+            if prompt_file.is_file():
+                prompt_text = prompt_file.read_text(encoding="utf-8", errors="replace")
+
+        for skill_name in declared_skills:
+            if skill_name not in registry:
+                # Already caught by the agent-level skill-resolution check;
+                # do not double-count.
+                continue
+
+            bundle = registry[skill_name]
+            pattern = _re.compile(
+                r"\{\{\s*" + _re.escape(skill_name) + r"\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}"
+            )
+            referenced_fields = pattern.findall(prompt_text)
+            for field in referenced_fields:
+                output_props = bundle.output_schema.get("properties", {})
+                if output_props and field not in output_props:
+                    console.print(
+                        f"  [yellow]![/yellow] agent [bold]{agent_dir.name!r}[/bold] "
+                        f"prompt references [bold]{{{{{skill_name}.{field}}}}}[/bold] "
+                        f"but skill [bold]{skill_name!r}[/bold] output schema has no "
+                        f"property {field!r} (available: {sorted(output_props.keys())})"
+                    )
+                    failures += 1
+
+    return failures

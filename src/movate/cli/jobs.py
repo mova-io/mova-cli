@@ -30,7 +30,13 @@ from movate.core.user_config import (
     resolve_bearer_token,
     resolve_target,
 )
-from movate.runtime.schemas import AgentListView, JobCancelView, JobListView, JobView
+from movate.runtime.schemas import (
+    AgentListView,
+    DeadLetterPurgeView,
+    JobCancelView,
+    JobListView,
+    JobView,
+)
 
 stdout = Console()
 err = Console(stderr=True)
@@ -420,6 +426,233 @@ def _emit(view: JobView, *, output_format: TableJson) -> None:
     if view.completed_at:
         table.add_row("completed_at", view.completed_at.isoformat())
     stdout.print(table)
+
+
+# ---------------------------------------------------------------------------
+# ``movate jobs dead-letter`` — operate jobs that exhausted their retry
+# budget (JobStatus.DEAD_LETTER). Inspect, recover (requeue), or prune.
+# Each verb takes ``--target`` so it can drive a remote runtime through
+# MovateClient (the new /api/v1/jobs/dead-letter* routes); --json shapes
+# mirror the sibling ``jobs`` commands.
+# ---------------------------------------------------------------------------
+
+dead_letter_app = typer.Typer(
+    name="dead-letter",
+    help="Manage retry-exhausted (dead-letter) jobs: list, show, retry, purge.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+jobs_app.add_typer(dead_letter_app, name="dead-letter")
+
+
+@dead_letter_app.command("list")
+def dead_letter_list(
+    agent: str = typer.Option(
+        None, "--agent", "-a", help="Only dead-letters for this agent/workflow name."
+    ),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max rows (server caps at 100)."),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """List this tenant's retry-exhausted (dead-letter) jobs, newest first.
+
+    [bold]Examples:[/bold]
+
+      [dim]# All dead-letters on the active target[/dim]
+      $ movate jobs dead-letter list
+
+      [dim]# Just one agent's, pipe-friendly[/dim]
+      $ movate jobs dead-letter list -a faq-agent -o json | jq '.jobs[].job_id'
+    """
+    listing = asyncio.run(
+        _fetch_dead_letter_list(
+            target=target, agent=agent, limit=limit, suppress=output_format == TableJson.JSON
+        )
+    )
+    if output_format == TableJson.JSON:
+        stdout.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    if listing.count == 0:
+        hint("[dim]no dead-letter jobs[/dim]")
+        return
+    table = Table(title=f"{listing.count} dead-letter job(s) on {target or '<active>'}")
+    table.add_column("job_id", style="dim")
+    table.add_column("kind/target", overflow="fold")
+    table.add_column("error", overflow="fold")
+    table.add_column("completed", style="dim")
+    for j in listing.jobs:
+        err = f"{j.error.type}: {j.error.message}" if j.error else ""
+        table.add_row(
+            j.job_id[:8] + "…",
+            f"{j.kind.value}/{j.target}",
+            err,
+            j.completed_at.strftime("%Y-%m-%d %H:%M:%S") if j.completed_at else "",
+        )
+    stdout.print(table)
+
+
+@dead_letter_app.command("show")
+def dead_letter_show(
+    job_id: str = typer.Argument(..., help="Dead-letter job id."),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Show one dead-letter job's full state (incl. the failure error).
+
+    Reuses the standard job-poll route — the id just happens to be a
+    dead-lettered job. Exits 1 (the job is in a failed terminal state).
+    """
+    view = asyncio.run(
+        _fetch_one(job_id=job_id, target=target, suppress=output_format == TableJson.JSON)
+    )
+    _emit(view, output_format=output_format)
+    if view.status != JobStatus.DEAD_LETTER:
+        warn(
+            f"job {view.job_id} is [bold]{view.status.value}[/bold], not dead_letter",
+        )
+
+
+@dead_letter_app.command("retry")
+def dead_letter_retry(
+    job_id: str = typer.Argument(
+        None, help="Dead-letter job id to requeue. Omit with --all to requeue every one."
+    ),
+    all_jobs: bool = typer.Option(
+        False, "--all", help="Requeue every dead-letter job for this tenant."
+    ),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Requeue a dead-letter job (or [bold]--all[/bold]) back onto the queue.
+
+    Resets the job to a fresh [bold]queued[/bold] state (attempt budget
+    cleared) so the worker picks it up again. Requires the [bold]run[/bold]
+    scope on the API key.
+
+      [dim]# One job[/dim]
+      $ movate jobs dead-letter retry "$JOB_ID"
+
+      [dim]# Every dead-letter for the tenant[/dim]
+      $ movate jobs dead-letter retry --all
+    """
+    if all_jobs == bool(job_id):
+        # Exactly one of {job_id, --all} must be given.
+        error("pass exactly one of <job_id> or --all", context="retry")
+        raise typer.Exit(code=2)
+
+    requeued = asyncio.run(
+        _retry_dead_letter(
+            job_id=job_id,
+            all_jobs=all_jobs,
+            target=target,
+            suppress=output_format == TableJson.JSON,
+        )
+    )
+    if output_format == TableJson.JSON:
+        stdout.print_json(data={"requeued": [v.job_id for v in requeued], "count": len(requeued)})
+        return
+    if not requeued:
+        hint("[dim]no dead-letter jobs to requeue[/dim]")
+        return
+    for v in requeued:
+        stdout.print(f"[green]✓[/green] requeued [bold]{v.job_id}[/bold] → queued")
+
+
+@dead_letter_app.command("purge")
+def dead_letter_purge(
+    before: str = typer.Option(
+        None,
+        "--before",
+        help="Only purge dead-letters completed before this ISO-8601 instant (e.g. 2026-05-01).",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    target: str = typer.Option(None, "--target", "-t", help="Deployment target name."),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """[bold red]Permanently delete[/bold red] this tenant's dead-letter jobs.
+
+    Destructive + irreversible. Requires the [bold]admin[/bold] scope.
+    Prompts for confirmation unless [bold]--yes[/bold] is passed (or
+    [bold]-o json[/bold], which is non-interactive). ``--before`` keeps
+    recent dead-letters and prunes only stale ones.
+
+      $ movate jobs dead-letter purge --before 2026-05-01 --yes
+    """
+    suppress = output_format == TableJson.JSON
+    if not yes and not suppress:
+        scope = "dead-letter jobs" if not before else f"dead-letter jobs completed before {before}"
+        confirmed = typer.confirm(
+            f"Permanently delete this tenant's {scope} on {target or '<active>'}?"
+        )
+        if not confirmed:
+            warn("aborted; nothing purged")
+            raise typer.Exit(code=1)
+
+    view = asyncio.run(_purge_dead_letter(before=before, target=target, suppress=suppress))
+    if output_format == TableJson.JSON:
+        stdout.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    stdout.print(f"[green]✓[/green] purged [bold]{view.purged}[/bold] dead-letter job(s)")
+
+
+async def _fetch_dead_letter_list(
+    *, target: str | None, agent: str | None, limit: int, suppress: bool = False
+) -> JobListView:
+    client = _build_client(target, suppress=suppress)
+    try:
+        async with client:
+            with spinner("fetching dead-letter jobs..."):
+                return await client.list_dead_letter_jobs(agent=agent, limit=limit)
+    except MovateClientError as exc:
+        error(str(exc), context="dead-letter list")
+        raise typer.Exit(code=exc.status_code // 100) from None
+
+
+async def _retry_dead_letter(
+    *, job_id: str | None, all_jobs: bool, target: str | None, suppress: bool = False
+) -> list[JobView]:
+    client = _build_client(target, suppress=suppress)
+    try:
+        async with client:
+            if all_jobs:
+                # Page through (server caps at 100) and requeue each. The
+                # list shrinks as we requeue, so re-list until empty.
+                requeued: list[JobView] = []
+                with spinner("requeueing all dead-letter jobs..."):
+                    while True:
+                        listing = await client.list_dead_letter_jobs(limit=100)
+                        if listing.count == 0:
+                            break
+                        for j in listing.jobs:
+                            requeued.append(await client.requeue_dead_letter_job(j.job_id))
+                return requeued
+            assert job_id is not None  # guarded by the caller
+            with spinner("requeueing dead-letter job..."):
+                return [await client.requeue_dead_letter_job(job_id)]
+    except MovateClientError as exc:
+        error(str(exc), context="dead-letter retry")
+        raise typer.Exit(code=exc.status_code // 100) from None
+
+
+async def _purge_dead_letter(
+    *, before: str | None, target: str | None, suppress: bool = False
+) -> DeadLetterPurgeView:
+    client = _build_client(target, suppress=suppress)
+    try:
+        async with client:
+            with spinner("purging dead-letter jobs..."):
+                return await client.purge_dead_letter_jobs(before=before)
+    except MovateClientError as exc:
+        error(str(exc), context="dead-letter purge")
+        raise typer.Exit(code=exc.status_code // 100) from None
 
 
 __all__ = ["jobs_app"]

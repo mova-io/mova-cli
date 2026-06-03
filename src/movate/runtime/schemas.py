@@ -142,7 +142,7 @@ class RunView(BaseModel):
     endpoint vs. ``GET /jobs/{id}`` which only carries pointer state.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     run_id: str
     job_id: str
@@ -165,10 +165,15 @@ class RunView(BaseModel):
     ConversationThread this run belongs to. ``None`` for standalone
     runs. Surfaces here so ``GET /runs/{id}`` clients can navigate
     back to the parent thread."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``: ``self``,
+    ``trace``, ``explain``, and ``agent``. Populated by :meth:`from_record`."""
 
     @classmethod
     def from_record(cls, record: RunRecord) -> RunView:
-        return cls(
+        from movate.runtime.hypermedia import run_links  # noqa: PLC0415
+
+        view = cls(
             run_id=record.run_id,
             job_id=record.job_id,
             agent=record.agent,
@@ -187,6 +192,11 @@ class RunView(BaseModel):
             node_id=record.node_id,
             thread_id=record.thread_id,
         )
+        # Set the aliased ``_links`` field by name post-construction (keeps the
+        # pydantic-mypy plugin happy — it expects the ``_links`` alias in the
+        # constructor; the field name works on assignment).
+        view.links = run_links(record.run_id, record.agent)
+        return view
 
 
 class RunEstimatePredictionView(BaseModel):
@@ -328,6 +338,18 @@ class JobCancelView(BaseModel):
     status: JobStatus
 
 
+class DeadLetterPurgeView(BaseModel):
+    """``POST /api/v1/jobs/dead-letter/purge`` response.
+
+    ``purged`` is the number of ``DEAD_LETTER`` rows deleted for the
+    authenticated tenant. Envelope (not a bare int) so the response can
+    grow back-compatibly (e.g. a future ``cutoff`` echo)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    purged: int
+
+
 # ---------------------------------------------------------------------------
 # Workflow HITL signal (ADR 017 D5, PR 2 — resume-on-signal)
 # ---------------------------------------------------------------------------
@@ -459,6 +481,50 @@ class ReadyView(BaseModel):
     wipes the ApiKeyRecord table → operators lose their saved keys."""
 
 
+class CapabilityVoiceView(BaseModel):
+    """The ``voice`` block of :class:`CapabilitiesView` (ADR 048/050 D4).
+
+    Advertises this runtime's voice capability: which pipeline modes are
+    available, which STT/TTS providers are configured (key present in env),
+    and whether voice is effectively enabled at all.
+
+    ``enabled`` is ``True`` when at least one STT + one TTS provider has its
+    credential env var set.  When ``False`` the other fields are still
+    populated (modes / provider lists) so a client knows *what would work* if
+    keys were provided — this lets ``mdk voice providers list`` give useful
+    guidance even on an unconfigured runtime.
+
+    Added as an **additive, optional** field on :class:`CapabilitiesView`
+    (``None`` on the minimal / unauthenticated view).  Absence means the
+    runtime predates this field — callers should fall back to the flat
+    ``features["voice"]`` / ``features["voice_realtime"]`` booleans.
+
+    CLAUDE.md rule 5 — flagged: new additive field on an existing endpoint.
+    No existing field is changed or removed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    """``True`` when at least one STT + one TTS provider is keyed and the
+    voice WS route is registered on this runtime.  ``False`` means voice
+    is not ready (no keys, or the route is absent / mdk[voice] not installed).
+    """
+    modes: list[str]
+    """Voice pipeline modes available on this runtime — a subset of
+    ``["pipeline", "realtime"]``.  ``pipeline`` is always present when
+    ``enabled`` is ``True``; ``realtime`` is only present when a
+    ``RealtimeVoiceProvider`` factory is configured (ADR 048 D2b)."""
+    stt_providers: list[str]
+    """STT provider names whose credential env var is set on this runtime
+    (e.g. ``["deepgram", "openai", "azure"]``).  Sorted.  Empty when no STT
+    key is configured."""
+    tts_providers: list[str]
+    """TTS provider names whose credential env var is set on this runtime
+    (e.g. ``["cartesia", "openai", "elevenlabs", "azure"]``).  Sorted.
+    Empty when no TTS key is configured."""
+
+
 class CapabilityModelsView(BaseModel):
     """The ``models`` block of :class:`CapabilitiesView`.
 
@@ -501,6 +567,37 @@ class CapabilityLimitsView(BaseModel):
     max_batch_size: int
     """Max rows accepted by ``POST /api/v1/agents/{name}/batch`` — the
     server-enforced ``MDK_BATCH_MAX_ROWS`` cap."""
+
+
+class CapabilityResourceView(BaseModel):
+    """One managed resource type in the capabilities matrix.
+
+    Lets an API-first client (e.g. a front end or an integrator) discover the
+    *manageable resource surface* — agents, projects, skills, contexts, KB —
+    without crawling the route table itself. Like every other capability field,
+    it's derived from the *deployed* route table: ``operations`` lists exactly
+    the CRUD verbs registered on THIS build, so a half-managed resource
+    (skills: create-only today) and a not-yet-shipped one (contexts, until
+    ADR 060) are reported honestly rather than promised.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """Resource family — ``agents`` / ``projects`` / ``skills`` / ``contexts``
+    / ``kb``."""
+    path: str
+    """Base ``/api/v1`` path for the resource (the collection or, for KB, the
+    per-agent sub-resource template)."""
+    operations: list[str]
+    """The lifecycle verbs registered for this resource on this build — a
+    subset of ``list``/``create``/``get``/``update``/``delete`` (plus
+    ``ingest``/``search``/``stats`` for KB). Detected from the live route
+    table, sorted for a stable wire shape."""
+    managed: bool
+    """``True`` when the resource has a full API lifecycle here (a write verb +
+    a read verb + ``delete``). ``False`` for a partial surface (e.g. skills,
+    which only expose ``create`` until ADR 060 lands)."""
 
 
 class CapabilitiesView(BaseModel):
@@ -548,6 +645,21 @@ class CapabilitiesView(BaseModel):
     extras_installed: list[str] | None = None
     """Optional ``pyproject`` extras importable in this image (marker-module
     probe). ``None`` in the minimal view."""
+    voice: CapabilityVoiceView | None = None
+    """Voice capability block (ADR 048/050 D4): modes, STT/TTS providers,
+    and whether voice is effectively enabled. ``None`` in the minimal
+    (unauthenticated) view. Additive — absent on runtimes that predate this
+    field; callers fall back to ``features["voice"]``/``features["voice_realtime"]``.
+
+    CLAUDE.md rule 5 — flagged: new additive field on an existing endpoint."""
+    resources: list[CapabilityResourceView] | None = None
+    """The manageable resource surface (agents/projects/skills/contexts/kb)
+    with the CRUD operations registered on this build — the API-first
+    discoverability answer to "what can I manage here, and how complete is
+    each?". ``None`` in the minimal view. Detected from the live route table,
+    so it tracks the deployed surface as resources gain operations.
+
+    CLAUDE.md rule 5 — flagged: new additive field on an existing endpoint."""
 
 
 class AgentView(BaseModel):
@@ -1687,7 +1799,7 @@ class SkillCreatedView(BaseModel):
     Mirror of :class:`AgentCreatedView` for the skill resource.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     name: str
     version: str
@@ -1698,6 +1810,16 @@ class SkillCreatedView(BaseModel):
     files_persisted: list[str]
     """Sorted list of files written, relative to ``skill_dir``.
     E.g. ``["impl.py", "skill.yaml"]``."""
+    id: str | None = None
+    """Uniform created-resource id (ADR 061 D2) — the skill's ``name``, under
+    the common ``id`` key. Additive; ``name`` stays."""
+    created_at: datetime | None = None
+    """Create-response timestamp (UTC, ADR 061 D2) — aligns the skill-create
+    envelope with project/agent."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``. Empty
+    ``{}`` until the skill GET/attach routes ship (ADR 060) — no dead links
+    (ADR 061 D4)."""
 
 
 class AgentDeletedView(BaseModel):
@@ -1976,7 +2098,7 @@ class KbIngestView(BaseModel):
     front-end branch.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     agent_name: str
     files: list[KbIngestFileResult] = Field(default_factory=list)
@@ -2013,6 +2135,10 @@ class KbIngestView(BaseModel):
     """The LLM-authored Markdown body. Set ONLY for ``kind="generated"``
     so the caller can review (and surface in the UI) what was actually
     embedded. ``None`` for every other kind."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``: ``self``
+    (the corpus), ``search``, ``stats``. Empty ``{}`` for callers/paths that
+    don't populate it."""
 
 
 # ---------------------------------------------------------------------------
@@ -2965,6 +3091,7 @@ __all__ = [
     "BenchModelView",
     "BenchResultView",
     "BenchSubmission",
+    "DeadLetterPurgeView",
     "EvalAcceptedView",
     "EvalCaseView",
     "EvalListView",
@@ -3855,6 +3982,89 @@ class GraphQueryRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Graph analytics (ADR 046) — read-only centrality / shortest-path / community
+# detection over the windowed graph the query layer builds. Additive: these
+# views sit beside the graph query views and never change an existing shape.
+# Computed by ``movate.core.graph.analytics`` (pure Python, no new dependency)
+# over the SAME windowed + tenant/project-scoped graphology doc the query
+# endpoints serve — so analytics inherits the node/edge cap and the no-leak
+# scoping for free.
+# ---------------------------------------------------------------------------
+
+
+class CentralityScoreView(BaseModel):
+    """One node's centrality score in a ``GET .../analytics/centrality`` response.
+
+    ``score`` is normalized to ``[0, 1]`` (degree and betweenness are both
+    normalized so they're comparable + map onto a size/color ramp in the
+    viewer). ``key`` is the node id; ``label`` / ``type`` decorate it so the
+    client can render a ranked list without a second fetch.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    label: str
+    type: str
+    score: float
+
+
+class GraphCentralityView(BaseModel):
+    """``GET /api/v1/graph/analytics/centrality`` response — top-N hubs.
+
+    ``measure`` echoes which centrality was computed (``degree`` |
+    ``betweenness``); ``scores`` is highest-first, capped at the requested
+    ``top_n``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    measure: str
+    scores: list[CentralityScoreView] = Field(default_factory=list)
+    count: int = 0
+
+
+class GraphShortestPathView(BaseModel):
+    """``GET /api/v1/graph/analytics/path`` response — a shortest path.
+
+    ``found`` is ``False`` (and ``nodes`` empty) when the two endpoints are in
+    different components or an endpoint is unknown / out of scope.  ``hops`` is
+    ``len(nodes) - 1`` (0 for a single-node path). ``nodes`` is the inclusive
+    ordered id sequence ``[from, ..., to]`` the viewer highlights.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    found: bool
+    nodes: list[str] = Field(default_factory=list)
+    hops: int = 0
+
+
+class CommunityView(BaseModel):
+    """One detected community in a ``GET .../analytics/communities`` response.
+
+    ``community_id`` is a small stable integer (largest community first);
+    ``members`` is the sorted node-id list; ``size`` is ``len(members)``. The
+    viewer tints each member by ``community_id``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    community_id: int
+    size: int
+    members: list[str] = Field(default_factory=list)
+
+
+class GraphCommunitiesView(BaseModel):
+    """``GET /api/v1/graph/analytics/communities`` response — cluster assignment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    communities: list[CommunityView] = Field(default_factory=list)
+    count: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Observability Intelligence layer (ADR 047) — wire types for the
 # /api/v1/observability/* endpoints. Kept here (not in core/observability) so
 # the HTTP surface evolves independently of the persisted insight model.
@@ -4061,7 +4271,7 @@ class ProjectView(BaseModel):
     concurrency on PUT (412 on stale).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     project_id: str
     tenant_id: str
@@ -4076,10 +4286,20 @@ class ProjectView(BaseModel):
     client sends it back as ``If-Match: "<etag>"`` on PUT to opt into
     optimistic concurrency; absent header → last-write-wins (back-compat
     with the rest of the runtime)."""
+    id: str | None = None
+    """Uniform created-resource id (ADR 061 D2) — the same value as
+    ``project_id``, exposed under the common ``id`` key so a client can treat
+    any created resource uniformly. Additive; the typed ``project_id`` stays."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``: ``self``,
+    ``agents``, ``members``, ``graph``. Empty ``{}`` for older callers/paths
+    that don't populate it."""
 
     @classmethod
     def from_record(cls, p: Project) -> ProjectView:
-        return cls(
+        from movate.runtime.hypermedia import project_links  # noqa: PLC0415
+
+        view = cls(
             project_id=p.project_id,
             tenant_id=p.tenant_id,
             name=p.name,
@@ -4089,7 +4309,11 @@ class ProjectView(BaseModel):
             updated_at=p.updated_at,
             archived_at=p.archived_at,
             etag=_project_etag(p),
+            id=p.project_id,
         )
+        # ``_links`` is aliased — set by field name post-construction (mypy).
+        view.links = project_links(p.project_id)
+        return view
 
 
 class ProjectListResponse(BaseModel):
@@ -4391,7 +4615,7 @@ class UnifiedAgentCreatedView(BaseModel):
     and ``project_id`` (which project the agent landed in).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     source: Literal["bundle", "spec", "wizard", "catalog"]
     project_id: str
@@ -4411,6 +4635,21 @@ class UnifiedAgentCreatedView(BaseModel):
             "(degrades cleanly per the dependency note in the PR body)."
         ),
     )
+    id: str | None = None
+    """Uniform created-resource id (ADR 061 D2) — the agent's ``agent_name``,
+    exposed under the common ``id`` key so a client can treat any created
+    resource uniformly. Additive; ``agent_name`` stays."""
+    created_at: datetime | None = None
+    """Create-response timestamp (UTC, ADR 061 D2). Aligns the agent-create
+    envelope with the project-create one, which already carries it."""
+    etag: str | None = None
+    """Content-hash concurrency token for the published bundle (ADR 061 D2) —
+    the registry ``content_hash``. A true content ETag; ``None`` when the
+    registry write degraded (the agent is still persisted to the FS)."""
+    links: dict[str, str] = Field(default_factory=dict, alias="_links")
+    """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``: ``self``,
+    ``validate``, ``kb``, ``publish``, ``run``, ``versions`` — the build→ship→run
+    path. Empty ``{}`` for callers/paths that don't populate it."""
 
 
 # ---------------------------------------------------------------------------

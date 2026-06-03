@@ -103,22 +103,33 @@ class LiteLLMProvider(BaseLLMProvider):
     version = "0.0.1"
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        # ``cache_prompt`` is a movate-side toggle, not a LiteLLM kwarg —
+        # split it out before the call. Default is "on for Anthropic
+        # models, no-op otherwise": LiteLLM passes ``cache_control`` blocks
+        # through to Anthropic and silently ignores them for OpenAI/etc.,
+        # so for non-Anthropic models we simply don't inject any markers.
+        params, cache_prompt = _pop_cache_prompt(request.params)
+        wire_messages = [m.model_dump(exclude_none=True) for m in request.messages]
+        wire_messages, tools = _apply_prompt_cache(
+            wire_messages, request.tools, model=request.provider, enabled=cache_prompt
+        )
+
         # Build the kwargs first; only include ``tools`` when the agent
         # has skills wired. LiteLLM accepts ``tools=None`` cleanly, but
         # being explicit keeps the request payload minimal in the
         # single-shot case and avoids upstream providers that mishandle
         # an empty tools array.
         extra_kwargs: dict[str, Any] = {}
-        if request.tools:
-            extra_kwargs["tools"] = request.tools
+        if tools:
+            extra_kwargs["tools"] = tools
 
         try:
             resp = await litellm.acompletion(
                 model=request.provider,
-                messages=[m.model_dump(exclude_none=True) for m in request.messages],
+                messages=wire_messages,
                 num_retries=0,  # movate owns retries
                 **extra_kwargs,
-                **request.params,
+                **params,
             )
         except lle.AuthenticationError as exc:
             raise AuthError(str(exc)) from exc
@@ -158,14 +169,19 @@ class LiteLLMProvider(BaseLLMProvider):
         # Merge user params with the streaming-specific options. User
         # params win on conflict, but ``stream`` and ``stream_options``
         # are forced so cost accounting always works.
-        params = dict(request.params)
+        params, cache_prompt = _pop_cache_prompt(request.params)
         existing_opts = params.pop("stream_options", None) or {}
         params["stream_options"] = {**existing_opts, "include_usage": True}
+
+        wire_messages = [m.model_dump(exclude_none=True) for m in request.messages]
+        wire_messages, _ = _apply_prompt_cache(
+            wire_messages, None, model=request.provider, enabled=cache_prompt
+        )
 
         try:
             resp = await litellm.acompletion(
                 model=request.provider,
-                messages=[m.model_dump(exclude_none=True) for m in request.messages],
+                messages=wire_messages,
                 stream=True,
                 num_retries=0,  # movate owns retries
                 **params,
@@ -284,6 +300,7 @@ def _to_completion_response(resp: Any) -> CompletionResponse:
         input=int(getattr(usage, "prompt_tokens", 0) or 0),
         output=int(getattr(usage, "completion_tokens", 0) or 0),
         cached_input=int(_cached_input_tokens(usage)),
+        cache_write=int(_cache_creation_tokens(usage)),
     )
 
     raw: dict[str, Any] = {
@@ -343,6 +360,7 @@ def _stream_chunk_from_litellm(chunk: Any) -> StreamChunk:
             input=int(getattr(usage, "prompt_tokens", 0) or 0),
             output=int(getattr(usage, "completion_tokens", 0) or 0),
             cached_input=int(_cached_input_tokens(usage)),
+            cache_write=int(_cache_creation_tokens(usage)),
         )
 
     return StreamChunk(text=text, tokens=tokens)
@@ -370,3 +388,131 @@ def _cached_input_tokens(usage: Any) -> int:
     if details is None:
         return 0
     return int(getattr(details, "cached_tokens", 0) or 0)
+
+
+def _cache_creation_tokens(usage: Any) -> int:
+    """Pull Anthropic ``cache_creation_input_tokens`` (cache WRITES) from a
+    LiteLLM usage object.
+
+    LiteLLM surfaces Anthropic's cache-write count at the top level of the
+    usage object (``usage.cache_creation_input_tokens``); on non-Anthropic
+    providers the attribute is absent and we report ``0``. Disjoint from
+    ``prompt_tokens`` on Anthropic — see :meth:`PricingTable.cost_for`."""
+    if usage is None:
+        return 0
+    return int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+
+
+_EPHEMERAL = {"type": "ephemeral"}
+
+
+def _pop_cache_prompt(params: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Split the movate-only ``cache_prompt`` toggle out of ``params``.
+
+    ``cache_prompt`` is NOT a LiteLLM kwarg, so it must be removed before
+    ``params`` is splatted into ``acompletion`` (LiteLLM forwards unknown
+    kwargs to the upstream provider, which would reject it). Defaults to
+    ``True`` — the markers are no-ops on non-Anthropic models, so leaving
+    it on costs nothing there. Opt out per-agent with
+    ``model.params.cache_prompt: false``."""
+    out = dict(params)
+    raw = out.pop("cache_prompt", True)
+    if isinstance(raw, str):
+        enabled = raw.strip().lower() not in {"false", "0", "no", "off", ""}
+    else:
+        enabled = bool(raw)
+    return out, enabled
+
+
+def _is_anthropic_model(provider: str) -> bool:
+    """True when ``provider`` routes to Anthropic through LiteLLM.
+
+    LiteLLM uses ``anthropic/<model>`` for first-party Anthropic and
+    ``bedrock/anthropic.<model>`` / ``vertex_ai/claude-*`` for the cloud
+    re-sellers. Prompt caching with ``cache_control`` blocks is an
+    Anthropic feature; we only inject markers for these routes and leave
+    every other model's request byte-for-byte unchanged."""
+    p = provider.lower()
+    return p.startswith("anthropic/") or "anthropic." in p or "claude" in p
+
+
+def _apply_prompt_cache(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    model: str,
+    enabled: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """Inject ``cache_control`` breakpoints when caching is on AND the
+    model routes to Anthropic; otherwise return the inputs unchanged.
+
+    Centralizes the "on for Anthropic, no-op otherwise" gate so the
+    ``complete`` / ``stream`` call sites stay a single branch-free call.
+    Returns ``(messages, tools)`` — both new objects when markers were
+    applied, the originals when not."""
+    if not (enabled and _is_anthropic_model(model)):
+        return messages, tools
+    return _cache_prefix_messages(messages), _cache_last_tool(tools)
+
+
+def _cache_prefix_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark the stable prompt prefix with an ephemeral cache breakpoint.
+
+    The stable prefix in the movate LiteLLM path is the rendered prompt
+    (system prompt + shared contexts), which the executor sends as the
+    FIRST message — a ``system`` role when the agent uses one, else the
+    first ``user`` turn carrying the rendered text. We tag that first
+    message's content with ``cache_control: ephemeral`` so the model
+    caches everything up to it; the variable suffix (later user turns,
+    tool results) stays uncached.
+
+    LiteLLM accepts ``cache_control`` either as a top-level key on the
+    message dict or on a content block. We convert the message's string
+    content into a single text block carrying the marker — the shape
+    LiteLLM reliably translates to Anthropic's ``cache_control`` field.
+    Returns a NEW list; the caller's messages are never mutated."""
+    if not messages:
+        return messages
+    # Find the first message that is part of the stable prefix: a system
+    # message if present, otherwise the first user turn. Both carry the
+    # rendered prompt depending on how the agent is configured.
+    idx = 0
+    for i, m in enumerate(messages):
+        if m.get("role") == "system":
+            idx = i
+            break
+        if m.get("role") == "user":
+            idx = i
+            break
+    target = messages[idx]
+    content = target.get("content")
+    if not isinstance(content, str) or not content:
+        # Already block-structured or empty — don't second-guess it.
+        return messages
+    out = list(messages)
+    out[idx] = {
+        **target,
+        "content": [
+            {"type": "text", "text": content, "cache_control": dict(_EPHEMERAL)},
+        ],
+    }
+    return out
+
+
+def _cache_last_tool(
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Tag the LAST tool spec with ``cache_control: ephemeral``.
+
+    Tool definitions are stable across requests, so a breakpoint on the
+    last one caches the whole tool block. LiteLLM forwards ``cache_control``
+    on a tool definition to Anthropic. Returns a NEW list with a
+    shallow-copied last entry so the executor's cached ``tool_specs`` are
+    never mutated."""
+    if not tools:
+        return tools
+    out = list(tools)
+    last = dict(out[-1])
+    last["cache_control"] = dict(_EPHEMERAL)
+    out[-1] = last
+    return out

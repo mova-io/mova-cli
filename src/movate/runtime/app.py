@@ -65,7 +65,9 @@ from movate.core.auth import (
 from movate.core.cache import build_cache
 from movate.core.canary import aggregate_side, choose_version
 from movate.core.events import EventKind, EventListView, EventView
+from movate.core.graph import analytics as graph_analytics
 from movate.core.graph import query as graph_query
+from movate.core.graph.analytics import CentralityMeasure
 from movate.core.graph.models import GraphologyDoc, NodeDetail, NodeSearchHit
 from movate.core.graph.query import GraphMode
 from movate.core.loader import AgentBundle
@@ -99,6 +101,7 @@ from movate.core.models import (
 )
 from movate.core.provider_keys import (
     ProviderKeyError,
+    ProviderKeyResolver,
     mint_tenant_provider_key,
     normalize_provider,
 )
@@ -172,6 +175,10 @@ from movate.runtime.hardening import (
     ResponseEconomics,
     resolve_max_request_bytes,
     set_response_economics,
+)
+from movate.runtime.hypermedia import (
+    agent_links,
+    kb_links,
 )
 from movate.runtime.long_poll import (
     HEADER_POLL_TIMEOUT,
@@ -266,6 +273,9 @@ from movate.runtime.schemas import (
     CatalogSubmitRequest,
     CatalogSyncRequest,
     CatalogSyncResponse,
+    CentralityScoreView,
+    CommunityView,
+    DeadLetterPurgeView,
     DescribeAgentRequest,
     DescribeAgentResponse,
     DescribeAgentTokenUsageView,
@@ -289,10 +299,13 @@ from movate.runtime.schemas import (
     FeedbackSubmission,
     FeedbackView,
     GeneratedEvalCaseView,
+    GraphCentralityView,
+    GraphCommunitiesView,
     GraphologyView,
     GraphQueryRequest,
     GraphSearchResult,
     GraphSearchView,
+    GraphShortestPathView,
     GroundedAnswerView,
     HarvestedCaseView,
     HarvestView,
@@ -417,6 +430,7 @@ from movate.tracing import (
     dec_sse_connections,
     inc_sse_connections,
     inject_current_trace_context,
+    install_log_correlation,
     record_audit_event,
 )
 
@@ -500,12 +514,18 @@ def _sse_frame(event: str, data: dict[str, Any]) -> str:
 #                                    voice_id / codec for THIS turn
 #     <binary frame>               an inbound audio chunk (pcm16 by default)
 #     {"type": "end"}              the caller finished the utterance → run the turn
+#     {"type": "interrupt"}        BARGE-IN: the user started speaking while the
+#                                    agent is talking → cancel the in-flight TTS
+#                                    (a binary frame arriving mid-answer is also
+#                                    treated as a barge-in)
 #
 #   server → client
 #     {"type": "transcript.partial", "text": ...}   streaming partial (STT)
 #     {"type": "transcript.final",   "text": ...}   endpointed utterance
 #     {"type": "agent.token",        "text": ...}   streamed agent token (D11)
 #     <binary frame>                                synthesized audio (tts.audio)
+#     {"type": "latency", "responded_in_ms", ...}   per-stage turn latency (the
+#                                                    demo badge; additive)
 #     {"type": "usage", ...}                        end-of-turn meter (ADR 036)
 #     {"type": "error", "message","code","stage"}   a stage failure + degrade
 #     {"type": "done", "run_id","status"}           terminal for the turn
@@ -527,6 +547,59 @@ def _voice_ctrl(type_: str, **payload: Any) -> dict[str, Any]:
     Single source of truth for the control-frame shape so the route and tests
     agree on the wire (a ``type`` discriminator + a flat payload)."""
     return {"type": type_, **payload}
+
+
+# Voice-adapter ``.name`` → BYOK credential namespace (ADR 048 D6 / ADR 018).
+#
+# The speech adapters name themselves by *capability* (``openai_whisper`` STT,
+# ``openai_tts`` TTS, ``openai_realtime``) but a tenant's BYOK key is stored
+# under the *provider family* (``openai``) — one ``openai`` key covers all of
+# that vendor's voice services, mirroring how ``normalize_provider`` collapses
+# ``openai/gpt-4o`` → ``openai`` for the LLM. This edge-only map collapses the
+# multi-service vendors; single-service adapters (``deepgram`` / ``elevenlabs``
+# / ``cartesia``) already name themselves by family and fall through unchanged.
+_VOICE_PROVIDER_FAMILY: dict[str, str] = {
+    "openai_whisper": "openai",
+    "openai_tts": "openai",
+    "openai_realtime": "openai",
+    "azure_speech_stt": "azure",
+    "azure_neural_tts": "azure",
+    "azure_openai_realtime": "azure",
+}
+
+
+async def _resolve_voice_api_key(
+    storage: StorageProvider, tenant_id: str, adapter: Any
+) -> str | None:
+    """Resolve a tenant's BYOK key for a voice adapter, at the edge (ADR 048 D6).
+
+    Maps the adapter's ``.name`` to its BYOK provider family and asks the
+    ADR 018 :class:`ProviderKeyResolver` for the tenant's own key. Returns the
+    plaintext key when the tenant brought one, else ``None`` so the adapter
+    falls through to its existing env-default credential — the no-tenant-key
+    path is byte-for-byte today's behavior (back-compat, ADR 018 D2).
+
+    BYOK is wired **here, at the transport edge** — the adapters stay
+    backend-agnostic and merely accept ``api_key=`` (CLAUDE.md rule 6). This
+    NEVER raises: a misconfigured/disabled key store (an ``AuthError`` from
+    strict isolation, a ``ProviderKeyError`` from a rotated data key, or any
+    storage hiccup) degrades to ``None`` rather than killing a voice
+    connection — the connection then uses the env default, exactly as if BYOK
+    were absent.
+    """
+    name = getattr(adapter, "name", "") or ""
+    provider = _VOICE_PROVIDER_FAMILY.get(name, normalize_provider(name))
+    if not provider:
+        return None
+    try:
+        return await ProviderKeyResolver(storage).resolve(tenant_id, provider)
+    except Exception:
+        # Degrade to the env default rather than killing the connection. This
+        # swallows the resolver's AuthError (strict per-tenant isolation with
+        # no tenant key) and ProviderKeyError (a rotated/misconfigured data
+        # key), plus any storage hiccup — BYOK being unconfigured must never
+        # break voice (CLAUDE.md rule 10, failure modes).
+        return None
 
 
 @dataclass
@@ -609,6 +682,140 @@ async def _send_voice_event(websocket: WebSocket, event: Any) -> None:
     else:
         # transcript.partial / transcript.final / agent.token
         await websocket.send_json(_voice_ctrl(event.kind, text=event.text))
+
+
+async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
+    """Emit one ``latency`` control frame for a finished pipeline turn.
+
+    Derives per-stage latencies from the ``at_ms`` offsets stamped on the
+    turn's :class:`~movate.voice.pipeline.VoiceEvent` stream (STT-final →
+    agent-first-token → TTS-first-audio) and sends a small JSON frame the demo
+    UI renders as the "responded in {X}ms" badge. Additive (a client that
+    doesn't know the frame ignores it); silent when there's nothing to report
+    (e.g. an STT-stage error produced no milestones).
+    """
+    from movate.voice.pipeline import (  # noqa: PLC0415 - lazy, voice-only path
+        compute_turn_latency,
+        format_latency_badge,
+    )
+
+    latency = compute_turn_latency(events)
+    badge = format_latency_badge(latency)
+    if not badge:
+        return
+    await websocket.send_json(
+        _voice_ctrl(
+            "latency",
+            badge=badge,
+            responded_in_ms=latency.responded_in_ms,
+            stt_final_ms=latency.stt_final_ms,
+            agent_first_token_ms=latency.agent_first_token_ms,
+            tts_first_audio_ms=latency.tts_first_audio_ms,
+        )
+    )
+
+
+async def _watch_voice_barge_in(
+    websocket: WebSocket, cancel: asyncio.Event, buffered: list[dict[str, Any]]
+) -> None:
+    """Watch the socket during a turn for the user barging in (ADR 048 D2b cue).
+
+    Sets ``cancel`` the moment the user cuts in while the agent is talking —
+    either an explicit ``{"type":"interrupt"}`` control frame or a fresh binary
+    mic frame arriving mid-answer (the user started their next utterance). That
+    is the signal ``run_voice_pipeline`` honors to stop the in-flight TTS.
+
+    Frames that aren't barge-in signals but matter to the session (a ``close``)
+    are appended to ``buffered`` so the run loop can act on them after the turn.
+    The task is cancelled by the run loop when the turn ends; a hangup just ends
+    the watch (the run loop's ``WebSocketDisconnect`` handler takes over).
+    """
+    with contextlib.suppress(WebSocketDisconnect):
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                return
+            if message.get("bytes") is not None:
+                # A mic frame arriving mid-answer = the user started talking.
+                cancel.set()
+                continue
+            text = message.get("text")
+            if text is None:
+                continue
+            try:
+                ctrl = json.loads(text)
+            except (ValueError, TypeError):
+                continue
+            ctrl_type = ctrl.get("type")
+            if ctrl_type == "interrupt":
+                cancel.set()
+            elif ctrl_type in ("close", "config", "end"):
+                buffered.append(ctrl)
+
+
+async def _stream_voice_pipeline_turn(
+    websocket: WebSocket,
+    *,
+    audio_in: AsyncIterator[Any],
+    stt: Any,
+    tts: Any,
+    executor: Any,
+    bundle: Any,
+    tenant_id: str,
+    config: Any,
+    stt_api_key: str | None,
+    tts_api_key: str | None,
+) -> bool:
+    """Stream one pipeline voice turn with barge-in + a latency badge.
+
+    Wraps :func:`movate.voice.run_voice_pipeline` with two pieces of demo
+    polish, both additive:
+
+    * **barge-in** — a concurrent watcher (:func:`_watch_voice_barge_in`) sets a
+      ``cancel`` event when the user cuts in (an ``interrupt`` control frame or a
+      mic frame mid-answer); the pipeline honors it by stopping the in-flight
+      TTS so the agent isn't talking over the user.
+    * **latency badge** — just before the terminal ``done``, one ``latency``
+      frame carrying the turn's per-stage timings is emitted (the demo's
+      "responded in {X}ms" UI + the voice-latency observability win).
+
+    Returns ``True`` when the session should end (the watcher saw a ``close``
+    during the turn), else ``False`` to run the next turn.
+    """
+    from movate.voice import run_voice_pipeline  # noqa: PLC0415
+
+    cancel = asyncio.Event()
+    buffered: list[dict[str, Any]] = []
+    watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
+    latency_events: list[Any] = []
+    try:
+        async for event in run_voice_pipeline(
+            audio_in=audio_in,
+            stt=stt,
+            tts=tts,
+            executor=executor,
+            bundle=bundle,
+            tenant_id=tenant_id,
+            input_key=config.input_key,
+            language=config.language,
+            voice_id=config.voice_id,
+            stt_api_key=stt_api_key,
+            tts_api_key=tts_api_key,
+            cancel=cancel,
+        ):
+            latency_events.append(event)
+            if event.kind == "done":
+                # Emit the latency badge just BEFORE done so it lands inside the
+                # turn (a client draining to ``done`` still sees it).
+                await _send_voice_latency(websocket, latency_events)
+            await _send_voice_event(websocket, event)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await watcher
+
+    # A ``close`` the watcher read mid-turn ends the session after this turn.
+    return any(b.get("type") == "close" for b in buffered)
 
 
 async def _send_realtime_chunk(websocket: WebSocket, chunk: Any) -> None:
@@ -700,7 +907,7 @@ async def _read_realtime_leading_config(
     return bool(ctrl.get("type") == "close")
 
 
-async def _run_voice_realtime(websocket: WebSocket, bundle: Any) -> None:
+async def _run_voice_realtime(websocket: WebSocket, bundle: Any, *, tenant_id: str) -> None:
     """Drive a ``?mode=realtime`` voice↔voice session (ADR 048 D2b / Phase 2).
 
     Voice-NATIVE: the inbound mic frames go straight to a
@@ -738,6 +945,11 @@ async def _run_voice_realtime(websocket: WebSocket, bundle: Any) -> None:
     provider = factory()
     instructions = _realtime_instructions(bundle)
     config = _VoiceTurnConfig()
+
+    # BYOK (ADR 048 D6 / ADR 018): the tenant's own realtime-provider key,
+    # resolved at the edge. ``None`` → the adapter's env default (back-compat).
+    store: StorageProvider = websocket.app.state.storage
+    realtime_api_key = await _resolve_voice_api_key(store, tenant_id, provider)
 
     # A queue bridges inbound binary WS frames (filled by a reader task) to the
     # provider's ``audio_in`` async iterator. ``None`` closes the mic stream.
@@ -784,6 +996,7 @@ async def _run_voice_realtime(websocket: WebSocket, bundle: Any) -> None:
             voice_id=config.voice_id,
             instructions=instructions,
             language=config.language,
+            api_key=realtime_api_key,
         ):
             await _send_realtime_chunk(websocket, chunk)
             if chunk.kind == "error":
@@ -1227,6 +1440,50 @@ async def _search_graph_nodes(
     return merged[:cap]
 
 
+# ----------------------------------------------------------------------
+# Graph analytics helpers (ADR 046). Analytics runs over the SAME windowed,
+# tenant + project-scoped, node/edge-capped graphology doc the query
+# endpoints serve — so it inherits the no-leak scoping and the
+# never-melt-the-tab cap for free, and never touches storage directly
+# (CLAUDE.md rule 6: the analytics layer is pure over the doc the query
+# layer builds). ``project_id`` (path) is the agent; ``project`` (query) is
+# the ADR 046 D1 project-scope filter.
+# ----------------------------------------------------------------------
+
+
+def _centrality_measure(raw: str | None) -> CentralityMeasure:
+    """Parse a ``measure`` query param into a :class:`CentralityMeasure`.
+
+    Unknown / missing → ``degree`` (the cheap default), so a typo degrades to
+    the fast measure rather than erroring."""
+    if raw == CentralityMeasure.BETWEENNESS.value:
+        return CentralityMeasure.BETWEENNESS
+    return CentralityMeasure.DEGREE
+
+
+async def _analytics_graph(
+    store: StorageProvider,
+    *,
+    agent: str,
+    tenant_id: str,
+    limit: int | None,
+    project_id: str | None,
+) -> GraphologyDoc:
+    """Load the windowed graph analytics computes over.
+
+    Reuses ``windowed_subgraph`` (unrooted, whole-graph-within-cap) so the
+    same tenant + project scoping + node/edge budget the GET endpoints enforce
+    applies to analytics. Knowledge mode only (the only persisted graph)."""
+    return await graph_query.windowed_subgraph(
+        store,
+        agent=agent,
+        tenant_id=tenant_id,
+        mode=GraphMode.KNOWLEDGE,
+        limit=limit,
+        project_id=project_id,
+    )
+
+
 # Graph-growth live-tail kinds — the typed projection of the ADR 035
 # outbox that the growth stream tails (ADR 046 D6). The publisher
 # (``kb.graph_events.make_outbox_publisher``) records exactly these on
@@ -1235,6 +1492,12 @@ _GRAPH_GROWTH_KINDS: tuple[str, str] = (
     EventKind.GRAPH_NODE_ADDED.value,
     EventKind.GRAPH_EDGE_ADDED.value,
 )
+
+# Upper bound (seconds) on the per-frame ``?pace=`` delay for the snapshot
+# replay. The demo "watch it assemble" effect uses small fractions of a
+# second; this ceiling stops a stray/abusive ``?pace=`` from pinning a
+# streaming connection open frame-by-frame for an unreasonable time.
+_GRAPH_REPLAY_PACE_MAX_S = 2.0
 
 
 def _graph_growth_frame_for_event(ev: EventView, *, project_id: str | None) -> str | None:
@@ -1254,6 +1517,43 @@ def _graph_growth_frame_for_event(ev: EventView, *, project_id: str | None) -> s
     return _sse_frame(sse_event, data)
 
 
+async def _replay_snapshot_frames(
+    doc: GraphologyDoc,
+    *,
+    seen_nodes: set[str],
+    seen_edges: set[str],
+    replay_pace_s: float,
+    is_disconnected: Callable[[], Awaitable[bool]] | None,
+) -> AsyncIterator[str]:
+    """Yield one ``node.added`` frame per node then one ``edge.added`` per edge.
+
+    Each frame is a single-element graphology document so the client merges it
+    with the same zero-transform ``graph.import(...)``. ``seen_nodes`` /
+    ``seen_edges`` are populated as we go (the caller dedupes the live-tail
+    against them). When ``replay_pace_s > 0`` we sleep that long *between*
+    frames so the viewer paints the graph node-by-node (the demo "watch it
+    grow" effect) and check the disconnect predicate before each frame so a
+    paced replay unwinds promptly when the EventSource closes. At ``0.0`` it
+    emits as fast as the client drains — the original snapshot contract."""
+    paced = replay_pace_s > 0.0
+    for node in doc.nodes:
+        if paced and is_disconnected is not None and await is_disconnected():
+            return
+        seen_nodes.add(node.key)
+        frame_doc = GraphologyDoc(nodes=[node], edges=[])
+        yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
+        if paced:
+            await asyncio.sleep(replay_pace_s)
+    for edge in doc.edges:
+        if paced and is_disconnected is not None and await is_disconnected():
+            return
+        seen_edges.add(edge.key)
+        frame_doc = GraphologyDoc(nodes=[], edges=[edge])
+        yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
+        if paced:
+            await asyncio.sleep(replay_pace_s)
+
+
 async def _sse_graph_growth_stream(
     *,
     store: StorageProvider,
@@ -1262,7 +1562,9 @@ async def _sse_graph_growth_stream(
     mode: GraphMode,
     cap: int,
     project_id: str | None = None,
+    min_confidence: float = 0.0,
     live: bool = False,
+    replay_pace_s: float = 0.0,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     poll_interval_s: float = _EVENTS_SSE_POLL_INTERVAL_S,
     heartbeat_interval_s: float = _EVENTS_SSE_HEARTBEAT_INTERVAL_S,
@@ -1275,7 +1577,18 @@ async def _sse_graph_growth_stream(
     node, then one ``edge.added`` frame per edge, each carrying a
     single-element graphology document so the client merges every frame
     with the same zero-transform ``graph.import(...)``. ``project_id``
-    (additive) scopes the replayed window to one project's subgraph.
+    (additive) scopes the replayed window to one project's subgraph;
+    ``min_confidence`` (additive) applies the same confidence floor the GET
+    endpoint does so a filtered stream and a filtered snapshot agree.
+
+    ``replay_pace_s`` (additive, default ``0.0`` = no delay) sleeps that many
+    seconds **between** snapshot frames so the viewer animates the graph
+    *assembling node-by-node* — the demo's "watch it grow" moment even when
+    the graph was built atomically (e.g. a one-shot ``mdk kb ingest
+    --build-graph`` that finished before the viewer opened). At ``0.0`` the
+    replay is emitted as fast as the client drains it, byte-for-byte the
+    original contract. Disconnect is honored between frames so a paced
+    replay unwinds promptly when the EventSource closes.
 
     Phase 2 — **live-tail** (only when ``live=True``): anchor a UTC-now
     cursor and poll the ADR 035 events outbox (the same machinery
@@ -1307,15 +1620,18 @@ async def _sse_graph_growth_stream(
         mode=mode,
         limit=cap,
         project_id=project_id,
+        min_confidence=min_confidence,
     )
-    for node in doc.nodes:
-        seen_nodes.add(node.key)
-        frame_doc = GraphologyDoc(nodes=[node], edges=[])
-        yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
-    for edge in doc.edges:
-        seen_edges.add(edge.key)
-        frame_doc = GraphologyDoc(nodes=[], edges=[edge])
-        yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
+    async for snapshot_frame in _replay_snapshot_frames(
+        doc,
+        seen_nodes=seen_nodes,
+        seen_edges=seen_edges,
+        replay_pace_s=replay_pace_s,
+        is_disconnected=is_disconnected,
+    ):
+        yield snapshot_frame
+    # A paced replay that aborted on disconnect leaves seen_* short of the doc;
+    # the loop simply stopped yielding, which is the correct unwind.
 
     if not live:
         yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
@@ -2006,7 +2322,7 @@ async def _unified_create_persist_and_attach(
         agent_name=result.bundle.spec.name,
         tenant_id=ctx.tenant_id,
     )
-    return UnifiedAgentCreatedView(
+    view = UnifiedAgentCreatedView(
         source=source,  # type: ignore[arg-type]
         project_id=project_id,
         agent_name=result.bundle.spec.name,
@@ -2017,7 +2333,14 @@ async def _unified_create_persist_and_attach(
         published_version=published.version if published is not None else None,
         changed=published.published if published is not None else True,
         attached=attachment.attached,
+        # Uniform created-resource envelope (ADR 061).
+        id=result.bundle.spec.name,
+        created_at=datetime.now(UTC),
+        etag=published.content_hash if published is not None else None,
     )
+    # Aliased ``_links`` set by field name post-construction (pydantic-mypy).
+    view.links = agent_links(result.bundle.spec.name)
+    return view
 
 
 async def _unified_create_spec(
@@ -2452,7 +2775,7 @@ def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
         prompt_hash=bundle.prompt_hash,
         input_schema=bundle.input_schema,
         output_schema=bundle.output_schema,
-        skills=list(spec.skills),
+        skills=[str(s) for s in spec.skills],
         contexts=list(spec.contexts),
         dataset=dataset_info,
         timeout_call_ms=spec.timeouts.call_ms,
@@ -3045,8 +3368,28 @@ def _read_idempotency_key(request: Request) -> str | None:
     return key
 
 
+def _idempotency_request_hash(payload: dict[str, Any]) -> str:
+    """Stable SHA-256 fingerprint of a submit payload (item 37 conflict guard).
+
+    Canonicalizes with ``json.dumps(..., sort_keys=True)`` so key order /
+    whitespace don't perturb the digest — two semantically-identical retries
+    fingerprint the same, while a genuinely different payload fingerprints
+    differently. ``default=str`` keeps non-JSON-native values (rare in a submit
+    body) from raising. The caller passes only the request-identifying fields
+    (agent/target/kind/input) — NOT volatile metadata like request_id — so a
+    retry that differs only in a fresh request id is still recognised as the
+    same submission.
+    """
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def _idempotent_submit_guard(
-    request: Request, store: StorageProvider, ctx: AuthContext
+    request: Request,
+    store: StorageProvider,
+    ctx: AuthContext,
+    *,
+    request_hash: str | None = None,
 ) -> str | None:
     """Return the ``job_id`` a prior submission with this key enqueued, or ``None``.
 
@@ -3056,11 +3399,31 @@ async def _idempotent_submit_guard(
     header (or an unusable one) → ``None`` → the endpoint creates a job as
     today. After creating, the endpoint calls
     :meth:`StorageProvider.record_run_submission` (race-safe) to bind the key.
+
+    **Payload-conflict guard.** When ``request_hash`` is supplied and the prior
+    row stored a (non-None) fingerprint that DIFFERS, the key was reused for a
+    different payload — we raise a **409** rather than silently returning the
+    wrong run. A prior row with a ``None`` fingerprint (legacy / pre-guard
+    record) is treated as "unknown" and returns the prior job unchanged
+    (back-compat). Passing ``request_hash=None`` disables the comparison
+    entirely (the pre-guard behavior).
     """
     key = _read_idempotency_key(request)
     if key is None:
         return None
-    return await store.get_run_submission(ctx.tenant_id, key)
+    prior = await store.get_run_submission_record(ctx.tenant_id, key)
+    if prior is None:
+        return None
+    if (
+        request_hash is not None
+        and prior.request_hash is not None
+        and prior.request_hash != request_hash
+    ):
+        raise conflict(
+            f"Idempotency-Key {key!r} was already used for a different request payload "
+            f"(prior job {prior.job_id}); reuse a key only for an identical retry"
+        )
+    return prior.job_id
 
 
 def _apply_history_char_budget(
@@ -4069,6 +4432,14 @@ def build_app(
     # Install the matching logging filter so log lines carry the same id (a
     # no-op-safe, idempotent attach mirroring ADR 024's trace correlation).
     install_request_id_logging()
+    # Stamp the active distributed-trace trace_id/span_id (ADR 019/024) onto
+    # every log record at the runtime edge so App Insights / Log Analytics can
+    # pivot from a trace to its correlated logs (item 38). Wired here — not only
+    # in the CLI callback — so correlation is active whenever the runtime is
+    # built (direct ASGI/uvicorn factory or embedded), not just under `serve`.
+    # Idempotent and a complete no-op when the otel extra is absent; never
+    # raises. Mirrors install_request_id_logging above.
+    install_log_correlation()
     app.add_middleware(RequestIdMiddleware)
 
     # Build the rate limiter once at app construction so bucket state
@@ -4382,8 +4753,14 @@ def build_app(
 
         # item 37 — submission idempotency. Pre-create check: a prior submit
         # with this key for this tenant returns the SAME job; do NOT enqueue
-        # again. No header → prior is None → today's path.
-        prior_job_id = await _idempotent_submit_guard(request, store, ctx)
+        # again. No header → prior is None → today's path. The fingerprint
+        # (kind/target/input — the request-identifying fields) lets the guard
+        # 409 a key reused for a DIFFERENT payload instead of silently
+        # returning the wrong job.
+        req_hash = _idempotency_request_hash(
+            {"kind": body.kind, "target": body.target, "input": body.input}
+        )
+        prior_job_id = await _idempotent_submit_guard(request, store, ctx, request_hash=req_hash)
         if prior_job_id is not None:
             return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
 
@@ -4407,7 +4784,7 @@ def build_app(
         # simultaneous race we may have enqueued one extra job).
         key = _read_idempotency_key(request)
         if key is not None:
-            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id)
+            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id, req_hash)
             if not recorded:
                 winning_job_id = await store.get_run_submission(ctx.tenant_id, key)
                 if winning_job_id is not None and winning_job_id != job.job_id:
@@ -4858,7 +5235,9 @@ def build_app(
                 # half-built projects.
                 if "skill.yaml" not in skill_files:
                     continue
-                persist_skill_bundle(skill_files, skills_path=skills_path)
+                # Bundled agent deploy — skill upload is intentional;
+                # use 'replace' so agents can re-deploy cleanly.
+                persist_skill_bundle(skill_files, skills_path=skills_path, on_conflict="replace")
                 _ = skill_name  # used implicitly via persist_skill_bundle
 
         result = persist_bundle(agent_files, agents_path=agents_path)
@@ -5079,7 +5458,9 @@ def build_app(
                 for skill_name, skill_files in skills_per_name.items():
                     if "skill.yaml" not in skill_files:
                         continue
-                    persist_skill_bundle(skill_files, skills_path=skills_path)
+                    persist_skill_bundle(
+                        skill_files, skills_path=skills_path, on_conflict="replace"
+                    )
                     _ = skill_name
             result = persist_bundle(agent_files, agents_path=agents_path)
             request.app.state.agents = scan_agents(agents_path)
@@ -5097,7 +5478,7 @@ def build_app(
                 agent_name=result.bundle.spec.name,
                 tenant_id=ctx.tenant_id,
             )
-            return UnifiedAgentCreatedView(
+            agent_view = UnifiedAgentCreatedView(
                 source="bundle",
                 project_id=project_id,
                 agent_name=result.bundle.spec.name,
@@ -5108,7 +5489,13 @@ def build_app(
                 published_version=published.version if published is not None else None,
                 changed=published.published if published is not None else True,
                 attached=attachment.attached,
+                # Uniform created-resource envelope (ADR 061).
+                id=result.bundle.spec.name,
+                created_at=datetime.now(UTC),
+                etag=published.content_hash if published is not None else None,
             )
+            agent_view.links = agent_links(result.bundle.spec.name)
+            return agent_view
 
         # ---- JSON path → parse discriminator ----
         try:
@@ -5365,9 +5752,10 @@ def build_app(
         impl: UploadFile | None = File(default=None),
         corpus: UploadFile | None = File(default=None),
         readme: UploadFile | None = File(default=None),
+        force: bool = False,
         ctx: AuthContext = Depends(auth_dep),
     ) -> SkillCreatedView:
-        """Create or replace a skill bundle under ``<skills_path>/<name>/``.
+        """Create a skill bundle under ``<skills_path>/<name>/``.
 
         Fixes the long-standing gap where agents declaring
         ``skills: [<name>]`` 422'd on upload with "skills resolution
@@ -5384,15 +5772,19 @@ def build_app(
         * ``corpus`` (optional) — JSON corpus shipped alongside.
         * ``readme`` (optional) — human-facing notes.
 
-        PUT semantics: re-uploading the same skill name overwrites
-        atomically. Skills are referenced by name from agents, so an
-        operator who tweaked their skill and re-deploys expects the
-        runtime to follow — different conflict policy from agents
-        (which 409 on conflict because agent identity is sticky).
+        Query parameters:
+
+        * ``force=true`` — overwrite an existing skill with the same name.
+          Without this flag a 409 is returned when the skill already exists,
+          preventing silent breakage on accidental re-deploy.
+
+        CLI FLAG: ``mdk deploy --force`` / ``mdk skills upload --force``
+        passes ``?force=true`` to this endpoint for intentional overwrites.
 
         Errors:
 
         * **401** — missing / bad bearer token
+        * **409** — skill already exists (pass ``?force=true`` to overwrite)
         * **422** — bundle failed validation (parse / schema / shape)
         * **503** — runtime was built without a ``skills_path``
         """
@@ -5411,7 +5803,8 @@ def build_app(
         if readme is not None:
             files["README.md"] = await readme.read()
 
-        result = persist_skill_bundle(files, skills_path=skills_path)
+        on_conflict = "replace" if force else "reject"
+        result = persist_skill_bundle(files, skills_path=skills_path, on_conflict=on_conflict)
 
         _ = ctx.tenant_id  # future per-tenant audit log entry
 
@@ -5422,6 +5815,11 @@ def build_app(
             description=spec.description or "",
             skill_dir=result.skill_dir.name,
             files_persisted=result.files_persisted,
+            # Uniform created-resource envelope (ADR 061). ``_links`` stays
+            # empty until the skill GET/attach routes ship (ADR 060) — no dead
+            # links.
+            id=spec.name,
+            created_at=datetime.now(UTC),
         )
 
     @v1.get(
@@ -5688,7 +6086,7 @@ def build_app(
             for skill_name, skill_files in skills_per_name.items():
                 if "skill.yaml" not in skill_files:
                     continue
-                persist_skill_bundle(skill_files, skills_path=skills_path)
+                persist_skill_bundle(skill_files, skills_path=skills_path, on_conflict="replace")
                 _ = skill_name
 
         result = persist_bundle(agent_files, agents_path=agents_path, on_conflict="replace")
@@ -6415,15 +6813,19 @@ def build_app(
         # in the chosen handler. Keeps the multipart path byte-for-byte
         # the same as before.
         content_type = (request.headers.get("content-type") or "").lower()
-        if content_type.startswith("multipart/"):
-            return await _ingest_upload(name, request, ctx)
         if content_type.startswith("application/json"):
-            return await _ingest_json(name, request, ctx)
-        # Other content types: most front-end clients will hit one of
-        # the two above. Treat unknown as multipart for the existing
-        # error shape — the multipart parser will fail with a clean
-        # 400 ("no files in the multipart form") on a bogus body.
-        return await _ingest_upload(name, request, ctx)
+            view = await _ingest_json(name, request, ctx)
+        else:
+            # Other content types: most front-end clients will hit JSON or
+            # multipart. Treat unknown as multipart for the existing error
+            # shape — the multipart parser fails with a clean 400 ("no files
+            # in the multipart form") on a bogus body.
+            view = await _ingest_upload(name, request, ctx)
+        # Hypermedia next-calls (ADR 061) — set once at the route boundary so
+        # every ingest kind (upload/text/url/generated) carries ``_links``
+        # (self / search / stats) without touching each builder.
+        view.links = kb_links(name)
+        return view
 
     @v1.get(
         "/agents/{name}/kb",
@@ -6782,6 +7184,7 @@ def build_app(
         depth: int | None = None,
         limit: int | None = None,
         project: str | None = None,
+        min_confidence: float = 0.0,
     ) -> GraphologyView:
         """A windowed subgraph for ``project_id`` as **graphology JSON**.
 
@@ -6789,8 +7192,9 @@ def build_app(
         response is a graphology import document (``{attributes, nodes,
         edges}``) a sigma.js client feeds to ``graph.import(...)`` with
         zero transform: each node carries ``label`` / ``type`` /
-        degree-derived ``size`` / ``color`` (+ ``community`` when stored);
-        layout ``x`` / ``y`` are omitted (the client runs ForceAtlas2).
+        degree-derived ``size`` / ``color`` (+ ``community`` /
+        ``confidence`` when stored); layout ``x`` / ``y`` are omitted (the
+        client runs ForceAtlas2).
 
         Query params:
 
@@ -6805,6 +7209,11 @@ def build_app(
           nodes/edges tagged with this ``project_id`` are returned (a
           project's subgraph across the agent's KBs). Omit (default) for
           the full per-agent graph — backward-compatible.
+        * ``min_confidence`` — **ADR 046 D2** confidence floor in ``[0, 1]``.
+          Drops nodes whose stored extraction confidence is below it (and
+          their now-dangling edges). Default ``0.0`` shows every node — an
+          opt-in, backward-compatible filter. A node with no recorded
+          confidence is treated as full-confidence (never dropped).
 
         Tenant-scoped: a cross-tenant ``project_id`` / ``root`` yields an
         empty document (no leak). Read scope.
@@ -6820,6 +7229,7 @@ def build_app(
             depth=depth,
             limit=limit,
             project_id=project,
+            min_confidence=min_confidence,
         )
         return GraphologyView.model_validate(doc.model_dump())
 
@@ -6980,6 +7390,151 @@ def build_app(
         )
         return GraphologyView.model_validate(doc.model_dump())
 
+    # ------------------------------------------------------------------
+    # Graph analytics (ADR 046) — read-only centrality / shortest-path /
+    # community detection. All three run over the SAME windowed + tenant +
+    # project-scoped + node/edge-capped graphology doc the query endpoints
+    # serve (via ``_analytics_graph`` → ``windowed_subgraph``), so they
+    # inherit the no-leak scoping and the never-melt-the-tab cap. Pure
+    # ``movate.core.graph.analytics`` (no new dependency, no storage access).
+    # ``{project_id}`` is the agent; ``?project=`` is the D1 project filter.
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/projects/{project_id}/graph/analytics/centrality",
+        response_model=GraphCentralityView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_centrality(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        measure: str = "degree",
+        top_n: int | None = None,
+        limit: int | None = None,
+        project: str | None = None,
+    ) -> GraphCentralityView:
+        """Top-N most central nodes — degree or betweenness centrality.
+
+        Ranks the windowed graph's nodes by importance:
+
+        * ``measure=degree`` (default) — normalized degree (how many other
+          nodes a node connects to). Cheap, O(V+E).
+        * ``measure=betweenness`` — normalized betweenness (how many shortest
+          paths route through a node — the "broker/bottleneck" measure).
+          Brandes, O(V·E); bounded by the node/edge cap.
+
+        Scores are normalized to ``[0, 1]`` so the two measures are comparable
+        and the viewer can map a score onto a size/color ramp. ``top_n`` caps
+        the returned list (default: all). ``limit`` bounds the graph window the
+        analytics runs over (default 500, max 5000 nodes/edges). ``?project=``
+        (ADR 046 D1) scopes to one project's subgraph. Tenant-scoped — a
+        cross-tenant ``project_id`` yields an empty result (no leak). Read
+        scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        doc = await _analytics_graph(
+            store,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            limit=limit,
+            project_id=project,
+        )
+        chosen = _centrality_measure(measure)
+        scores = graph_analytics.centrality(doc, measure=chosen, top_n=top_n)
+        return GraphCentralityView(
+            measure=chosen.value,
+            scores=[
+                CentralityScoreView(key=s.key, label=s.label, type=s.type, score=s.score)
+                for s in scores
+            ],
+            count=len(scores),
+        )
+
+    @v1.get(
+        "/projects/{project_id}/graph/analytics/path",
+        response_model=GraphShortestPathView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_shortest_path(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        from_: str = Query(..., alias="from"),
+        to: str = Query(...),
+        limit: int | None = None,
+        project: str | None = None,
+    ) -> GraphShortestPathView:
+        """Shortest path between two entity ids (BFS, undirected).
+
+        ``from`` / ``to`` are node ids (the ``from`` query param maps to a
+        ``from_`` handler arg — ``from`` is a Python keyword). Returns the
+        inclusive ordered id sequence ``[from, ..., to]`` the viewer
+        highlights, or ``found=false`` with an empty list when the two
+        endpoints are in different components or an id is unknown / out of
+        scope (no error — same no-leak convention as the query layer).
+
+        ``limit`` bounds the graph window the search runs over (default 500,
+        max 5000). ``?project=`` (ADR 046 D1) scopes to one project's
+        subgraph; an endpoint outside that scope simply isn't in the window, so
+        the path is "not found". Tenant-scoped. Read scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        doc = await _analytics_graph(
+            store,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            limit=limit,
+            project_id=project,
+        )
+        path = graph_analytics.shortest_path(doc, source=from_, target=to)
+        return GraphShortestPathView(found=path.found, nodes=path.nodes, hops=path.hops)
+
+    @v1.get(
+        "/projects/{project_id}/graph/analytics/communities",
+        response_model=GraphCommunitiesView,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_graph_communities(
+        project_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int | None = None,
+        project: str | None = None,
+    ) -> GraphCommunitiesView:
+        """Community (cluster) assignment over the windowed graph.
+
+        Detects communities as connected components of the undirected graph —
+        each maximal set of mutually reachable nodes is one community. Fully
+        deterministic (a pure function of the edge set), so the viewer's
+        per-community colors stay stable across reloads. Communities are
+        returned largest-first, each with a small stable ``community_id`` and
+        its sorted ``members``.
+
+        ``limit`` bounds the graph window (default 500, max 5000). ``?project=``
+        (ADR 046 D1) scopes to one project's subgraph. Tenant-scoped — a
+        cross-tenant ``project_id`` yields an empty result. Read scope.
+        """
+        store: StorageProvider = request.app.state.storage
+        doc = await _analytics_graph(
+            store,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            limit=limit,
+            project_id=project,
+        )
+        comms = graph_analytics.communities(doc)
+        return GraphCommunitiesView(
+            communities=[
+                CommunityView(community_id=c.community_id, size=c.size, members=c.members)
+                for c in comms
+            ],
+            count=len(comms),
+        )
+
     @v1.get(
         "/projects/{project_id}/graph/stream",
         tags=["agents-v1", "graph"],
@@ -6995,6 +7550,8 @@ def build_app(
         limit: int | None = None,
         project: str | None = None,
         live: bool = False,
+        min_confidence: float = 0.0,
+        pace: float = 0.0,
     ) -> StreamingResponse:
         """Growth stream for ``project_id``'s graph over **SSE**.
 
@@ -7033,16 +7590,30 @@ def build_app(
         Bounded by ``limit`` (node/edge cap). ``?project=`` (ADR 046 D1,
         additive) scopes both the replayed window AND the live-tail to one
         project's subgraph (a cross-project event never reaches the
-        stream). Tenant-scoped. Read scope.
+        stream). ``?min_confidence=`` (ADR 046 D2, additive) applies a
+        confidence floor to the replayed window (and, in live mode, leaves
+        low-confidence live frames to the viewer's dimming) — default
+        ``0.0`` shows everything. ``?pace=`` (additive, default ``0.0``)
+        sleeps that many seconds between snapshot frames so the viewer
+        animates the graph **assembling node-by-node** — the demo "watch it
+        grow" effect even for a graph that was built atomically. A paced
+        replay honors client disconnect between frames. Tenant-scoped. Read
+        scope.
         """
         store: StorageProvider = request.app.state.storage
         tenant_id = ctx.tenant_id
         cap = graph_query.clamp_cap(limit)
         graph_mode = _graph_mode(mode)
+        # Bound the per-frame pacing so a stray ?pace= can't pin a connection
+        # open for an absurd time; the demo uses fractions of a second.
+        replay_pace_s = min(max(pace, 0.0), _GRAPH_REPLAY_PACE_MAX_S)
 
         async def _is_disconnected() -> bool:
             return await request.is_disconnected()
 
+        # A paced replay also needs the disconnect predicate so it can unwind
+        # between frames even in snapshot (non-live) mode.
+        needs_disconnect = live or replay_pace_s > 0.0
         generator = _sse_graph_growth_stream(
             store=store,
             agent=project_id,
@@ -7050,8 +7621,10 @@ def build_app(
             mode=graph_mode,
             cap=cap,
             project_id=project,
+            min_confidence=min_confidence,
             live=live,
-            is_disconnected=_is_disconnected if live else None,
+            replay_pace_s=replay_pace_s,
+            is_disconnected=_is_disconnected if needs_disconnect else None,
         )
         return StreamingResponse(
             generator,
@@ -7521,7 +8094,13 @@ def build_app(
         # ?wait=true branch above returns before here and is out of scope).
         # Pre-create check: a prior submit with this key for this tenant
         # returns the SAME job; do NOT enqueue again. No header → today's path.
-        prior_job_id = await _idempotent_submit_guard(request, store, ctx)
+        # The fingerprint (agent name / input / thread — the request-identifying
+        # fields) lets the guard 409 a key reused for a DIFFERENT payload
+        # instead of silently returning the wrong job.
+        req_hash = _idempotency_request_hash(
+            {"agent": name, "input": body.input, "thread_id": body.thread_id}
+        )
+        prior_job_id = await _idempotent_submit_guard(request, store, ctx, request_hash=req_hash)
         if prior_job_id is not None:
             response.status_code = 202
             return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
@@ -7557,7 +8136,7 @@ def build_app(
         # enqueued one extra job).
         key = _read_idempotency_key(request)
         if key is not None:
-            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id)
+            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id, req_hash)
             if not recorded:
                 winning_job_id = await store.get_run_submission(ctx.tenant_id, key)
                 if winning_job_id is not None and winning_job_id != job.job_id:
@@ -7968,6 +8547,121 @@ def build_app(
         )
         views = [JobView.from_record(r) for r in records]
         return JobListView(jobs=views, count=len(views))
+
+    # ------------------------------------------------------------------
+    # Dead-letter management (additive /api/v1 surface). Operate the jobs
+    # that exhausted their retry budget and landed in DEAD_LETTER. The
+    # GET is registered BEFORE ``/jobs/{job_id}`` so the static path
+    # ``/jobs/dead-letter`` is matched here, not captured as a job_id.
+    # ------------------------------------------------------------------
+    @v1.get(
+        "/jobs/dead-letter",
+        response_model=JobListView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_dead_letter_jobs(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        agent: str | None = Query(
+            default=None,
+            description="Narrow to one agent/workflow name (the job ``target``).",
+        ),
+        limit: int = 20,
+    ) -> JobListView:
+        """List this tenant's retry-exhausted (``DEAD_LETTER``) jobs.
+
+        The operator triage surface for jobs the retry policy gave up on
+        (distinct from a one-off ``ERROR``). Newest-first, tenant-scoped
+        (a tenant never sees another's dead-letters). ``agent`` narrows to
+        a single component. Limit hard-capped at 100.
+
+        Read-only (``read`` scope). Recover a row with
+        ``POST /api/v1/jobs/{job_id}/requeue``; prune with
+        ``POST /api/v1/jobs/dead-letter/purge``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_dead_letter_jobs(ctx.tenant_id, limit=capped_limit, agent=agent)
+        views = [JobView.from_record(r) for r in records]
+        return JobListView(jobs=views, count=len(views))
+
+    @v1.post(
+        "/jobs/{job_id}/requeue",
+        response_model=JobView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_requeue_dead_letter_job(
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JobView:
+        """Recover a ``DEAD_LETTER`` job back onto the queue.
+
+        Body-less. Resets the job to a fresh ``QUEUED`` state
+        (``attempt_count=0``, ``next_retry_at`` / ``claimed_at`` /
+        ``completed_at`` / ``error`` cleared) so the worker claims it
+        again on the next poll. Returns the requeued :class:`JobView`.
+
+        Gated on the ``run`` scope (it re-enqueues work — a stronger
+        capability than the ``read`` used to list). Tenant-scoped at the
+        storage layer; status-guarded on ``DEAD_LETTER``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``run`` scope
+        * **404** — no ``DEAD_LETTER`` job with this id for this tenant
+          (missing, cross-tenant, or the job is not dead-lettered — you
+          can only requeue a retry-exhausted job)
+        """
+        store: StorageProvider = request.app.state.storage
+        ok = await store.requeue_dead_letter_job(job_id, tenant_id=ctx.tenant_id)
+        if not ok:
+            raise not_found("dead-letter job", job_id)
+        record = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+        if record is None:  # pragma: no cover — requeue just succeeded
+            raise not_found("job", job_id)
+        return JobView.from_record(record)
+
+    @v1.post(
+        "/jobs/dead-letter/purge",
+        response_model=DeadLetterPurgeView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_purge_dead_letter_jobs(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        before: datetime | None = Query(
+            default=None,
+            description=(
+                "Only purge dead-letters whose ``completed_at`` is strictly "
+                "older than this ISO-8601 instant. Omit to purge all."
+            ),
+        ),
+    ) -> DeadLetterPurgeView:
+        """Permanently delete this tenant's ``DEAD_LETTER`` jobs.
+
+        Destructive housekeeping. Gated on the ``admin`` scope (the
+        strongest — it irrecoverably deletes rows) and tenant-scoped:
+        deletes ONLY this tenant's dead-letter rows, never a live job and
+        never another tenant's. ``before`` keeps recent dead-letters for
+        inspection while clearing stale ones. Returns the count purged.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        purged = await store.purge_dead_letter_jobs(ctx.tenant_id, before=before)
+        return DeadLetterPurgeView(purged=purged)
 
     # ------------------------------------------------------------------
     # /api/v1 aliases for the unversioned job-poll + run-fetch routes.
@@ -14183,7 +14877,7 @@ def build_app(
         # absent / "pipeline") is the unchanged pipeline path below.
         mode = (websocket.query_params.get("mode") or "pipeline").strip().lower()
         if mode == "realtime":
-            await _run_voice_realtime(websocket, bundle)
+            await _run_voice_realtime(websocket, bundle, tenant_id=ctx.tenant_id)
             return
 
         # ── Wire the UNCHANGED Executor + the speech adapters ──
@@ -14193,17 +14887,22 @@ def build_app(
         from movate.providers.mock import MockProvider  # noqa: PLC0415
         from movate.providers.pricing import load_pricing  # noqa: PLC0415
         from movate.tracing import build_tracer  # noqa: PLC0415
-        from movate.voice import run_voice_pipeline  # noqa: PLC0415
         from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
 
         # Phase-1 reference adapters, built from the app-state factories
         # (default: OpenAI Whisper STT + OpenAI TTS). A tenant swaps providers
         # (Deepgram / ElevenLabs) by registering a different factory behind the
-        # same seam — the route is provider-agnostic (ADR 048 D3). BYOK key
-        # resolution (ADR 018) is the documented next wire-up; for now adapters
-        # read OPENAI_API_KEY (their SDK default) when no per-call key is passed.
+        # same seam — the route is provider-agnostic (ADR 048 D3).
         stt = websocket.app.state.voice_stt_factory()
         tts = websocket.app.state.voice_tts_factory()
+
+        # BYOK (ADR 048 D6 / ADR 018): resolve the tenant's OWN STT/TTS key at
+        # this edge and thread it into the adapters. No tenant key → ``None`` →
+        # the adapter falls back to its env-default credential, byte-for-byte
+        # today's behavior. Resolution is wired here, never inside the adapter
+        # (CLAUDE.md rule 6); the adapters merely accept ``api_key=``.
+        stt_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, stt)
+        tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts)
 
         # Config persists across turns in a session; a per-turn ``config`` frame
         # can override it before that turn's ``end``.
@@ -14231,18 +14930,20 @@ def build_app(
                     for raw_bytes in frames:
                         yield _AudioChunk(data=raw_bytes)
 
-                async for event in run_voice_pipeline(
+                stop = await _stream_voice_pipeline_turn(
+                    websocket,
                     audio_in=_audio_in(),
                     stt=stt,
                     tts=tts,
                     executor=executor,
                     bundle=bundle,
                     tenant_id=ctx.tenant_id,
-                    input_key=config.input_key,
-                    language=config.language,
-                    voice_id=config.voice_id,
-                ):
-                    await _send_voice_event(websocket, event)
+                    config=config,
+                    stt_api_key=stt_api_key,
+                    tts_api_key=tts_api_key,
+                )
+                if stop:
+                    return
         except WebSocketDisconnect:
             # Client hung up — nothing to clean up beyond the executor task,
             # which run_voice_pipeline reaps in its own finally. Normal exit.

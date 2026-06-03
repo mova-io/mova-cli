@@ -19,6 +19,11 @@
  *   5. expand -> fetch neighbors, import, let FA2 settle the new nodes
  *   6. live-growth toggle -> EventSource stream, add nodes/edges as they arrive
  *   7. color-by-type/community, size-by-degree, filter-by-type, zoom/pan
+ *   8. analytics (opt-in, ADR 046): size+color by centrality (degree |
+ *      betweenness), tint by detected community, and highlight the shortest
+ *      path between two nodes — each fetched from /graph/analytics/* via the
+ *      same proxy and applied over the loaded graph (no data mutation; toggling
+ *      off restores the base styling). Graceful on empty/small graphs.
  */
 (function () {
   "use strict";
@@ -51,6 +56,30 @@
   var liveSource = null;            // EventSource for live growth
   var palette = {};                 // type/community -> color
   var paletteIdx = 0;
+  // Confidence dimming (ADR 046 D2): fade nodes whose stored `confidence`
+  // attribute is below this floor so the audience sees the graph is honest
+  // about uncertainty. 0 (default) = show everything at full strength —
+  // back-compat, no visual change unless an operator drags the slider. A node
+  // with no recorded confidence is treated as full-confidence (never dimmed).
+  var minConfidence = 0;
+  // How long the paced snapshot replay sleeps between frames server-side, so
+  // the live-growth toggle makes the graph visibly ASSEMBLE node-by-node even
+  // for a graph that was built atomically before the viewer opened.
+  var LIVE_REPLAY_PACE_S = 0.12;
+
+  // ---- analytics state (ADR 046) -----------------------------------------
+  // All analytics are OFF by default — base render, drill-down, and live-growth
+  // behave exactly as before unless an operator opts in. Each toggle fetches
+  // from the runtime's /graph/analytics/* endpoints (via the same local proxy)
+  // and decorates the already-loaded graph; none of it mutates the graph data,
+  // so toggling off restores the base styling. All graceful on an empty graph.
+  var centralityOn = false;         // size + color nodes by centrality score
+  var centralityMeasure = "degree"; // "degree" | "betweenness"
+  var centralityScores = {};        // node id -> normalized score in [0,1]
+  var communityOn = false;          // tint nodes by detected community id
+  var communityOf = {};             // node id -> community id (int)
+  var pathSet = null;               // Set of node ids on a highlighted path
+  var pathEdgeKeys = null;          // Set of edge keys on the highlighted path
 
   var COLORS = [
     "#58a6ff", "#3fb950", "#f0883e", "#bc8cff", "#f85149",
@@ -96,13 +125,52 @@
     return colorMode === "community" ? attrs.community : (attrs.kind || attrs.label);
   }
 
+  // Map a centrality score in [0,1] onto a sequential cool→hot ramp (blue →
+  // amber → red) so a more central node reads as "hotter". Pure function of the
+  // score; no palette state.
+  function centralityColor(score) {
+    var s = Math.max(0, Math.min(1, score || 0));
+    var stops = ["#1f3b73", "#3b6fb0", "#56d4dd", "#e3b341", "#f0883e", "#f85149"];
+    var t = s * (stops.length - 1);
+    return stops[Math.round(t)];
+  }
+
+  // Confidence of a node from its stored `confidence` attribute (ADR 046 D2).
+  // Returns a number in [0,1], or null when no score was recorded (the node is
+  // then treated as full-confidence — never dimmed).
+  function confidenceOf(node) {
+    var c = graph.getNodeAttribute(node, "confidence");
+    return (typeof c === "number") ? c : null;
+  }
+
+  // True iff a node should be dimmed for being below the confidence floor.
+  // A node with no recorded confidence is never dimmed (full-confidence
+  // assumption); the floor at 0 dims nothing (back-compat default).
+  function isLowConfidence(node) {
+    if (minConfidence <= 0) return false;
+    var c = confidenceOf(node);
+    return c !== null && c < minConfidence;
+  }
+
   function styleNode(node, attrs) {
     var degree = graph.degree(node);
-    graph.mergeNodeAttributes(node, {
-      size: sizeByDegree ? Math.max(3, Math.min(18, 3 + Math.sqrt(degree) * 2.2)) : 6,
-      color: colorFor(paletteKey(attrs)),
-      _baseColor: colorFor(paletteKey(attrs))
-    });
+    var size, color;
+    if (centralityOn) {
+      // Centrality wins for both size and color: a more-central node is bigger
+      // and hotter. Falls back to a neutral small dot for a node with no score
+      // (e.g. a node added by drill-in after centrality was computed).
+      var score = centralityScores[node];
+      var s = (typeof score === "number") ? score : 0;
+      size = Math.max(3, Math.min(20, 4 + s * 16));
+      color = centralityColor(s);
+    } else if (communityOn && communityOf[node] != null) {
+      size = sizeByDegree ? Math.max(3, Math.min(18, 3 + Math.sqrt(degree) * 2.2)) : 6;
+      color = colorFor("community:" + communityOf[node]);
+    } else {
+      size = sizeByDegree ? Math.max(3, Math.min(18, 3 + Math.sqrt(degree) * 2.2)) : 6;
+      color = colorFor(paletteKey(attrs));
+    }
+    graph.mergeNodeAttributes(node, { size: size, color: color, _baseColor: color });
   }
 
   function restyleAll() {
@@ -212,12 +280,37 @@
       var res = Object.assign({}, data);
       var kind = graph.getNodeAttribute(node, "kind");
       if (disabledTypes.has(kind)) { res.hidden = true; return res; }
+      // Confidence dimming (ADR 046 D2): a node below the confidence floor
+      // fades to a muted grey and shrinks, and drops its label so the eye
+      // settles on the confident core of the graph. Computed before the
+      // focus/path/live decorations below so those (which the operator is
+      // actively driving) can still override it for a dimmed node they click.
+      if (isLowConfidence(node)) {
+        res.color = "#3a4048";
+        res.label = "";
+        res.size = (res.size || 4) * 0.6;
+        res.zIndex = 0;
+      }
       if (selectedNode) {
         if (node === selectedNode) {
           res.highlighted = true;
           res.zIndex = 2;
         } else if (hoveredNeighbors && hoveredNeighbors.has(node)) {
           res.zIndex = 1;
+        } else {
+          res.color = "#2a3038";
+          res.label = "";
+          res.zIndex = 0;
+        }
+      }
+      // Shortest-path highlight (analytics): nodes ON the path glow + pop above
+      // any focus dimming; nodes OFF the path are dimmed while a path is shown.
+      if (pathSet) {
+        if (pathSet.has(node)) {
+          res.color = "#f0883e";
+          res.highlighted = true;
+          res.size = (res.size || 4) * 1.3;
+          res.zIndex = 4;
         } else {
           res.color = "#2a3038";
           res.label = "";
@@ -243,10 +336,25 @@
           disabledTypes.has(graph.getNodeAttribute(t, "kind"))) {
         res.hidden = true; return res;
       }
+      // Fade an edge whose endpoint is below the confidence floor so a dimmed
+      // node doesn't leave a vivid edge dangling into the confident core.
+      if (isLowConfidence(s) || isLowConfidence(t)) {
+        res.color = "#22272e"; res.zIndex = 0;
+      }
       if (selectedNode) {
         if (s === selectedNode || t === selectedNode) {
           res.color = "#58a6ff"; res.zIndex = 1;
         } else { res.hidden = true; }
+      }
+      // Shortest-path highlight: edges ON the path are drawn thick + amber and
+      // never hidden; other edges are hidden while a path is shown so the route
+      // reads clearly.
+      if (pathEdgeKeys) {
+        if (pathEdgeKeys.has(edge)) {
+          res.hidden = false; res.color = "#f0883e"; res.size = (res.size || 1) + 2; res.zIndex = 4;
+        } else if (!selectedNode) {
+          res.hidden = true;
+        }
       }
       // Live-growth halo on a freshly-arrived edge (mirrors the node glow).
       if (graph.getEdgeAttribute(edge, "_new")) {
@@ -514,10 +622,169 @@
   function updateStats() {
     var visN = 0;
     graph.forEachNode(function (node, attrs) {
-      if (!disabledTypes.has(attrs.kind)) visN++;
+      if (disabledTypes.has(attrs.kind)) return;
+      if (isLowConfidence(node)) return;  // dimmed by the confidence floor
+      visN++;
     });
     el("stat-nodes").textContent = visN;
     el("stat-edges").textContent = graph.size;
+  }
+
+  // ---- analytics (centrality / communities / shortest path, ADR 046) ------
+  // Each helper hits a project-scoped /graph/analytics/* endpoint via the same
+  // local proxy and decorates the loaded graph. The runtime computes over the
+  // same windowed + tenant/project-scoped graph the viewer loaded, so results
+  // line up with what's on screen. Every helper degrades gracefully: on an
+  // empty graph or an older runtime (404/501) it just clears the decoration and
+  // notes it in the status bar — the base render stays intact.
+  function analyticsPath(sub) {
+    return "/api/v1/projects/" + encodeURIComponent(CFG.project) + "/graph/analytics/" + sub;
+  }
+
+  function setCentrality(on) {
+    centralityOn = on;
+    if (!on) { centralityScores = {}; restyleAll(); status("centrality off"); return; }
+    if (graph.order === 0) { status("no graph to rank"); el("centrality-toggle").checked = false; centralityOn = false; return; }
+    status("computing " + centralityMeasure + " centrality…");
+    api(analyticsPath("centrality") + "?measure=" + encodeURIComponent(centralityMeasure))
+      .then(function (d) {
+        centralityScores = {};
+        (d.scores || []).forEach(function (s) { centralityScores[s.key] = s.score; });
+        restyleAll();
+        renderHubs(d.scores || []);
+        status("centrality (" + (d.measure || centralityMeasure) + ") on " + (d.count || 0) + " nodes");
+      })
+      .catch(function (err) {
+        centralityOn = false; el("centrality-toggle").checked = false; restyleAll();
+        status("centrality unavailable: " + err.message);
+      });
+  }
+
+  function setCommunities(on) {
+    communityOn = on;
+    if (!on) { communityOf = {}; el("stat-communities").textContent = "—"; restyleAll(); status("communities off"); return; }
+    if (graph.order === 0) { status("no graph to cluster"); el("community-toggle").checked = false; communityOn = false; return; }
+    status("detecting communities…");
+    api(analyticsPath("communities"))
+      .then(function (d) {
+        communityOf = {};
+        (d.communities || []).forEach(function (c) {
+          (c.members || []).forEach(function (m) { communityOf[m] = c.community_id; });
+        });
+        el("stat-communities").textContent = (d.count != null ? d.count : (d.communities || []).length);
+        restyleAll();
+        status((d.count || 0) + " communities detected");
+      })
+      .catch(function (err) {
+        communityOn = false; el("community-toggle").checked = false; el("stat-communities").textContent = "—";
+        restyleAll();
+        status("communities unavailable: " + err.message);
+      });
+  }
+
+  // Render the top-hubs list from a centrality response; each row flies to its
+  // node on click. Refetches if centrality scores aren't already loaded.
+  function renderHubs(scores) {
+    var box = el("hubs-list");
+    box.innerHTML = "";
+    if (!scores || !scores.length) {
+      box.innerHTML = '<li class="empty">no hubs (empty graph)</li>';
+      return;
+    }
+    scores.slice(0, 10).forEach(function (s) {
+      var li = document.createElement("li");
+      var lbl = document.createElement("span");
+      lbl.textContent = s.label || s.key;
+      var sc = document.createElement("span");
+      sc.className = "hub-score"; sc.textContent = fmtVal(s.score);
+      li.appendChild(lbl); li.appendChild(sc);
+      li.addEventListener("click", function () {
+        if (graph.hasNode(s.key)) { flyTo(s.key); openDetail(s.key); }
+        else { drillTo(s.key, s.label); }
+      });
+      box.appendChild(li);
+    });
+  }
+
+  function loadHubs() {
+    if (graph.order === 0) { renderHubs([]); status("no graph to rank"); return; }
+    el("hubs-btn").disabled = true;
+    status("ranking by " + centralityMeasure + "…");
+    api(analyticsPath("centrality") + "?measure=" + encodeURIComponent(centralityMeasure) + "&top_n=10")
+      .then(function (d) { renderHubs(d.scores || []); status("top hubs by " + (d.measure || centralityMeasure)); })
+      .catch(function (err) { status("hubs unavailable: " + err.message); })
+      .finally(function () { el("hubs-btn").disabled = false; });
+  }
+
+  // Resolve a user-typed node reference (id OR label) to a node id present in
+  // the loaded graph. Exact id wins; otherwise a case-insensitive label match.
+  function resolveNodeRef(ref) {
+    var raw = (ref || "").trim();
+    if (!raw) return null;
+    if (graph.hasNode(raw)) return raw;
+    var needle = raw.toLowerCase();
+    var found = null;
+    graph.forEachNode(function (node, attrs) {
+      if (found) return;
+      if (String(attrs.label || "").toLowerCase() === needle) found = node;
+    });
+    return found;
+  }
+
+  function runShortestPath() {
+    var fromRef = el("path-from").value, toRef = el("path-to").value;
+    var from = resolveNodeRef(fromRef), to = resolveNodeRef(toRef);
+    var result = el("path-result");
+    if (!from || !to) {
+      result.className = "path-result miss";
+      result.textContent = "enter two known nodes (id or label)";
+      return;
+    }
+    el("path-btn").disabled = true;
+    result.className = "path-result"; result.textContent = "finding path…";
+    api(analyticsPath("path") + "?from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to))
+      .then(function (d) {
+        if (!d.found || !d.nodes || !d.nodes.length) {
+          clearPath();
+          result.className = "path-result miss";
+          result.textContent = "no path between these nodes";
+          return;
+        }
+        highlightPath(d.nodes);
+        result.className = "path-result ok";
+        result.textContent = "path: " + d.hops + " hop" + (d.hops === 1 ? "" : "s");
+      })
+      .catch(function (err) {
+        clearPath();
+        result.className = "path-result miss";
+        result.textContent = "path unavailable: " + err.message;
+      })
+      .finally(function () { el("path-btn").disabled = false; });
+  }
+
+  // Highlight a path (list of node ids) by recording the on-path node set + the
+  // edge keys connecting consecutive nodes, then refreshing so the reducers
+  // light them up. Edge keys are resolved from the graph (any edge between two
+  // consecutive path nodes, either direction).
+  function highlightPath(nodeIds) {
+    pathSet = new Set(nodeIds);
+    pathEdgeKeys = new Set();
+    for (var i = 0; i + 1 < nodeIds.length; i++) {
+      var a = nodeIds[i], b = nodeIds[i + 1];
+      if (!graph.hasNode(a) || !graph.hasNode(b)) continue;
+      graph.forEachEdge(a, function (edge, attrs, src, tgt) {
+        if ((src === a && tgt === b) || (src === b && tgt === a)) pathEdgeKeys.add(edge);
+      });
+    }
+    if (renderer) renderer.refresh();
+    if (nodeIds.length && graph.hasNode(nodeIds[0])) flyTo(nodeIds[0]);
+  }
+
+  function clearPath() {
+    pathSet = null; pathEdgeKeys = null;
+    el("path-result").textContent = "";
+    el("path-result").className = "path-result";
+    if (renderer) renderer.refresh();
   }
 
   // ---- live growth (Server-Sent Events) -----------------------------------
@@ -537,7 +804,11 @@
       // ?live=true engages the live-tail (without it the stream is a one-shot
       // snapshot). The {project} path param is the agent the snapshot used, so
       // the live-tail is scoped to the SAME graph the viewer is showing.
-      var url = "/api/v1/projects/" + encodeURIComponent(CFG.project) + "/graph/stream?live=true";
+      // &pace= sleeps that many seconds between snapshot frames server-side so
+      // the graph visibly ASSEMBLES node-by-node when the toggle flips — the
+      // demo "watch it grow" moment even for an already-built graph.
+      var url = "/api/v1/projects/" + encodeURIComponent(CFG.project) +
+        "/graph/stream?live=true&pace=" + encodeURIComponent(LIVE_REPLAY_PACE_S);
       liveSource = new EventSource(url, { withCredentials: true });
       liveSource.addEventListener("node.added", function (ev) { onLiveNode(ev); });
       liveSource.addEventListener("edge.added", function (ev) { onLiveEdge(ev); });
@@ -552,6 +823,42 @@
       liveSource.close(); liveSource = null;
       status("live growth OFF");
     }
+  }
+
+  // Replay growth: clear the loaded graph, then open a PACED snapshot stream so
+  // the graph visibly re-assembles node-by-node from the server — the demo's
+  // "watch it grow" moment, decoupled from whether a real ingest is running.
+  // Uses the snapshot stream (no ?live), which still honors ?pace and ends with
+  // a `done` frame; each re-imported node/edge is genuinely new after the
+  // clear, so the existing highlight-halo path fires. Read-only: it only
+  // re-reads what the server already serves.
+  var replaySource = null;
+  function replayGrowth() {
+    if (replaySource) { replaySource.close(); replaySource = null; }
+    // Tearing the live-tail down first (if any) avoids two streams racing to
+    // import the same keys; the operator can re-enable live afterward.
+    if (liveSource) { liveSource.close(); liveSource = null; el("live-toggle").checked = false; el("live-toggle").parentElement.classList.remove("on"); }
+    clearFocus();
+    graph.clear();
+    if (renderer) renderer.refresh();
+    rebuildTypeFilters();
+    updateStats();
+    var url = "/api/v1/projects/" + encodeURIComponent(CFG.project) +
+      "/graph/stream?pace=" + encodeURIComponent(LIVE_REPLAY_PACE_S);
+    replaySource = new EventSource(url, { withCredentials: true });
+    replaySource.addEventListener("node.added", function (ev) { onLiveNode(ev); });
+    replaySource.addEventListener("edge.added", function (ev) { onLiveEdge(ev); });
+    replaySource.addEventListener("done", function () {
+      if (replaySource) { replaySource.close(); replaySource = null; }
+      startLayout(2500);
+      status("replay complete — " + graph.order + " nodes");
+    });
+    replaySource.onerror = function () {
+      // A snapshot stream closes the connection after `done`; some browsers
+      // surface that as an error. Only warn if we never finished assembling.
+      if (replaySource && graph.order === 0) status("replay stream unavailable (graph still interactive)");
+    };
+    status("replaying growth…");
   }
 
   function parseEvent(ev) { try { return JSON.parse(ev.data); } catch (_) { return null; } }
@@ -649,12 +956,37 @@
     el("size-by-degree").addEventListener("change", function (e) {
       sizeByDegree = e.target.checked; restyleAll();
     });
+    el("min-confidence").addEventListener("input", function (e) {
+      minConfidence = parseFloat(e.target.value) || 0;
+      el("min-confidence-val").textContent = minConfidence.toFixed(2);
+      // Pure viewer-side dimming: just refresh the reducers + the stat count.
+      // No re-fetch, no data mutation — dragging back to 0 fully restores.
+      if (renderer) renderer.refresh();
+      updateStats();
+    });
+    el("replay-btn").addEventListener("click", function () { replayGrowth(); });
     el("live-toggle").addEventListener("change", function (e) { setLive(e.target.checked); });
     el("detail-close").addEventListener("click", function () {
       detailPanel.classList.add("hidden"); detailPanel.setAttribute("aria-hidden", "true");
     });
     el("expand-btn").addEventListener("click", function () {
       var node = el("expand-btn").dataset.node; if (node) expand(node);
+    });
+
+    // ---- analytics controls (ADR 046) ----
+    el("centrality-toggle").addEventListener("change", function (e) { setCentrality(e.target.checked); });
+    el("centrality-measure").addEventListener("change", function (e) {
+      centralityMeasure = e.target.value;
+      if (centralityOn) setCentrality(true);   // recompute under the new measure
+      else loadHubs();                          // keep the hubs list in step
+    });
+    el("community-toggle").addEventListener("change", function (e) { setCommunities(e.target.checked); });
+    el("hubs-btn").addEventListener("click", function () { loadHubs(); });
+    el("path-btn").addEventListener("click", function () { runShortestPath(); });
+    el("path-clear").addEventListener("click", function () { clearPath(); });
+    // Enter in either path input runs the search.
+    ["path-from", "path-to"].forEach(function (id) {
+      el(id).addEventListener("keydown", function (e) { if (e.key === "Enter") runShortestPath(); });
     });
   }
 

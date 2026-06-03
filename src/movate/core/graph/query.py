@@ -32,7 +32,7 @@ from movate.core.graph.models import (
     NodeSearchHit,
     Provenance,
 )
-from movate.core.graph.serialize import to_graphology
+from movate.core.graph.serialize import _confidence_of, to_graphology
 from movate.core.models import Entity, Relation, Subgraph
 from movate.storage.base import StorageProvider
 
@@ -83,6 +83,18 @@ def _clamp_depth(value: int | None) -> int:
     return min(int(value), MAX_DEPTH)
 
 
+def _clamp_confidence(value: float | None) -> float:
+    """Clamp a caller-supplied ``min_confidence`` floor into ``[0, 1]``.
+
+    ``None`` / non-positive → ``0.0`` (the no-op "show all" default that
+    keeps the historical behavior). Above ``1.0`` → ``1.0``. Single source of
+    truth so the filter floor is identical across the GET + stream endpoints.
+    """
+    if value is None or value <= 0.0:
+        return 0.0
+    return min(float(value), 1.0)
+
+
 async def windowed_subgraph(
     storage: StorageProvider,
     *,
@@ -94,6 +106,7 @@ async def windowed_subgraph(
     depth: int | None = None,
     limit: int | None = None,
     project_id: str | None = None,
+    min_confidence: float = 0.0,
 ) -> GraphologyDoc:
     """A capped window onto the graph, as a graphology document.
 
@@ -111,6 +124,16 @@ async def windowed_subgraph(
     one project's subgraph; ``None`` (the default) keeps the historical
     per-agent scope so the viewer's behavior is unchanged without it.
 
+    ``min_confidence`` (ADR 046 D2, additive) optionally drops nodes whose
+    stored extraction confidence (``metadata["confidence"]``) is below the
+    threshold — the read-path side of "the graph is honest about
+    uncertainty". The default ``0.0`` keeps **every** node (a no-op filter),
+    so the wire shape is byte-for-byte unchanged unless an operator opts in.
+    A node with no recorded confidence is treated as full-confidence and is
+    never dropped (back-compat: a graph that predates confidence scoring is
+    fully visible at any threshold). Edges dangling after a node is dropped
+    are pruned by the serializer's drop-on-join rule.
+
     ``mode=topology`` returns an empty document (not yet implemented).
     Every path is hard-capped at ``min(limit, MAX_CAP)`` nodes/edges.
     """
@@ -119,6 +142,7 @@ async def windowed_subgraph(
         # Topology graph not persisted yet — stable empty response.
         return to_graphology([], [])
 
+    floor = _clamp_confidence(min_confidence)
     if root is not None:
         return await _rooted_window(
             storage,
@@ -129,6 +153,7 @@ async def windowed_subgraph(
             cap=cap,
             type_filter=type,
             project_id=project_id,
+            min_confidence=floor,
         )
 
     return await _unrooted_window(
@@ -138,6 +163,7 @@ async def windowed_subgraph(
         cap=cap,
         type_filter=type,
         project_id=project_id,
+        min_confidence=floor,
     )
 
 
@@ -151,6 +177,7 @@ async def _rooted_window(
     cap: int,
     type_filter: str | None,
     project_id: str | None = None,
+    min_confidence: float = 0.0,
 ) -> GraphologyDoc:
     # Reject a cross-tenant / unknown root up front (no leak): get_entity
     # returns None for a foreign tenant, so an empty doc comes back rather
@@ -171,6 +198,10 @@ async def _rooted_window(
         project_id=project_id,
     )
     entities = _apply_type_filter(sub.entities, type_filter, always_keep={root})
+    # The root seed always survives the confidence floor too, so "show me
+    # around this node" never returns an empty window just because the seed
+    # itself is low-confidence.
+    entities = _apply_confidence_filter(entities, min_confidence, always_keep={root})
     entities = entities[:cap]
     relations = _cap_relations(sub.relations, entities, cap)
     return to_graphology(entities, relations)
@@ -184,11 +215,13 @@ async def _unrooted_window(
     cap: int,
     type_filter: str | None,
     project_id: str | None = None,
+    min_confidence: float = 0.0,
 ) -> GraphologyDoc:
     entities = await storage.list_entities(
         agent=agent, tenant_id=tenant_id, limit=_SCAN_LIMIT, project_id=project_id
     )
     entities = _apply_type_filter(entities, type_filter)
+    entities = _apply_confidence_filter(entities, min_confidence)
     entities = entities[:cap]
     if not entities:
         return to_graphology([], [])
@@ -394,6 +427,36 @@ def _apply_type_filter(
         return entities
     keep = always_keep or set()
     return [e for e in entities if e.type == type_filter or e.entity_id in keep]
+
+
+def _apply_confidence_filter(
+    entities: list[Entity],
+    min_confidence: float,
+    *,
+    always_keep: set[str] | None = None,
+) -> list[Entity]:
+    """Drop entities below the ``min_confidence`` floor (no-op at ``0.0``).
+
+    Confidence is read from ``metadata["confidence"]`` via the shared
+    :func:`movate.core.graph.serialize._confidence_of` accessor (so the
+    read-path filter and the serialized node attribute agree on what
+    "confidence" means). A node with **no** recorded confidence is kept —
+    an unscored graph (pre-confidence ingest) stays fully visible at any
+    threshold, so the filter is purely additive. ``always_keep`` ids (e.g. a
+    rooted window's seed) survive regardless of score.
+    """
+    if min_confidence <= 0.0:
+        return entities
+    keep = always_keep or set()
+    out: list[Entity] = []
+    for e in entities:
+        if e.entity_id in keep:
+            out.append(e)
+            continue
+        conf = _confidence_of(e)
+        if conf is None or conf >= min_confidence:
+            out.append(e)
+    return out
 
 
 def _one_hop_neighbors(*, node_id: str, sub: Subgraph) -> list[NodeNeighbor]:

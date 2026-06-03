@@ -341,6 +341,14 @@ def doctor(  # noqa: PLR0912 — branch count is inherent to a multi-section dia
     # day-stale-install class of bug into a self-fixing prompt.
     stale_result, stale_purpose = _check_version_staleness()
     _add("mdk up-to-date", stale_result, stale_purpose, "")
+    # Project-pinned minimum mdk version (Monday-demo polish). Compares the
+    # installed __version__ against `mdk_version_min:` in project.yaml (or
+    # the MDK_VERSION_MIN env override). Silent skip when neither source is
+    # set — only customer projects that opt in get the row.
+    binary_staleness = _check_mdk_binary_staleness()
+    if binary_staleness is not None:
+        result, purpose = binary_staleness
+        _add("mdk-binary-staleness", result, purpose, "")
     _add("", "", "", "")
 
     # Required deps — Purpose + SPDX license columns. Every entry in
@@ -1097,6 +1105,72 @@ def _check_version_staleness() -> tuple[str, str]:
     return (_ok(f"current (built {label})"), "installed build is up to date")
 
 
+def _parse_calver_tuple(version: str) -> tuple[int, ...] | None:
+    """Parse a CalVer ``YYYY.M.D.N`` into a comparable int tuple.
+
+    Returns ``None`` on any non-CalVer / unparseable input so callers can
+    skip the comparison rather than raise. Used by the project-pinned
+    minimum-version check to avoid false positives on legacy SemVer tags.
+    """
+    parts = version.strip().split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _check_mdk_binary_staleness() -> tuple[str, str] | None:
+    """Compare installed ``mdk`` against the project-pinned minimum.
+
+    Sources, in order: ``MDK_VERSION_MIN`` env var (operator override),
+    then ``project.yaml`` ``mdk_version_min:`` field. The env wins when
+    both are set so an operator can pin a stricter floor without editing
+    the project file.
+
+    Returns ``(result_markup, purpose)`` for the doctor row, or ``None``
+    when neither source is set — the caller then skips the row entirely
+    so projects that don't opt in stay quiet.
+
+    Failure modes (all degrade to ``None`` rather than crashing doctor):
+
+    * project config malformed or unreadable
+    * pinned value isn't CalVer-shaped (legacy SemVer / typo)
+    * installed ``__version__`` isn't CalVer-shaped
+    """
+    pinned = os.environ.get("MDK_VERSION_MIN", "").strip()
+    if not pinned:
+        try:
+            from movate.core.config import load_project_config  # noqa: PLC0415
+
+            cfg = load_project_config()
+            pinned = (cfg.mdk_version_min or "").strip()
+        except Exception:
+            # No project / malformed config — silently skip, the project-
+            # config-parses check above already surfaces parse failures.
+            return None
+    if not pinned:
+        return None
+
+    pinned_tuple = _parse_calver_tuple(pinned)
+    installed_tuple = _parse_calver_tuple(__version__)
+    if pinned_tuple is None or installed_tuple is None:
+        # Can't compare apples-to-apples; degrade to a neutral note
+        # rather than crying wolf on a legacy SemVer install.
+        return ("[dim]skipped (non-CalVer version)[/dim]", f"project expects >= {pinned}")
+
+    if installed_tuple >= pinned_tuple:
+        return (
+            _ok(f"{__version__} >= {pinned}"),
+            "installed mdk satisfies the project's minimum",
+        )
+    return (
+        f"[yellow]⚠ mdk binary is stale: installed = {__version__}, "
+        f"project expects >= {pinned}[/yellow] — "
+        f"update: uv tool install --editable '.[runtime,playground]' --force",
+        "installed mdk is older than the project's minimum",
+    )
+
+
 def _classify_result(check: str, result: str) -> str | None:
     """Bucket a doctor table row into ``ok`` / ``missing`` / ``error``.
 
@@ -1588,7 +1662,7 @@ def _run_agent_doctor(  # noqa: PLR0912 — multi-section diagnostic
     # Check 4: skills resolve — name-by-name so a failure points at
     # WHICH skill is missing, not just "count mismatch".
     if bundle.spec.skills:
-        declared_skills = list(bundle.spec.skills)
+        declared_skills = [str(s) for s in bundle.spec.skills]
         # Each entry in `bundle.skills` is a SkillBundle whose .spec
         # has .name; cross-reference with what the agent.yaml declared.
         resolved_names = [getattr(s.spec, "name", "?") for s in bundle.skills]

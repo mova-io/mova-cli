@@ -89,6 +89,41 @@ def test_full_view_shape(client: TestClient, read_auth) -> None:
     assert body["extras_installed"] is not None
 
 
+def test_full_view_resources_reflect_route_table(client: TestClient, read_auth) -> None:
+    """The ``resources`` block enumerates the manageable surface, derived from
+    the live route table — agents/projects/kb are fully managed, skills is
+    create-only (``managed: false``), and contexts is absent until its API
+    ships (ADR 060)."""
+    header, _ = read_auth
+    body = client.get("/api/v1/capabilities", headers=header).json()
+
+    resources = body["resources"]
+    assert resources is not None
+    by_name = {r["name"]: r for r in resources}
+
+    # Agents / projects / KB are fully managed here.
+    for name in ("agents", "projects", "kb"):
+        assert name in by_name, f"{name} missing from resources"
+        assert by_name[name]["managed"] is True
+        assert by_name[name]["path"].startswith("/api/v1/")
+        assert by_name[name]["operations"]  # non-empty
+
+    # Skills exists but is create-only on this build → managed=false, and the
+    # honest operation list reflects exactly that.
+    assert by_name["skills"]["operations"] == ["create"]
+    assert by_name["skills"]["managed"] is False
+
+    # Contexts has no API on this build → omitted entirely (not promised).
+    assert "contexts" not in by_name
+
+
+def test_minimal_view_omits_resources(client: TestClient) -> None:
+    """The unauthenticated minimal probe carries no ``resources`` block."""
+    body = client.get("/api/v1/capabilities").json()
+    assert body["minimal"] is True
+    assert body["resources"] is None
+
+
 def test_full_view_models_match_catalog(client: TestClient, read_auth) -> None:
     header, _ = read_auth
     body = client.get("/api/v1/capabilities", headers=header).json()

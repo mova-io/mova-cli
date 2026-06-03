@@ -19,6 +19,102 @@ SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 # ---------------------------------------------------------------------------
+# SkillRef — agent.yaml ``skills:`` list element (additive, backward-compat)
+# ---------------------------------------------------------------------------
+
+
+class SkillRef(BaseModel):
+    """A skill reference in an agent's ``skills:`` list.
+
+    Accepts two forms in ``agent.yaml`` (both backward-compatible):
+
+    * **Bare string** (original)::
+
+        skills:
+          - kb-lookup
+          - web-search
+
+    * **Inline object with optional semver constraint** (new)::
+
+        skills:
+          - name: kb-lookup
+            version: "^1.2"
+          - name: web-search
+            version: ">=1.0,<2.0"
+
+    Bare strings are treated as ``version: "*"`` (any version accepted).
+    When a ``version`` constraint is declared, :func:`resolve_agent_skills`
+    checks the installed skill's version against it at agent-load time and
+    raises :class:`movate.core.loader.AgentLoadError` on a mismatch — fail
+    at load time, not silently at the first run.
+
+    ``SkillRef`` implements ``__str__`` (returns ``name``) and cross-type
+    ``__eq__`` / ``__hash__`` so existing code that does
+    ``"kb-vector-lookup" in spec.skills`` or iterates ``for s in spec.skills``
+    treating each entry as a plain name string continues to work unchanged.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(
+        ..., min_length=1, description="Skill name matching skills/<name>/skill.yaml."
+    )
+    version: str = Field(
+        default="*",
+        description=(
+            "Semver constraint the installed skill's version must satisfy. "
+            "``'*'`` (the default, used for bare-string entries) accepts any "
+            "installed version. Constraint syntax: ``'^1.2'`` (compatible), "
+            "``'>=1.0,<2.0'`` (range), ``'1.2.3'`` (exact). Uses "
+            "``packaging.version`` under the hood — same library that pip uses."
+        ),
+    )
+
+    # Cross-type equality so ``"kb-vector-lookup" in spec.skills`` works
+    # identically to the pre-SkillRef ``list[str]`` behavior.
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.name == other
+        if isinstance(other, SkillRef):
+            return self.name == other.name and self.version == other.version
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        # Hash on name only — mirrors the equality contract with strings so
+        # set-membership tests (``"name" in {ref}`` etc.) remain intuitive.
+        return hash(self.name)
+
+    def __str__(self) -> str:
+        return self.name
+
+    def __repr__(self) -> str:
+        if self.version == "*":
+            return f"SkillRef({self.name!r})"
+        return f"SkillRef({self.name!r}, version={self.version!r})"
+
+    @classmethod
+    def _from_raw(cls, v: object) -> SkillRef:
+        """Coerce a raw YAML value into a :class:`SkillRef`.
+
+        Called by the ``AgentSpec.skills`` field validator so both the
+        bare-string form and the inline-object form parse correctly.
+        """
+        if isinstance(v, str):
+            return cls(name=v)
+        if isinstance(v, dict):
+            name = v.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"skill ref dict must have a non-empty 'name' key; got {v!r}")
+            version = v.get("version", "*")
+            if not isinstance(version, str):
+                version = str(version)
+            return cls(name=name, version=version)
+        raise ValueError(
+            f"each skills: entry must be a string or {{name, version}} dict; got {type(v).__name__}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Agent specification (mirrors agent.yaml)
 # ---------------------------------------------------------------------------
 
@@ -521,6 +617,69 @@ class SkillSideEffects(StrEnum):
     MUTATES_STATE = "mutates-state"
 
 
+class SkillCapabilities(BaseModel):
+    """Optional ``capabilities:`` block in ``skill.yaml``.
+
+    Exposes the most commonly-needed execution guarantees as a
+    first-class named block so operators can reason about a skill's
+    behaviour without reading its implementation.
+
+    All flags default to ``None`` (unset / unknown) — the block is
+    additive and entirely optional. Existing ``skill.yaml`` files that
+    omit it load unchanged (backward-compatible).
+
+    The ``side_effects`` field on :class:`SkillSpec` is preserved for
+    backward-compatibility; when a ``capabilities:`` block is present,
+    the flags here are the authoritative source and ``side_effects``
+    is derived from them at dispatch time for advisory checks.
+
+    Example ``skill.yaml``::
+
+        capabilities:
+          read_only: true      # never modifies external state
+          deterministic: true  # same input → same output (cacheable)
+          network: false       # no outbound network
+          mutating: false      # doesn't mutate state
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    read_only: bool | None = Field(
+        default=None,
+        description=(
+            "When ``true``, the skill never modifies any external state "
+            "(no DB writes, no HTTP POST/PUT/DELETE, no filesystem writes). "
+            "Advisory at dispatch time: if ``true`` and the calling agent "
+            "has ``side_effects: mutates-state``, a warning is logged."
+        ),
+    )
+    deterministic: bool | None = Field(
+        default=None,
+        description=(
+            "When ``true``, the same input always produces the same output "
+            "(suitable for caching). ``None`` = unknown. "
+            "Execution-semantic: none today — informational for operators."
+        ),
+    )
+    network: bool | None = Field(
+        default=None,
+        description=(
+            "When ``false``, the skill makes no outbound network calls. "
+            "When ``true``, it does (e.g. an HTTP skill or a remote API). "
+            "``None`` = unknown. Informational today."
+        ),
+    )
+    mutating: bool | None = Field(
+        default=None,
+        description=(
+            "When ``false``, the skill does not mutate any external state. "
+            "Roughly the inverse of ``read_only`` — ``read_only: true`` "
+            "implies ``mutating: false``. Both are optional; set whichever "
+            "is most natural for the skill. ``None`` = unknown."
+        ),
+    )
+
+
 class SkillSpec(BaseModel):
     """Parsed ``skills/<name>/skill.yaml`` (api_version: movate/v1, kind: Skill).
 
@@ -553,6 +712,20 @@ class SkillSpec(BaseModel):
         description=(
             "Documentary annotation rendered in ``mdk show <skill>`` and "
             "available for project-policy enforcement in a future PR."
+        ),
+    )
+
+    # Optional capabilities block — additive, all fields default to None.
+    # Preserved backward-compatible: omitting the block leaves all flags unset.
+    capabilities: SkillCapabilities = Field(
+        default_factory=SkillCapabilities,
+        description=(
+            "Optional execution-guarantee block. Exposes ``read_only``, "
+            "``deterministic``, ``network``, and ``mutating`` flags as "
+            "first-class skill.yaml fields. All default to ``None`` "
+            "(unknown); set only the flags that are meaningful for this "
+            "skill. The ``side_effects`` field is preserved for backward "
+            "compatibility."
         ),
     )
 
@@ -1083,6 +1256,76 @@ class RetrievalConfig(BaseModel):
         )
 
 
+class VoiceConfig(BaseModel):
+    """Per-agent voice configuration block (ADR 048 D5 / ADR 050 D4).
+
+    **ADDITIVE, OPTIONAL** field on :class:`AgentSpec` — every existing
+    ``agent.yaml`` that omits this block is valid and unchanged.  Absence
+    means "no per-agent voice override; tenant defaults apply when this agent
+    is invoked on the voice endpoint."
+
+    CLAUDE.md rule 5 — flagged: this is the single additive schema change
+    for voice.  All fields default to ``None`` / ``False`` so omitting the
+    block serializes identically to today.  The voice WS handler in
+    ``runtime/app.py`` reads this block to override the runtime defaults for
+    the per-connection turn config.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Opt this agent in to voice.  When ``False`` (the default, and the "
+            "value when the block is absent), the runtime still accepts voice "
+            "connections for this agent using tenant defaults — this flag is a "
+            "*per-agent explicit enablement*, not a gate. "
+            "Future: set to ``True`` to opt into per-agent reporting/metering."
+        ),
+    )
+    mode: Literal["pipeline", "realtime"] = Field(
+        default="pipeline",
+        description=(
+            "Voice pipeline mode for this agent.  ``pipeline`` (the default) "
+            "routes through STT → unchanged text Executor → TTS (ADR 048 D2a); "
+            "``realtime`` selects the full-duplex ``RealtimeVoiceProvider`` "
+            "path (ADR 048 D2b, Phase 2) when configured on the runtime."
+        ),
+    )
+    stt: str | None = Field(
+        default=None,
+        description=(
+            "STT provider override for this agent "
+            "(e.g. ``'deepgram'``, ``'openai'``, ``'azure'``).  "
+            "``None`` → use the runtime/tenant default."
+        ),
+    )
+    tts: str | None = Field(
+        default=None,
+        description=(
+            "TTS provider override for this agent "
+            "(e.g. ``'cartesia'``, ``'openai'``, ``'elevenlabs'``, ``'azure'``).  "
+            "``None`` → use the runtime/tenant default."
+        ),
+    )
+    voice_id: str = Field(
+        default="",
+        description=(
+            "Provider-specific synthesized-voice id for this agent.  "
+            "Empty string → provider default.  "
+            "Example: ``'rachel'`` (ElevenLabs) or a Cartesia voice UUID."
+        ),
+    )
+    language: str | None = Field(
+        default=None,
+        description=(
+            "BCP-47 language hint for STT/TTS "
+            "(e.g. ``'en-US'``, ``'fr-FR'``).  "
+            "``None`` → auto-detect / provider default."
+        ),
+    )
+
+
 class AgentSpec(BaseModel):
     """Parsed ``agent.yaml`` contents (api_version: movate/v1, kind: Agent)."""
 
@@ -1227,16 +1470,37 @@ class AgentSpec(BaseModel):
     # executor enters a tool-use loop on requests that have skills wired.
     # An agent with `skills: []` (the default) keeps the v0.5 single-shot
     # behavior. See docs/adr/002-skills-and-contexts.md.
+    #
+    # SCHEMA FLAG (additive, backward-compatible): each entry may now be
+    # EITHER a bare string (original form) OR an inline {name, version}
+    # object with a semver constraint.  Bare strings remain valid and are
+    # treated as version: "*" (any version).  Callers that iterate or
+    # test membership with plain strings continue to work because SkillRef
+    # implements cross-type __eq__ / __hash__ / __str__.
 
-    skills: list[str] = Field(
+    skills: list[SkillRef] = Field(
         default_factory=list,
         description=(
-            "Names of skills (from the project's skills/ registry) this "
-            "agent may invoke during a tool-use loop. Each name must resolve "
-            "to a `skills/<name>/skill.yaml` at load time. Empty list keeps "
-            "the agent in single-shot mode (no tool-use loop)."
+            "Skills (from the project's skills/ registry) this agent may "
+            "invoke during a tool-use loop.  Each entry is EITHER a bare "
+            "skill name string (original form, treated as version='*') OR an "
+            "inline object ``{name: str, version: str}`` with a semver "
+            "constraint.  Unknown names or unsatisfied constraints raise "
+            "AgentLoadError at agent-load time.  Empty list keeps the agent "
+            "in single-shot mode (no tool-use loop)."
         ),
     )
+
+    @field_validator("skills", mode="before")
+    @classmethod
+    def _coerce_skill_refs(cls, v: object) -> list[object]:
+        """Accept bare strings and inline dicts; coerce both to SkillRef."""
+        if not isinstance(v, list):
+            raise ValueError(f"skills must be a list; got {type(v).__name__}")
+        result: list[object] = []
+        for item in v:
+            result.append(SkillRef._from_raw(item))
+        return result
 
     # ---- v0.6 shared contexts (ADR 002) ----
     # Names referencing `contexts/<name>.md` files in the project's
@@ -1311,6 +1575,25 @@ class AgentSpec(BaseModel):
             "Only meaningful for agents that use a `kb-vector-lookup` "
             "skill or otherwise produce a `grounded` / `citations` output "
             "field. Non-RAG agents should leave this ``off``."
+        ),
+    )
+
+    # ---- ADR 048 D5 / ADR 050 — per-agent voice override (ADDITIVE, OPTIONAL) ----
+    # Every existing agent.yaml validates unchanged — this field is absent →
+    # None, which means "no per-agent voice override; tenant defaults apply when
+    # invoked on the WS /api/v1/agents/{name}/voice endpoint."
+    # CLAUDE.md rule 5 — flagged: the single additive schema change for voice.
+    voice: VoiceConfig | None = Field(
+        default=None,
+        description=(
+            "Optional per-agent voice configuration (ADR 048 D5).  "
+            "When absent (the default on EVERY existing agent.yaml), the runtime "
+            "applies tenant defaults when this agent is invoked on the voice "
+            "endpoint — the agent is voice-capable with ZERO changes.  "
+            "Add this block only to override the tenant-default STT/TTS provider, "
+            "voice id, language, or pipeline mode for THIS agent specifically.\n\n"
+            "CLAUDE.md rule 5: additive-only; omitting the block serializes "
+            "identically to today.  No existing field is changed or removed."
         ),
     )
 
@@ -1494,6 +1777,18 @@ class TokenUsage(BaseModel):
     input: int = 0
     output: int = 0
     cached_input: int = 0
+    """Prompt tokens served FROM the cache (Anthropic
+    ``cache_read_input_tokens`` / OpenAI ``cached_tokens``). Billed at the
+    discounted cache-read rate (~0.1x input). Already counted within
+    ``input`` for OpenAI-style providers, but reported separately by
+    Anthropic — see ``cost_for`` for how the two conventions reconcile."""
+    cache_write: int = 0
+    """Prompt tokens WRITTEN to the cache this request (Anthropic
+    ``cache_creation_input_tokens``). Billed at the cache-write premium
+    (~1.25x input for the default 5-minute TTL). Disjoint from ``input``
+    on Anthropic — the SDK reports uncached input, cache reads, and cache
+    writes as three separate counts. Defaults to ``0`` so non-caching and
+    non-Anthropic paths serialize byte-for-byte as before (additive)."""
 
 
 class Metrics(BaseModel):
@@ -2608,6 +2903,16 @@ class JobKind(StrEnum):
     agent registry, prompts, contexts, or eval datasets — read-only is
     enforced by construction (the Auditor only reads + calls the
     BaseLLMProvider; never invokes the storage save_agent / save_kb paths)."""
+    FINETUNE = "finetune"
+    """Async fine-tune job (ADR 063). ``JobRecord.input`` carries the
+    fine-tune config (``base_model``, ``min_score``, ``provider``,
+    ``promote_if_better``). The worker builds a training dataset from the
+    agent's harvested/golden eval cases (:func:`movate.core.finetune.
+    build_finetune_dataset`), dispatches a hosted fine-tune via the
+    :class:`movate.core.finetune.FineTuneProvider` seam (BYOK keys), registers
+    the resulting model in the catalog with provenance, and runs eval-vs-base
+    — never auto-promoting unless ``promote_if_better`` is set. The job's
+    output payload carries ``{model_id, eval_id}``."""
 
 
 class JobRecord(BaseModel):

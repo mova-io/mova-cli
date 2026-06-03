@@ -19,6 +19,9 @@ Modules:
   ``color``.
 * :mod:`movate.core.graph.query` — pure windowing / neighbor-expansion /
   search / bounded-traversal compositions over the ``StorageProvider``.
+* :mod:`movate.core.graph.analytics` — pure centrality / shortest-path /
+  community detection over the windowed graphology doc the query layer
+  builds (no storage, no new dependency).
 
 Boundary: depends only on Protocols + core models. Never imports a
 concrete backend, the runtime, or the CLI (CLAUDE.md rule 6 — ``cli ⊥
@@ -27,6 +30,15 @@ runtime``; ``core`` depends on adapter Protocols).
 
 from __future__ import annotations
 
+from movate.core.graph.analytics import (
+    CentralityMeasure,
+    CentralityScore,
+    Community,
+    ShortestPath,
+    centrality,
+    communities,
+    shortest_path,
+)
 from movate.core.graph.models import (
     GraphEdge,
     GraphNode,
@@ -52,6 +64,9 @@ from movate.core.graph.serialize import color_for, size_from_degree, to_grapholo
 __all__ = [
     "DEFAULT_CAP",
     "MAX_CAP",
+    "CentralityMeasure",
+    "CentralityScore",
+    "Community",
     "GraphEdge",
     "GraphMode",
     "GraphNode",
@@ -60,11 +75,15 @@ __all__ = [
     "NodeNeighbor",
     "NodeSearchHit",
     "Provenance",
+    "ShortestPath",
+    "centrality",
     "clamp_cap",
     "color_for",
+    "communities",
     "expand_node_neighbors",
     "node_detail",
     "search_nodes",
+    "shortest_path",
     "size_from_degree",
     "to_graphology",
     "traverse",

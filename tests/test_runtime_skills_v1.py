@@ -150,8 +150,12 @@ def test_create_skill_with_impl_persists_all_files(
 def test_create_skill_twice_overwrites(
     client: TestClient, agents_path: Path, auth_header: dict[str, str]
 ) -> None:
-    """Re-uploading the same skill name must overwrite — agents reference
-    skills by name and a re-deploy should follow."""
+    """Re-uploading the same skill name with ?force=true must overwrite.
+
+    Without ``?force=true`` (the new safe default) a second upload now
+    returns 409 to prevent silent breakage.  Pass ``?force=true`` (or CLI
+    ``mdk deploy --force``) for intentional overwrites.
+    """
     r1 = client.post(
         "/api/v1/skills",
         files=[("skill_yaml", ("skill.yaml", _SKILL_YAML, "application/x-yaml"))],
@@ -159,10 +163,18 @@ def test_create_skill_twice_overwrites(
     )
     assert r1.status_code == 201, r1.text
 
-    # Second upload with an extra file — the previous (minimal) upload
-    # should be replaced wholesale, not merged.
-    r2 = client.post(
+    # Second upload without ?force → 409 (safe default, no silent overwrite).
+    r_conflict = client.post(
         "/api/v1/skills",
+        files=[("skill_yaml", ("skill.yaml", _SKILL_YAML, "application/x-yaml"))],
+        headers=auth_header,
+    )
+    assert r_conflict.status_code == 409, r_conflict.text
+
+    # Second upload with ?force=true and an extra file — the previous
+    # (minimal) upload is replaced wholesale, not merged.
+    r2 = client.post(
+        "/api/v1/skills?force=true",
         files=[
             ("skill_yaml", ("skill.yaml", _SKILL_YAML, "application/x-yaml")),
             ("impl", ("impl.py", _IMPL_PY, "text/x-python")),
@@ -215,6 +227,12 @@ def test_create_skill_spec_validation_failure_returns_422(
         headers=auth_header,
     )
     assert r.status_code == 422
+    # The customer-facing message is the friendly field list, NOT pydantic's
+    # raw dump (no errors.pydantic.dev trailer, no input_type=dict noise).
+    message = r.json()["detail"]["error"]["message"]
+    assert "errors.pydantic.dev" not in message
+    assert "input_type" not in message
+    assert "version" in message and "implementation" in message
 
 
 # ---------------------------------------------------------------------------

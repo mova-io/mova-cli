@@ -70,7 +70,7 @@ def persist_skill_bundle(
     files: dict[str, bytes],
     *,
     skills_path: Path,
-    on_conflict: str = "replace",
+    on_conflict: str = "reject",
 ) -> SkillPersistResult:
     """Validate + persist a skill bundle to ``<skills_path>/<name>/``.
 
@@ -78,12 +78,22 @@ def persist_skill_bundle(
     :data:`_ALLOWED_FILES`; the route handler extracts individual
     multipart fields into this shape.
 
-    Default ``on_conflict="replace"`` is intentional — skills are
-    referenced by name from agent bundles, so a deploy that re-uploads
-    the same skill must overwrite cleanly without forcing the operator
-    to DELETE first. (The agent endpoint defaults to ``reject`` because
-    customers care about agent-identity uniqueness — different model
-    for different resources.)
+    ``on_conflict`` controls what happens when a skill with the same name
+    already exists on disk:
+
+    * ``"reject"`` (the default) — raises :class:`SkillCreationError` with
+      HTTP 409 and a clear message.  Prevents silent overwrites on accidental
+      re-deploy.  Callers must pass ``on_conflict='replace'`` (or the
+      end-user must pass ``--force``) for intentional overwrites.
+    * ``"replace"`` — atomically overwrites the existing bundle.  Used by
+      the CLI's ``mdk deploy --force`` and the API's ``?force=true`` flag.
+    * ``"update"`` — alias for ``"replace"``; accepted for callers that use
+      the older terminology.
+
+    BEHAVIOR CHANGE FLAG: the default changed from ``"replace"`` to
+    ``"reject"`` to prevent silent breakage on accidental re-deploy.
+    Callers that relied on the implicit overwrite behavior must now pass
+    ``on_conflict='replace'`` explicitly.
 
     Raises :class:`SkillCreationError` on any failure; never leaves
     partial state on disk.
@@ -92,10 +102,15 @@ def persist_skill_bundle(
     name = _extract_skill_name(files["skill.yaml"])
     target_dir = skills_path / name
 
-    if target_dir.exists() and on_conflict == "reject":
+    if target_dir.exists() and on_conflict not in ("replace", "update"):
+        # Determine installed version for the error message (best-effort).
+        try:
+            existing = load_skill(target_dir)
+            installed_version = existing.spec.version
+        except Exception:
+            installed_version = "unknown"
         raise SkillCreationError(
-            f"skill {name!r} already exists at {target_dir}; "
-            f"PUT-style replace is the default — set on_conflict='replace'",
+            f"Skill {name!r} v{installed_version} already exists. Use --force to overwrite.",
             status_code=409,
         )
 

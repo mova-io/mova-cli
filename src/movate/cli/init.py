@@ -719,6 +719,46 @@ def _cd_target(project_root: Path) -> str:
     return rel_str if rel_str != "." else str(project_root)
 
 
+def _example_mock_payload(project_root: Path, agent_name: str) -> str:
+    """Best-effort example payload for the post-init ``mdk run --mock`` hint.
+
+    Looks for ``agents/<name>/schema/input.yaml`` (the conventional spot
+    a scaffolded agent's input schema lives) and extracts ``example:``
+    values per field. Falls back to ``{"message":"hello"}`` — the spec's
+    documented default — when the schema can't be read or has no examples.
+
+    Single-line JSON, no internal whitespace: the result is interpolated
+    into a copy-pasteable shell command, so the operator should see
+    ``--mock '{"user_id":1,"question":"..."}'`` not a pretty-printed dict.
+    """
+    import json as _json  # noqa: PLC0415
+
+    fallback = '{"message":"hello"}'
+    schema_path = project_root / "agents" / agent_name / "schema" / "input.yaml"
+    if not schema_path.is_file():
+        return fallback
+    try:
+        import yaml as _yaml  # noqa: PLC0415
+
+        data = _yaml.safe_load(schema_path.read_text()) or {}
+        fields = data.get("fields") or {}
+        if not isinstance(fields, dict):
+            return fallback
+        payload: dict[str, object] = {}
+        for key, spec in fields.items():
+            if not isinstance(spec, dict):
+                continue
+            if "example" in spec:
+                payload[key] = spec["example"]
+        if not payload:
+            return fallback
+        return _json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        # Schema parse failure is not worth derailing the init success
+        # panel — fall back to the documented default.
+        return fallback
+
+
 def _is_in_project() -> bool:
     """Walk up from cwd looking for ``movate.yaml`` — the same
     convention :mod:`movate.cli.add_cmd` uses. Lets ``mdk init``
@@ -980,16 +1020,22 @@ def _init_project(  # noqa: PLR0912 — orchestrator; per-step branches read cle
         # commands: doctor agent / run / eval / deploy.
         agent_list = [t.strip() for t in with_agents.split(",") if t.strip()]
         first_agent = agent_list[0] if agent_list else "<agent>"
+        # Each command chains `cd {project} &&` so copy-pasting any one
+        # line works from anywhere — the smoke test found that running
+        # `mdk run <agent>` from one directory up gave a confusing
+        # `agent.yaml not found` error. A sensible `--mock` payload is
+        # included so the operator's first run never hits a real provider.
+        mock_payload = _example_mock_payload(project_root, first_agent)
         body += (
             f"\n[bold]Next steps[/bold] "
             f"[dim](you already added {len(agent_list)} agent(s))[/dim][bold]:[/bold]\n"
-            f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]\n"
-            f"  [dim]$[/dim] [bold]mdk doctor agent {first_agent}[/bold]"
-            f"   [dim]# per-agent health check[/dim]\n"
-            f"  [dim]$[/dim] [bold]mdk run {first_agent} '{{...}}'[/bold]"
-            f"   [dim]# try one live[/dim]\n"
-            f"  [dim]$[/dim] [bold]mdk eval {first_agent} --gate 0.7[/bold]"
-            f"   [dim]# gate on the seed dataset[/dim]"
+            f"  [dim]$[/dim] [bold]cd {cd_to} && mdk run {first_agent} "
+            f"--mock '{mock_payload}'[/bold]"
+            f"   [dim]# try one live (mock provider)[/dim]\n"
+            f"  [dim]$[/dim] [bold]cd {cd_to} && mdk validate {first_agent}[/bold]"
+            f"   [dim]# static check (schema + policy)[/dim]\n"
+            f"  [dim]$[/dim] [bold]cd {cd_to} && mdk eval {first_agent} --mock[/bold]"
+            f"   [dim]# eval dataset under the mock provider[/dim]"
         )
     else:
         # No agents yet. Suggest `add --list` + drop the
@@ -1214,21 +1260,24 @@ def _render_combined_init_summary(
             line += f" [dim]— {desc}[/dim]"
         lines.append(line)
 
-    # Workspace-level next steps. `mdk validate --all` is the natural
-    # follow-up (one command to confirm every agent loads cleanly) and
-    # `mdk eval --gate` is the standard CI gate.
+    # Workspace-level next steps. Each line chains `cd {project} &&` so
+    # copy-paste works from anywhere — the smoke test found that running
+    # `mdk run <agent>` from one directory up gave a confusing
+    # `agent.yaml not found` error. A sensible `--mock` payload is
+    # included so the operator's first run never hits a real provider.
     first_name = str(added[0]["name"]) if added else "<agent>"
     cd_to = _cd_target(project_root)
+    mock_payload = _example_mock_payload(project_root, first_name)
     lines.extend(
         [
             "",
             "[bold]Next steps:[/bold]",
-            f"  [dim]$[/dim] [bold]cd {cd_to}[/bold]",
-            "  [dim]$[/dim] [bold]mdk validate --all[/bold]"
+            f"  [dim]$[/dim] [bold]cd {cd_to} && mdk validate --all[/bold]"
             "   [dim]# confirm every agent loads cleanly[/dim]",
-            f"  [dim]$[/dim] [bold]mdk run {first_name} '{{...}}'[/bold]"
-            "   [dim]# try one live[/dim]",
-            "  [dim]$[/dim] [bold]mdk ci eval --mock[/bold]"
+            f"  [dim]$[/dim] [bold]cd {cd_to} && mdk run {first_name} "
+            f"--mock '{mock_payload}'[/bold]"
+            "   [dim]# try one live (mock provider)[/dim]",
+            f"  [dim]$[/dim] [bold]cd {cd_to} && mdk ci eval --mock[/bold]"
             "   [dim]# gate every agent against its baseline[/dim]",
         ]
     )

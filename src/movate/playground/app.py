@@ -84,13 +84,22 @@ except ImportError as exc:  # pragma: no cover - covered by CLI hint
 
 from movate.playground.capabilities import RuntimeCapabilities, parse_capabilities
 from movate.playground.client import PlaygroundClient, PlaygroundClientConfig
+from movate.playground.connection import (
+    ConnectionMonitor,
+    ConnectionState,
+    reconnected_banner,
+    slow_banner,
+    unreachable_banner,
+)
 from movate.playground.conversation import (
     ConversationState,
     FeedbackRoute,
+    Role,
     extract_output_text,
     feedback_route,
     select_backend,
 )
+from movate.playground.harvest_feedback import harvest_feedback_turn
 from movate.playground.state import resolve_data_layer_config
 from movate.playground.targets import (
     TARGETS_ENV_VAR,
@@ -115,6 +124,11 @@ _K_BACKEND = "backend"
 _K_CONVO = "conversation_state"
 _K_UPLOADS = "upload_store"
 _K_TARGET = "target_name"
+# Connection-status monitor (Item 1). One per session; tracks reachability.
+_K_CONN_MONITOR = "conn_monitor"
+_K_CONN_STATE = "conn_state"
+# Feedback idempotency guard (Item 4). Records run_ids already submitted.
+_K_FEEDBACK_SUBMITTED = "feedback_submitted"
 # Voice mode (opt-in; default OFF). The voice WS client is session-scoped; the
 # per-turn chunk counter lets on_audio_end skip a no-audio recording.
 _K_VOICE_CLIENT = "voice_client"
@@ -322,6 +336,14 @@ async def _init_session() -> tuple[PlaygroundClient, RuntimeCapabilities]:
     cl.user_session.set(_K_CAPS, caps)
     cl.user_session.set(_K_CONVO, ConversationState())
     cl.user_session.set(_K_UPLOADS, UploadStore())
+    # Item 1: connection monitor — probe the runtime on each turn.
+    # ``_client`` is the inner httpx.AsyncClient; absent on stub clients (tests).
+    http_client = getattr(client, "_client", None)
+    monitor = ConnectionMonitor(client=http_client) if http_client is not None else None
+    cl.user_session.set(_K_CONN_MONITOR, monitor)
+    cl.user_session.set(_K_CONN_STATE, ConnectionState.CONNECTED)
+    # Item 4: track which run_ids have already received feedback (idempotency).
+    cl.user_session.set(_K_FEEDBACK_SUBMITTED, set())
     return client, caps
 
 
@@ -354,6 +376,50 @@ def _capability_banner(caps: RuntimeCapabilities) -> str:
         f"_Memory: **{memory}** · responses: **{stream}** · "
         f"uploads up to {caps.max_upload_mb} MB, {caps.max_upload_count} files{voice}_"
     )
+
+
+_AGENT_LABEL_MAX_DESC = 60  # max description chars in the picker label
+_AGENT_LABEL_MAX_TAGS = 3  # max tags shown in the label
+
+
+def _agent_picker_label(agent: dict[str, Any]) -> str:
+    """Build a rich label for the agent picker (Item 2).
+
+    Format: ``name — description [tag1, tag2]`` with graceful truncation.
+    The name + version are always shown; the description and tags are added
+    when present so the operator can pick the right agent without guessing.
+    ``v?`` is suppressed when the runtime doesn't include a version field.
+    """
+    name = agent.get("name") or "?"
+    version = agent.get("version")
+    version_part = f" · v{version}" if version else ""
+
+    desc = (agent.get("description") or "").strip()
+    if len(desc) > _AGENT_LABEL_MAX_DESC:
+        desc = desc[: _AGENT_LABEL_MAX_DESC - 1] + "…"
+
+    tags: list[str] = agent.get("tags") or []
+    tag_part = ""
+    if tags:
+        shown = tags[:_AGENT_LABEL_MAX_TAGS]
+        overflow = ", …" if len(tags) > _AGENT_LABEL_MAX_TAGS else ""
+        tag_part = " [" + ", ".join(shown) + overflow + "]"
+
+    if desc:
+        return f"{name}{version_part} — {desc}{tag_part}"
+    return f"{name}{version_part}{tag_part}"
+
+
+def _agent_picker_tooltip(agent: dict[str, Any]) -> str:
+    """Full description + all tags for the picker button tooltip."""
+    parts: list[str] = []
+    desc = (agent.get("description") or "").strip()
+    if desc:
+        parts.append(desc)
+    tags: list[str] = agent.get("tags") or []
+    if tags:
+        parts.append("Tags: " + ", ".join(tags))
+    return "  ".join(parts)[:200] if parts else agent.get("name", "")
 
 
 def _is_auth_error(exc: Exception) -> bool:
@@ -449,8 +515,8 @@ async def start() -> None:
         cl.Action(
             name="pick_agent",
             payload={"value": a.get("name", "")},
-            label=f"{a.get('name', '?')} · v{a.get('version', '?')}",
-            tooltip=a.get("description", "")[:120],
+            label=_agent_picker_label(a),
+            tooltip=_agent_picker_tooltip(a),
         )
         for a in agents
     ]
@@ -671,6 +737,34 @@ def _parse_structured_input(raw: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+async def _check_connection() -> None:
+    """Item 1 — probe the runtime and surface status changes in the chat.
+
+    Compares the new state against the stored previous state and emits a
+    Chainlit step/message only on transitions (CONNECTED→DISCONNECTED,
+    DISCONNECTED→CONNECTED, etc.) so the UI isn't cluttered by repeated
+    green banners on every turn.
+    """
+    monitor: ConnectionMonitor | None = cl.user_session.get(_K_CONN_MONITOR)
+    if monitor is None:
+        return
+    prev: ConnectionState = cl.user_session.get(_K_CONN_STATE, ConnectionState.CONNECTED)
+    new_state = await monitor.check()
+    cl.user_session.set(_K_CONN_STATE, new_state)
+    if new_state == prev:
+        return
+    # State changed — emit an appropriate banner.
+    if new_state == ConnectionState.DISCONNECTED:
+        await cl.Message(content=unreachable_banner()).send()
+    elif prev == ConnectionState.DISCONNECTED and new_state in {
+        ConnectionState.CONNECTED,
+        ConnectionState.SLOW,
+    }:
+        await cl.Message(content=reconnected_banner()).send()
+    elif new_state == ConnectionState.SLOW and monitor.last_duration_s is not None:
+        await cl.Message(content=slow_banner(monitor.last_duration_s)).send()
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     """Handle one operator turn: uploads → run → render → feedback.
@@ -680,6 +774,9 @@ async def on_message(message: cl.Message) -> None:
     (re-sent transcript) transparently. Streaming renders tokens live when
     the runtime advertises it.
     """
+    # Item 1: probe the runtime before each turn; surface status changes.
+    await _check_connection()
+
     # Process any attached files first so this turn's context includes them.
     await _handle_uploads(message)
 
@@ -695,6 +792,20 @@ async def on_message(message: cl.Message) -> None:
         # — only nudge when there's actual text but no agent.
         if message.content.strip():
             await cl.Message(content="Pick an agent first from the buttons above.").send()
+        return
+
+    # Item 1: if the runtime was found unreachable, show a friendly retry
+    # hint rather than letting the run attempt fail with a raw exception.
+    conn_state: ConnectionState = cl.user_session.get(_K_CONN_STATE, ConnectionState.CONNECTED)
+    if conn_state == ConnectionState.DISCONNECTED:
+        await cl.Message(
+            content=(
+                "⚠️ Runtime unreachable — retrying...\n\n"
+                "The last reachability check found the runtime unreachable. "
+                "Your message will be sent once the runtime is back — "
+                "or try again in a moment."
+            )
+        ).send()
         return
 
     user_text = message.content.strip()
@@ -858,43 +969,68 @@ def _voice_client_for_session() -> VoiceWSClient | None:
 async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
     """Consume one voice turn off ``ws``, streaming text into ``msg`` + playing TTS.
 
-    Renders ``transcript.partial`` as a live "(listening) …" caption, replaces
-    it with the bold final transcript once endpointed, streams ``agent.token``
-    deltas under it, and on completion attaches the synthesized audio as a
+    Item 3 — partial-transcript display:
+    Each ``transcript.partial`` frame updates the live message content so the
+    operator sees captions appearing in real-time (like live subtitles), even
+    on slow connections. When ``is_final`` arrives the caption is replaced with
+    the confirmed utterance. Agent tokens are streamed via ``stream_token`` for
+    a responsive feel. On completion, synthesized audio is attached as a
     ``cl.Audio`` element (auto-played) plus the 👍/👎 feedback actions. An
-    ``error`` frame is surfaced inline; the text answer (if any already
-    streamed) is preserved so a TTS-stage failure still leaves the reply
-    readable (the runtime degrades text-first, ADR 048 D8).
+    ``error`` frame is surfaced inline; any text already streamed is preserved
+    so a TTS-stage failure still leaves the reply readable (ADR 048 D8).
     """
     transcript = ""
     answer_parts: list[str] = []
     audio_frames: list[Any] = []
     run_id: str | None = None
+    latency_badge = ""
+    # Item 3: track the last partial text so we can replace it cleanly
+    # when a new partial or the final transcript arrives.
+    _last_caption = ""
 
     def _compose(caption: str) -> str:
         head = f"🎙 _{caption}_" if caption else ""
         body = "".join(answer_parts)
-        return f"{head}\n\n{body}" if head and body else head or body
+        composed = f"{head}\n\n{body}" if head and body else head or body
+        # Latency badge (demo polish): pin "⚡ responded in {X}ms" under the turn
+        # once the runtime reports it, so the stage sees the speed live.
+        if latency_badge:
+            composed = f"{composed}\n\n`{latency_badge}`" if composed else f"`{latency_badge}`"
+        return composed
 
     async for frame in ws.iter_turn():
         if frame.is_partial:
-            msg.content = _compose(f"(listening) {frame.text}")
+            # Item 3: stream each partial into the live message so the operator
+            # sees STT progress in real-time (caption-style, updated in-place).
+            _last_caption = f"(listening) {frame.text}"
+            msg.content = _compose(_last_caption)
             await msg.update()
         elif frame.is_final_transcript:
+            # Final transcript replaces the last partial caption.
             transcript = frame.text
-            msg.content = _compose(f"you said: “{transcript}”")
+            _last_caption = f"you said: “{transcript}”"
+            msg.content = _compose(_last_caption)
             await msg.update()
         elif frame.is_agent_token:
+            # Item 3: use stream_token for agent tokens so the answer feels live.
             answer_parts.append(frame.text)
-            msg.content = _compose(f"you said: “{transcript}”" if transcript else "")
+            # Rebuild full content to keep the transcript header visible.
+            caption = _last_caption if _last_caption else ""
+            msg.content = _compose(caption)
             await msg.update()
         elif frame.is_audio:
             audio_frames.append(frame)
+        elif frame.is_latency:
+            # Latency badge frame — capture it; the terminal update renders it
+            # under the answer (and the next compose pins it live).
+            latency_badge = frame.latency_badge
+            msg.content = _compose(_last_caption if _last_caption else "")
+            await msg.update()
         elif frame.is_error:
             stage = frame.data.get("stage", "?")
             message = frame.data.get("message", "voice error")
             answer_parts.append(f"\n\n❌ voice {stage} error: {message}")
-            msg.content = _compose(f"you said: “{transcript}”" if transcript else "")
+            msg.content = _compose(_last_caption if _last_caption else "")
             await msg.update()
         elif frame.is_done:
             run_id = frame.data.get("run_id") or None
@@ -1022,19 +1158,68 @@ def _feedback_actions(run_id: str | None) -> list[cl.Action]:
     ]
 
 
+def _turn_io_for_run(convo: ConversationState | None, run_id: str) -> tuple[str, str]:
+    """Look up a turn's (user_input, assistant_output) by its ``run_id``.
+
+    Reads the playground's structured :class:`ConversationState` mirror — the
+    assistant turn carries the ``run_id``; the nearest preceding user turn is
+    its input. Returns empty strings when the turn can't be located (e.g. a
+    resumed thread whose mirror lacks this run). Pure + side-effect-free so the
+    feedback-harvest path stays unit-testable and never touches the render path.
+    """
+    if convo is None:
+        return "", ""
+    output_text = ""
+    idx: int | None = None
+    for i, turn in enumerate(convo.turns):
+        if turn.role is Role.ASSISTANT and turn.run_id == run_id:
+            output_text = turn.text
+            idx = i
+            break
+    if idx is None:
+        return "", ""
+    user_input = ""
+    for j in range(idx - 1, -1, -1):
+        if convo.turns[j].role is Role.USER:
+            user_input = convo.turns[j].text
+            break
+    return user_input, output_text
+
+
 @cl.action_callback("feedback")
 async def on_feedback(action: cl.Action) -> None:
-    """Persist 👍/👎 (+ optional comment) for a run.
+    """Persist 👍/👎 (+ optional comment) for a run, and harvest an eval case.
 
     Routes to the feedback API when the runtime advertises it (ADR 045
     D14), else the existing persistence path — never regressing today's
     behavior. Both currently POST ``/runs/{id}/feedback`` client-side.
+
+    Item 4 changes:
+    * Idempotent-safe: same run_id + value submitted twice is a no-op
+      (tracked in the session-scoped ``_K_FEEDBACK_SUBMITTED`` set so the
+      buttons can't be double-submitted).
+    * On success: emits "✓ Thanks!" confirmation.
+    * On failure: emits a toast-style note and leaves buttons active.
+
+    Eval-harvest (ADR 016 D1): on a recorded thumb the turn becomes a
+    **proposed** eval case written to ``<agent>/evals/harvested.jsonl`` — the
+    same human-review artifact ``mdk eval harvest`` produces, never auto-
+    promoted into the live dataset. 👎 prompts for an optional *expected-better*
+    answer and lands needs-review (no asserted expected); 👍 lands a golden
+    case. Best-effort: if harvest is unavailable the feedback still records.
     """
     client: PlaygroundClient = cl.user_session.get(_K_CLIENT)
     caps: RuntimeCapabilities = cl.user_session.get(_K_CAPS)
     run_id = action.payload.get("run_id") or cl.user_session.get("last_run_id")
     if not run_id or not client:
         await cl.Message(content="No run to attach feedback to. Send a message first.").send()
+        return
+
+    # Item 4: idempotency guard — same run + value combination is a no-op.
+    feedback_key = f"{run_id}:{action.payload.get('value', '')}"
+    submitted: set[str] = cl.user_session.get(_K_FEEDBACK_SUBMITTED) or set()
+    if feedback_key in submitted:
+        await cl.Message(content="✓ Feedback already recorded for this turn.").send()
         return
 
     score = 1 if action.payload.get("value") == "up" else -1
@@ -1067,16 +1252,59 @@ async def on_feedback(action: cl.Action) -> None:
             user_id=user_id,
         )
     except Exception as exc:
-        await cl.Message(content=f"❌ Could not save feedback: {type(exc).__name__}: {exc}").send()
+        # Item 4: on failure, surface a toast-style message and leave buttons active.
+        await cl.Message(
+            content=f"⚠️ Feedback couldn't be saved — try again. ({type(exc).__name__}: {exc})"
+        ).send()
         return
+
+    # Item 4: mark this run+value as submitted (idempotency) + confirm visually.
+    submitted.add(feedback_key)
+    cl.user_session.set(_K_FEEDBACK_SUBMITTED, submitted)
+
+    # Eval-harvest (ADR 016 D1): turn this graded turn into a *proposed* eval
+    # case via the existing harvest pipeline. On a 👎, optionally ask the tester
+    # for the expected-better answer so the proposed case carries a suggested
+    # expected (still needs-review — a human confirms before it enters the gate).
+    expected_better: str | None = None
+    if score == -1:
+        better_msg = await cl.AskUserMessage(
+            content=(
+                "Optional: what *should* the answer have been? "
+                "This seeds a proposed eval case for review (or press Enter to skip)."
+            ),
+            timeout=120,
+        ).send()
+        if better_msg and isinstance(better_msg, dict):
+            better_text = better_msg.get("output", "").strip()
+            if better_text:
+                expected_better = better_text
+
+    agent_name = cl.user_session.get(_K_AGENT)
+    agent_detail = cl.user_session.get(_K_AGENT_DETAIL) or {}
+    convo: ConversationState | None = cl.user_session.get(_K_CONVO)
+    user_input, output_text = _turn_io_for_run(convo, run_id)
+    harvested_to = harvest_feedback_turn(
+        value="up" if score == 1 else "down",
+        run_id=run_id,
+        user_input=user_input,
+        output_text=output_text,
+        comment=comment_text,
+        expected_better=expected_better,
+        agent_name=str(agent_name) if agent_name else None,
+        agent_version=(agent_detail.get("version") if isinstance(agent_detail, dict) else None),
+    )
 
     suffix = " + comment" if comment_text else ""
     via = "feedback API" if route is FeedbackRoute.FEEDBACK_API else "runtime persistence"
+    harvest_note = ""
+    if harvested_to is not None:
+        kind = "golden eval case" if score == 1 else "proposed eval case (needs review)"
+        harvest_note = f" Saved as a {kind} for review — run `mdk eval harvest` to promote."
     await cl.Message(
         content=(
-            f"✅ Feedback saved ({'👍' if score == 1 else '👎'}{suffix}) via {via}. "
-            "It's in Postgres now and (if Langfuse is configured on the runtime) "
-            "also pushed as a score on the trace."
+            f"✓ Thanks! Feedback saved ({'👍' if score == 1 else '👎'}{suffix}) via {via}."
+            f"{harvest_note}"
         )
     ).send()
 

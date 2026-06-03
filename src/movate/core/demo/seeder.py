@@ -7,6 +7,11 @@ pass-rate that trends, one agent drifting, and two *injected anomalies* (a cost
 spike on one agent, a latency regression correlated with a deploy) so the
 anomaly-annotation + narrative panels have something to point at.
 
+When ``SeedConfig.with_voice`` is ``True``, each successful run also gets a
+:class:`VoiceTurnRecord` — realistic STT/TTS latency + audio duration + cost
+figures drawn from the same seeded RNG (so the bundle is still byte-for-byte
+reproducible for a given ``(seed, now)``).
+
 Design constraints (CLAUDE.md):
 
 * **Pure + deterministic.** No storage, no async, no clock-now surprises that
@@ -16,7 +21,9 @@ Design constraints (CLAUDE.md):
 * **Tagged + purgeable.** See the module docstring of :mod:`movate.core.demo`:
   every row's ``tenant_id`` starts with :data:`DEMO_TENANT_PREFIX` and every
   run/eval input carries :data:`DEMO_MARKER_KEY` ``= True``. Nothing here can
-  produce an untagged row.
+  produce an untagged row.  Voice-turn records carry the same ``tenant_id``
+  prefix and are cleared by ``mdk demo clear`` via the ``voice_turns`` table
+  (same ``tenant_id LIKE 'demo-%'`` predicate).
 * **Stdlib only.** ``random`` + ``datetime``; no new deps.
 
 The numbers are illustrative, not modelled — the goal is "looks like a real
@@ -76,19 +83,27 @@ class SeedConfig:
     ``now`` is injected (not read from the clock inside the generator) so the
     output is fully reproducible for a given ``(seed, now)`` — demos can be
     re-run and screenshots will match. The CLI defaults it to ``datetime.now``.
+
+    ``with_voice`` — when ``True``, each successful run gets a companion
+    :class:`VoiceTurnRecord` (Deepgram STT + Cartesia TTS, realistic latencies).
+    Defaults to ``False`` so existing callers see no change.
     """
 
     agents: int = 6
     tenants: int = 3
-    days: int = 30
+    days: int = 7
     seed: int = 1337
     now: datetime = field(default_factory=lambda: datetime.now(UTC))
     # Roughly how many runs to generate per agent per day at the fleet's
     # baseline. The actual count wobbles with a day/agent multiplier so the
     # charts aren't flat. Kept modest * agents * tenants * days so the default
-    # 6/3/30 lands in the low-thousands — plenty for nice charts, cheap to
+    # 6/3/7 lands in the low-hundreds — plenty for nice demo charts, cheap to
     # batch-insert.
     runs_per_agent_per_day: int = 4
+    with_voice: bool = False
+    """Generate one :class:`VoiceTurnRecord` per successful run (Deepgram +
+    Cartesia, realistic latencies, same seeded RNG). Off by default for
+    backward compat; set via ``mdk demo seed --with-voice``."""
 
 
 # --- generation tunables (named so the shape is legible + lint-clean) ---
@@ -130,6 +145,92 @@ _TENANT_SLUGS: tuple[str, ...] = (
     "wayne",
 )
 
+DEMO_TELEMETRY_TENANT_ID = f"{DEMO_TENANT_PREFIX}{_TENANT_SLUGS[0]}"
+"""The canonical telemetry tenant (``demo-acme``) — the first tenant the seeder
+always populates and the one the evals/anomalies/analyzer insights concentrate
+under. ``mdk demo doctor`` reads insights back under this tenant (the analyzer
+runs per ``demo-`` telemetry tenant), distinct from the scenario's
+:data:`~movate.core.demo.scenario.DEMO_TENANT_ID` (the serve --dev tenant the
+agents + graph live under)."""
+
+
+# ---------------------------------------------------------------------------
+# Voice-turn record
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VoiceTurnRecord:
+    """One synthetic voice turn paired with a successful :class:`RunRecord`.
+
+    Fields mirror the shape the runtime's voice-WebSocket handler collects
+    (``_VoiceTurnConfig`` + STT/TTS adapter telemetry) so this record can feed
+    future voice-latency panels without any schema changes.  The ``run_id``
+    links it back to its parent ``RunRecord``; the ``tenant_id`` inherits the
+    ``demo-`` prefix so ``mdk demo clear`` purges it.
+
+    All numeric values are **illustrative** — they sit within realistic ranges
+    for Deepgram Nova-2 STT (~100-350 ms) and Cartesia Sonic TTS (~60-200 ms)
+    on a sub-30-second utterance but are not modelled from real traffic.
+    """
+
+    run_id: str
+    tenant_id: str
+    agent: str
+    stt_provider: str  # always "deepgram" in demo
+    stt_latency_ms: int
+    tts_provider: str  # always "cartesia" in demo
+    tts_latency_ms: int
+    audio_duration_s: float
+    realtime_mode: bool
+    turn_cost_usd: float
+    created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Voice generation helper
+# ---------------------------------------------------------------------------
+
+# Realistic per-provider latency bands (ms) derived from published benchmarks.
+# STT: Deepgram Nova-2 typically 80-350 ms for <30 s utterances.
+# TTS: Cartesia Sonic typically 60-180 ms TTFB on short responses.
+_STT_LATENCY_LO = 90
+_STT_LATENCY_HI = 340
+_TTS_LATENCY_LO = 65
+_TTS_LATENCY_HI = 185
+# Audio duration (s): conversational turns typically 3-28 s.
+_AUDIO_DURATION_LO = 3.0
+_AUDIO_DURATION_HI = 28.0
+# Per-turn voice cost ($): ~0.0007-0.003 USD (blended STT + TTS at typical rates).
+_TURN_COST_LO = 0.0007
+_TURN_COST_HI = 0.0030
+
+
+def _gen_voice_turn(rng: random.Random, run: RunRecord) -> VoiceTurnRecord:
+    """Return one synthetic voice turn for a successful run.
+
+    All values are drawn from the *same seeded RNG stream* as the rest of the
+    bundle so the whole bundle stays reproducible for a given ``(seed, now)``.
+    """
+    return VoiceTurnRecord(
+        run_id=run.run_id,
+        tenant_id=run.tenant_id,
+        agent=run.agent,
+        stt_provider="deepgram",
+        stt_latency_ms=rng.randint(_STT_LATENCY_LO, _STT_LATENCY_HI),
+        tts_provider="cartesia",
+        tts_latency_ms=rng.randint(_TTS_LATENCY_LO, _TTS_LATENCY_HI),
+        audio_duration_s=round(rng.uniform(_AUDIO_DURATION_LO, _AUDIO_DURATION_HI), 2),
+        realtime_mode=False,
+        turn_cost_usd=round(rng.uniform(_TURN_COST_LO, _TURN_COST_HI), 6),
+        created_at=run.created_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Events
+# ---------------------------------------------------------------------------
+
 
 @dataclass
 class DemoEvent:
@@ -155,9 +256,13 @@ class DemoEvent:
 class DemoBundle:
     """Everything :func:`generate_bundle` produces, ready for batch insert.
 
-    The CLI persists ``runs`` + ``evals`` + ``failures`` through the storage
-    Protocol and uses ``events`` + ``narrative`` for the demo's printed
-    storyline. ``stats`` is a small summary for the CLI's success panel.
+    The CLI persists ``runs`` + ``evals`` + ``failures`` (and ``voice_turns``
+    when present) through the storage Protocol and uses ``events`` + ``narrative``
+    for the demo's printed storyline. ``stats`` is a small summary for the CLI's
+    success panel.
+
+    ``voice_turns`` is empty unless ``SeedConfig.with_voice`` is ``True``; it
+    contains one :class:`VoiceTurnRecord` per successful run.
     """
 
     runs: list[RunRecord]
@@ -166,6 +271,7 @@ class DemoBundle:
     events: list[DemoEvent]
     narrative: str
     stats: dict[str, float | int]
+    voice_turns: list[VoiceTurnRecord] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +626,15 @@ def generate_bundle(cfg: SeedConfig) -> DemoBundle:
     evals, eval_events = _gen_evals(cfg, rng, agents, tenants, drift_agent=drift_agent)
     failures = _gen_failures(runs)
 
+    # Voice-turn records — one per successful run when with_voice is set.
+    # Generated AFTER runs so the RNG stream from runs is complete; this keeps
+    # the existing run data identical whether or not with_voice is requested.
+    voice_turns: list[VoiceTurnRecord] = []
+    if cfg.with_voice:
+        for run in runs:
+            if run.status == JobStatus.SUCCESS:
+                voice_turns.append(_gen_voice_turn(rng, run))
+
     # A couple of "good news" canary promotions so the exec "wins" panel has
     # something positive to show.
     canary_events = [
@@ -549,6 +664,7 @@ def generate_bundle(cfg: SeedConfig) -> DemoBundle:
         "runs": len(runs),
         "evals": len(evals),
         "failures": len(failures),
+        "voice_turns": len(voice_turns),
         "events": len(events),
         "tenants": len(tenants),
         "agents": len(agents),
@@ -557,13 +673,16 @@ def generate_bundle(cfg: SeedConfig) -> DemoBundle:
         "success_rate_pct": round(100.0 * n_success / max(1, len(runs)), 1),
     }
 
+    voice_suffix = (
+        f" + {len(voice_turns):,} voice turns (Deepgram/Cartesia)." if voice_turns else "."
+    )
     narrative = (
         f"Seeded {len(runs):,} runs + {len(evals):,} evals across "
         f"{len(agents)} agents x {len(tenants)} tenants over {cfg.days} days. "
         f"Storyline: cost spike on '{cost_spike_agent}' mid-window; latency "
         f"regression on '{latency_regression_agent}' after a deploy; eval "
         f"drift on '{drift_agent}'. Total synthetic spend ~"
-        f"${stats['total_cost_usd']:,.2f}."
+        f"${stats['total_cost_usd']:,.2f}{voice_suffix}"
     )
 
     return DemoBundle(
@@ -573,4 +692,5 @@ def generate_bundle(cfg: SeedConfig) -> DemoBundle:
         events=events,
         narrative=narrative,
         stats=stats,
+        voice_turns=voice_turns,
     )

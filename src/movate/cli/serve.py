@@ -182,6 +182,12 @@ async def _run_serve(
     # optional [runtime] deps (uvicorn, fastapi). Deferring to here
     # means ``mdk kb ingest``, ``mdk eval``, and other non-serve
     # commands don't crash when the [runtime] extra isn't installed.
+    # Probe up-front and print a friendly install hint instead of a
+    # raw ``ModuleNotFoundError`` traceback when the extra is missing.
+    from movate.cli._runtime_extras import ensure_runtime_extras  # noqa: PLC0415
+
+    ensure_runtime_extras()
+
     import uvicorn  # noqa: PLC0415
 
     from movate.cli._runtime import register_pool_observability  # noqa: PLC0415
@@ -262,12 +268,42 @@ async def _run_serve(
         if agents
         else "agents:      [yellow]none loaded[/yellow] [dim](GET /agents returns empty)[/dim]"
     )
+    # Voice capability line — reads the same env-var detection as
+    # build_voice_capabilities() so the startup print and the capabilities
+    # endpoint tell the same story (ADR 050 D4 / item 3 of feat/voice-cli-ux).
+    # Import is deferred-local to keep cli ⊥ runtime at module scope (the
+    # runtime import is already lazy inside _run_serve via the uvicorn block).
+    from movate.runtime.capabilities import (  # noqa: PLC0415
+        _configured_stt_providers,
+        _configured_tts_providers,
+    )
+
+    _stt_providers = _configured_stt_providers()
+    _tts_providers = _configured_tts_providers()
+    _realtime_env = (os.environ.get("MDK_VOICE_REALTIME") or "").strip()
+    if _stt_providers and _tts_providers:
+        _voice_line = (
+            f"voice:       [bold green]STT={_stt_providers[0]}[/bold green]  "
+            f"[bold green]TTS={_tts_providers[0]}[/bold green]"
+            + (
+                f"  (realtime: [bold green]{_realtime_env}[/bold green])"
+                if _realtime_env
+                else "  [dim](realtime: off)[/dim]"
+            )
+        )
+    else:
+        _voice_line = (
+            "voice:       [yellow]not configured[/yellow]  "
+            "[dim](set DEEPGRAM_API_KEY + CARTESIA_API_KEY to enable)[/dim]"
+        )
+
     _body_lines = [
         f"[bold cyan]http://{host}:{port}[/bold cyan]",
         "",
         _agent_line,
         _rate_line,
         _cors_line,
+        _voice_line,
         "",
         "[dim]mdk run <agent> '<input>'   →  invoke an agent[/dim]",
         "[dim]mdk logs --last             →  inspect last run[/dim]",

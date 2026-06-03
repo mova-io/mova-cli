@@ -33,6 +33,12 @@ Failure → :class:`SkillError` mapping:
 * Response body isn't a dict → ``validation_failed`` (the skill's
   output schema requires an object)
 
+Tracing (ADR 024):
+
+When ``ctx.tracer`` is set the backend opens an ``http.call`` child span
+under ``ctx.parent_span`` and closes it on success/error. The span
+carries the resolved URL, HTTP method, and response status code.
+
 Caches one ``httpx.AsyncClient`` per backend instance — the connection
 pool amortizes TCP+TLS across N tool calls in a long-running session.
 """
@@ -40,6 +46,7 @@ pool amortizes TCP+TLS across N tool calls in a long-running session.
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -85,7 +92,7 @@ class HttpSkillBackend:
         self._client: httpx.AsyncClient | None = None
         self._transport = transport
 
-    async def execute(
+    async def execute(  # noqa: PLR0912 — sequential HTTP pipeline; each branch is a distinct failure mode
         self,
         skill: SkillBundle,
         input: dict[str, Any],
@@ -131,81 +138,107 @@ class HttpSkillBackend:
             else max(1, ctx.call_ms_budget // 1000)
         )
 
-        try:
-            if method in _BODY_METHODS:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    json=input,
-                    timeout=timeout,
-                )
-            else:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    params=input,
-                    timeout=timeout,
-                )
-        except httpx.TimeoutException as exc:
-            # Surface as TIMEOUT so the LLM sees consistent vocabulary;
-            # the outer dispatch wrap will also catch wait_for timeouts
-            # but a raw httpx.TimeoutException can happen sub-budget
-            # (e.g. DNS hung).
-            raise SkillError(
-                type=SkillErrorType.TIMEOUT,
-                message=(
-                    f"http skill {skill.spec.name!r}: timeout after {timeout}s "
-                    f"calling {method} {url}: {exc}"
-                ),
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"http skill {skill.spec.name!r}: transport error on "
-                    f"{method} {url}: {type(exc).__name__}: {exc}"
-                ),
-            ) from exc
-
-        # 4) Status check. Anything non-2xx is the operator's API
-        # telling us "no, that didn't work" — surface as backend_error
-        # so the model can recover (e.g. try a different tool, give up,
-        # explain the failure to the user).
-        if response.status_code >= _HTTP_ERROR_THRESHOLD:
-            body_excerpt = response.text[:500]
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"http skill {skill.spec.name!r}: {method} {url} returned "
-                    f"{response.status_code}: {body_excerpt}"
-                ),
+        # ADR 024 — open an ``http.call`` child span under the executor's
+        # ``skill.<name>`` span (ctx.parent_span). No-op when tracer is None.
+        _span = None
+        _t0 = 0.0
+        if ctx.tracer is not None:
+            _t0 = time.monotonic()
+            _span = ctx.tracer.start_span(
+                "http.call",
+                {"skill": skill.spec.name, "http.method": method, "http.url": url},
+                parent=ctx.parent_span,
             )
 
-        # 5) Parse response. JSON-only — non-JSON endpoints aren't
-        # usable as skills today (the model contract requires the
-        # output to match a JSON Schema). validation_failed for non-dict
-        # so the operator sees a clean error rather than a deep
-        # jsonschema traceback.
         try:
-            payload = response.json()
-        except ValueError as exc:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(f"http skill {skill.spec.name!r}: response body wasn't valid JSON: {exc}"),
-            ) from exc
+            try:
+                if method in _BODY_METHODS:
+                    response = await client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        json=input,
+                        timeout=timeout,
+                    )
+                else:
+                    response = await client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        params=input,
+                        timeout=timeout,
+                    )
+            except httpx.TimeoutException as exc:
+                # Surface as TIMEOUT so the LLM sees consistent vocabulary;
+                # the outer dispatch wrap will also catch wait_for timeouts
+                # but a raw httpx.TimeoutException can happen sub-budget
+                # (e.g. DNS hung).
+                raise SkillError(
+                    type=SkillErrorType.TIMEOUT,
+                    message=(
+                        f"http skill {skill.spec.name!r}: timeout after {timeout}s "
+                        f"calling {method} {url}: {exc}"
+                    ),
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise SkillError(
+                    type=SkillErrorType.BACKEND_ERROR,
+                    message=(
+                        f"http skill {skill.spec.name!r}: transport error on "
+                        f"{method} {url}: {type(exc).__name__}: {exc}"
+                    ),
+                ) from exc
 
-        if not isinstance(payload, dict):
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"http skill {skill.spec.name!r}: response was a "
-                    f"{type(payload).__name__}, expected a JSON object"
-                ),
-            )
+            # 4) Status check. Anything non-2xx is the operator's API
+            # telling us "no, that didn't work" — surface as backend_error
+            # so the model can recover (e.g. try a different tool, give up,
+            # explain the failure to the user).
+            if response.status_code >= _HTTP_ERROR_THRESHOLD:
+                body_excerpt = response.text[:500]
+                raise SkillError(
+                    type=SkillErrorType.BACKEND_ERROR,
+                    message=(
+                        f"http skill {skill.spec.name!r}: {method} {url} returned "
+                        f"{response.status_code}: {body_excerpt}"
+                    ),
+                )
 
-        return payload
+            # 5) Parse response. JSON-only — non-JSON endpoints aren't
+            # usable as skills today (the model contract requires the
+            # output to match a JSON Schema). validation_failed for non-dict
+            # so the operator sees a clean error rather than a deep
+            # jsonschema traceback.
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise SkillError(
+                    type=SkillErrorType.BACKEND_ERROR,
+                    message=(
+                        f"http skill {skill.spec.name!r}: response body wasn't valid JSON: {exc}"
+                    ),
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise SkillError(
+                    type=SkillErrorType.VALIDATION_FAILED,
+                    message=(
+                        f"http skill {skill.spec.name!r}: response was a "
+                        f"{type(payload).__name__}, expected a JSON object"
+                    ),
+                )
+
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "http.status_code", response.status_code)
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="ok")
+            return payload
+        except Exception:
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="error")
+            raise
 
     async def aclose(self) -> None:
         """Close the connection pool. Called when the executor shuts
