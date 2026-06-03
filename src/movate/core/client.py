@@ -49,6 +49,7 @@ from movate.runtime.schemas import (
     ProjectMemberView,
     ProjectView,
     RunAccepted,
+    RunReplayView,
     RunSubmission,
     RunView,
     WorkflowCreateRequest,
@@ -266,6 +267,22 @@ class MovateClient:
         r = await self._client.get(f"/runs/{run_id}")
         self._raise_for_status(r)
         return RunView.model_validate(r.json())
+
+    async def replay_run(
+        self, run_id: str, *, against: str = "published", mock: bool = False
+    ) -> RunReplayView:
+        """``POST /api/v1/runs/{id}/replay`` — re-run a historical run's recorded
+        input against a chosen agent version (ADR 045 D13).
+
+        ``against`` is ``"published"`` (latest) or ``"version:X"``. Returns the
+        original + replayed runs side-by-side with a ``changed`` flag. The
+        original run is immutable; the replay is a new persisted run."""
+        r = await self._client.post(
+            f"/api/v1/runs/{run_id}/replay",
+            params={"against": against, "mock": mock},
+        )
+        self._raise_for_status(r)
+        return RunReplayView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Observability Intelligence (ADR 047)

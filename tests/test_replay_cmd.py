@@ -22,6 +22,8 @@ import json
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from typer.testing import CliRunner
@@ -34,6 +36,7 @@ from movate.core.models import (
     RunRecord,
     TokenUsage,
 )
+from movate.runtime.schemas import RunReplayView, RunView
 from movate.storage import SqliteProvider
 
 runner = CliRunner(mix_stderr=False)
@@ -269,3 +272,79 @@ def test_replay_creates_new_run_record(db_with_run: tuple[Path, RunRecord], proj
     assert fetched.output == original.output
     # Two records total: the original + the replay
     assert len(all_runs) == 2
+
+
+# ---------------------------------------------------------------------------
+# Remote replay (ADR 045 D13) — `mdk replay <id> --target <runtime>`
+# ---------------------------------------------------------------------------
+
+
+def _run_record(run_id: str, output: dict) -> RunRecord:
+    return RunRecord(
+        run_id=run_id,
+        job_id=f"j-{run_id}",
+        tenant_id="t",
+        agent="demo",
+        agent_version="0.1.0",
+        prompt_hash="h",
+        provider="openai/gpt-4o-mini",
+        provider_version="v1",
+        pricing_version="2026-05",
+        status=JobStatus.SUCCESS,
+        input={"text": "hi"},
+        output=output,
+        metrics=Metrics(),
+    )
+
+
+def test_replay_remote_target_calls_endpoint(monkeypatch) -> None:
+    """``mdk replay <id> --target prod`` hits the client's replay_run and renders
+    the original→replayed result (ADR 045 D13)."""
+
+    view = RunReplayView(
+        original=RunView.from_record(_run_record("r-old", {"message": "OLD"})),
+        replayed=RunView.from_record(_run_record("r-new", {"message": "NEW"})),
+        against="published",
+        changed=True,
+    )
+    mock_replay = AsyncMock(return_value=view)
+    monkeypatch.setattr("movate.core.client.MovateClient.replay_run", mock_replay)
+    monkeypatch.setattr(
+        "movate.core.user_config.resolve_target",
+        lambda t: ("prod", SimpleNamespace(url="http://rt.example")),
+    )
+    monkeypatch.setattr("movate.core.user_config.resolve_bearer_token", lambda cfg: "tok")
+    monkeypatch.setattr("movate.cli._console.get_global_target", lambda: "prod")
+
+    result = runner.invoke(app, ["replay", "r-old", "--target", "prod", "--against", "published"])
+    assert result.exit_code == 0, result.output + result.stderr
+    mock_replay.assert_awaited_once()
+    # The recorded run id + the replay id + the changed verdict surface.
+    assert "r-old" in result.output and "r-new" in result.output
+    assert "changed" in result.output
+
+
+def test_replay_remote_json_output(monkeypatch) -> None:
+    """``--target ... --json`` emits the RunReplayView as JSON (no Rich render)."""
+
+    view = RunReplayView(
+        original=RunView.from_record(_run_record("r1", {"message": "a"})),
+        replayed=RunView.from_record(_run_record("r2", {"message": "a"})),
+        against="version:0.2.0",
+        changed=False,
+    )
+    monkeypatch.setattr("movate.core.client.MovateClient.replay_run", AsyncMock(return_value=view))
+    monkeypatch.setattr(
+        "movate.core.user_config.resolve_target",
+        lambda t: ("prod", SimpleNamespace(url="http://rt.example")),
+    )
+    monkeypatch.setattr("movate.core.user_config.resolve_bearer_token", lambda cfg: "tok")
+    monkeypatch.setattr("movate.cli._console.get_global_target", lambda: "prod")
+
+    result = runner.invoke(
+        app, ["replay", "r1", "--target", "prod", "--against", "version:0.2.0", "--json"]
+    )
+    assert result.exit_code == 0, result.output + result.stderr
+    payload = json.loads(result.output)
+    assert payload["against"] == "version:0.2.0"
+    assert payload["changed"] is False

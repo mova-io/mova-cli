@@ -97,6 +97,8 @@ REMOTE_VERB_ROUTES: dict[str, list[tuple[str, str]]] = {
     ],
     "jobs dead-letter purge": [("POST", "/api/v1/jobs/dead-letter/purge")],
     "runs show": [("GET", "/runs/{run_id}")],
+    # run replay / time-travel (ADR 045 D13) — remote via --target
+    "replay": [("POST", "/api/v1/runs/{run_id}/replay")],
     # batch inference
     "batch submit": [("POST", "/api/v1/agents/{name}/batch")],
     "batch status": [("GET", "/api/v1/batches/{batch_id}")],

@@ -159,6 +159,61 @@ def _outputs_equal(a: dict[str, Any] | None, b: dict[str, Any] | None) -> bool:
     return json.dumps(a or {}, sort_keys=True) == json.dumps(b or {}, sort_keys=True)
 
 
+def _replay_remote(
+    run_id: str,
+    *,
+    target: str,
+    against: str,
+    mock: bool,
+    diff: bool,
+    json_output: bool,
+) -> None:
+    """Replay against a deployed runtime via ``POST /runs/{id}/replay`` (ADR 045 D13)."""
+    from movate.cli._console import get_global_target  # noqa: PLC0415
+    from movate.core.client import MovateClient, MovateClientError  # noqa: PLC0415
+    from movate.core.user_config import (  # noqa: PLC0415
+        UserConfigError,
+        resolve_bearer_token,
+        resolve_target,
+    )
+
+    try:
+        _name, target_cfg = resolve_target(target or get_global_target())
+        token = resolve_bearer_token(target_cfg)
+    except UserConfigError as exc:
+        err_console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    async def _go() -> Any:
+        async with MovateClient(base_url=target_cfg.url, api_key=token) as client:
+            return await client.replay_run(run_id, against=against, mock=mock)
+
+    try:
+        view = asyncio.run(_go())
+    except MovateClientError as exc:
+        err_console.print(f"[red]✗[/red] remote replay failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        console.print_json(view.model_dump_json())
+        return
+
+    state = "changed" if view.changed else "unchanged"
+    state_style = "yellow" if view.changed else "green"
+    console.print(
+        f"[bold]replay[/bold] {view.original.run_id} → {view.replayed.run_id}  "
+        f"[dim](against[/dim] [cyan]{view.against}[/cyan][dim],[/dim] "
+        f"[{state_style}]{state}[/{state_style}][dim])[/dim]"
+    )
+    # Default to side-by-side for a remote replay (the whole point is the diff);
+    # without --diff, show just the replayed output.
+    if diff:
+        _render_output("original", view.original.output)
+        _render_output("replayed", view.replayed.output)
+    else:
+        _render_output("replayed", view.replayed.output)
+
+
 # ---------------------------------------------------------------------------
 # Command
 # ---------------------------------------------------------------------------
@@ -203,6 +258,23 @@ def replay(
         "--json",
         help="Emit the replayed RunRecord as JSON. Skips the Rich rendering.",
     ),
+    target: str | None = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Replay against a [bold]deployed[/bold] runtime (named target or URL) via "
+            "[bold]POST /api/v1/runs/{id}/replay[/bold] (ADR 045 D13) instead of the "
+            "local on-disk agent. Pair with [bold]--against[/bold] to pick the version."
+        ),
+    ),
+    against: str = typer.Option(
+        "published",
+        "--against",
+        help=(
+            "Remote only ([bold]--target[/bold]): the agent version to replay against — "
+            "[bold]published[/bold] (latest) or [bold]version:X[/bold]."
+        ),
+    ),
 ) -> None:
     """Re-execute a past run with the same input.
 
@@ -211,13 +283,28 @@ def replay(
     the original run, that's the whole point — see how the new prompt
     handles the old input.
 
+    With [bold]--target[/bold] the replay runs on a [bold]deployed[/bold] runtime
+    (``POST /api/v1/runs/{id}/replay``, ADR 045 D13) against the published — or a
+    pinned [bold]--against version:X[/bold] — agent version, returning the
+    original vs replayed side-by-side. Without it, replay is local (below).
+
     [bold]Examples:[/bold]
 
-      [dim]$ mdk replay r-abc-123                    # re-run, print new output[/dim]
+      [dim]$ mdk replay r-abc-123                    # re-run locally, print new output[/dim]
       [dim]$ mdk replay r-abc-123 --diff             # side-by-side with original[/dim]
       [dim]$ mdk replay r-abc-123 --mock             # offline / hermetic[/dim]
-      [dim]$ mdk replay r-abc-123 --json > new.json  # capture for diffing[/dim]
+      [dim]$ mdk replay r-abc-123 --target prod      # replay on the deployed runtime[/dim]
+      [dim]$ mdk replay r-abc-123 --target prod --against version:0.2.0[/dim]
     """
+    # Remote replay (ADR 045 D13): hit the deployed endpoint instead of the
+    # local on-disk agent. Only when --target is explicit — bare `mdk replay`
+    # stays local (back-compat).
+    if target is not None:
+        _replay_remote(
+            run_id, target=target, against=against, mock=mock, diff=diff, json_output=json_output
+        )
+        return
+
     original = asyncio.run(_fetch_run(run_id, tenant_id))
     if original is None:
         err_console.print(
