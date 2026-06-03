@@ -80,6 +80,18 @@ VOICE_KEY_ENV_VARS: tuple[str, ...] = (
     "AZURE_SPEECH_REGION",
 )
 
+# Enterprise connector env vars (ADR 052 Phase 1 — Action Fabric).
+# Set via ``mdk auth login servicenow`` / ``msgraph`` (or by hand) and
+# consumed by the HTTP skill backend when dispatching connector skills.
+# ServiceNow needs an API key + instance URL; Microsoft Graph needs an
+# access token + tenant ID.
+CONNECTOR_KEY_ENV_VARS: tuple[str, ...] = (
+    "SERVICENOW_API_KEY",
+    "SERVICENOW_INSTANCE_URL",
+    "MSGRAPH_ACCESS_TOKEN",
+    "MSGRAPH_TENANT_ID",
+)
+
 # Every env var the credentials store should autoload. Union of the
 # groups above; surfaced as a constant so `autoload_credentials`
 # and any future "what does mdk track?" enumeration agree on the
@@ -89,6 +101,7 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
     *VOICE_KEY_ENV_VARS,
+    *CONNECTOR_KEY_ENV_VARS,
 )
 
 

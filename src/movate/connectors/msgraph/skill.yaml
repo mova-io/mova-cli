@@ -1,0 +1,208 @@
+# Microsoft Graph API connector -- user + license management (ADR 052 Phase 1).
+#
+# Three skill variants against the Microsoft Graph REST API v1.0.
+# Each uses kind: http through the existing HttpSkillBackend.
+# Auth is bearer-from-env:MSGRAPH_ACCESS_TOKEN.
+#
+# Usage in agent.yaml:
+#   tools:
+#     - msgraph-user-create@1.0.0
+#     - msgraph-user-resetpassword@1.0.0
+#     - msgraph-license-assign@1.0.0
+
+actions:
+
+  # -----------------------------------------------------------------------
+  # msgraph-user-create -- POST /v1.0/users
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: msgraph-user-create
+    version: 1.0.0
+    description: >-
+      Create a new user in Azure Active Directory via the Microsoft Graph
+      API. Returns the created user object including the system-generated
+      id and userPrincipalName.
+    schema:
+      input:
+        type: object
+        properties:
+          displayName:
+            type: string
+            description: "The display name for the user (e.g. Jane Doe)."
+          mailNickname:
+            type: string
+            description: "The mail alias for the user (e.g. janedoe)."
+          userPrincipalName:
+            type: string
+            description: "The UPN (e.g. janedoe@contoso.com)."
+          accountEnabled:
+            type: boolean
+            description: Whether the account is enabled (default true).
+          passwordProfile:
+            type: object
+            description: Password configuration for the new user.
+            properties:
+              forceChangePasswordNextSignIn:
+                type: boolean
+                description: Require password change on first sign-in.
+              password:
+                type: string
+                description: Initial password for the user.
+            required:
+              - password
+          department:
+            type: string
+            description: Department the user belongs to.
+          jobTitle:
+            type: string
+            description: Job title of the user.
+          officeLocation:
+            type: string
+            description: Office location of the user.
+        required:
+          - displayName
+          - mailNickname
+          - userPrincipalName
+          - passwordProfile
+      output:
+        type: object
+        properties:
+          id:
+            type: string
+          displayName:
+            type: string
+          userPrincipalName:
+            type: string
+          mail:
+            type: string
+          accountEnabled:
+            type: boolean
+    implementation:
+      kind: http
+      entry: https://graph.microsoft.com/v1.0/users
+      method: POST
+      auth: bearer-from-env:MSGRAPH_ACCESS_TOKEN
+      headers:
+        Content-Type: application/json
+    side_effects: mutates-state
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # msgraph-user-resetpassword -- POST .../resetPassword
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: msgraph-user-resetpassword
+    version: 1.0.0
+    description: >-
+      Reset a user's password via the Microsoft Graph authentication
+      methods API. Requires the user_id and authentication method_id.
+      Returns the updated authentication method object.
+    schema:
+      input:
+        type: object
+        properties:
+          user_id:
+            type: string
+            description: The Azure AD object id of the user.
+          method_id:
+            type: string
+            description: The authentication method id.
+          newPassword:
+            type: string
+            description: "The new password. If omitted, the system generates one."
+        required:
+          - user_id
+          - method_id
+      output:
+        type: object
+        properties:
+          id:
+            type: string
+          newPassword:
+            type: string
+            description: The system-generated or provided new password.
+    implementation:
+      kind: http
+      entry: "https://graph.microsoft.com/v1.0/users/{{ input.user_id }}/authentication/methods/{{ input.method_id }}/resetPassword"
+      method: POST
+      auth: bearer-from-env:MSGRAPH_ACCESS_TOKEN
+      headers:
+        Content-Type: application/json
+    side_effects: mutates-state
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # msgraph-license-assign -- POST .../assignLicense
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: msgraph-license-assign
+    version: 1.0.0
+    description: >-
+      Assign or remove licenses for a user via the Microsoft Graph API.
+      Accepts lists of license SKU IDs to add and/or remove. Returns
+      the updated user object with assigned licenses.
+    schema:
+      input:
+        type: object
+        properties:
+          user_id:
+            type: string
+            description: The Azure AD object id of the user.
+          addLicenses:
+            type: array
+            description: Licenses to assign.
+            items:
+              type: object
+              properties:
+                skuId:
+                  type: string
+                  description: The SKU id of the license to assign (GUID).
+                disabledPlans:
+                  type: array
+                  description: Service plan IDs to disable within this license.
+                  items:
+                    type: string
+              required:
+                - skuId
+          removeLicenses:
+            type: array
+            description: SKU IDs of licenses to remove.
+            items:
+              type: string
+        required:
+          - user_id
+          - addLicenses
+          - removeLicenses
+      output:
+        type: object
+        properties:
+          id:
+            type: string
+          displayName:
+            type: string
+          assignedLicenses:
+            type: array
+            items:
+              type: object
+              properties:
+                skuId:
+                  type: string
+                disabledPlans:
+                  type: array
+                  items:
+                    type: string
+    implementation:
+      kind: http
+      entry: "https://graph.microsoft.com/v1.0/users/{{ input.user_id }}/assignLicense"
+      method: POST
+      auth: bearer-from-env:MSGRAPH_ACCESS_TOKEN
+      headers:
+        Content-Type: application/json
+    side_effects: mutates-state
+    cost:
+      per_call_usd: 0.0

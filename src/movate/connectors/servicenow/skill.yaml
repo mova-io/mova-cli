@@ -1,0 +1,234 @@
+# ServiceNow Table API connector -- incident CRUD (ADR 052 Phase 1).
+#
+# Three skill variants against the ServiceNow Table API. Each uses
+# kind: http through the existing HttpSkillBackend. The instance host
+# is passed as an input field and templated into the URL at call time.
+# Auth is bearer-from-env:SERVICENOW_API_KEY.
+#
+# Usage in agent.yaml:
+#   tools:
+#     - servicenow-incident-create@1.0.0
+#     - servicenow-incident-get@1.0.0
+#     - servicenow-incident-update@1.0.0
+
+actions:
+
+  # -----------------------------------------------------------------------
+  # servicenow-incident-create -- POST /api/now/table/incident
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: servicenow-incident-create
+    version: 1.0.0
+    description: >-
+      Create a new incident in ServiceNow. Populates the incident record
+      with the provided fields and returns the created record including
+      the system-generated sys_id and number.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "ServiceNow instance hostname (e.g. mycompany.service-now.com)."
+          short_description:
+            type: string
+            description: Brief summary of the incident.
+          description:
+            type: string
+            description: Detailed description of the incident.
+          urgency:
+            type: integer
+            enum: [1, 2, 3]
+            description: "Urgency level: 1=High, 2=Medium, 3=Low."
+          priority:
+            type: integer
+            enum: [1, 2, 3, 4, 5]
+            description: "Priority: 1=Critical .. 5=Planning."
+          assignment_group:
+            type: string
+            description: sys_id of the assignment group.
+          caller_id:
+            type: string
+            description: sys_id of the caller (the user reporting the incident).
+          category:
+            type: string
+            description: Incident category (e.g. software, hardware, network).
+          impact:
+            type: integer
+            enum: [1, 2, 3]
+            description: "Impact level: 1=High, 2=Medium, 3=Low."
+        required:
+          - instance_host
+          - short_description
+      output:
+        type: object
+        properties:
+          result:
+            type: object
+            properties:
+              sys_id:
+                type: string
+              number:
+                type: string
+              short_description:
+                type: string
+              state:
+                type: string
+              urgency:
+                type: string
+              priority:
+                type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/api/now/table/incident"
+      method: POST
+      auth: bearer-from-env:SERVICENOW_API_KEY
+      headers:
+        Content-Type: application/json
+        Accept: application/json
+    side_effects: mutates-state
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # servicenow-incident-get -- GET /api/now/table/incident/{sys_id}
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: servicenow-incident-get
+    version: 1.0.0
+    description: >-
+      Retrieve a single incident record from ServiceNow by its sys_id.
+      Returns the full incident record including all standard fields.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "ServiceNow instance hostname (e.g. mycompany.service-now.com)."
+          sys_id:
+            type: string
+            description: The sys_id of the incident to retrieve.
+        required:
+          - instance_host
+          - sys_id
+      output:
+        type: object
+        properties:
+          result:
+            type: object
+            properties:
+              sys_id:
+                type: string
+              number:
+                type: string
+              short_description:
+                type: string
+              description:
+                type: string
+              state:
+                type: string
+              urgency:
+                type: string
+              priority:
+                type: string
+              category:
+                type: string
+              impact:
+                type: string
+              opened_at:
+                type: string
+              resolved_at:
+                type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/api/now/table/incident/{{ input.sys_id }}"
+      method: GET
+      auth: bearer-from-env:SERVICENOW_API_KEY
+      headers:
+        Accept: application/json
+    side_effects: read-only
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # servicenow-incident-update -- PATCH /api/now/table/incident/{sys_id}
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: servicenow-incident-update
+    version: 1.0.0
+    description: >-
+      Update an existing incident in ServiceNow. Sends a partial update
+      (PATCH) with the provided fields and returns the updated record.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "ServiceNow instance hostname (e.g. mycompany.service-now.com)."
+          sys_id:
+            type: string
+            description: The sys_id of the incident to update.
+          short_description:
+            type: string
+            description: Updated brief summary.
+          description:
+            type: string
+            description: Updated detailed description.
+          state:
+            type: integer
+            enum: [1, 2, 3, 6, 7, 8]
+            description: "State: 1=New, 2=InProgress, 3=OnHold, 6=Resolved, 7=Closed."
+          urgency:
+            type: integer
+            enum: [1, 2, 3]
+            description: "Updated urgency: 1=High, 2=Medium, 3=Low."
+          priority:
+            type: integer
+            enum: [1, 2, 3, 4, 5]
+            description: Updated priority.
+          assignment_group:
+            type: string
+            description: sys_id of the new assignment group.
+          close_code:
+            type: string
+            description: Resolution code when closing.
+          close_notes:
+            type: string
+            description: Resolution notes when closing.
+        required:
+          - instance_host
+          - sys_id
+      output:
+        type: object
+        properties:
+          result:
+            type: object
+            properties:
+              sys_id:
+                type: string
+              number:
+                type: string
+              short_description:
+                type: string
+              state:
+                type: string
+              urgency:
+                type: string
+              priority:
+                type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/api/now/table/incident/{{ input.sys_id }}"
+      method: PATCH
+      auth: bearer-from-env:SERVICENOW_API_KEY
+      headers:
+        Content-Type: application/json
+        Accept: application/json
+    side_effects: mutates-state
+    cost:
+      per_call_usd: 0.0
