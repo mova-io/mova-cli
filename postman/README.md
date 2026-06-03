@@ -126,6 +126,43 @@ The CLI verbs don't map one-to-one onto runtime endpoints — the control plane
   there's no inline-text or URL body field. To ingest a URL, fetch it to an
   `.html`/`.md` file and upload that.
 
+## Remote + async on Azure — what actually persists
+
+Against a **deployed** runtime (`MOVATE_DB_URL=postgresql://…` → `PostgresProvider`,
+durable across pod restarts; `useAzureFiles=true` for the shared agents/skills
+volume; an embeddings key set), the collection drives real persistent state —
+no local files involved:
+
+| Resource / action | Remote on Azure? | Persisted where | Async? |
+|---|---|---|---|
+| **Create project** | ✅ | Postgres (`projects`) | sync (instant) |
+| **Add agent** (1a/1b/1c) | ✅ | Postgres registry **+** shared Azure Files bundle | sync; `--llm` authoring is CLI-only |
+| **Add KB** (3a) | ✅ | Postgres + `pgvector` | sync (needs embeddings key) |
+| **Validate** (2) | ✅ | stateless | sync |
+| **Eval** (E1–E3) | ✅ | Postgres `jobs` + `EvalRecord` | **✅ async** — 202 + `job_id`, worker pod runs it, poll the job |
+| **Run** (6) | ✅ | Postgres `jobs` + `RunRecord` | async by default (`?wait=true` to block) |
+| **Add skill** (4) | ⚠️ **partial** | shared Azure Files volume (durable + cross-pod), **not** Postgres | sync |
+| **Add context** | ❌ **no API yet** | — | — |
+
+**The two caveats that matter for "everything remote":**
+
+- **Skills** create + persist remotely (on the shared volume), but the API is
+  **create-only** (no list/get/update/attach) and skills are **filesystem-backed,
+  not tenant-scoped Postgres rows**. Fine for a single-tenant deploy; not yet a
+  first-class managed resource.
+- **Contexts have no `/api/v1` surface at all** — they can only be authored
+  locally in a bundle today, so you **cannot create a context remotely**.
+
+Both are exactly what **ADR 060** (skills + contexts as managed resources)
+closes — promoting them to tenant-scoped, versioned Postgres resources with full
+CRUD + attach. Until that lands, the contexts/skills-management requests are
+intentionally **absent** from this collection (the anti-drift test rejects a
+request that points at a route which doesn't exist); they'll be added in the
+same PR that ships their routes.
+
+Everything else — projects, agents, KB, validate, eval, runs — is fully
+remote, persistent, and (for eval/runs) async on Azure today.
+
 ## Security
 
 No secrets are committed. `bearer_token` is an **empty `secret` placeholder**

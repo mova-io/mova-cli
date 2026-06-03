@@ -1,0 +1,201 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "mdk dead-letter view: jobs that exhausted their retry budget and landed in JobStatus.DEAD_LETTER (distinct from a one-off ERROR). Derived from mdk.jobs.completed{status=dead_letter} (golden-signals counter). A non-zero, rising dead-letter rate is a poison-job / systemic-dependency signal. Operate the backlog with `mdk jobs dead-letter list|show|retry|purge` (or the /api/v1/jobs/dead-letter* routes).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "text",
+      "id": 300,
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 0},
+      "title": "mdk - dead-letter: triage",
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - dead-letter rate\n\n**What this shows.** Jobs reaching the terminal `DEAD_LETTER` status (retry budget exhausted), from `mdk.jobs.completed{status=dead_letter}`. Distinct from `ERROR` (failed once, not retried) — a dead-letter is *we tried N times and gave up*.\n\n**Normal range.** ~0. A steady non-zero or rising trend = a poison input, a systemic dependency outage, or a too-tight retry budget.\n\n**If you see X.**\n\n- `single agent/tenant spiking` -> poison input for that target. `mdk jobs dead-letter list -a <agent>` to inspect, `... show <id>` for the error, `... retry <id>` once the cause is fixed.\n- `broad spike across agents` -> a shared dependency (provider / DB) was down long enough to exhaust budgets. Recover in bulk with `mdk jobs dead-letter retry --all` after it recovers.\n- `slow steady accumulation` -> prune stale rows with `mdk jobs dead-letter purge --before <ISO>` after triage.\n\n**Recovery.** `retry` resets a job to a fresh `QUEUED` state (attempt_count=0) so the worker reclaims it. `purge` is tenant-scoped + irreversible (admin scope)."
+      }
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Dead-letter throughput: rate of jobs reaching DEAD_LETTER, by tenant. Source: mdk.jobs.completed{status=dead_letter}.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 6},
+      "id": 1,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (tenant) (rate(mdk_jobs_completed_total{status=\"dead_letter\", tenant=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{tenant}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dead-letter rate by tenant (5m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Dead-letter share of all terminal jobs = dead_letter / all-completed. A rising ratio means a growing fraction of work is un-recoverable by the retry policy.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "showPoints": "never", "thresholdsStyle": {"mode": "line+area"}},
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.02},
+              {"color": "red", "value": 0.1}
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "id": 2,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(rate(mdk_jobs_completed_total{status=\"dead_letter\", tenant=~\"$tenant\"}[15m])) / clamp_min(sum(rate(mdk_jobs_completed_total{tenant=~\"$tenant\"}[15m])), 1e-9)",
+          "legendFormat": "dead-letter share",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dead-letter share of completions (orange 2%, red 10%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Cumulative dead-letters over the dashboard window (sum of increase). The size of the backlog awaiting `mdk jobs dead-letter` triage.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 1},
+              {"color": "red", "value": 25}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_jobs_completed_total{status=\"dead_letter\", tenant=~\"$tenant\"}[$__range]))",
+          "legendFormat": "dead-letters (window)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dead-letters in window (backlog to triage)",
+      "type": "stat"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "jobs", "dead-letter", "reliability"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": ".*"},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(mdk_jobs_completed_total, tenant)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "tenant",
+        "multi": true,
+        "name": "tenant",
+        "options": [],
+        "query": {"query": "label_values(mdk_jobs_completed_total, tenant)", "refId": "StandardVariableQuery"},
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - dead-letter",
+  "uid": "mdk-dead-letter",
+  "version": 1,
+  "weekStart": ""
+}

@@ -409,3 +409,32 @@ add `project_id` + layout/render columns), (2) serialize existing rows into
 graphology JSON (D3), (3) compute + persist FA2 coordinates (D4), (4) wire the
 read endpoints (D5) + the SSE projection (D6), (5) vendor the sigma viewer (D8).
 `RetrievalConfig.graph` (D9) and cluster-LOD (D7) are independent follow-ups.
+
+---
+
+## Viewer scope decision (2026-05-30) — sigma.js is the sole v1 viewer
+
+A short-lived viewer bake-off explored three alternative front-ends against the
+same data: an **ipysigma** notebook viewer (PR #558), a **Dash + dash-cytoscape**
+viewer (PR #560), and a **PyVis** air-gapped standalone-HTML viewer (PR #561).
+
+**Decision: sigma.js + graphology (D8) is the *sole* supported viewer for v1;**
+the three alternatives are **deferred to v1.1** and their PRs are closed (not
+merged). Rationale, straight from this ADR's own decisions:
+
+- The API contract is **graphology's documented JSON** (D3/R1), chosen precisely
+  so it is *library-agnostic* — sigma / cytoscape / react-force-graph / PyVis are
+  all thin adapters over the **same** endpoint. Shipping one reference viewer does
+  not lock anything in; the alternatives stay **revivable** against the unchanged
+  contract whenever a concrete need appears (a notebook workflow → ipysigma; a
+  fully air-gapped export → PyVis).
+- Three parallel viewers triple the surface to keep in lockstep with the live
+  growth stream (D6) + drill semantics (D7) for **zero** additional capability —
+  they render the same graph. One well-supported, demo-grade WebGL viewer beats
+  three half-maintained ones (CLAUDE.md: optimize for *stable*, minimal surface).
+- sigma is the one that scales to ~10k+ nodes with built-in drill events (see
+  *Alternatives considered* above) — the right single bet for the flagship demo.
+
+This is a scoping/closure decision, not a new architectural seam: D3/D8 are
+unchanged; the graphology contract is the durable interface that keeps the
+deferred viewers cheap to revive.

@@ -273,6 +273,19 @@ class WorkflowSpec(BaseModel):
     description: str = ""
     owner: str = ""
 
+    runtime: Literal["native", "langgraph", "temporal"] = Field(
+        "native",
+        description=(
+            "Execution backend for this workflow (ADR 055 D1). 'native' (default) "
+            "is the in-process WorkflowRunner — today's behavior, no extra. "
+            "'temporal' compiles to a Temporal workflow (opt-in mdk[temporal], "
+            "ADR 054). 'langgraph' is reserved (ADR 030; execution lands in ADR "
+            "055 step 3). Additive + default-preserving: no existing workflow.yaml "
+            "carries this key (extra='forbid'), so every current workflow stays "
+            "'native' byte-for-byte."
+        ),
+    )
+
     state_schema: str = Field(
         ..., description="Path to a JSON Schema file, relative to workflow.yaml"
     )

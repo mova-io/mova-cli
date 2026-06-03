@@ -1,570 +1,379 @@
-"""Phase 1 Track C unit tests for ``movate.core.workflow.temporal_activities``.
+"""Tests for the Phase 1 Temporal activity wrappers (ADR 054 Track C).
 
-These tests verify the **load-bearing** property of ADR 054 D3: the two
-activities reuse the existing mdk execution path. They assert:
+The four activities (``call_agent_activity`` / ``call_skill_activity`` /
+``call_gate_activity`` / ``call_judge_activity``) are the call targets the
+Track-B compiler (``movate.core.workflow.compilers.temporal``) emits by name.
+These tests assert:
 
-* ``call_agent_activity`` calls :meth:`Executor.execute` with the right args
-  (no second execution model — D3).
-* ``session_id`` flows from the activity input onto the
-  :class:`RunRequest.session_id` (D10 — sessions hold conversation state).
-* A serialized parent-span dict is reconstructed into a SpanCtx and forwarded
-  as ``parent_span=`` (D11 — tracing).
-* ``workflow_id`` is forwarded as ``workflow_run_id=`` (D6 — one identity).
-* The returned dict is the JSON-shape of a :class:`RunResponse`.
-* The tracer is invoked through the existing executor path (not bypassed).
-* ``call_skill_activity`` calls :func:`dispatch_skill` with the right args
-  for both the python backend and an HTTP-style mocked backend, and the
-  :class:`SkillExecutionContext` fields it builds carry the activity inputs.
-* The module imports cleanly even with ``temporalio`` absent (lazy contract).
+* import-safety without the ``[temporal]`` extra (ADR 054 D7) — copying the
+  compiler suite's ``sys.meta_path``-blocking pattern,
+* the DI contract (``configure_activities`` / ``_get_context``),
+* that each activity is a thin shim forwarding to the Executor / SkillBackend
+  (ADR 054 D3) — exercised with fakes so no network / LLM is hit.
 
-The tests stub ``temporalio.activity`` either via ``sys.modules`` (lazy-import
-case) or by patching :class:`Executor` and :func:`dispatch_skill` (the
-exercise-the-shim cases). No real Temporal install is required.
+Hermetic + fast: no ``temporal server``, no real provider.
 """
 
 from __future__ import annotations
 
-import importlib
-import json
 import sys
-from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import yaml
 
-from movate.core.executor import Executor
-from movate.core.models import (
-    Metrics,
-    RunRequest,
-    RunResponse,
-    SkillImplementationKind,
-    TokenUsage,
-)
-from movate.core.skill_backend.base import (
-    _BACKENDS,
-    SkillExecutionContext,
-    register_backend,
-)
-from movate.core.skill_loader import SkillBundle, load_skill
-from movate.core.workflow.temporal_activities import (
-    call_agent_activity,
-    call_skill_activity,
-)
-from movate.providers.mock import MockProvider
-from movate.providers.pricing import load_pricing
+import movate.core.workflow.temporal_activities as ta
+from movate.core.models import ErrorInfo, Metrics, RunResponse
 from movate.testing import InMemoryStorage, NullTracer
-from movate.tracing.base import SpanCtx
 
 # ---------------------------------------------------------------------------
-# Helpers — agent fixture builder (mirrors tests/test_workflow_runner.py)
+# Fakes — no network, no LLM, no temporal server.
 # ---------------------------------------------------------------------------
 
 
-def _scaffold_agent(agent_dir: Path, *, name: str = "echo-agent") -> Path:
-    """Build a minimal valid agent directory the loader can parse.
+class _FakeBundle:
+    """Minimal stand-in for an AgentBundle / SkillBundle the activities touch."""
 
-    Same shape as the workflow-runner test fixtures so this file stays
-    consistent with the rest of the suite.
-    """
-    agent_dir.mkdir(parents=True, exist_ok=True)
-    (agent_dir / "schema").mkdir(exist_ok=True)
-    (agent_dir / "evals").mkdir(exist_ok=True)
+    def __init__(self, name: str = "fake-agent", properties: dict | None = None) -> None:
+        class _Spec:
+            pass
 
-    (agent_dir / "agent.yaml").write_text(
-        yaml.safe_dump(
+        self.spec = _Spec()
+        self.spec.name = name  # type: ignore[attr-defined]
+        # ``input_schema`` is read by the activities' state projection.
+        self.input_schema = {"properties": properties} if properties is not None else {}
+
+
+class _FakeExecutor:
+    """Records the ``execute`` call + returns a canned RunResponse."""
+
+    def __init__(self, response: RunResponse) -> None:
+        self._response = response
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(self, bundle: Any, request: Any, **kwargs: Any) -> RunResponse:
+        self.calls.append(
             {
-                "api_version": "movate/v1",
-                "kind": "Agent",
-                "name": name,
-                "version": "0.1.0",
-                "description": "echo agent for temporal activity tests",
-                "model": {
-                    "provider": "openai/gpt-4o-mini-2024-07-18",
-                    "params": {"temperature": 0.0},
-                },
-                "prompt": "./prompt.md",
-                "schema": {
-                    "input": "./schema/input.json",
-                    "output": "./schema/output.json",
-                },
-                "evals": {"dataset": "./evals/dataset.jsonl"},
+                "agent": request.agent,
+                "input": dict(request.input),
+                "workflow_run_id": kwargs.get("workflow_run_id"),
+                "node_id": kwargs.get("node_id"),
+                "tenant_id_override": kwargs.get("tenant_id_override"),
             }
         )
-    )
-    (agent_dir / "prompt.md").write_text("echo {{ input.text }}\n")
-    (agent_dir / "schema" / "input.json").write_text(
-        json.dumps(
-            {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["text"],
-                "properties": {"text": {"type": "string", "minLength": 1}},
-            }
-        )
-    )
-    (agent_dir / "schema" / "output.json").write_text(
-        json.dumps(
-            {
-                "$schema": "https://json-schema.org/draft/2020-12/schema",
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["text"],
-                "properties": {"text": {"type": "string"}},
-            }
-        )
-    )
-    (agent_dir / "evals" / "dataset.jsonl").write_text(
-        json.dumps({"input": {"text": "x"}, "expected": {"text": "x"}}) + "\n"
-    )
-    return agent_dir
+        return self._response
 
 
-def _success_response(run_id: str = "fixed-run") -> RunResponse:
-    """A canonical successful :class:`RunResponse` used by the executor mocks."""
+def _ok_response(data: dict[str, Any]) -> RunResponse:
+    return RunResponse(status="success", data=data, metrics=Metrics())
+
+
+def _err_response(message: str) -> RunResponse:
     return RunResponse(
-        status="success",
-        run_id=run_id,
-        data={"text": "ok"},
-        human_readable="ok",
-        trace_id="trace-from-executor",
-        metrics=Metrics(
-            latency_ms=12,
-            tokens=TokenUsage(input=10, output=5),
-            cost_usd=0.0001,
-            provider="mock",
-            pricing_version="test",
-            trace_id="trace-from-executor",
-        ),
+        status="error",
+        data={},
+        metrics=Metrics(),
+        error=ErrorInfo(type="internal", message=message),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_context() -> Any:
+    """Each test starts with no configured context (module global)."""
+    ta._CONTEXT = None
+    yield
+    ta._CONTEXT = None
+
+
+def _configure(monkeypatch: pytest.MonkeyPatch, tenant_id: str = "local") -> None:
+    """Install a context without building a real LiteLLM provider."""
+    ta.configure_activities(
+        storage=InMemoryStorage(),
+        pricing=object(),  # never read by the fakes
+        tracer=NullTracer(),
+        provider=object(),  # never read — _executor_for is monkeypatched
+        tenant_id=tenant_id,
     )
 
 
 # ---------------------------------------------------------------------------
-# call_agent_activity tests — D3 / D6 / D10 / D11
+# 1: Import-safety (ADR 054 D7) — module imports with temporalio blocked.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_call_agent_activity_invokes_executor(tmp_path: Path) -> None:
-    """D3 — the activity calls ``Executor.execute(bundle, request, ...)``
-    on the existing executor, not a Temporal-specific second path."""
-    agent_dir = _scaffold_agent(tmp_path / "agent")
-    mock_executor = MagicMock()
-    mock_executor.execute = AsyncMock(return_value=_success_response())
+@pytest.mark.unit
+def test_import_safe_without_temporalio(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The activities module imports cleanly even when ``temporalio`` is absent.
 
-    with patch(
-        "movate.core.workflow.temporal_activities._build_executor",
-        return_value=mock_executor,
-    ):
-        await call_agent_activity(
-            agent_ref=str(agent_dir),
-            request_json={"agent": "echo-agent", "input": {"text": "hello"}},
-        )
+    Copies the compiler suite's ``sys.meta_path``-blocking pattern: hide
+    temporalio, re-import fresh, assert the four activities are present +
+    callable and that ``_require_temporalio`` raises the install hint.
+    """
+    blocked = [m for m in sys.modules if m == "temporalio" or m.startswith("temporalio.")]
+    saved = {m: sys.modules[m] for m in blocked}
+    for m in blocked:
+        del sys.modules[m]
 
-    assert mock_executor.execute.await_count == 1, (
-        "Executor.execute should be the single load-bearing call (ADR 054 D3)"
+    class _BlockTemporalioFinder:
+        def find_module(self, name: str, path: Any = None) -> Any:
+            return self if name == "temporalio" or name.startswith("temporalio.") else None
+
+        def load_module(self, name: str) -> Any:
+            raise ImportError(f"hidden by test: {name}")
+
+    finder = _BlockTemporalioFinder()
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
+
+    mod_name = "movate.core.workflow.temporal_activities"
+    if mod_name in sys.modules:
+        del sys.modules[mod_name]
+
+    try:
+        import movate.core.workflow.temporal_activities as fresh  # noqa: PLC0415
+
+        # The four activities exist and are plain (async) callables.
+        for fn_name in (
+            "call_agent_activity",
+            "call_skill_activity",
+            "call_gate_activity",
+            "call_judge_activity",
+        ):
+            assert callable(getattr(fresh, fn_name))
+
+        # The worker gate raises a clear install hint when temporalio is gone.
+        assert fresh._HAVE_TEMPORALIO is False
+        with pytest.raises(RuntimeError) as ei:
+            fresh._require_temporalio()
+        assert "[temporal] extra is not installed" in str(ei.value)
+        assert "uv tool install" in str(ei.value)
+    finally:
+        for m, mod in saved.items():
+            sys.modules[m] = mod
+        if mod_name in sys.modules:
+            del sys.modules[mod_name]
+
+
+# ---------------------------------------------------------------------------
+# 2: DI contract — _get_context raises before configure_activities.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_get_context_unconfigured_raises() -> None:
+    assert ta._CONTEXT is None
+    with pytest.raises(RuntimeError) as ei:
+        ta._get_context()
+    assert "not configured" in str(ei.value)
+
+
+@pytest.mark.unit
+def test_configure_then_get_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch, tenant_id="acme")
+    ctx = ta._get_context()
+    assert ctx.tenant_id == "acme"
+    assert isinstance(ctx.storage, InMemoryStorage)
+
+
+@pytest.mark.unit
+def test_configure_defaults_pricing_and_tracer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted pricing/tracer fall back to load_pricing()/build_tracer()."""
+    sentinel_pricing = object()
+    sentinel_tracer = object()
+    monkeypatch.setattr("movate.providers.pricing.load_pricing", lambda *a, **k: sentinel_pricing)
+    monkeypatch.setattr("movate.tracing.build_tracer", lambda: sentinel_tracer)
+    ta.configure_activities(storage=InMemoryStorage(), provider=object())
+    ctx = ta._get_context()
+    assert ctx.pricing is sentinel_pricing
+    assert ctx.tracer is sentinel_tracer
+
+
+# ---------------------------------------------------------------------------
+# 3: _require_temporalio raises the install hint when the extra is absent.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_require_temporalio_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ta, "_HAVE_TEMPORALIO", False)
+    with pytest.raises(RuntimeError) as ei:
+        ta._require_temporalio()
+    assert "[temporal] extra is not installed" in str(ei.value)
+    assert "uv tool install" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# 4: call_agent_activity forwards to the Executor + returns response.data.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_call_agent_activity_forwards(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch, tenant_id="tenantA")
+
+    bundle = _FakeBundle(name="echoer", properties={"text": {"type": "string"}})
+    fake_exec = _FakeExecutor(_ok_response({"step1": "done"}))
+
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+    monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
+
+    state = {"text": "hello", "unused": "drop-me"}
+    out = await ta.call_agent_activity("node-1", "/agents/echoer", state, "run-xyz")
+
+    assert out == {"step1": "done"}
+    assert len(fake_exec.calls) == 1
+    call = fake_exec.calls[0]
+    # State is projected to the agent's input schema (only "text").
+    assert call["input"] == {"text": "hello"}
+    assert call["workflow_run_id"] == "run-xyz"
+    assert call["node_id"] == "node-1"
+    assert call["tenant_id_override"] == "tenantA"
+
+
+@pytest.mark.unit
+async def test_call_agent_activity_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-success RunResponse surfaces as an exception (Temporal retries)."""
+    _configure(monkeypatch)
+    bundle = _FakeBundle()
+    monkeypatch.setattr(
+        ta, "_executor_for", lambda ctx, state: _FakeExecutor(_err_response("boom"))
     )
-    # Positional args: (bundle, request)
-    pos_args, _kw_args = mock_executor.execute.await_args
-    bundle, request = pos_args
-    assert bundle.spec.name == "echo-agent"
-    assert isinstance(request, RunRequest)
-    assert request.input == {"text": "hello"}
+    monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
+
+    with pytest.raises(RuntimeError) as ei:
+        await ta.call_agent_activity("node-1", "/agents/x", {}, "run-1")
+    assert "boom" in str(ei.value)
 
 
-@pytest.mark.asyncio
-async def test_call_agent_activity_threads_session_id(tmp_path: Path) -> None:
-    """D10 — ``session_id`` flows onto the :class:`RunRequest` so
-    conversation state lives in the session store, not Temporal history."""
-    agent_dir = _scaffold_agent(tmp_path / "agent")
-    mock_executor = MagicMock()
-    mock_executor.execute = AsyncMock(return_value=_success_response())
+@pytest.mark.unit
+async def test_call_agent_activity_tenant_from_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tenant_id in state overrides the context default."""
+    _configure(monkeypatch, tenant_id="ctx-default")
+    bundle = _FakeBundle()
+    fake_exec = _FakeExecutor(_ok_response({}))
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+    monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
 
-    with patch(
-        "movate.core.workflow.temporal_activities._build_executor",
-        return_value=mock_executor,
-    ):
-        await call_agent_activity(
-            agent_ref=str(agent_dir),
-            request_json={"agent": "echo-agent", "input": {"text": "hi"}},
-            session_id="session-abc",
-        )
-
-    _, request = mock_executor.execute.await_args.args
-    assert request.session_id == "session-abc"
+    await ta.call_agent_activity("n", "/a", {"tenant_id": "from-state"}, "r")
+    assert fake_exec.calls[0]["tenant_id_override"] == "from-state"
 
 
-@pytest.mark.asyncio
-async def test_call_agent_activity_threads_parent_span(tmp_path: Path) -> None:
-    """D11 — a serialized parent-span dict is reconstructed as a
-    :class:`SpanCtx` and passed to ``Executor.execute(parent_span=...)``."""
-    agent_dir = _scaffold_agent(tmp_path / "agent")
-    mock_executor = MagicMock()
-    mock_executor.execute = AsyncMock(return_value=_success_response())
+# ---------------------------------------------------------------------------
+# 5: call_gate_activity runs the classifier + returns its decision dict.
+# ---------------------------------------------------------------------------
 
-    parent_span_context = {
-        "span_id": "span-1",
-        "trace_id": "trace-from-workflow",
-        "parent_id": None,
-        "name": "workflow.execute",
-        "attributes": {"workflow_run_id": "wf-123"},
+
+@pytest.mark.unit
+async def test_call_gate_activity_returns_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    bundle = _FakeBundle(name="turn-judge", properties={"text": {"type": "string"}})
+    fake_exec = _FakeExecutor(_ok_response({"label": "resolved"}))
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+    monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
+
+    decision = await ta.call_gate_activity(
+        "turn-gate-1",
+        "/agents/turn-judge",
+        {"transcript": "the dialogue"},
+        "run-1",
+        "",
+        "transcript",
+        ["continue", "resolved"],
+    )
+    # The classifier's decision dict (carrying "label") is returned verbatim.
+    assert decision == {"label": "resolved"}
+    # The classifier sees the native-runner input shape: the input_field value
+    # mapped to "text" + the route labels (NOT a raw state projection).
+    assert fake_exec.calls[0]["input"] == {
+        "text": "the dialogue",
+        "labels": ["continue", "resolved"],
     }
 
-    with patch(
-        "movate.core.workflow.temporal_activities._build_executor",
-        return_value=mock_executor,
-    ):
-        await call_agent_activity(
-            agent_ref=str(agent_dir),
-            request_json={"agent": "echo-agent", "input": {"text": "hi"}},
-            parent_span_context=parent_span_context,
-        )
 
-    _, kw_args = mock_executor.execute.await_args
-    parent_span = kw_args["parent_span"]
-    assert isinstance(parent_span, SpanCtx)
-    assert parent_span.trace_id == "trace-from-workflow"
-    assert parent_span.span_id == "span-1"
-    assert parent_span.name == "workflow.execute"
-
-
-@pytest.mark.asyncio
-async def test_call_agent_activity_uses_workflow_id_as_run_id(tmp_path: Path) -> None:
-    """D6 — the Temporal ``workflow_id`` IS the mdk ``workflow_run_id``."""
-    agent_dir = _scaffold_agent(tmp_path / "agent")
-    mock_executor = MagicMock()
-    mock_executor.execute = AsyncMock(return_value=_success_response())
-
-    with patch(
-        "movate.core.workflow.temporal_activities._build_executor",
-        return_value=mock_executor,
-    ):
-        await call_agent_activity(
-            agent_ref=str(agent_dir),
-            request_json={"agent": "echo-agent", "input": {"text": "hi"}},
-            workflow_id="wf-id-abc",
-            node_id="node-1",
-            tenant_id="tenant-xyz",
-        )
-
-    _, kw_args = mock_executor.execute.await_args
-    assert kw_args["workflow_run_id"] == "wf-id-abc"
-    assert kw_args["node_id"] == "node-1"
-    assert kw_args["tenant_id_override"] == "tenant-xyz"
-
-
-@pytest.mark.asyncio
-async def test_call_agent_activity_returns_run_response_dict(tmp_path: Path) -> None:
-    """The activity returns a JSON-safe dict shaped like a :class:`RunResponse`,
-    so Temporal can marshal it back to the workflow."""
-    agent_dir = _scaffold_agent(tmp_path / "agent")
-    response = _success_response(run_id="run-xyz")
-    mock_executor = MagicMock()
-    mock_executor.execute = AsyncMock(return_value=response)
-
-    with patch(
-        "movate.core.workflow.temporal_activities._build_executor",
-        return_value=mock_executor,
-    ):
-        result = await call_agent_activity(
-            agent_ref=str(agent_dir),
-            request_json={"agent": "echo-agent", "input": {"text": "hi"}},
-        )
-
-    assert isinstance(result, dict)
-    assert result["status"] == "success"
-    assert result["run_id"] == "run-xyz"
-    assert result["data"] == {"text": "ok"}
-    # The full Pydantic shape must be preserved so the workflow body can
-    # reconstruct a RunResponse on the other side without a custom converter.
-    rebuilt = RunResponse.model_validate(result)
-    assert rebuilt.metrics.cost_usd == response.metrics.cost_usd
-
-
-@pytest.mark.asyncio
-async def test_call_agent_activity_does_not_bypass_tracing(tmp_path: Path) -> None:
-    """D11 — tracing wires through the existing :class:`Executor` path; the
-    activity never builds its own tracer/span. Concretely: when the real
-    executor runs, its tracer's ``start_span`` IS invoked (we don't smuggle
-    in a NullTracer or skip tracing). We assert this via a real executor with
-    a tracer spy.
-    """
-    agent_dir = _scaffold_agent(tmp_path / "agent")
-
-    # Build a real executor whose tracer is a NullTracer wrapped with a spy
-    # on start_span — proves the executor's tracing path fires.
-    storage = InMemoryStorage()
-    await storage.init()
-    tracer = NullTracer()
-    original_start_span = tracer.start_span
-    start_span_calls: list[str] = []
-
-    def _spy_start_span(name: str, attrs: Any = None, parent: Any = None) -> Any:
-        start_span_calls.append(name)
-        return original_start_span(name, attrs, parent)
-
-    tracer.start_span = _spy_start_span  # type: ignore[method-assign]
-
-    executor = Executor(
-        provider=MockProvider(response=json.dumps({"text": "ok"})),
-        pricing=load_pricing(),
-        storage=storage,
-        tracer=tracer,
+@pytest.mark.unit
+async def test_call_gate_activity_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    bundle = _FakeBundle()
+    monkeypatch.setattr(
+        ta, "_executor_for", lambda ctx, state: _FakeExecutor(_err_response("nope"))
     )
-
-    with patch(
-        "movate.core.workflow.temporal_activities._build_executor",
-        return_value=executor,
-    ):
-        result = await call_agent_activity(
-            agent_ref=str(agent_dir),
-            request_json={"agent": "echo-agent", "input": {"text": "hi"}},
-        )
-
-    assert result["status"] == "success"
-    assert any(name == "agent.execute" for name in start_span_calls), (
-        "Executor.execute must open its agent.execute span — tracing is not bypassed."
-    )
+    monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
+    with pytest.raises(RuntimeError) as ei:
+        await ta.call_gate_activity("g", "/clf", {}, "r")
+    assert "nope" in str(ei.value)
 
 
 # ---------------------------------------------------------------------------
-# call_skill_activity tests — dispatch_skill reuse
+# 6: call_skill_activity dispatches through dispatch_skill + returns output.
 # ---------------------------------------------------------------------------
 
 
-def _scaffold_python_skill(
-    skill_dir: Path,
-    *,
-    name: str = "echo-skill",
-    entry: str = "tests.test_temporal_activities:_echo_skill",
-) -> SkillBundle:
-    """Build a minimal Python-backend skill bundle in memory.
-
-    Mirrors the pattern in ``tests/test_skill_backend_tracing.py`` — uses
-    the inline shorthand schema (``input: {text: string}``) the loader
-    compiles into a JSON Schema at load time.
-    """
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "skill.yaml").write_text(
-        "api_version: movate/v1\n"
-        "kind: Skill\n"
-        f"name: {name}\n"
-        "version: 0.1.0\n"
-        "schema:\n"
-        "  input:\n"
-        "    text: string\n"
-        "  output:\n"
-        "    result: string\n"
-        "implementation:\n"
-        "  kind: python\n"
-        f"  entry: {entry}\n"
-    )
-    return load_skill(skill_dir)
-
-
-def _echo_skill(input: dict[str, Any], ctx: SkillExecutionContext) -> dict[str, Any]:
-    """Python skill entrypoint used by the Python-backend tests."""
-    return {"result": input.get("text", "")}
-
-
-@pytest.mark.asyncio
-async def test_call_skill_activity_invokes_dispatch_skill(tmp_path: Path) -> None:
-    """The activity is a thin shim — it calls :func:`dispatch_skill` with the
-    loaded :class:`SkillBundle`, the input dict, and a built
-    :class:`SkillExecutionContext`."""
-    skill_bundle = _scaffold_python_skill(tmp_path / "echo-skill")
-
-    mock_dispatch = AsyncMock(return_value={"result": "hello"})
-
-    with patch(
-        "movate.core.skill_backend.dispatch_skill",
-        new=mock_dispatch,
-    ):
-        out = await call_skill_activity(
-            skill_ref=str(skill_bundle.skill_dir),
-            input_json={"text": "hello"},
-            workflow_id="wf-abc",
-            tenant_id="t-1",
-        )
-
-    assert out == {"result": "hello"}
-    assert mock_dispatch.await_count == 1
-    skill_arg, input_arg, ctx_arg = mock_dispatch.await_args.args
-    assert isinstance(skill_arg, SkillBundle)
-    assert skill_arg.spec.name == "echo-skill"
-    assert input_arg == {"text": "hello"}
-    assert isinstance(ctx_arg, SkillExecutionContext)
-
-
-@pytest.mark.asyncio
-async def test_call_skill_activity_works_with_python_backend(tmp_path: Path) -> None:
-    """Integration: the activity dispatches to the real Python backend without
-    any Temporal-specific second path."""
-    skill_bundle = _scaffold_python_skill(tmp_path / "echo-skill")
-    output = await call_skill_activity(
-        skill_ref=str(skill_bundle.skill_dir),
-        input_json={"text": "hello"},
-    )
-    assert output == {"result": "hello"}
-
-
-@pytest.mark.asyncio
-async def test_call_skill_activity_works_with_http_backend_mocked(
-    tmp_path: Path,
-) -> None:
-    """The activity wraps any registered backend — verified here by registering
-    a fake HTTP-style backend (network mocked) and dispatching through it.
-
-    We re-use the existing :data:`_BACKENDS` registry, register a fake HTTP
-    backend keyed on :attr:`SkillImplementationKind.HTTP`, scaffold an
-    http-kind skill bundle, then call the activity. The activity loads the
-    bundle from disk, calls :func:`dispatch_skill`, which routes by kind to
-    the fake backend — same code path the real production HTTP backend takes.
-    """
-    skill_dir = tmp_path / "http-skill"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "skill.yaml").write_text(
-        "api_version: movate/v1\n"
-        "kind: Skill\n"
-        "name: http-skill\n"
-        "version: 0.1.0\n"
-        "schema:\n"
-        "  input:\n"
-        "    q: string\n"
-        "  output:\n"
-        "    answer: string\n"
-        "implementation:\n"
-        "  kind: http\n"
-        "  entry: https://example.invalid/skill\n"
-    )
-
-    class _FakeHTTPBackend:
-        kind = SkillImplementationKind.HTTP
-
-        async def execute(
-            self,
-            skill: SkillBundle,
-            input: dict[str, Any],
-            ctx: SkillExecutionContext,
-        ) -> dict[str, Any]:
-            # Network mocked — same shape a real backend would return.
-            return {"answer": f"mocked:{input['q']}"}
-
-    # Snapshot the registry and restore after — register_backend() mutates a
-    # module-level dict, so we have to put the real http backend back.
-    original = _BACKENDS.get(SkillImplementationKind.HTTP)
-    register_backend(_FakeHTTPBackend())
-    try:
-        out = await call_skill_activity(
-            skill_ref=str(skill_dir),
-            input_json={"q": "ping"},
-        )
-    finally:
-        if original is not None:
-            _BACKENDS[SkillImplementationKind.HTTP] = original
-        else:
-            _BACKENDS.pop(SkillImplementationKind.HTTP, None)
-    assert out == {"answer": "mocked:ping"}
-
-
-@pytest.mark.asyncio
-async def test_call_skill_activity_threads_context(tmp_path: Path) -> None:
-    """The activity inputs (parent_span, workflow_id, tenant_id, agent_ref)
-    appear on the :class:`SkillExecutionContext` passed to
-    :func:`dispatch_skill`."""
-    skill_bundle = _scaffold_python_skill(tmp_path / "echo-skill")
+@pytest.mark.unit
+async def test_call_skill_activity_forwards(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch, tenant_id="tnt")
+    skill = _FakeBundle(name="my-skill", properties={"q": {"type": "string"}})
 
     captured: dict[str, Any] = {}
 
-    async def _fake_dispatch(
-        skill: SkillBundle,
-        input: dict[str, Any],
-        ctx: SkillExecutionContext,
-    ) -> dict[str, Any]:
-        captured["ctx"] = ctx
-        return {"result": "ok"}
+    async def _fake_dispatch(skill_arg: Any, input_arg: dict, ctx_arg: Any) -> dict:
+        captured["input"] = dict(input_arg)
+        captured["tenant_id"] = ctx_arg.tenant_id
+        captured["run_id"] = ctx_arg.run_id
+        return {"answer": 42}
 
-    parent_span_context = {
-        "span_id": "skill-span-1",
-        "trace_id": "trace-xyz",
-        "parent_id": None,
-        "name": "workflow.execute",
-        "attributes": {},
-    }
-    with patch(
-        "movate.core.skill_backend.dispatch_skill",
-        new=_fake_dispatch,
-    ):
-        await call_skill_activity(
-            skill_ref=str(skill_bundle.skill_dir),
-            input_json={"text": "hi"},
-            parent_span_context=parent_span_context,
-            workflow_id="wf-42",
-            tenant_id="acme",
-            agent_ref="some-agent",
-            call_ms_budget=12_345,
-        )
+    monkeypatch.setattr("movate.core.skill_loader.load_skill", lambda ref: skill)
+    monkeypatch.setattr("movate.core.skill_backend.base.dispatch_skill", _fake_dispatch)
 
-    ctx = captured["ctx"]
-    assert ctx.run_id == "wf-42"  # D6 alignment
-    assert ctx.tenant_id == "acme"
-    assert ctx.agent_name == "some-agent"
-    assert ctx.call_ms_budget == 12_345
-    assert ctx.trace_id == "trace-xyz"
-    assert isinstance(ctx.parent_span, SpanCtx)
-    assert ctx.parent_span.span_id == "skill-span-1"
+    out = await ta.call_skill_activity(
+        "skill-node", "/skills/my-skill", {"q": "x", "z": 1}, "run-7"
+    )
+
+    assert out == {"answer": 42}
+    # Input narrowed to the skill's declared schema ("q" only).
+    assert captured["input"] == {"q": "x"}
+    assert captured["tenant_id"] == "tnt"
+    assert captured["run_id"] == "run-7"
 
 
 # ---------------------------------------------------------------------------
-# Lazy-import contract
+# 7: call_judge_activity returns {terminate, verdict} from state interpretation.
 # ---------------------------------------------------------------------------
 
 
-def test_lazy_temporalio_import() -> None:
-    """Re-importing the activities module with ``temporalio`` hidden must NOT
-    raise — the module ships an internal no-op decorator so the lazy-import
-    contract (the same ADR 030 D1 established for LangGraph) holds.
-    """
-    # Hide temporalio from import so the module re-import falls through to
-    # the internal _NoopActivityModule.
-    saved: dict[str, Any] = {
-        key: sys.modules[key]
-        for key in list(sys.modules)
-        if key == "temporalio" or key.startswith("temporalio.")
-    }
-    for key in list(saved):
-        del sys.modules[key]
+@pytest.mark.unit
+async def test_call_judge_activity_terminating(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    out = await ta.call_judge_activity("judge-1", {"verdict": "accept"}, "run-1")
+    assert out == {"terminate": True, "verdict": "accept"}
 
-    # Make temporalio unimportable.
-    class _Blocker:
-        def find_module(self, name: str, path: Any = None) -> Any:
-            if name == "temporalio" or name.startswith("temporalio."):
-                return self
-            return None
 
-        def load_module(self, name: str) -> Any:
-            raise ImportError(f"blocked: {name}")
+@pytest.mark.unit
+async def test_call_judge_activity_non_terminating(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    out = await ta.call_judge_activity("judge-1", {"label": "continue"}, "run-1")
+    assert out == {"terminate": False, "verdict": "continue"}
 
-    blocker = _Blocker()
-    sys.meta_path.insert(0, blocker)  # type: ignore[arg-type]
-    try:
-        # Drop the activities module so the next import re-binds against
-        # the blocked temporalio.
-        sys.modules.pop("movate.core.workflow.temporal_activities", None)
-        mod = importlib.import_module("movate.core.workflow.temporal_activities")
-        assert hasattr(mod, "call_agent_activity")
-        assert hasattr(mod, "call_skill_activity")
-        # The internal helper must report the no-op shape.
-        assert mod._activity.__class__.__name__ == "_NoopActivityModule"
-        # _require_temporalio must raise with the documented remediation.
-        with pytest.raises(RuntimeError, match=r"\[temporal\] extra is not installed"):
-            mod._require_temporalio()
-    finally:
-        sys.meta_path.remove(blocker)  # type: ignore[arg-type]
-        sys.modules.update(saved)
-        # Re-import with temporalio available so subsequent tests get the
-        # real-SDK path.
-        sys.modules.pop("movate.core.workflow.temporal_activities", None)
-        importlib.import_module("movate.core.workflow.temporal_activities")
+
+@pytest.mark.unit
+async def test_call_judge_activity_reads_gate_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A verdict left by an upstream gate's ``*_decision`` dict is honored."""
+    _configure(monkeypatch)
+    state = {"turn_gate_1_decision": {"label": "resolved"}}
+    out = await ta.call_judge_activity("judge-1", state, "run-1")
+    assert out == {"terminate": True, "verdict": "resolved"}
+
+
+@pytest.mark.unit
+async def test_call_judge_activity_no_verdict_defaults_continue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No verdict signal → non-terminating (the safe bounded-loop default)."""
+    _configure(monkeypatch)
+    out = await ta.call_judge_activity("judge-1", {"text": "no verdict here"}, "run-1")
+    assert out == {"terminate": False, "verdict": ""}
+
+
+@pytest.mark.unit
+async def test_judge_activity_unconfigured_raises() -> None:
+    """The judge still enforces the configure contract (D3)."""
+    assert ta._CONTEXT is None
+    with pytest.raises(RuntimeError):
+        await ta.call_judge_activity("j", {"verdict": "accept"}, "r")

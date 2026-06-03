@@ -1,444 +1,544 @@
-"""Temporal activity wrappers — Phase 1 of ADR 054 Track C.
+"""Temporal activity wrappers — Track C of ADR 054 Phase 1.
 
-This module ships **two** activities — :func:`call_agent_activity` and
-:func:`call_skill_activity` — that the ADR 054 Temporal compiler emits as the
-**only** way an mdk workflow node touches an LLM or a skill when
-``workflow.yaml: runtime: temporal`` is selected.
+These are the four activity functions the Track-B compiler
+(:mod:`movate.core.workflow.compilers.temporal`) emits ``execute_activity``
+calls against *by name*:
 
-The single load-bearing property of this module is **ADR 054 D3: activities
-REUSE the existing mdk execution path**. Concretely:
+* :func:`call_agent_activity`  — AGENT node       (compiler ``_emit_agent_node``)
+* :func:`call_skill_activity`  — SKILL/TOOL node  (compiler ``_emit_skill_node``)
+* :func:`call_gate_activity`   — GATE / INTENT_ROUTER (compiler ``_emit_gate_node``)
+* :func:`call_judge_activity`  — JUDGE node       (compiler ``_emit_judge_node``)
 
-* :func:`call_agent_activity` forwards to
-  :meth:`movate.core.executor.Executor.execute` exactly as the native runner
-  and the LangGraph backend do — same tool-use loop, same provider chain, same
-  retry/fallback, same tracing, same metering, same BYOK, same session input
-  assembly. The :class:`~movate.core.executor.Executor` does NOT know it is
-  running under Temporal. There is no second execution model, no bypass route,
-  no Temporal-specific Executor.
-* :func:`call_skill_activity` forwards to
-  :func:`movate.core.skill_backend.dispatch_skill` exactly as the executor's
-  tool-use loop does for an inside-agent tool call — same four backends
-  (python, http, mcp, agent), same :class:`SkillExecutionContext`, same
-  :class:`SkillError` taxonomy. Used by the compiler for **structural**
-  skill-call nodes (a skill that the workflow itself wires in, vs. a skill
-  the agent's LLM picks via tool-use — those still run *inside*
-  :func:`call_agent_activity` via the existing tool-use loop).
+[bold]Execution-model reuse (ADR 054 D3).[/bold] Each activity is a *thin
+shim*: it forwards to the SAME :class:`movate.core.executor.Executor` /
+:func:`movate.core.skill_backend.base.dispatch_skill` the native runner
+(:mod:`movate.core.workflow.runner`) calls. There is no second execution
+model, no Temporal-specific Executor, no bypass route. Tracing (ADR 024),
+metering (ADR 036 — see D11 below), session state (ADR 045 D10 — see D10
+below) and BYOK (ADR 018) all flow through that one place automatically,
+because the Executor is the one place they are wired.
 
-Phase 1 wiring details:
+[bold]Metering (ADR 054 D11).[/bold] Metering wraps *the activity* by
+construction: the Executor meters every ``execute(...)`` and every skill
+dispatch already. Temporal's automatic retries re-invoke the activity, and
+each attempt is metered as its own attempt — so this module builds **no new
+meter and no idempotency / dedup code**. The ADR explicitly forbids bespoke
+retry/idempotency here; Temporal's retry policy (emitted by the compiler)
+owns retries.
 
-* **Parent-span propagation** — the caller (the compiler-generated workflow
-  body) passes ``parent_span_context`` so the activity's
-  ``agent.execute`` / ``dispatch_skill`` spans nest under the workflow root,
-  preserving the ADR 024 trace tree across the workflow/activity boundary.
-  Same pattern Track B (#594) shipped for the SkillBackend python backend.
-* **session_id threading** (ADR 054 D10 — sessions hold conversation state,
-  Temporal holds control flow) — the activity accepts a ``session_id`` and
-  threads it onto the :class:`RunRequest` so conversation history lives in
-  the session store, not in Temporal workflow history.
-* **workflow_id == run_id** (ADR 054 D6) — the caller passes the Temporal
-  ``workflow_id`` (which IS the mdk ``workflow_run_id``); the activity passes
-  it through to :meth:`Executor.execute` as ``workflow_run_id=``, so persisted
-  :class:`RunRecord`s carry the same id Temporal Web shows for the workflow.
-* **Heartbeating** — for long LLM calls (deep-research / reflection) the
-  activity spawns a background heartbeat task at 10s cadence so Temporal's
-  ``heartbeat_timeout`` (D9) does not fire spuriously. ``temporalio.activity``
-  raises if heartbeat is called outside an activity context, which is exactly
-  what we want for the import-safe / unit-test path: the task only runs when
-  the activity is actually inside a Temporal worker.
-* **Lazy temporalio import** — this module is import-safe without the
-  ``mdk[temporal]`` extra installed (mirrors ADR 030 D1 for LangGraph). The
-  ``@activity.defn`` decorator binds lazily inside the helpers, and the
-  ``_require_temporalio`` shim raises a clear remediation message if the
-  extra is missing.
+[bold]Sessions (ADR 054 D10).[/bold] Conversation state lives in the session
+store and is read/written by the Executor; Temporal history holds only
+control flow (the ``state`` dict the workflow threads). Because the activity
+reuses the Executor (D3), the session remains the conversation's home with
+**no new wiring** here.
 
-Nothing in this module touches the native runner, the LangGraph backend, or
-any storage / tracing / metering primitive that the existing path does not
-already touch. Adding a backend never grows the seam — that is the
-non-negotiable D3 boundary.
+[bold]Timeouts / heartbeating (ADR 054 D9).[/bold] ``schedule_to_close_timeout``,
+``heartbeat_timeout`` and the retry policy are set by the WORKFLOW (the
+compiler emits them per ``execute_activity`` call). The activity body itself
+just executes. Phase 3 adds activity-side heartbeating for long LLM calls
+(D9 / Phase 3 row) — Phase 1 deliberately ships none.
+
+[bold]Import isolation (ADR 054 D7).[/bold] ``temporalio`` is imported
+defensively at module scope: when the ``[temporal]`` extra is absent the
+``@activity.defn`` decorator degrades to an identity decorator so this module
+still imports and the four functions stay plain async callables (tests call
+them directly). The worker path goes through :func:`_require_temporalio`,
+which fails loud with an install hint. This mirrors the compiler's contract,
+asserted by ``test_lazy_temporalio_import`` for the compiler and by the Track
+C import-safety test for this module.
+
+[bold]Dependency injection.[/bold] The four activities are bare module-level
+functions (the compiler imports them by name), but they need an
+:class:`Executor`. :func:`configure_activities` installs an
+:class:`ActivityContext` into a module global at worker startup
+(``mdk worker --backend temporal``, a later track); :func:`_get_context`
+reads it. An activity invoked before configuration raises a clear
+``RuntimeError`` rather than silently building an unconfigured Executor.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-if TYPE_CHECKING:
-    from movate.core.executor import Executor
+if TYPE_CHECKING:  # pragma: no cover — typing only, never imported at runtime here.
+    from movate.providers.base import BaseLLMProvider
+    from movate.providers.pricing import PricingTable
+    from movate.storage.base import StorageProvider
+    from movate.tracing.base import Tracer
 
-log = logging.getLogger(__name__)
+_log = logging.getLogger(__name__)
 
-# Heartbeat cadence for long activity bodies. Paired with the default
-# ``heartbeat_timeout = 30s`` (ADR 054 D9) — a 10s cadence gives Temporal
-# three signals per timeout window, so a single dropped heartbeat does not
-# cause a spurious retry. The task fires inside ``call_agent_activity`` for
-# the duration of ``Executor.execute`` and is cancelled on completion.
-_HEARTBEAT_CADENCE_S = 10.0
+
+# ---------------------------------------------------------------------------
+# Defensive temporalio import (ADR 054 D7 — import isolation).
+#
+# When the [temporal] extra is installed we use the real ``@activity.defn``
+# decorator so the worker can register these functions. When it is absent we
+# fall back to an identity decorator so this module still imports and the four
+# functions remain plain async callables (the native install never pays for
+# temporalio, and the unit tests can call the activities directly).
+# ---------------------------------------------------------------------------
+
+# Declared ``Any`` so the two bindings below (the real ``temporalio.activity``
+# module vs the identity fallback) unify, and so ``@_activity.defn`` type-checks
+# in both the extra-present and extra-absent mypy environments.
+_activity: Any
+
+try:
+    from temporalio import activity as _activity  # module-scope, guarded by try/except
+
+    _HAVE_TEMPORALIO = True
+except ImportError:  # pragma: no cover — exercised by the import-safety test.
+    _HAVE_TEMPORALIO = False
+
+    class _IdentityActivity:
+        """Stand-in for ``temporalio.activity`` when the extra is absent.
+
+        Only ``defn`` is referenced at module-import time. It returns the
+        function unchanged so the four activities stay plain async callables.
+        """
+
+        @staticmethod
+        def defn(fn: Any) -> Any:
+            return fn
+
+    _activity = _IdentityActivity()
 
 
 def _require_temporalio() -> Any:
-    """Lazy-import ``temporalio.activity`` so this module is safe to import
-    without the ``mdk[temporal]`` extra installed.
+    """Return the live ``temporalio.activity`` module or fail with an install hint.
 
-    Mirrors the lazy-import contract ADR 030 D1 established for LangGraph:
-    the only thing that pulls in the heavy SDK is calling the activity
-    body or wrapping a function with the decorator. The decorator binding
-    in this module's body falls through ``_NoopActivityModule`` if
-    ``temporalio`` is absent so module import never fails — the activity
-    just is not registered with any worker.
+    The worker path (``mdk worker --backend temporal``, a later track) calls
+    this before registering the activities so an operator without the
+    ``[temporal]`` extra gets the install instruction immediately rather than
+    an obscure ``ImportError`` at registration time. Mirrors the compiler's
+    :func:`movate.core.workflow.compilers.temporal._require_temporalio`.
     """
-    try:
-        from temporalio import activity  # noqa: PLC0415
-
-        return activity
-    except ImportError as exc:  # pragma: no cover - exercised by lazy-import test
+    if not _HAVE_TEMPORALIO:
         raise RuntimeError(
             "The [temporal] extra is not installed. "
             "Install with: uv tool install --editable '.[temporal]' --force"
-        ) from exc
+        )
+    return _activity
 
 
-class _NoopActivityModule:
-    """Stand-in for :mod:`temporalio.activity` when the extra is missing.
+# ---------------------------------------------------------------------------
+# Dependency injection — the activity context.
+# ---------------------------------------------------------------------------
 
-    Provides a no-op ``defn`` decorator + a no-op ``heartbeat`` so the
-    module *imports* cleanly without ``temporalio`` installed. Calling the
-    decorated activity body still works (it is just a coroutine); only
-    *registering* it with a Temporal worker requires the real SDK, and
-    that happens in the worker boot path (out of scope for Phase 1
-    Track C, lands in Track A's ``mdk worker --backend temporal``).
+
+@dataclass(frozen=True)
+class ActivityContext:
+    """The dependencies the four activities forward into.
+
+    Built once at worker startup by :func:`configure_activities` and stored in
+    a module global. Frozen so a worker can't mutate it out from under an
+    in-flight activity. Mirrors the worker-side Executor construction in
+    :mod:`movate.runtime.dispatch` (provider + pricing + tracer + storage +
+    tenant_id) so the Temporal worker builds the SAME Executor the job-queue
+    worker does (ADR 054 D3 — one execution model).
     """
 
-    @staticmethod
-    def defn(*_args: Any, **_kwargs: Any) -> Any:
-        def _decorator(func: Any) -> Any:
-            return func
-
-        return _decorator
-
-    @staticmethod
-    def heartbeat(*_args: Any, **_kwargs: Any) -> None:
-        # No-op outside a Temporal worker context. Production calls go
-        # through the real ``temporalio.activity.heartbeat`` which raises
-        # outside an activity — we want the unit-test / import-safe path
-        # to be silent.
-        return None
+    storage: StorageProvider
+    pricing: PricingTable
+    tracer: Tracer
+    provider: BaseLLMProvider
+    tenant_id: str = "local"
+    defaults: Any = None
+    """Optional :class:`movate.core.layered_defaults.AgentDefaults` threaded
+    into :func:`load_agent` resolution (project-level model defaults). ``None``
+    (the default) lets the loader read project config itself, matching every
+    other library caller."""
 
 
-def _activity_module() -> Any:
-    """Return :mod:`temporalio.activity` if available, else the no-op stub.
+_CONTEXT: ActivityContext | None = None
 
-    Centralizes the lazy-import so the two ``@activity.defn`` bindings
-    below resolve at module-load time without forcing the dependency.
-    Tests that want to assert the real-SDK path stub ``temporalio.activity``
-    directly via ``unittest.mock.patch``.
+
+def configure_activities(
+    *,
+    storage: StorageProvider,
+    pricing: PricingTable | None = None,
+    tracer: Tracer | None = None,
+    provider: BaseLLMProvider | None = None,
+    tenant_id: str = "local",
+    defaults: Any = None,
+) -> None:
+    """Install the :class:`ActivityContext` the four activities read.
+
+    Called once at worker startup (``mdk worker --backend temporal``, a later
+    track). Mirrors :mod:`movate.runtime.dispatch`'s Executor wiring:
+
+    * ``pricing`` defaults to :func:`movate.providers.pricing.load_pricing`.
+    * ``tracer`` defaults to :func:`movate.tracing.build_tracer`.
+    * ``provider`` defaults to :class:`movate.providers.litellm.LiteLLMProvider`.
+      A node whose ``state`` carries a truthy ``mock`` flag swaps in
+      :class:`movate.providers.mock.MockProvider` per-activity (matching
+      dispatch.py's mock handling) — see :func:`_executor_for`.
+
+    Idempotent — re-calling replaces the context (workers re-register cleanly).
     """
-    try:
-        from temporalio import activity  # noqa: PLC0415
-
-        return activity
-    except ImportError:
-        return _NoopActivityModule()
-
-
-# Bound once at module load; ``@activity.defn`` runs once per function and
-# either registers with the real SDK or no-ops via the stub. Either way the
-# wrapped coroutine is callable directly (the production path goes through
-# Temporal's worker; the unit-test path calls the coroutine directly with
-# mocked collaborators — see tests/test_temporal_activities.py).
-_activity = _activity_module()
-
-
-def _spanctx_from_dict(parent_span_context: dict[str, Any] | None) -> Any:
-    """Reconstruct a :class:`movate.tracing.base.SpanCtx` from a serialized
-    dict so a Temporal-marshalled trace context can re-parent the activity's
-    inner spans.
-
-    Temporal serializes activity inputs as JSON-safe payloads. The compiler
-    captures the workflow's root SpanCtx as ``{"trace_id", "span_id", ...}``
-    and passes it through; this helper rebuilds the dataclass on the
-    activity side so it can be passed directly to
-    ``Executor.execute(parent_span=...)`` and ``Tracer.start_span(parent=...)``.
-
-    Returns ``None`` when no context is supplied — every standalone caller
-    (including the unit tests for this module) gets the byte-for-byte
-    no-parent behavior of the existing native runner.
-    """
-    if parent_span_context is None:
-        return None
-    # Lazy import — keeps this module import-light + matches the seam rule
-    # (workflow modules don't pull tracing at module scope).
-    from movate.tracing.base import SpanCtx  # noqa: PLC0415
-
-    return SpanCtx(
-        span_id=parent_span_context.get("span_id", ""),
-        trace_id=parent_span_context.get("trace_id", ""),
-        parent_id=parent_span_context.get("parent_id"),
-        name=parent_span_context.get("name", ""),
-        attributes=parent_span_context.get("attributes", {}) or {},
-    )
-
-
-async def _heartbeat_loop(cadence_s: float = _HEARTBEAT_CADENCE_S) -> None:
-    """Heartbeat task fired inside ``call_agent_activity`` for long bodies.
-
-    Emits a Temporal heartbeat every ``cadence_s`` seconds so Temporal's
-    ``heartbeat_timeout`` (ADR 054 D9, default 30s) does not fire a
-    spurious retry on a still-running long LLM call. Cancelled on activity
-    completion. Outside a real worker, ``activity.heartbeat`` is the
-    no-op stub above (or raises in the real SDK, which we swallow) — the
-    loop is harmless in tests.
-    """
-    while True:
-        try:
-            await asyncio.sleep(cadence_s)
-        except asyncio.CancelledError:
-            raise
-        # ``heartbeat`` only does anything inside an active Temporal worker;
-        # outside one, swallow any error so the loop is harmless in tests.
-        with contextlib.suppress(Exception):
-            _activity.heartbeat()
-
-
-def _build_executor() -> Executor:
-    """Construct an Executor wired to the same stack the runtime + native
-    runner use.
-
-    Track C Phase 1 ships the activity *body*; the worker bootstrap (which
-    will inject a long-lived Executor via dependency injection, mirroring
-    ``mdk worker``'s existing scaffolding) lands in Track A's
-    ``mdk worker --backend temporal``. Until then this helper builds a
-    fresh Executor per activity invocation against the production stack
-    so the activity body is fully exercised end-to-end. Tests bypass this
-    helper entirely by patching :class:`movate.core.executor.Executor`.
-
-    Lazy imports keep this module's import graph light — wiring a provider /
-    pricing table / storage at module scope would pull half of mdk through
-    every time this file is loaded.
-    """
-    from movate.core.executor import Executor as _Executor  # noqa: PLC0415
-    from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+    # Local imports keep this module import-cheap and avoid import cycles —
+    # the rest of core/workflow follows the same convention.
     from movate.providers.pricing import load_pricing  # noqa: PLC0415
-    from movate.testing import InMemoryStorage  # noqa: PLC0415
     from movate.tracing import build_tracer  # noqa: PLC0415
 
-    return _Executor(
-        provider=LiteLLMProvider(),
-        pricing=load_pricing(),
-        storage=InMemoryStorage(),
-        tracer=build_tracer(),
+    if provider is None:
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+        provider = LiteLLMProvider()
+
+    global _CONTEXT  # noqa: PLW0603 — module-global DI registry, set once at worker startup.
+    _CONTEXT = ActivityContext(
+        storage=storage,
+        pricing=pricing if pricing is not None else load_pricing(),
+        tracer=tracer if tracer is not None else build_tracer(),
+        provider=provider,
+        tenant_id=tenant_id,
+        defaults=defaults,
     )
 
 
-@_activity.defn(name="mdk.call_agent")  # type: ignore[untyped-decorator]
-async def call_agent_activity(
-    agent_ref: str,
-    request_json: dict[str, Any],
-    session_id: str | None = None,
-    parent_span_context: dict[str, Any] | None = None,
-    workflow_id: str | None = None,
-    tenant_id: str | None = None,
-    node_id: str | None = None,
-) -> dict[str, Any]:
-    """Wrap a full mdk agent run as a Temporal activity (ADR 054 D3).
+def _get_context() -> ActivityContext:
+    """Return the configured :class:`ActivityContext` or fail loud.
 
-    Reuses :meth:`movate.core.executor.Executor.execute` unchanged — same
-    skills, same tracing, same metering, same BYOK, same fallback chain.
-    The Executor does not know it is running under Temporal; this function
-    is a thin shim that translates Temporal's serialized inputs into the
-    native execution call and serializes the :class:`RunResponse` back.
-
-    ADR 054 wirings honored:
-
-    * D3 — call goes straight to ``Executor.execute(bundle, request, ...)``.
-    * D6 — ``workflow_id`` is forwarded as ``workflow_run_id=`` so the
-      persisted :class:`RunRecord` shares its identity with Temporal Web.
-    * D9 — a background heartbeat task fires every 10s for the duration of
-      the underlying call so a long LLM round-trip does not trigger a
-      spurious retry.
-    * D10 — ``session_id`` is threaded onto the :class:`RunRequest` so
-      conversation state lives in the session store, not in workflow history.
-    * D11 — tracing + metering flow through ``Executor.execute`` exactly as
-      they do today; no metering shim lives in this file.
-
-    :param agent_ref: Filesystem path (or registry name) of the agent bundle
-        to load — same shape :func:`movate.core.loader.load_agent` accepts.
-    :param request_json: Serialized :class:`RunRequest` payload (``input``,
-        optional ``user_id``, ``request_id``, etc.).
-    :param session_id: Optional session id; when set, propagates to the
-        ``RunRequest.session_id`` field so the executor's tracing carries it
-        and the session store can be looked up downstream.
-    :param parent_span_context: Optional serialized
-        :class:`~movate.tracing.base.SpanCtx`; when supplied, the activity's
-        root ``agent.execute`` span nests under it.
-    :param workflow_id: The Temporal workflow id (== mdk ``workflow_run_id``
-        per D6). Forwarded as ``workflow_run_id=`` to the executor.
-    :param tenant_id: The tenant id for this run; forwarded as
-        ``tenant_id_override=`` so persistence / budget checks use it.
-    :param node_id: Optional workflow node id; forwarded as ``node_id=`` to
-        stamp the persisted :class:`RunRecord`.
-
-    :returns: Serialized :class:`RunResponse` dict.
+    Raises ``RuntimeError`` if :func:`configure_activities` was never called —
+    an activity must never silently run against a half-built Executor.
     """
-    # Lazy imports — module import stays light + adapter-seam rule is
-    # preserved (the activity reaches into core only at call time).
+    if _CONTEXT is None:
+        raise RuntimeError(
+            "Temporal activities are not configured. The worker must call "
+            "movate.core.workflow.temporal_activities.configure_activities(...) "
+            "at startup before any activity runs (ADR 054 D3)."
+        )
+    return _CONTEXT
+
+
+def _resolve_tenant_id(ctx: ActivityContext, state: dict[str, Any]) -> str:
+    """Resolve the tenant for this activity.
+
+    A ``tenant_id`` carried in ``state`` wins (a multi-tenant worker stamps the
+    right tenant per run, the same belt-and-braces the runner uses via
+    ``tenant_id_override``); otherwise fall back to the context default.
+    """
+    state_tenant = state.get("tenant_id")
+    if isinstance(state_tenant, str) and state_tenant:
+        return state_tenant
+    return ctx.tenant_id
+
+
+def _executor_for(ctx: ActivityContext, state: dict[str, Any]) -> Any:
+    """Build the Executor for one activity, mirroring ``dispatch.py``.
+
+    A truthy ``mock`` flag in ``state`` swaps :class:`MockProvider` in for the
+    configured provider (matching dispatch.py's per-job mock handling) so a
+    ``mdk run --mock`` style state runs the whole Temporal pipeline without
+    real spend. Everything else (pricing, tracer, storage, tenant) comes from
+    the context.
+    """
+    from movate.core.executor import Executor  # noqa: PLC0415
+
+    provider = ctx.provider
+    if state.get("mock"):
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+
+        provider = MockProvider()
+
+    return Executor(
+        provider=provider,
+        pricing=ctx.pricing,
+        storage=ctx.storage,
+        tracer=ctx.tracer,
+        tenant_id=_resolve_tenant_id(ctx, state),
+    )
+
+
+def _project_state(state: dict[str, Any], bundle: Any) -> dict[str, Any]:
+    """Filter ``state`` to the keys the agent's input schema names.
+
+    A faithful copy of :func:`movate.core.workflow.runner._project_state` so
+    the activity feeds the agent the SAME narrowed input the native runner
+    would (no behavioral drift between backends). If the schema lists no
+    ``properties`` the whole state is passed.
+    """
+    props = bundle.input_schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return dict(state)
+    return {k: state[k] for k in props if k in state}
+
+
+# ---------------------------------------------------------------------------
+# The four activities (compiler-emitted call targets — ADR 054 D4).
+#
+# Arg order is fixed by the compiler's ``execute_activity(..., args=[...])``
+# calls — do NOT reorder without updating compilers/temporal.py in lockstep.
+# ---------------------------------------------------------------------------
+
+
+@_activity.defn  # type: ignore[untyped-decorator]
+async def call_agent_activity(
+    node_id: str,
+    ref: str,
+    state: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any]:
+    """AGENT node → run the agent through the Executor; return ``response.data``.
+
+    Compiler contract (``_emit_agent_node``): the workflow does
+    ``state.update(<result>)`` with this return value, so we return the
+    agent's output dict (``RunResponse.data``) exactly as the native runner
+    merges it (``runner.py`` ~L480).
+
+    ADR 054 D3: forwards to ``Executor.execute(...)`` — the same call the
+    native runner makes — with ``workflow_run_id`` + ``node_id`` stamped so
+    the per-node RunRecord stitches to this Temporal workflow (D6: workflow
+    id == run_id). D11: the Executor meters the call, so Temporal retries are
+    metered per-attempt with no bespoke meter here.
+    """
     from movate.core.loader import load_agent  # noqa: PLC0415
     from movate.core.models import RunRequest  # noqa: PLC0415
 
-    bundle = load_agent(agent_ref)
+    ctx = _get_context()
+    bundle = load_agent(ref, defaults=ctx.defaults)
+    agent_input = _project_state(state, bundle)
+    executor = _executor_for(ctx, state)
 
-    # Reconstruct the RunRequest from the wire payload. Threading
-    # ``session_id`` through the request (D10) keeps conversation state
-    # in the session store; nothing lands in Temporal history.
-    request_kwargs: dict[str, Any] = dict(request_json)
-    # Ensure the request matches the loaded bundle so the executor's
-    # downstream agent-name check stays correct even if the caller passed
-    # a slightly different alias.
-    request_kwargs.setdefault("agent", bundle.spec.name)
-    if session_id is not None:
-        request_kwargs["session_id"] = session_id
-    request = RunRequest(**request_kwargs)
-
-    parent_span = _spanctx_from_dict(parent_span_context)
-    executor = _build_executor()
-
-    # Heartbeat loop guards long activity bodies (D9). Cancelled on
-    # completion; the suppress around heartbeat() keeps the loop harmless
-    # outside a real worker context.
-    heartbeat_task = asyncio.create_task(_heartbeat_loop())
-    try:
-        response = await executor.execute(
-            bundle,
-            request,
-            workflow_run_id=workflow_id,
-            node_id=node_id,
-            parent_span=parent_span,
-            tenant_id_override=tenant_id,
+    response = await executor.execute(
+        bundle,
+        RunRequest(agent=bundle.spec.name, input=agent_input),
+        workflow_run_id=run_id,
+        node_id=node_id,
+        tenant_id_override=_resolve_tenant_id(ctx, state),
+    )
+    if response.status != "success":
+        # Surface as an exception so Temporal's retry policy (emitted by the
+        # compiler) can retry per D11/D4, instead of silently merging a
+        # failed run's (empty) data into workflow state.
+        raise RuntimeError(
+            f"agent node {node_id!r} ({ref}) failed: "
+            f"{response.error.message if response.error else response.status}"
         )
-    finally:
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await heartbeat_task
-
-    # Pydantic v2 ``model_dump`` returns a JSON-safe dict — Temporal can
-    # marshal it directly without bespoke converters.
-    return response.model_dump(mode="json")
+    return dict(response.data)
 
 
-@_activity.defn(name="mdk.call_skill")  # type: ignore[untyped-decorator]
+@_activity.defn  # type: ignore[untyped-decorator]
 async def call_skill_activity(
-    skill_ref: str,
-    input_json: dict[str, Any],
-    parent_span_context: dict[str, Any] | None = None,
-    workflow_id: str | None = None,
-    tenant_id: str | None = None,
-    agent_ref: str | None = None,
-    call_ms_budget: int | None = None,
+    node_id: str,
+    ref: str,
+    state: dict[str, Any],
+    run_id: str,
 ) -> dict[str, Any]:
-    """Wrap a single skill call as a Temporal activity.
+    """SKILL node → dispatch the skill through ``SkillBackend``; return its output.
 
-    Reuses :func:`movate.core.skill_backend.dispatch_skill` unchanged — same
-    four backends (python, http, mcp, agent), same :class:`SkillError`
-    taxonomy, same input/output validation. Used by the compiler when a
-    workflow node is a **structural** skill call (vs. a skill the agent's
-    LLM picks via tool-use; those still run *inside* :func:`call_agent_activity`
-    through the existing tool-use loop, never this entrypoint).
+    Compiler contract (``_emit_skill_node``): the workflow does
+    ``state.update(<result>)``, so we return the skill's output dict.
 
-    Skill resolution order:
+    ADR 054 D3: dispatches through the SAME
+    :func:`movate.core.skill_backend.base.dispatch_skill` the Executor's
+    tool-use loop uses — no second skill path. ``ref`` is the skill directory
+    (the compiler emits ``node.ref``; for a SKILL/TOOL IR node that is the
+    skill dir, resolved exactly like the agent loader resolves an agent dir).
+    The skill input is the current ``state`` narrowed to the skill's input
+    schema, same projection rule as agents.
 
-    * ``skill_ref`` as a filesystem path containing a ``skill.yaml`` →
-      :func:`movate.core.skill_loader.load_skill`.
-    * ``skill_ref`` as a bare skill name → resolved against the bundle at
-      ``agent_ref`` if provided (matches the executor's tool-use loop
-      semantics: skills live on an agent), else raises a clear error.
-
-    :param skill_ref: Filesystem path to a skill bundle OR a bare skill name
-        (resolved against ``agent_ref``'s bundle when supplied).
-    :param input_json: Skill input dict (validated against the skill's
-        ``input`` schema by :func:`dispatch_skill`).
-    :param parent_span_context: Optional serialized
-        :class:`~movate.tracing.base.SpanCtx`; when supplied, the skill's
-        backend-side spans nest under it.
-    :param workflow_id: The Temporal workflow id (== mdk ``workflow_run_id``
-        per D6). Forwarded into the :class:`SkillExecutionContext`.
-    :param tenant_id: The tenant id for this skill call; forwarded into the
-        :class:`SkillExecutionContext` so backends scoped to a tenant
-        (HTTP / MCP) honor it.
-    :param agent_ref: Optional agent bundle to resolve ``skill_ref`` against
-        when it is a bare name rather than a path.
-    :param call_ms_budget: Optional override for the call timeout (ms);
-        defaults to the skill's own ``timeout_call_ms`` or 30s when neither
-        side specifies.
-
-    :returns: The validated skill output dict.
+    Note: standalone SKILL/TOOL workflow nodes are a v1.1 IR type the spec
+    validator does not yet accept (``ir.py`` — TOOL is declared but rejected),
+    so this path is reachable in Phase 1 only via a hand-built graph or a
+    future IR. It is wired against the real ``dispatch_skill`` so it lights up
+    for free when TOOL nodes ship — no stub.
     """
-    # Lazy imports — same import-graph discipline as ``call_agent_activity``.
-    from pathlib import Path  # noqa: PLC0415
-
-    from movate.core.skill_backend import (  # noqa: PLC0415
+    from movate.core.skill_backend.base import (  # noqa: PLC0415
         SkillExecutionContext,
         dispatch_skill,
     )
-
-    # Side-effect-only imports register each backend with the dispatch
-    # registry. Same pattern the executor uses (executor.py imports them
-    # inside ``_run_with_tool_use``) so we stay symmetric.
-    from movate.core.skill_backend import agent as _agent_backend  # noqa: F401, PLC0415
-    from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
-    from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
-    from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
     from movate.core.skill_loader import load_skill  # noqa: PLC0415
 
-    skill_path = Path(skill_ref)
-    if skill_path.is_dir() and (skill_path / "skill.yaml").exists():
-        skill = load_skill(skill_path)
-    elif agent_ref is not None:
-        # Bare name + agent context: resolve against the agent bundle's
-        # already-loaded skills list. This is the same lookup shape the
-        # executor's tool-use loop does (skill_index in _run_with_tool_use).
-        from movate.core.loader import load_agent  # noqa: PLC0415
+    ctx = _get_context()
+    skill = load_skill(ref)
 
-        bundle = load_agent(agent_ref)
-        match = next((s for s in bundle.skills if s.spec.name == skill_ref), None)
-        if match is None:
-            raise ValueError(
-                f"skill {skill_ref!r} is not declared on agent {agent_ref!r}; "
-                f"available: {sorted(s.spec.name for s in bundle.skills)}"
-            )
-        skill = match
+    # Narrow state to the skill's declared input (same projection rule as
+    # agents) so the skill sees a contract-shaped input, not the whole state.
+    props = skill.input_schema.get("properties")
+    if isinstance(props, dict) and props:
+        skill_input = {k: state[k] for k in props if k in state}
     else:
-        # No agent context + not a directory: surface as a clear error rather
-        # than silently guessing. The compiler is responsible for picking the
-        # right ref shape.
-        raise ValueError(
-            f"skill_ref {skill_ref!r} is not a skill directory and no agent_ref "
-            "was provided to resolve it against"
+        skill_input = dict(state)
+
+    tenant_id = _resolve_tenant_id(ctx, state)
+    skill_ctx = SkillExecutionContext(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        mock=bool(state.get("mock")),
+        storage=ctx.storage,
+        tracer=ctx.tracer,
+    )
+    output = await dispatch_skill(skill, skill_input, skill_ctx)
+    return dict(output)
+
+
+def _resolve_classifier_ref(classifier_agent: str, workflow_dir: str) -> str:
+    """Resolve a possibly-relative classifier ref against the workflow dir.
+
+    Mirrors the native runner's intent-router resolution
+    (:meth:`movate.core.workflow.runner.WorkflowRunner._run_intent_router`): an
+    absolute ref is used as-is; a relative ref (e.g. ``./agents/goal-judge`` —
+    the form the IR leaves ``classifier_agent`` in, unlike the absolutized AGENT
+    ``node.ref``) is resolved against the compiled workflow's source dir, which
+    the Track-B compiler bakes into the activity args (``_emit_gate_node``).
+
+    Without this the worker would call :func:`load_agent` on a CWD-relative ref
+    and raise ``AgentLoadError`` — the exact Phase-1 divergence the conformance
+    suite caught (ADR 055 D7). ``workflow_dir`` empty (a hand-built direct call)
+    falls back to passing the ref through unchanged.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    if not classifier_agent or not workflow_dir:
+        return classifier_agent
+    ref_path = Path(classifier_agent)
+    if ref_path.is_absolute():
+        return classifier_agent
+    return str((Path(workflow_dir) / classifier_agent).resolve())
+
+
+@_activity.defn  # type: ignore[untyped-decorator]
+async def call_gate_activity(
+    node_id: str,
+    classifier_agent: str,
+    state: dict[str, Any],
+    run_id: str,
+    workflow_dir: str = "",
+    input_field: str = "",
+    route_labels: list[str] | None = None,
+) -> dict[str, Any]:
+    """GATE / INTENT_ROUTER node → run the classifier agent; return its decision.
+
+    Compiler contract (``_emit_gate_node``): the workflow branches on this
+    return value's ``"label"`` (``current = routes[label] or fallback``) — the
+    ``routes`` / ``fallback`` stay in workflow scope. So this activity's job is
+    narrow: run the classifier agent and hand back its decision dict (which
+    carries ``"label"``; see ``pattern_simulation``'s ``turn-judge`` output
+    schema). The workflow then maps that label to the next node and does NOT
+    merge the decision into state (native parity).
+
+    The compiler passes ``(node_id, classifier_agent, state, run_id,
+    workflow_dir, input_field, route_labels)``:
+
+    * ``workflow_dir`` is the compiled workflow's source dir, used to resolve a
+      relative ``classifier_agent`` ref the same way the native runner does
+      (see :func:`_resolve_classifier_ref`).
+    * ``input_field`` + ``route_labels`` build the classifier input
+      ``{"text": str(state[input_field]), "labels": route_labels}`` — the EXACT
+      shape the native runner sends (``runner._run_intent_router``), which the
+      classifier agents' input schemas require (``text`` + ``labels``). They
+      default so a direct caller passing an already-absolute ref needs only the
+      original four args.
+
+    Mirrors the native runner's intent-router path (``runner._run_intent_router``)
+    but without the routing table (which the workflow owns): the classifier
+    runs through the SAME Executor (ADR 054 D3) and its ``response.data``
+    (carrying ``label``) is returned verbatim.
+    """
+    from movate.core.loader import load_agent  # noqa: PLC0415
+    from movate.core.models import RunRequest  # noqa: PLC0415
+
+    ctx = _get_context()
+    clf_ref = _resolve_classifier_ref(classifier_agent, workflow_dir)
+    bundle = load_agent(clf_ref, defaults=ctx.defaults)
+    # Build the classifier input the SAME way the native runner does
+    # (runner._run_intent_router): {text: <state[input_field]>, labels: <route
+    # keys>}. The classifier agents' input schemas require both keys, so the
+    # _project_state projection used for agent nodes is the wrong builder here.
+    clf_input = {"text": str(state.get(input_field, "")), "labels": list(route_labels or [])}
+    executor = _executor_for(ctx, state)
+
+    response = await executor.execute(
+        bundle,
+        RunRequest(agent=bundle.spec.name, input=clf_input),
+        workflow_run_id=run_id,
+        node_id=node_id,
+        tenant_id_override=_resolve_tenant_id(ctx, state),
+    )
+    if response.status != "success":
+        raise RuntimeError(
+            f"gate node {node_id!r} classifier {classifier_agent!r} failed: "
+            f"{response.error.message if response.error else response.status}"
         )
+    # Return the classifier's decision dict verbatim — it carries "label",
+    # which the generated workflow branches on (recorded in history per D4).
+    return dict(response.data)
 
-    parent_span = _spanctx_from_dict(parent_span_context)
-    # Construct the SkillExecutionContext with the same fields the executor's
-    # tool-use loop populates so backends see an identical shape across the
-    # native + Temporal paths.
-    effective_budget = (
-        call_ms_budget
-        if call_ms_budget is not None
-        else (skill.spec.timeout_call_ms if skill.spec.timeout_call_ms else 30_000)
-    )
-    ctx = SkillExecutionContext(
-        trace_id=parent_span.trace_id if parent_span is not None else "",
-        tenant_id=tenant_id or "local",
-        run_id=workflow_id or "",
-        call_ms_budget=effective_budget,
-        agent_name=agent_ref or "",
-        parent_span=parent_span,
-    )
 
-    output = await dispatch_skill(skill, input_json, ctx)
-    return output
+# Verdict labels that mean "stop the loop". ``accept`` is the reflection
+# judge's vocabulary (movate.core.reflection.JudgeVerdict); ``resolved`` is
+# the simulation pattern's turn-judge label (pattern_simulation/turn-judge).
+_TERMINATING_VERDICTS = frozenset({"accept", "resolved", "terminate", "done"})
+
+
+@_activity.defn  # type: ignore[untyped-decorator]
+async def call_judge_activity(
+    node_id: str,
+    state: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any]:
+    """JUDGE node → return ``{"terminate": bool, "verdict": str}``.
+
+    Compiler contract (``_emit_judge_node``): the workflow does
+    ``if <verdict>.get('terminate'): return state``, so we return a dict with
+    a boolean ``terminate`` (plus the raw ``verdict`` label for the operator).
+
+    Phase-1 honesty (flagged): the IR carries no dedicated JUDGE node type yet
+    — judges currently ride as ``intent-router`` nodes and therefore compile
+    to :func:`call_gate_activity`, not this function (see the
+    ``_emit_judge_node`` docstring in the compiler: it is the canonical shape
+    encoded once, *unused* by the Phase-1 emitter). The compiler also passes
+    NO agent ref to this activity — only ``(node_id, state, run_id)`` — so we
+    cannot run a judge agent here. This activity therefore *interprets a
+    verdict already present in ``state``* (a ``verdict`` or ``label`` key, or a
+    ``<node>_decision`` dict left by an upstream gate/judge that DID run a
+    classifier agent) and maps the reflection/simulation vocabulary
+    (``accept`` / ``resolved``) to ``terminate``. When ``state`` carries no
+    verdict signal the activity is non-terminating (``terminate=False``) — the
+    safe default that lets a bounded loop run to its cap.
+
+    A future IR JUDGE node that carries a judge-agent ref would run that agent
+    through the Executor here (ADR 054 D4 row 4); until then this stays a pure
+    state interpreter. Documented honestly per CLAUDE.md §11.
+    """
+    _get_context()  # Fail loud if the worker forgot to configure (D3 contract).
+
+    verdict_label = _extract_verdict_label(state)
+    terminate = verdict_label.lower() in _TERMINATING_VERDICTS
+    return {"terminate": terminate, "verdict": verdict_label}
+
+
+def _extract_verdict_label(state: dict[str, Any]) -> str:
+    """Pull a verdict label out of ``state`` for :func:`call_judge_activity`.
+
+    Looks (in order) at a top-level ``verdict`` / ``label`` string, then at any
+    ``*_decision`` dict an upstream gate stamped (carrying ``label`` /
+    ``verdict``). Returns ``""`` when nothing verdict-like is present (the
+    non-terminating default).
+    """
+    for key in ("verdict", "label"):
+        value = state.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key, value in state.items():
+        if key.endswith("_decision") and isinstance(value, dict):
+            for inner in ("label", "verdict"):
+                inner_value = value.get(inner)
+                if isinstance(inner_value, str) and inner_value:
+                    return inner_value
+    return ""
 
 
 __all__ = [
+    "ActivityContext",
     "call_agent_activity",
+    "call_gate_activity",
+    "call_judge_activity",
     "call_skill_activity",
+    "configure_activities",
 ]

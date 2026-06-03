@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from movate.storage.base import RunSubmissionRecord
 
 from movate.core.dr_backup import ImportResult
 from movate.core.events import Event
@@ -118,7 +121,10 @@ class InMemoryStorage:
         self.trigger_deliveries: dict[tuple[str, str], str] = {}
         # item 37: submission idempotency, keyed by (tenant_id, idempotency_key)
         # → the job_id the first async submit enqueued.
-        self.run_submissions: dict[tuple[str, str], str] = {}
+        # (tenant_id, idempotency_key) -> (job_id, request_hash). The
+        # request_hash (item 37 payload-conflict guard) is None when the submit
+        # recorded no fingerprint (back-compat path).
+        self.run_submissions: dict[tuple[str, str], tuple[str, str | None]] = {}
         self.canary_configs: list[CanaryConfig] = []
         # ADR 040 — projects + members + M:N junctions for agents/workflows/KBs.
         # Lists for direct test assertion (matches the other entities here).
@@ -457,17 +463,33 @@ class InMemoryStorage:
         return True
 
     async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
-        return self.run_submissions.get((tenant_id, idempotency_key))
+        row = self.run_submissions.get((tenant_id, idempotency_key))
+        return row[0] if row is not None else None
+
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        from movate.storage.base import RunSubmissionRecord  # noqa: PLC0415
+
+        row = self.run_submissions.get((tenant_id, idempotency_key))
+        if row is None:
+            return None
+        job_id, request_hash = row
+        return RunSubmissionRecord(job_id=job_id, request_hash=request_hash)
 
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         # Mirrors the DB's atomic INSERT-OR-IGNORE: only the first write for a
         # key lands; a later one finds the row and is a no-op.
         key = (tenant_id, idempotency_key)
         if key in self.run_submissions:
             return False
-        self.run_submissions[key] = job_id
+        self.run_submissions[key] = (job_id, request_hash)
         return True
 
     # ------------------------------------------------------------------
@@ -1485,6 +1507,76 @@ class InMemoryStorage:
                 return j.status
         # Missing or cross-tenant — matches get_job's None shape.
         return None
+
+    # ------------------------------------------------------------------
+    # Dead-letter operations — mirror the SQL backends' semantics.
+    # ------------------------------------------------------------------
+
+    async def list_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 20,
+        agent: str | None = None,
+    ) -> list[JobRecord]:
+        rows = [
+            j for j in self.jobs if j.tenant_id == tenant_id and j.status == JobStatus.DEAD_LETTER
+        ]
+        if agent is not None:
+            rows = [j for j in rows if j.target == agent]
+        return sorted(rows, key=lambda j: j.created_at, reverse=True)[:limit]
+
+    async def requeue_dead_letter_job(self, job_id: str, *, tenant_id: str) -> bool:
+        """Reset a DEAD_LETTER job → QUEUED with a fresh budget.
+
+        Status-guarded: only a ``DEAD_LETTER`` row for this tenant is
+        touched. Returns ``True`` iff a row was actually requeued.
+        Single event loop → atomic by construction.
+        """
+        for i, j in enumerate(self.jobs):
+            if (
+                j.job_id == job_id
+                and j.tenant_id == tenant_id
+                and j.status == JobStatus.DEAD_LETTER
+            ):
+                self.jobs[i] = j.model_copy(
+                    update={
+                        "status": JobStatus.QUEUED,
+                        "attempt_count": 0,
+                        "next_retry_at": None,
+                        "claimed_at": None,
+                        "completed_at": None,
+                        "error": None,
+                    }
+                )
+                return True
+        # Missing, cross-tenant, or not DEAD_LETTER — no-op.
+        return False
+
+    async def purge_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> int:
+        """Delete this tenant's DEAD_LETTER rows (optionally older than
+        ``before`` by ``completed_at``). Returns the count deleted."""
+
+        def _purgeable(j: JobRecord) -> bool:
+            if j.tenant_id != tenant_id or j.status != JobStatus.DEAD_LETTER:
+                return False
+            if before is not None:
+                # Keep rows with no completed_at, or completed at/after the
+                # cutoff — matches the SQL backends' strict ``< before`` plus
+                # ``completed_at IS NOT NULL`` predicate.
+                return j.completed_at is not None and j.completed_at < before
+            return True
+
+        to_delete = [j for j in self.jobs if _purgeable(j)]
+        if to_delete:
+            ids = {j.job_id for j in to_delete}
+            self.jobs = [j for j in self.jobs if j.job_id not in ids]
+        return len(to_delete)
 
     # ------------------------------------------------------------------
     # API keys (v0.5 stage 2)

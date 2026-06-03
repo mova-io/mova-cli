@@ -25,9 +25,12 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
+
+if TYPE_CHECKING:
+    from movate.storage.base import RunSubmissionRecord
 
 from movate.core.dr_backup import ImportResult
 from movate.core.events import Event
@@ -659,8 +662,16 @@ CREATE TABLE IF NOT EXISTS run_submissions (
     idempotency_key TEXT NOT NULL,
     job_id          TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL,
+    request_hash    TEXT,
     PRIMARY KEY (tenant_id, idempotency_key)
 );
+-- item 37 (payload-conflict guard): nullable canonical-payload fingerprint.
+-- A repeat submit reusing an Idempotency-Key with a DIFFERENT payload must 409
+-- rather than silently dedup to the original job. NULL on rows recorded before
+-- this column existed → "fingerprint unknown" → the app skips the conflict
+-- check and returns the prior job, so the upgrade is byte-for-byte
+-- back-compatible. Idempotent ADD COLUMN IF NOT EXISTS.
+ALTER TABLE run_submissions ADD COLUMN IF NOT EXISTS request_hash TEXT;
 
 -- ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
 -- agent): a challenger version + a traffic weight (0 = kill switch), with an
@@ -2237,21 +2248,44 @@ class PostgresProvider:
         )
         return row["job_id"] if row else None
 
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        from movate.storage.base import RunSubmissionRecord  # noqa: PLC0415
+
+        row = await self._db.fetchrow(
+            "SELECT job_id, request_hash FROM run_submissions "
+            "WHERE tenant_id = $1 AND idempotency_key = $2",
+            tenant_id,
+            idempotency_key,
+        )
+        if row is None:
+            return None
+        return RunSubmissionRecord(job_id=row["job_id"], request_hash=row["request_hash"])
+
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         # INSERT ... ON CONFLICT DO NOTHING on the (tenant_id, idempotency_key)
         # PRIMARY KEY: the row is written only if absent, so a concurrent retry
         # races atomically to one winner. asyncpg returns the command tag
         # "INSERT 0 1" on a fresh insert, "INSERT 0 0" when the conflict
-        # suppressed it.
+        # suppressed it. ``request_hash`` (item 37 payload-conflict guard) is
+        # the canonical-payload fingerprint; None preserves the pre-guard shape.
         status: str = await self._db.execute(
-            "INSERT INTO run_submissions (tenant_id, idempotency_key, job_id, created_at) "
-            "VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
+            "INSERT INTO run_submissions "
+            "(tenant_id, idempotency_key, job_id, created_at, request_hash) "
+            "VALUES ($1, $2, $3, $4, $5) "
+            "ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
             tenant_id,
             idempotency_key,
             job_id,
             datetime.now(UTC),
+            request_hash,
         )
         return status.endswith(" 1")
 
@@ -3696,6 +3730,80 @@ class PostgresProvider:
             # No row for this (job_id, tenant_id) — missing or cross-tenant.
             return None
         return JobStatus(row["status"])
+
+    # ------------------------------------------------------------------
+    # Dead-letter operations (operate retry-exhausted jobs)
+    # ------------------------------------------------------------------
+
+    async def list_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 20,
+        agent: str | None = None,
+    ) -> list[JobRecord]:
+        """Newest-first DEAD_LETTER rows for ``tenant_id`` (optional ``agent``
+        = ``target`` filter). Tenant-scoped in WHERE."""
+        params: list[Any] = [tenant_id]
+        clauses = ["tenant_id = $1", "status = 'dead_letter'"]
+        if agent is not None:
+            params.append(agent)
+            clauses.append(f"target = ${len(params)}")
+        params.append(limit)
+        sql = (
+            f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} "
+            f"ORDER BY created_at DESC LIMIT ${len(params)}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_job(r) for r in rows]
+
+    async def requeue_dead_letter_job(self, job_id: str, *, tenant_id: str) -> bool:
+        """Reset a DEAD_LETTER job → QUEUED with a fresh attempt budget.
+
+        Single ``UPDATE ... RETURNING`` guarded on ``status =
+        'dead_letter'`` (and tenant). The RETURNING row is present iff a
+        row actually flipped, so we report ``True``/``False`` — a
+        non-dead-letter / cross-tenant id returns ``False`` and the
+        API/CLI maps that to a clean error."""
+        row = await self._db.fetchrow(
+            """
+            UPDATE jobs
+            SET status = 'queued',
+                attempt_count = 0,
+                next_retry_at = NULL,
+                claimed_at = NULL,
+                completed_at = NULL,
+                error = NULL
+            WHERE job_id = $1 AND tenant_id = $2 AND status = 'dead_letter'
+            RETURNING job_id
+            """,
+            job_id,
+            tenant_id,
+        )
+        return row is not None
+
+    async def purge_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> int:
+        """Delete this tenant's DEAD_LETTER rows; returns the count deleted.
+
+        Tenant + status scoped in WHERE. ``before`` narrows to rows whose
+        ``completed_at`` is strictly older than the cutoff (and non-NULL);
+        ``None`` purges all dead-letter rows for the tenant."""
+        params: list[Any] = [tenant_id]
+        clauses = ["tenant_id = $1", "status = 'dead_letter'"]
+        if before is not None:
+            params.append(before)
+            clauses.append("completed_at IS NOT NULL")
+            clauses.append(f"completed_at < ${len(params)}")
+        rows = await self._db.fetch(
+            f"DELETE FROM jobs WHERE {' AND '.join(clauses)} RETURNING job_id",
+            *params,
+        )
+        return len(rows)
 
     # ------------------------------------------------------------------
     # API keys

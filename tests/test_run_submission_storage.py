@@ -61,3 +61,46 @@ async def test_get_unknown_key_returns_none(storage) -> None:
     await storage.record_run_submission("tenant-a", "key-1", "job-1")
     assert await storage.get_run_submission("tenant-a", "missing") is None
     assert await storage.get_run_submission("tenant-other", "key-1") is None
+
+
+# ---------------------------------------------------------------------------
+# item 37 payload-conflict guard: request_hash fingerprint round-trip. The
+# additive nullable column lets the submit endpoint 409 a key reused for a
+# DIFFERENT payload. A row recorded without a hash (back-compat / legacy)
+# reads back as None → "unknown" → no conflict.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_request_hash_round_trips(storage) -> None:
+    """``record_run_submission(..., request_hash=...)`` persists the fingerprint."""
+    assert await storage.record_run_submission("tenant-a", "key-1", "job-1", "hash-abc") is True
+    rec = await storage.get_run_submission_record("tenant-a", "key-1")
+    assert rec is not None
+    assert rec.job_id == "job-1"
+    assert rec.request_hash == "hash-abc"
+
+
+@pytest.mark.unit
+async def test_request_hash_defaults_to_none(storage) -> None:
+    """Omitting ``request_hash`` (the pre-guard call shape) stores None."""
+    assert await storage.record_run_submission("tenant-a", "key-1", "job-1") is True
+    rec = await storage.get_run_submission_record("tenant-a", "key-1")
+    assert rec is not None
+    assert rec.job_id == "job-1"
+    assert rec.request_hash is None
+
+
+@pytest.mark.unit
+async def test_get_run_submission_record_unknown_key_is_none(storage) -> None:
+    assert await storage.get_run_submission_record("tenant-a", "missing") is None
+
+
+@pytest.mark.unit
+async def test_get_run_submission_record_is_per_tenant_scoped(storage) -> None:
+    await storage.record_run_submission("tenant-a", "key-1", "job-a", "hash-a")
+    await storage.record_run_submission("tenant-b", "key-1", "job-b", "hash-b")
+    rec_a = await storage.get_run_submission_record("tenant-a", "key-1")
+    rec_b = await storage.get_run_submission_record("tenant-b", "key-1")
+    assert rec_a is not None and rec_a.request_hash == "hash-a"
+    assert rec_b is not None and rec_b.request_hash == "hash-b"
