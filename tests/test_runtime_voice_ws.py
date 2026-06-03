@@ -26,10 +26,14 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from movate.core.auth import ALL_SCOPES, SCOPE_READ, ApiKeyEnv, mint_api_key
+from movate.core.models import VoiceConfig
 from movate.core.provider_keys import ENV_PROVIDER_KEY_SECRET, mint_tenant_provider_key
 from movate.runtime import build_app
+from movate.runtime.app import _seed_voice_turn_config, _send_voice_latency, _VoiceTurnConfig
 from movate.testing import InMemoryStorage
 from movate.voice import AudioChunk, FakeRealtime, FakeSTT, FakeTTS
+from movate.voice.observer import MetricsObserver
+from movate.voice.pipeline import VoiceEvent
 
 
 @pytest.fixture
@@ -198,6 +202,56 @@ async def test_voice_ws_emits_latency_frame_before_done(
     assert "responded in" in latency["badge"]
     # The per-stage fields are present for the trace/observability consumer.
     assert "responded_in_ms" in latency
+    # A non-speculative turn carries NO speculation block (back-compat).
+    assert "speculation" not in latency
+
+
+class _FakeWS:
+    """Minimal WebSocket double capturing ``send_json`` payloads."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_json(self, obj: dict) -> None:
+        self.sent.append(obj)
+
+
+async def test_send_voice_latency_carries_speculation_block_when_fired() -> None:
+    """ADR 070/073 A/B signal: when a speculation fired, the latency frame
+    carries a ``speculation`` block (committed / commit_ratio / head-start) the
+    demo perf panel + runbook aggregate. Gated on ``started`` so a
+    non-speculative turn stays byte-for-byte unchanged."""
+    events = [
+        VoiceEvent(kind="transcript.final", text="hi", at_ms=100.0),
+        VoiceEvent(kind="agent.token", text="he", at_ms=300.0),
+    ]
+    metrics = MetricsObserver()
+    metrics.on_event("speculation_started", chars=2)
+    metrics.on_event("speculation_committed", head_start_ms=420)
+
+    ws = _FakeWS()
+    await _send_voice_latency(ws, events, metrics)
+
+    assert len(ws.sent) == 1
+    frame = ws.sent[0]
+    assert frame["type"] == "latency"
+    spec = frame["speculation"]
+    assert spec["committed"] == 1
+    assert spec["commit_ratio"] == 1.0
+    assert spec["avg_head_start_ms"] == 420.0
+
+
+async def test_send_voice_latency_omits_speculation_when_idle() -> None:
+    """No speculation fired → no ``speculation`` key (additive, opt-in)."""
+    events = [
+        VoiceEvent(kind="transcript.final", text="hi", at_ms=100.0),
+        VoiceEvent(kind="agent.token", text="he", at_ms=300.0),
+    ]
+    ws = _FakeWS()
+    await _send_voice_latency(ws, events, MetricsObserver())
+
+    assert len(ws.sent) == 1
+    assert "speculation" not in ws.sent[0]
 
 
 class _SlowTTS:
@@ -338,6 +392,49 @@ def test_voice_ws_realtime_routes_to_realtime_provider(
     # The provider was driven voice-native: it received the mic frame + the
     # client's voice_id — and NO run was persisted (no Executor in this path).
     assert rt.received == [b"\x00\x01\x02\x03"]
+    assert rt.voice_ids == ["rachel"]
+
+
+def test_voice_ws_realtime_seeds_voice_id_from_agent_block(
+    storage, agents_path, auth_setup
+) -> None:
+    """ADR 071 D1: an agent's voice.voice_id reaches the realtime provider with
+    NO client config frame (the block is the default)."""
+    app = build_app(storage, agents_path=agents_path)
+    rt = FakeRealtime(transcript="hi", answer="done", frames=1)
+    app.state.voice_realtime_factory = lambda: rt
+    token, _ = auth_setup
+    client = TestClient(app)
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice WS transport",
+        b"description: demo agent for the voice WS transport\n"
+        b"voice:\n  enabled: true\n  voice_id: rachel",
+    )
+    r = client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect(
+        f"/api/v1/agents/voice-demo/voice?mode=realtime&token={token}"
+    ) as ws:
+        ws.send_bytes(b"\x00\x01")  # a mic frame — NO config frame
+        ws.send_json({"type": "close"})
+        while True:
+            msg = ws.receive()
+            if msg.get("type") == "websocket.close":
+                break
+            if msg.get("text") and json.loads(msg["text"]).get("type") == "response_done":
+                break
+
+    # The agent block's voice_id reached the provider without a client frame.
     assert rt.voice_ids == ["rachel"]
 
 
@@ -567,6 +664,72 @@ def _drain_turn_with_usage(ws) -> list[dict | bytes]:
             return frames
 
 
+# ── ADR 071 — per-agent voice block seeds the per-turn config ──────────────────
+
+
+def _bundle_with_voice(**voice_fields):
+    """A minimal stand-in bundle exposing ``.spec.voice`` (a VoiceConfig)."""
+    from types import SimpleNamespace  # noqa: PLC0415 - test-local helper
+
+    voice = VoiceConfig(**voice_fields) if voice_fields else None
+    return SimpleNamespace(spec=SimpleNamespace(voice=voice))
+
+
+def test_seed_voice_turn_config_applies_agent_block() -> None:
+    """ADR 071 D1-D3: voice_id/language/tts_streaming/speculative seed from the block."""
+    cfg = _VoiceTurnConfig()
+    _seed_voice_turn_config(
+        cfg,
+        _bundle_with_voice(
+            voice_id="rachel", language="fr-FR", tts_streaming=False, speculative=True
+        ),
+    )
+    assert cfg.voice_id == "rachel"
+    assert cfg.language == "fr-FR"
+    assert cfg.tts_streaming is False
+    assert cfg.speculative is True
+
+
+def test_seed_voice_turn_config_absent_block_keeps_defaults() -> None:
+    """No voice block → runtime defaults untouched (byte-for-byte today)."""
+    cfg = _VoiceTurnConfig()
+    before = (cfg.voice_id, cfg.language, cfg.tts_streaming, cfg.speculative)
+    _seed_voice_turn_config(cfg, _bundle_with_voice())  # voice is None
+    assert (cfg.voice_id, cfg.language, cfg.tts_streaming, cfg.speculative) == before
+
+
+def test_seed_voice_turn_config_tts_streaming_none_keeps_default() -> None:
+    """tts_streaming unset (None) leaves the runtime default (True) in place."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.tts_streaming is True  # runtime default
+    _seed_voice_turn_config(cfg, _bundle_with_voice(voice_id="x"))  # no tts_streaming
+    assert cfg.tts_streaming is True  # unchanged
+
+
+def test_seed_voice_turn_config_keyterms() -> None:
+    """ADR 071 D4: keyterms seed from the agent block; empty list = no boosting."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.keyterms == []  # default
+    _seed_voice_turn_config(cfg, _bundle_with_voice(keyterms=["VPN", "Okta"]))
+    assert cfg.keyterms == ["VPN", "Okta"]
+    # Empty keyterms list leaves the (empty) default untouched.
+    cfg2 = _VoiceTurnConfig()
+    _seed_voice_turn_config(cfg2, _bundle_with_voice(voice_id="x"))
+    assert cfg2.keyterms == []
+
+
+def test_seed_voice_turn_config_endpointing() -> None:
+    """ADR 073 D3: endpointing_ms seeds from the agent block; None keeps default."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.endpointing_ms is None  # default → adapter value (1500)
+    _seed_voice_turn_config(cfg, _bundle_with_voice(endpointing_ms=800))
+    assert cfg.endpointing_ms == 800
+    # Absent endpointing in the block leaves the default (None) untouched.
+    cfg2 = _VoiceTurnConfig()
+    _seed_voice_turn_config(cfg2, _bundle_with_voice(voice_id="x"))
+    assert cfg2.endpointing_ms is None
+
+
 # ---------------------------------------------------------------------------
 # Gap 1: Voice turns recorded as RunRecords (ADR 050 D1)
 # ---------------------------------------------------------------------------
@@ -581,12 +744,49 @@ async def test_voice_turn_persisted_as_run_record_with_modality(
     token, tenant_id = auth_setup
     _create_agent(client, token)
 
+
+def test_seed_voice_turn_config_adaptive_endpointing() -> None:
+    """ADR 073 Phase 3: endpointing_adaptive seeds from the agent block (default False)."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.endpointing_adaptive is False
+    _seed_voice_turn_config(cfg, _bundle_with_voice(endpointing_adaptive=True))
+    assert cfg.endpointing_adaptive is True
+
+
+async def test_voice_ws_threads_agent_endpointing_to_stt(storage, agents_path, auth_setup) -> None:
+    """End-to-end: an agent's voice.endpointing_ms reaches
+    stt.transcribe(endpointing_ms=...)."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("turn the lights on")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = FakeTTS
+    token, _ = auth_setup
+    client = TestClient(app)
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice WS transport",
+        b"description: demo agent for the voice WS transport\n"
+        b"voice:\n  enabled: true\n  endpointing_ms: 700",
+    )
+    r = client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
     with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
         ws.send_json({"type": "config", "mock": True})
         ws.send_bytes(b"\x00\x01\x02\x03")
         ws.send_json({"type": "end"})
-        frames = _drain_turn_with_usage(ws)
+        _drain_turn(ws)
         ws.send_json({"type": "close"})
+
+    assert stt.endpointing_seen == [700]
 
     ctrl = [f for f in frames if isinstance(f, dict)]
     done = next(c for c in ctrl if c["type"] == "done")
@@ -704,3 +904,63 @@ async def test_voice_turn_emits_usage_frame_with_cost(
     assert record is not None
     assert record.stt_cost_usd == usage["stt_cost_usd"]
     assert record.tts_cost_usd == usage["tts_cost_usd"]
+
+
+async def test_voice_ws_config_frame_overrides_endpointing(
+    storage, agents_path, auth_setup
+) -> None:
+    """A client ``config`` frame can pin endpointing_ms per-turn (the demo A/B
+    toggle), overriding the agent-block seed."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("turn the lights on")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = FakeTTS
+    token, _ = auth_setup
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True, "endpointing_ms": 300})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "end"})
+        _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    assert stt.endpointing_seen == [300]
+
+
+async def test_voice_ws_threads_agent_keyterms_to_stt(storage, agents_path, auth_setup) -> None:
+    """End-to-end: an agent's voice.keyterms reach stt.transcribe(keyterms=...)."""
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("turn the lights on")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = FakeTTS
+    token, _ = auth_setup
+    client = TestClient(app)
+    # Create an agent whose voice block carries keyterms.
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice WS transport",
+        b"description: demo agent for the voice WS transport\n"
+        b"voice:\n  enabled: true\n  keyterms: ['VPN', 'Okta']",
+    )
+    r = client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "end"})
+        _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    # The FakeSTT recorded the keyterms the pipeline passed it.
+    assert stt.keyterms_seen == [["VPN", "Okta"]]

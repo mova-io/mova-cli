@@ -282,6 +282,44 @@ def test_features_true_when_route_registered(client: TestClient, read_auth) -> N
     assert feats["workflows_api"] is True
     assert feats["provider_keys"] is True
     assert feats["batch_runs"] is True
+    # ADR 050 D2 — the one-shot REST voice surface is advertised distinctly from
+    # the WS ``voice`` transport (both are wired on the real runtime).
+    assert feats["voice"] is True
+    assert feats["voice_rest"] is True
+    # ADR 045 D13 — run replay / time-travel is wired on the real runtime.
+    assert feats["run_replay"] is True
+
+
+def test_voice_rest_flag_flips_with_route_table() -> None:
+    """``voice_rest`` is route-detected: absent on a bare app, True once the
+    one-shot POST /agents/{name}/voice APIRoute is registered (ADR 050 D2)."""
+    bare = FastAPI()
+    assert detect_features(bare)["voice_rest"] is False
+
+    router = APIRouter()
+
+    @router.post("/agents/{name}/voice")
+    async def _voice() -> dict[str, str]:  # pragma: no cover - never called
+        return {}
+
+    bare.include_router(router)
+    assert detect_features(bare)["voice_rest"] is True
+
+
+def test_run_replay_flag_flips_with_route_table() -> None:
+    """``run_replay`` is route-detected: absent on a bare app, True once the
+    POST /runs/{run_id}/replay APIRoute is registered (ADR 045 D13)."""
+    bare = FastAPI()
+    assert detect_features(bare)["run_replay"] is False
+
+    router = APIRouter()
+
+    @router.post("/runs/{run_id}/replay")
+    async def _replay() -> dict[str, str]:  # pragma: no cover - never called
+        return {}
+
+    bare.include_router(router)
+    assert detect_features(bare)["run_replay"] is True
 
 
 def test_feature_flag_flips_with_route_table() -> None:
