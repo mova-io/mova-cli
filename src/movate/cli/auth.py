@@ -865,9 +865,13 @@ _PROVIDERS_PROMPT_NAME = {
     # has its own multi-value login path (like telegram). DISTINCT from the
     # `azure` (Azure OpenAI) provider above — different Azure resource + key.
     "azure-speech": "Azure Speech (voice STT + TTS)",
-    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). Each needs
-    # two values (API key/token + routing URL) — handled via a dedicated
-    # multi-value code path like telegram/azure-speech.
+    # Twilio is the telephony transport (ADR 074) — phone calls to mdk voice
+    # agents. Needs an account SID + auth token (multi-value path).
+    "twilio": "Twilio (telephony transport)",
+    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). ServiceNow
+    # needs two values (API key + instance URL) — handled via a dedicated
+    # multi-value code path like telegram/azure-speech. Microsoft Graph
+    # likewise needs two values (access token + tenant ID).
     "servicenow": "ServiceNow (enterprise connector)",
     "msgraph": "Microsoft Graph (enterprise connector)",
     "workday": "Workday (enterprise connector)",
@@ -903,6 +907,12 @@ _TELEGRAM_PROVIDERS = frozenset({"telegram"})
 # its env vars don't fit the one-key-per-provider shape, and it isn't an LLM
 # provider the picker should live-verify against an LLM endpoint.
 _VOICE_PROVIDERS = frozenset({"azure-speech"})
+
+# Twilio needs TWO values (account SID + auth token) -- same multi-value
+# pattern as telegram and azure-speech. Dispatched to its own code path.
+# Kept out of _PROVIDER_TO_ENV_VAR for the same reason: its env vars
+# don't fit the one-key shape, and it isn't an LLM provider.
+_TELEPHONY_PROVIDERS = frozenset({"twilio"})
 
 # Enterprise connector providers that need TWO values — same multi-value
 # pattern as telegram/azure-speech. Dispatched to their own code paths
@@ -1053,6 +1063,11 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_azure_speech(key=key, save_to=save_to)
         return
 
+    # Twilio (ADR 074) — the telephony transport. Needs account SID + auth token.
+    if provider in _TELEPHONY_PROVIDERS:
+        _login_twilio(key=key, save_to=save_to)
+        return
+
     # Enterprise connectors (ADR 052 Phase 1) — each needs two values.
     if provider in _CONNECTOR_PROVIDERS:
         _login_connector(provider, key=key, save_to=save_to)
@@ -1071,6 +1086,7 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
                 set(_PROVIDER_TO_ENV_VAR)
                 | _TELEGRAM_PROVIDERS
                 | _VOICE_PROVIDERS
+                | _TELEPHONY_PROVIDERS
                 | _CONNECTOR_PROVIDERS
                 | _TEMPORAL_PROVIDERS
             )
@@ -2566,6 +2582,7 @@ def _prompt_for_provider() -> str:
         ("elevenlabs", _PROVIDERS_PROMPT_NAME["elevenlabs"]),
         ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
         ("azure-speech", _PROVIDERS_PROMPT_NAME["azure-speech"]),
+        ("twilio", _PROVIDERS_PROMPT_NAME["twilio"]),
         ("temporal", _PROVIDERS_PROMPT_NAME["temporal"]),
     ]
     stdout.print("[bold]Which provider would you like to set up?[/bold]")
@@ -3024,6 +3041,69 @@ def _login_temporal(*, key: str | None, save_to: str) -> None:
             if tls_cert:
                 fh.write(f"TEMPORAL_TLS_CERT={tls_cert}\n")
                 fh.write(f"TEMPORAL_TLS_KEY={tls_key}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_twilio(*, key: str | None, save_to: str) -> None:
+    """Guided Twilio setup for telephony transport (ADR 074).
+
+    Twilio needs TWO values:
+      * ``TWILIO_ACCOUNT_SID`` -- the Account SID from the Twilio console.
+      * ``TWILIO_AUTH_TOKEN`` -- the Auth Token from the Twilio console.
+
+    No live verification: verifying would need the optional ``twilio`` SDK
+    (``mdk[telephony]``) and a billable roundtrip; the transport surfaces a
+    clear error at first use if the pair is wrong. Persists to
+    ``~/.movate/credentials`` (default) or project ``.env``.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    hint(
+        "[dim]Twilio telephony setup:\n"
+        "  1. Log in to [bold]console.twilio.com[/bold]\n"
+        "  2. Copy your [bold]Account SID[/bold] from the dashboard\n"
+        "  3. Copy your [bold]Auth Token[/bold] (click 'Show' to reveal)[/dim]"
+    )
+
+    # Accept --key as the account SID when passed (CI ergonomics),
+    # otherwise prompt for it.
+    account_sid = key.strip() if key is not None else typer.prompt("Twilio Account SID").strip()
+    if not account_sid:
+        error("empty Account SID -- aborted.")
+        raise typer.Exit(code=2)
+
+    auth_token = typer.prompt(
+        "Twilio Auth Token", hide_input=True, confirmation_prompt=False
+    ).strip()
+    if not auth_token:
+        error("empty Auth Token -- aborted.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("TWILIO_ACCOUNT_SID", account_sid)
+        store.set("TWILIO_AUTH_TOKEN", auth_token)
+        success(
+            f"saved [bold]TWILIO_ACCOUNT_SID[/bold] + "
+            f"[bold]TWILIO_AUTH_TOKEN[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+        hint(
+            "[dim]Every [bold]mdk[/bold] invocation on this machine now picks "
+            "up these for the Twilio telephony transport. Install the SDK with "
+            "[bold]uv add 'movate-cli[telephony]'[/bold] to use it.[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"TWILIO_ACCOUNT_SID={account_sid}\n")
+            fh.write(f"TWILIO_AUTH_TOKEN={auth_token}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")

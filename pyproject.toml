@@ -251,6 +251,18 @@ voice = [
     # permissive-only, justified in its own PR): Gemini Live realtime (a
     # fast-follow), and any audio lib for edge transcoding or VAD when needed.
 ]
+telephony = [
+    # Twilio telephony transport (ADR 074 D3/D5). Twilio is the enterprise-PSTN
+    # path: global phone numbers, carrier-grade SIP trunking, established
+    # enterprise billing. The ``twilio`` SDK is MIT-licensed (permissive,
+    # passes ``scripts/check_licenses.py --strict``). Imported LAZILY inside
+    # ``movate.voice.transports.twilio`` -- a runtime without ``mdk[telephony]``
+    # never loads it (same posture as the voice/langfuse/keychain extras).
+    # Separate from the ``[voice]`` extra (which stays lean: STT/TTS provider
+    # SDKs only) so operators who need web-WS voice but not phone calls pay
+    # nothing for the Twilio SDK.
+    "twilio>=9.0,<10",
+]
 langchain = [
     "langchain-core>=0.3,<1",
 ]
@@ -526,6 +538,10 @@ module = [
     # movate.cli.voice_cmd._voice_try_async, so mypy on `src` is clean when
     # the [voice] extra is absent.
     "sounddevice.*",
+    # Twilio SDK — optional [telephony] extra (ADR 074). No type stubs shipped;
+    # imported LAZILY inside movate.voice.transports.twilio, so mypy on `src`
+    # stays clean whether or not the extra is installed.
+    "twilio.*",
     # External-orchestrator adapters (ADR 017 D3) — optional extras with no
     # type stubs. Imported LAZILY inside the adapter functions/factory; this
     # keeps mypy on `src` clean whether or not the extras are installed.

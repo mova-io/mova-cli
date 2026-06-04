@@ -80,6 +80,16 @@ VOICE_KEY_ENV_VARS: tuple[str, ...] = (
     "AZURE_SPEECH_REGION",
 )
 
+# Telephony-provider env vars (ADR 074, the ``[telephony]`` extra). Set via
+# ``mdk auth login twilio`` (or by hand) and consumed by the Twilio transport
+# in ``movate.voice.transports.twilio``. Kept SEPARATE from VOICE_KEY_ENV_VARS
+# because telephony is a transport concern, not a speech-adapter concern --
+# but they need the same autoload-from-credentials-file treatment.
+TELEPHONY_KEY_ENV_VARS: tuple[str, ...] = (
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+)
+
 # Enterprise connector env vars (ADR 052 Phase 1 — Action Fabric).
 # Set via ``mdk auth login servicenow`` / ``msgraph`` (or by hand) and
 # consumed by the HTTP skill backend when dispatching connector skills.
@@ -127,6 +137,7 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
     *VOICE_KEY_ENV_VARS,
+    *TELEPHONY_KEY_ENV_VARS,
     *CONNECTOR_KEY_ENV_VARS,
     *TEMPORAL_KEY_ENV_VARS,
 )
