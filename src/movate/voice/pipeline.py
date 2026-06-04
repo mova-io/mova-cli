@@ -414,6 +414,7 @@ async def run_voice_pipeline(
     turn_detector: Any = None,
     observer: Any = None,
     clock: Any = None,
+    extra_input: dict[str, Any] | None = None,
 ) -> AsyncIterator[VoiceEvent]:
     """Drive one voice turn: audio → STT → the agent stage → TTS → audio.
 

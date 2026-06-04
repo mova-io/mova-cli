@@ -1141,6 +1141,14 @@ _MIGRATIONS = [
         "CREATE INDEX IF NOT EXISTS idx_session_messages_session "
         "ON session_messages(session_id, tenant_id, created_at)"
     ),
+    # ADR 050 D1 — voice-as-run parity: voice-specific columns on runs.
+    # All nullable (None for text runs); additive, no backfill needed.
+    "ALTER TABLE runs ADD COLUMN modality TEXT",
+    "ALTER TABLE runs ADD COLUMN stt_latency_ms REAL",
+    "ALTER TABLE runs ADD COLUMN tts_latency_ms REAL",
+    "ALTER TABLE runs ADD COLUMN audio_duration_s REAL",
+    "ALTER TABLE runs ADD COLUMN stt_cost_usd REAL",
+    "ALTER TABLE runs ADD COLUMN tts_cost_usd REAL",
 ]
 
 
@@ -1330,14 +1338,20 @@ class SqliteProvider:
         # Use named columns rather than positional VALUES so column order in
         # the schema can drift without breaking inserts (and so lightweight
         # ALTER-added columns work).
+        #
+        # INSERT OR REPLACE so the voice-parity handler (ADR 050 D1) can
+        # re-save a RunRecord with voice-specific fields (modality, stt/tts
+        # latency + cost) after the Executor's initial save.
         await self._db.execute(
             """
-            INSERT INTO runs (
+            INSERT OR REPLACE INTO runs (
                 run_id, job_id, tenant_id, agent, agent_version, prompt_hash,
                 provider, provider_version, pricing_version, status,
                 input, output, metrics, error, created_at,
-                workflow_run_id, node_id, thread_id, skill_calls, turns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                workflow_run_id, node_id, thread_id, skill_calls, turns,
+                modality, stt_latency_ms, tts_latency_ms, audio_duration_s,
+                stt_cost_usd, tts_cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run.run_id,
@@ -1361,6 +1375,13 @@ class SqliteProvider:
                 # ADR 024 D2 — per-step retention as JSON arrays.
                 json.dumps([c.model_dump() for c in run.skill_calls]),
                 json.dumps([t.model_dump() for t in run.turns]),
+                # ADR 050 D1 — voice-specific fields (all None for text runs).
+                run.modality,
+                run.stt_latency_ms,
+                run.tts_latency_ms,
+                run.audio_duration_s,
+                run.stt_cost_usd,
+                run.tts_cost_usd,
             ),
         )
         await self._db.commit()
@@ -5466,6 +5487,14 @@ def _row_to_run(row: aiosqlite.Row) -> RunRecord:
         thread_id=row["thread_id"] if "thread_id" in keys else None,
         skill_calls=skill_calls,
         turns=turns,
+        # ADR 050 D1 — voice-specific fields. NULL / absent on pre-migration
+        # or text-only rows → None, so existing records load unchanged.
+        modality=_opt_col(row, "modality") if "modality" in keys else None,
+        stt_latency_ms=_opt_col(row, "stt_latency_ms") if "stt_latency_ms" in keys else None,
+        tts_latency_ms=_opt_col(row, "tts_latency_ms") if "tts_latency_ms" in keys else None,
+        audio_duration_s=_opt_col(row, "audio_duration_s") if "audio_duration_s" in keys else None,
+        stt_cost_usd=_opt_col(row, "stt_cost_usd") if "stt_cost_usd" in keys else None,
+        tts_cost_usd=_opt_col(row, "tts_cost_usd") if "tts_cost_usd" in keys else None,
     )
 
 
