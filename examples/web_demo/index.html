@@ -492,7 +492,7 @@ button.active { background:var(--accent); color:white; }
       <span class="lg"><span class="sw" style="background:var(--c2);"></span>● transcript</span>
       <span class="lg"><span class="sw" style="background:var(--c3);"></span>● agent token</span>
       <span class="lg"><span class="sw" style="background:var(--accent);"></span>● TTS frame</span>
-      <span style="margin-left:auto;color:var(--muted);" id="monitor-now">—</span>
+      <span style="margin-left:auto;color:var(--muted);font-family:'SF Mono',Menlo,monospace;font-variant-numeric:tabular-nums;min-width:12em;text-align:right;" id="monitor-now">—</span>
     </div>
   </section>
 
@@ -1897,17 +1897,40 @@ function tickMonitor(now) {
   monMic[monIdx] = sampleMicLevel();
   monAgent[monIdx] = decayAgentLevel();
   monIdx = (monIdx + 1) % MON_N;
+  // Update elapsed text BEFORE draw so the layout invalidation settles
+  // before we read cached canvas dimensions (avoids read-after-write thrash).
+  const elapsedSec = Math.floor((now - monStartTime) / 1000);
+  const monNow = $('monitor-now');
+  if (monNow && monNow.dataset.lastSec !== String(elapsedSec)) {
+    monNow.dataset.lastSec = String(elapsedSec);
+    monNow.textContent = `elapsed ${elapsedSec}s · samples ${MON_FPS}/s`;
+  }
   drawMonitor();
 }
+
+// Cached canvas dimensions — updated by ResizeObserver instead of
+// per-frame clientWidth reads (which force synchronous layout flushes
+// and caused a visible ~1-second "shudder" whenever the elapsed-time
+// DOM text changed width).
+let monCssW = 800, monCssH = 140;
+const _monResizeObs = new ResizeObserver(entries => {
+  for (const e of entries) {
+    monCssW = e.contentRect.width || 800;
+    monCssH = e.contentRect.height || 140;
+  }
+});
+// Attach observer as soon as the canvas exists (load-time or first draw).
+let _monObsAttached = false;
 
 function drawMonitor() {
   const c = $('monitor-canvas');
   if (!c) return;
+  if (!_monObsAttached) { _monResizeObs.observe(c); _monObsAttached = true; monCssW = c.clientWidth || 800; monCssH = c.clientHeight || 140; }
   const dpr = window.devicePixelRatio || 1;
-  const cssW = c.clientWidth || 800;
-  const cssH = c.clientHeight || 140;
-  if (c.width !== cssW * dpr || c.height !== cssH * dpr) {
-    c.width = cssW * dpr; c.height = cssH * dpr;
+  const cssW = monCssW;
+  const cssH = monCssH;
+  if (c.width !== Math.round(cssW * dpr) || c.height !== Math.round(cssH * dpr)) {
+    c.width = Math.round(cssW * dpr); c.height = Math.round(cssH * dpr);
   }
   const ctx = c.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1977,17 +2000,9 @@ function drawMonitor() {
   ctx.strokeStyle = colMid; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(cssW - 1, 0); ctx.lineTo(cssW - 1, cssH);
   ctx.stroke();
-
-  // Update the "elapsed" footer text — integer seconds only (the chart
-  // redraws ~30× per second; a tenths-of-a-second counter looked jittery).
-  // Only mutate the DOM when the integer actually changes to avoid layout
-  // shifts from variable-width digits in the right-aligned "samples" suffix.
-  const elapsedSec = Math.floor((performance.now() - monStartTime) / 1000);
-  const monNow = $('monitor-now');
-  if (monNow && monNow.dataset.lastSec !== String(elapsedSec)) {
-    monNow.dataset.lastSec = String(elapsedSec);
-    monNow.textContent = `elapsed ${elapsedSec}s · samples ${MON_FPS}/s`;
-  }
+  // Elapsed-time DOM update moved to tickMonitor() — writing DOM inside
+  // drawMonitor caused a read-after-write layout thrash on the next frame
+  // (clientWidth forced a sync layout flush every time the text changed).
 }
 
 function startMonitor() {

@@ -36,6 +36,8 @@ from fastapi.staticfiles import StaticFiles
 
 from movate.voice import (
     AdaptiveEndpointing,
+    AgentTurnError,
+    AgentTurnResult,
     AudioChunk,
     CartesiaTTS,
     DeepgramSTT,
@@ -493,14 +495,14 @@ class _KeyedTTS:
 
 AGENT_TIERS = {
     "openai": "OpenAI Chat (GPT-4o-mini)",
-    "lyzr": "Lyzr ADK (/v4 streaming)",
+    "lyzr": "Mova-iO Streaming (/v3 native)",
     # L6: alternative Lyzr integration path — wraps Lyzr's /v3/inference/chat/
     # (the SDK's historical endpoint) inside movate.voice.LyzrAgentTurn. Slower
-    # than /v4 (buffered, no token streaming) but demonstrates the
+    # than streaming (buffered, no token streaming) but demonstrates the
     # SDK-wrapping binding shipped in mdk-voice. The architectural point: the
-    # same voice pipeline handles BOTH a streaming-token agent (via /v4) AND a
-    # non-streaming SDK-shaped agent (via LyzrAgentTurn) without changing.
-    "lyzr_sdk": "Lyzr (SDK binding)",
+    # same voice pipeline handles BOTH a streaming agent AND a non-streaming
+    # SDK-shaped agent (via LyzrAgentTurn) without changing.
+    "lyzr_sdk": "Mova-iO SDK (buffered)",
 }
 
 
@@ -539,6 +541,176 @@ class _LyzrV3HTTPAgent:
         return {"response": body.get("response", "")}
 
 
+class LyzrV3StreamAgent:
+    """Streaming agent using Lyzr's native ``/v3/inference/stream/`` endpoint.
+
+    Uses ``x-api-key`` header auth (the standard Lyzr auth) instead of
+    ``Authorization: Bearer`` (the OpenAI-compat ``/v4`` path). This matters
+    because some agents are only accessible via the ``/v3`` auth — the ``/v4``
+    OpenAI-compat shim can return 403 for the same key + agent_id that works
+    fine on ``/v3``.
+
+    Streams the response using ``httpx.AsyncClient.stream()`` and fires
+    ``on_token`` per chunk so the voice pipeline can overlap TTS synthesis
+    with agent generation — same latency benefit as the OpenAI SSE path.
+
+    Implements the AgentTurn protocol: ``async run(text, *, on_token, ...)``
+    returning an ``AgentTurnResult``.
+    """
+
+    name = "lyzr-v3-stream"
+    version = "1"
+    speculatable = True  # stateless per-call; safe to discard
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        api_key: str,
+        voice_hint: str | None = None,
+        on_tool_call: Callable[[dict[str, Any]], None] | None = None,
+        on_extras: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self._agent_id = agent_id
+        self._api_key = api_key
+        self._voice_hint = (voice_hint or "").strip() or None
+        self.on_tool_call = on_tool_call
+        self.on_extras = on_extras
+        self._session_id = f"mdk-voice-{id(self):x}"
+
+    def reset(self) -> None:
+        """Clear server-side session by rotating the session_id."""
+        self._session_id = f"mdk-voice-{id(self):x}-{__import__('time').monotonic_ns()}"
+
+    async def run(
+        self,
+        text: str,
+        *,
+        on_token: Callable[[str], None] | None = None,
+        language: str | None = None,
+        session_id: str | None = None,
+    ) -> AgentTurnResult:
+        import httpx  # noqa: PLC0415
+
+        user_content = text
+        if self._voice_hint:
+            user_content = f"{text}\n\n[Voice channel — {self._voice_hint}]"
+
+        payload = {
+            "user_id": "mdk-voice-demo",
+            "agent_id": self._agent_id,
+            "session_id": session_id or self._session_id,
+            "message": user_content,
+        }
+        headers = {
+            "x-api-key": self._api_key,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream, application/x-ndjson, application/json",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                async with client.stream(
+                    "POST",
+                    "https://agent-prod.studio.lyzr.ai/v3/inference/stream/",
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = (await resp.aread()).decode(errors="replace")
+                        return AgentTurnResult(
+                            status="error",
+                            error=AgentTurnError(message=f"{resp.status_code}: {body[:500]}"),
+                        )
+
+                    collected: list[str] = []
+                    # Auto-detect the streaming format by inspecting chunks.
+                    # Lyzr may use SSE ("data: ..."), newline-delimited JSON,
+                    # or plain text streaming. We handle all three.
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        text_chunk = ""
+
+                        # SSE format: "data: ..." lines
+                        if line.startswith("data:"):
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(data)
+                                # OpenAI-compat SSE shape
+                                if "choices" in obj:
+                                    delta = obj["choices"][0].get("delta", {})
+                                    text_chunk = delta.get("content", "")
+                                # Lyzr native shape
+                                elif "response" in obj:
+                                    text_chunk = obj["response"]
+                                elif "content" in obj:
+                                    text_chunk = obj["content"]
+                                elif "chunk" in obj:
+                                    text_chunk = obj["chunk"]
+                                # Surface extras if present
+                                if self.on_extras is not None:
+                                    extras: dict[str, Any] = {}
+                                    for f in ("citations", "sources", "metadata"):
+                                        if f in obj and obj[f]:
+                                            extras[f] = obj[f]
+                                    if extras:
+                                        try:
+                                            self.on_extras(extras)
+                                        except Exception:  # noqa: BLE001
+                                            pass
+                            except json.JSONDecodeError:
+                                # Plain text after "data: " prefix
+                                text_chunk = data
+
+                        # Newline-delimited JSON (no "data:" prefix)
+                        elif line.startswith("{"):
+                            try:
+                                obj = json.loads(line)
+                                text_chunk = (
+                                    obj.get("response", "")
+                                    or obj.get("content", "")
+                                    or obj.get("chunk", "")
+                                    or obj.get("text", "")
+                                )
+                                # Check for done signal
+                                if obj.get("done") is True and not text_chunk:
+                                    break
+                            except json.JSONDecodeError:
+                                text_chunk = line
+
+                        # Plain text streaming — each line IS a chunk
+                        else:
+                            text_chunk = line
+
+                        if text_chunk:
+                            collected.append(text_chunk)
+                            if on_token is not None:
+                                on_token(text_chunk)
+
+                    answer = "".join(collected).strip()
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return AgentTurnResult(
+                status="error",
+                error=AgentTurnError(message=str(exc) or exc.__class__.__name__),
+            )
+
+        if not answer:
+            return AgentTurnResult(
+                status="error",
+                error=AgentTurnError(message="Empty response from Lyzr streaming endpoint"),
+            )
+
+        return AgentTurnResult(status="ok", text=answer)
+
+
 def _lyzr_agent_id() -> str | None:
     """Read the Lyzr agent_id from env or ~/.mdk_lyzr_agent_id."""
     aid = os.environ.get("LYZR_AGENT_ID")
@@ -561,21 +733,21 @@ def _build_agent(
 ) -> object:
     """Build an AgentTurn for the chosen tier.
 
-    Lyzr exposes an OpenAI-compatible streaming endpoint at
-    ``/v4/chat/completions`` (Bearer auth, SSE deltas, ``model=agent_id``), so
-    we point :class:`OpenAIChatAgent` at it. That gets us **token streaming +
-    sentence-by-sentence TTS** for the Lyzr tier instead of the buffered
-    ``/v3/inference/chat/`` (which made the live phone call feel slow). Same
-    code path, two backends — that is the framework-neutral seam paying off.
+    The ``lyzr`` tier uses Lyzr's native ``/v3/inference/stream/`` endpoint
+    with ``x-api-key`` header auth. This is the officially documented Lyzr
+    streaming API and avoids the 403 permission issues that the OpenAI-compat
+    ``/v4/chat/completions`` shim (Bearer auth) sometimes returns for BYOK
+    agents. Token streaming feeds the sentence-by-sentence TTS pipeline just
+    like the OpenAI Chat path — same latency benefit.
 
-    The agent's own system prompt is configured in Lyzr Studio, so we don't
-    send ours when talking to Lyzr (``send_system=False``).
+    The agent's own system prompt is configured in Lyzr Studio, so we append
+    a voice-context cue to the user message instead of overriding it.
     """
     # Lyzr agents in Studio are typically configured to produce structured,
     # multi-section chat output (headers, bullet lists, citations). That reads
     # terribly aloud. We don't touch the operator's system prompt — we just
     # append a voice-context cue to the user turn so the model knows to
-    # reshape the answer for spoken delivery. Same hint used for both /v4 and
+    # reshape the answer for spoken delivery. Same hint used for streaming and
     # the SDK paths. Adjust to taste; leave empty to disable.
     _LYZR_VOICE_HINT = (
         "please respond conversationally in 1-3 short sentences suitable for "
@@ -587,19 +759,23 @@ def _build_agent(
         # BYOK: prefer the user-supplied lyzr_api_key; else env.
         key = lyzr_api_key or os.environ.get("LYZR_API_KEY")
         agent_id = (lyzr_agent_id or _lyzr_agent_id() or "").strip()
+        log.info(
+            "build_agent(lyzr): agent_id=%s key_source=%s key_len=%d",
+            (agent_id or "—")[:8],
+            "byok" if lyzr_api_key else ("env" if key else "none"),
+            len(key) if key else 0,
+        )
         if key and agent_id:
             try:
-                return OpenAIChatAgent(
-                    model=agent_id,
-                    base_url="https://agent-prod.studio.lyzr.ai/v4",
+                return LyzrV3StreamAgent(
+                    agent_id=agent_id,
                     api_key=key,
-                    send_system=False,
+                    voice_hint=_LYZR_VOICE_HINT,
                     on_tool_call=on_tool_call,
                     on_extras=on_extras,
-                    voice_hint=_LYZR_VOICE_HINT,
                 )
             except Exception as exc:  # noqa: BLE001 - any Lyzr setup failure → fallback
-                log.warning("Lyzr unavailable, falling back to OpenAI Chat: %s", exc)
+                log.warning("Lyzr streaming unavailable, falling back to OpenAI Chat: %s", exc)
         else:
             log.warning(
                 "Lyzr selected but %s missing — falling back to OpenAI Chat",
@@ -1863,12 +2039,14 @@ async def twilio_voice(ws: WebSocket) -> None:
     # Apply the playground's last-pushed config so the phone uses the same
     # agent / voice / hedge / budget the browser demo is currently set to.
     session_holder: list[Session] = [_apply_twilio_config(Session())]
+    _s = session_holder[0]
     log.info(
-        "twilio: new session agent=%s/%s tts=%s voice=%s",
-        session_holder[0].agent_tier,
-        (session_holder[0].lyzr_agent_id or "—")[:8],
-        session_holder[0].tts_tier,
-        (session_holder[0].voice_id or "default")[:24],
+        "twilio: new session agent=%s/%s tts=%s voice=%s byok_lyzr=%s",
+        _s.agent_tier,
+        (_s.lyzr_agent_id or "—")[:8],
+        _s.tts_tier,
+        (_s.voice_id or "default")[:24],
+        bool(_s.user_keys.get("lyzr")),
     )
     resumed_call_sid: list[str | None] = [None]
 
