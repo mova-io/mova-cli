@@ -15723,7 +15723,12 @@ def build_app(
         # Derive the WS URL from the incoming request's host.
         host = request.headers.get("host", request.url.hostname or "localhost")
         # Use wss:// if the request came over HTTPS, ws:// otherwise.
-        scheme = "wss" if request.url.scheme == "https" else "ws"
+        # Behind a reverse proxy (Azure Container Apps, nginx, etc.) the
+        # proxy terminates TLS and forwards plain HTTP internally, so
+        # request.url.scheme is "http" even though the client connected
+        # over HTTPS.  X-Forwarded-Proto carries the original scheme.
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        scheme = "wss" if proto == "https" else "ws"
         stream_url = f"{scheme}://{host}/api/v1/agents/{name}/call/twilio/stream"
 
         twiml = (
