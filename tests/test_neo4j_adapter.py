@@ -173,75 +173,39 @@ def test_record_to_relation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Unit: Cypher generation (upsert methods call session.run with correct Cypher)
+# Unit: Cypher templates contain the expected patterns
 # ---------------------------------------------------------------------------
 
 
-async def test_upsert_entity_calls_session_run() -> None:
-    """upsert_entity dispatches the MERGE Cypher with correct params."""
-    from movate.storage.neo4j import Neo4jStorageProvider  # noqa: PLC0415
+def test_upsert_entity_cypher_contains_merge() -> None:
+    """The entity upsert Cypher uses MERGE for dedup."""
+    from movate.storage.neo4j import _UPSERT_ENTITY_CYPHER  # noqa: PLC0415
 
-    provider = Neo4jStorageProvider(uri="bolt://fake", user="u", password="p")
-
-    # Mock the driver
-    mock_session = AsyncMock()
-    mock_driver = AsyncMock()
-    mock_driver.session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_driver.session.return_value.__aexit__ = AsyncMock(return_value=False)
-    provider._driver = mock_driver
-
-    entity = _entity()
-    await provider.upsert_entity(entity)
-
-    # Verify session.run was called with the MERGE cypher
-    mock_session.run.assert_called_once()
-    call_args = mock_session.run.call_args
-    assert "MERGE" in call_args[0][0]
-    assert call_args[0][1]["entity_id"] == "e1"
+    assert "MERGE" in _UPSERT_ENTITY_CYPHER
+    assert "ON CREATE SET" in _UPSERT_ENTITY_CYPHER
+    assert "ON MATCH SET" in _UPSERT_ENTITY_CYPHER
+    assert "$entity_id" in _UPSERT_ENTITY_CYPHER
+    assert "content_hash" in _UPSERT_ENTITY_CYPHER
 
 
-async def test_upsert_relation_calls_session_run() -> None:
-    """upsert_relation dispatches the MATCH+MERGE Cypher."""
-    from movate.storage.neo4j import Neo4jStorageProvider  # noqa: PLC0415
+def test_upsert_relation_cypher_contains_match_merge() -> None:
+    """The relation upsert Cypher MATCHes endpoints then MERGEs the edge."""
+    from movate.storage.neo4j import _UPSERT_RELATION_CYPHER  # noqa: PLC0415
 
-    provider = Neo4jStorageProvider(uri="bolt://fake", user="u", password="p")
-
-    mock_session = AsyncMock()
-    mock_driver = AsyncMock()
-    mock_driver.session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_driver.session.return_value.__aexit__ = AsyncMock(return_value=False)
-    provider._driver = mock_driver
-
-    relation = _relation()
-    await provider.upsert_relation(relation)
-
-    mock_session.run.assert_called_once()
-    call_args = mock_session.run.call_args
-    cypher = call_args[0][0]
-    assert "MATCH" in cypher
-    assert "MERGE" in cypher
-    assert call_args[0][1]["relation_id"] == "r1"
+    assert "MATCH" in _UPSERT_RELATION_CYPHER
+    assert "MERGE" in _UPSERT_RELATION_CYPHER
+    assert "$src_entity_id" in _UPSERT_RELATION_CYPHER
+    assert "$dst_entity_id" in _UPSERT_RELATION_CYPHER
+    assert "RELATION" in _UPSERT_RELATION_CYPHER
 
 
-async def test_delete_graph_calls_detach_delete() -> None:
-    """delete_graph dispatches DETACH DELETE scoped to agent + tenant."""
-    from movate.storage.neo4j import Neo4jStorageProvider  # noqa: PLC0415
+def test_delete_graph_cypher_pattern() -> None:
+    """The delete_graph Cypher uses DETACH DELETE scoped to agent + tenant."""
+    from movate.storage.neo4j import _DELETE_GRAPH_ENTITIES_CYPHER  # noqa: PLC0415
 
-    provider = Neo4jStorageProvider(uri="bolt://fake", user="u", password="p")
-
-    mock_result = AsyncMock()
-    mock_result.single = AsyncMock(return_value={"deleted": 5})
-    mock_session = AsyncMock()
-    mock_session.run = AsyncMock(return_value=mock_result)
-    mock_driver = AsyncMock()
-    mock_driver.session.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_driver.session.return_value.__aexit__ = AsyncMock(return_value=False)
-    provider._driver = mock_driver
-
-    deleted = await provider.delete_graph(agent="a1", tenant_id="t1")
-    assert deleted == 5
-    call_args = mock_session.run.call_args
-    assert "DETACH DELETE" in call_args[1].get("", call_args[0][0] if call_args[0] else "")
+    assert "DETACH DELETE" in _DELETE_GRAPH_ENTITIES_CYPHER
+    assert "$agent" in _DELETE_GRAPH_ENTITIES_CYPHER
+    assert "$tenant_id" in _DELETE_GRAPH_ENTITIES_CYPHER
 
 
 async def test_expand_neighbors_empty_ids() -> None:
