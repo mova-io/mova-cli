@@ -42,31 +42,44 @@ BUILTIN_CONNECTORS: dict[str, dict[str, Any]] = {
     },
     "msgraph": {
         "module": "movate.connectors.msgraph",
+        "skills": [
             "msgraph-user-create",
             "msgraph-user-resetpassword",
             "msgraph-license-assign",
+        ],
         "env_vars": ["MSGRAPH_ACCESS_TOKEN", "MSGRAPH_TENANT_ID"],
         "description": (
             "Microsoft Graph API -- user provisioning, password reset, license assignment."
+        ),
+    },
     "workday": {
         "module": "movate.connectors.workday",
+        "skills": [
             "workday-worker-get",
             "workday-worker-create",
             "workday-timeoff-balance",
+        ],
         "env_vars": ["WORKDAY_ACCESS_TOKEN", "WORKDAY_BASE_URL"],
         "description": ("Workday HCM API -- worker lookup, onboarding, time-off balance."),
+    },
     "salesforce": {
         "module": "movate.connectors.salesforce",
+        "skills": [
             "salesforce-account-get",
             "salesforce-case-create",
             "salesforce-contact-search",
+        ],
         "env_vars": ["SALESFORCE_ACCESS_TOKEN", "SALESFORCE_INSTANCE_URL"],
         "description": ("Salesforce REST API -- account lookup, case creation, contact search."),
+    },
     "sap": {
         "module": "movate.connectors.sap",
+        "skills": [
             "sap-employee-get",
             "sap-purchaseorder-create",
+        ],
         "env_vars": ["SAP_API_KEY", "SAP_BASE_URL"],
+        "description": (
             "SAP S/4HANA OData API -- business partner lookup, purchase order creation."
         ),
     },
