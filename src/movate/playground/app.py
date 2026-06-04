@@ -1132,7 +1132,7 @@ def _voice_client_for_session() -> VoiceWSClient | None:
     return VoiceWSClient(runtime_url=cfg.runtime_url, agent=agent_name, token=cfg.api_key)
 
 
-async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:  # noqa: PLR0912
+async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
     """Consume one voice turn off ``ws``, streaming text into ``msg`` + playing TTS.
 
     Item 3 — partial-transcript display:
