@@ -712,7 +712,7 @@ class LyzrV3StreamAgent:
                 error=AgentTurnError(message="Empty response from Lyzr streaming endpoint"),
             )
 
-        return AgentTurnResult(status="ok", text=answer)
+        return AgentTurnResult(status="ok", answer_text=answer)
 
 
 def _lyzr_agent_id() -> str | None:
