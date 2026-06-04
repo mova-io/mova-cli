@@ -82,6 +82,9 @@ class MetricsObserver:
         self.speculations_committed = 0
         self.speculations_cancelled = 0
         self.speculation_head_start_ms_total = 0
+        # Mid-stream failover outcomes (batch 2, #211): how often a provider
+        # failed mid-stream and the composite transparently switched.
+        self.midstream_failovers: Counter[str] = Counter()
 
     def on_event(self, event: str, /, **fields: Any) -> None:
         self.events[event] += 1
@@ -93,8 +96,11 @@ class MetricsObserver:
             self.engines[str(fields.get("provider", ""))] += 1
             if fields.get("escalated"):
                 self.escalations += 1
-        elif event == "failover":
-            self.failovers[str(fields.get("from", ""))] += 1
+        elif event in ("failover", "midstream_failover"):
+            provider = str(fields.get("from") or fields.get("provider", ""))
+            self.failovers[provider] += 1
+            # Track mid-stream failovers separately for operability (#211).
+            self.midstream_failovers[provider] += event == "midstream_failover"
         elif event == "circuit_open":
             self.circuit_open[str(fields.get("provider", ""))] += 1
         elif event == "retry":
@@ -106,7 +112,11 @@ class MetricsObserver:
         elif event == "audio_gated":
             self.silence_frames_dropped += int(fields.get("dropped", 0))
             self.silence_frames_kept += int(fields.get("kept", 0))
-        elif event == "speculation_started":
+        elif event in ("speculation_started", "speculation_committed", "speculation_cancelled"):
+            self._record_speculation(event, fields)
+
+    def _record_speculation(self, event: str, fields: dict[str, Any]) -> None:
+        if event == "speculation_started":
             self.speculations_started += 1
         elif event == "speculation_committed":
             self.speculations_committed += 1
@@ -131,6 +141,7 @@ class MetricsObserver:
         self.speculations_committed = 0
         self.speculations_cancelled = 0
         self.speculation_head_start_ms_total = 0
+        self.midstream_failovers.clear()
 
     def speculation_snapshot(self) -> dict[str, Any]:
         """Just the speculative-kickoff outcomes + the derived A/B metrics.
@@ -167,6 +178,7 @@ class MetricsObserver:
             "silence_frames_dropped": self.silence_frames_dropped,
             "silence_frames_kept": self.silence_frames_kept,
             "speculation": self.speculation_snapshot(),
+            "midstream_failovers": dict(self.midstream_failovers),
         }
 
 
