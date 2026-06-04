@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.6.3.16"
+version = "2026.6.3.18"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -476,6 +476,9 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # skills_cmd search/info/validate each have branchy filter+render pipelines;
 # extracting branches would obscure the linear operator-facing control flow.
 "src/movate/cli/skills_cmd.py" = ["PLR0912"]
+# _handle_uploads has one branch per UploadOutcome; RUF001 fires on the
+# Unicode info-source emoji (ℹ️) which is intentional operator-facing text.
+"src/movate/playground/app.py" = ["PLR0912", "RUF001"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 

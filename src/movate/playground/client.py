@@ -13,6 +13,7 @@ Keep this dependency-light — only ``httpx`` (already in the
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,11 @@ from typing import Any
 import httpx
 
 from movate.playground.sse import StreamEvent, iter_sse_events
+
+
+def _request_id() -> str:
+    """Generate a unique ``X-Request-Id`` for playground → runtime tracing (#220)."""
+    return f"pg-{uuid.uuid4().hex[:12]}"
 
 
 @dataclass
@@ -49,7 +55,13 @@ class PlaygroundClientConfig:
 
 
 class PlaygroundClient:
-    """Thin async client over httpx for the playground's needs."""
+    """Thin async client over httpx for the playground's needs.
+
+    #220: every request carries an ``X-Request-Id`` header so operators can
+    correlate playground requests to runtime traces. The request_id is also
+    stored on the instance as :attr:`last_request_id` so error messages in
+    the UI can include it.
+    """
 
     def __init__(self, config: PlaygroundClientConfig) -> None:
         self._config = config
@@ -61,6 +73,13 @@ class PlaygroundClient:
             timeout=httpx.Timeout(config.timeout_s),
             headers=headers,
         )
+        self.last_request_id: str = ""
+
+    def _rid_headers(self) -> dict[str, str]:
+        """Build an ``X-Request-Id`` header dict and stash the id (#220)."""
+        rid = _request_id()
+        self.last_request_id = rid
+        return {"X-Request-Id": rid}
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -69,7 +88,7 @@ class PlaygroundClient:
         """Return the runtime's agent catalog as a list of
         ``{name, version, description, input_schema, output_schema}``
         dicts. Reads ``GET /api/v1/agents``."""
-        resp = await self._client.get("/api/v1/agents")
+        resp = await self._client.get("/api/v1/agents", headers=self._rid_headers())
         resp.raise_for_status()
         data = resp.json()
         # The /api/v1/agents endpoint returns
@@ -80,7 +99,7 @@ class PlaygroundClient:
         """Return full agent detail (including resolved input + output
         schemas, prompt path, contexts, skills). Reads
         ``GET /api/v1/agents/{name}``."""
-        resp = await self._client.get(f"/api/v1/agents/{name}")
+        resp = await self._client.get(f"/api/v1/agents/{name}", headers=self._rid_headers())
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
@@ -100,6 +119,7 @@ class PlaygroundClient:
         resp = await self._client.post(
             f"/api/v1/agents/{agent}/runs",
             json={"input": input_data},
+            headers=self._rid_headers(),
         )
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
@@ -120,7 +140,7 @@ class PlaygroundClient:
         HTTP error is surfaced so a genuinely broken runtime is loud.
         """
         try:
-            resp = await self._client.get("/api/v1/capabilities")
+            resp = await self._client.get("/api/v1/capabilities", headers=self._rid_headers())
         except httpx.HTTPError:
             return None
         if resp.status_code == httpx.codes.NOT_FOUND:
@@ -138,7 +158,9 @@ class PlaygroundClient:
         the ``{session_id, ...}`` envelope; subsequent turns go via
         :meth:`submit_session_message`.
         """
-        resp = await self._client.post("/api/v1/sessions", json={"agent": agent})
+        resp = await self._client.post(
+            "/api/v1/sessions", json={"agent": agent}, headers=self._rid_headers()
+        )
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
@@ -159,6 +181,7 @@ class PlaygroundClient:
         resp = await self._client.post(
             f"/api/v1/sessions/{session_id}/messages",
             json={"input": input_data},
+            headers=self._rid_headers(),
         )
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
@@ -189,7 +212,7 @@ class PlaygroundClient:
         run's duration; the caller renders tokens into a ``cl.Message``
         as they land.
         """
-        headers = {"Accept": "text/event-stream"}
+        headers = {"Accept": "text/event-stream", **self._rid_headers()}
         async with self._client.stream(
             "POST",
             f"/api/v1/agents/{agent}/runs/stream",
@@ -204,7 +227,7 @@ class PlaygroundClient:
     async def get_job(self, job_id: str) -> dict[str, Any]:
         """Fetch the current state of a job (queued / running /
         success / failed / etc.). Reads ``GET /jobs/{job_id}``."""
-        resp = await self._client.get(f"/jobs/{job_id}")
+        resp = await self._client.get(f"/jobs/{job_id}", headers=self._rid_headers())
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
@@ -212,7 +235,7 @@ class PlaygroundClient:
     async def get_run(self, run_id: str) -> dict[str, Any]:
         """Fetch a completed run's full result (output + metrics).
         Reads ``GET /runs/{run_id}``."""
-        resp = await self._client.get(f"/runs/{run_id}")
+        resp = await self._client.get(f"/runs/{run_id}", headers=self._rid_headers())
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
@@ -274,6 +297,7 @@ class PlaygroundClient:
         resp = await self._client.post(
             f"/api/v1/agents/{agent}/kb",
             files=multipart_files,
+            headers=self._rid_headers(),
         )
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
@@ -299,7 +323,7 @@ class PlaygroundClient:
         payload: dict[str, Any] = {"agent": agent}
         if title:
             payload["title"] = title
-        resp = await self._client.post("/api/v1/threads", json=payload)
+        resp = await self._client.post("/api/v1/threads", json=payload, headers=self._rid_headers())
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
@@ -316,7 +340,7 @@ class PlaygroundClient:
         params: dict[str, Any] = {"limit": limit}
         if agent is not None:
             params["agent"] = agent
-        resp = await self._client.get("/api/v1/threads", params=params)
+        resp = await self._client.get("/api/v1/threads", params=params, headers=self._rid_headers())
         resp.raise_for_status()
         data = resp.json()
         return list(data.get("threads") or [])
@@ -333,7 +357,9 @@ class PlaygroundClient:
         ``include_runs=False`` to skip the history scan when the
         client only needs metadata."""
         params = {"include_runs": "true" if include_runs else "false"}
-        resp = await self._client.get(f"/api/v1/threads/{thread_id}", params=params)
+        resp = await self._client.get(
+            f"/api/v1/threads/{thread_id}", params=params, headers=self._rid_headers()
+        )
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
@@ -354,6 +380,7 @@ class PlaygroundClient:
         resp = await self._client.post(
             f"/api/v1/threads/{thread_id}/messages",
             json={"input": input_data},
+            headers=self._rid_headers(),
         )
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
@@ -382,7 +409,9 @@ class PlaygroundClient:
             payload["dimensions"] = dimensions
         if user_id is not None:
             payload["user_id"] = user_id
-        resp = await self._client.post(f"/runs/{run_id}/feedback", json=payload)
+        resp = await self._client.post(
+            f"/runs/{run_id}/feedback", json=payload, headers=self._rid_headers()
+        )
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result

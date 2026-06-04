@@ -67,6 +67,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+import uuid
 from typing import Any
 
 # Chainlit is an optional dependency (``[playground]`` extra). Import
@@ -106,7 +108,13 @@ from movate.playground.targets import (
     PlaygroundTarget,
     decode_targets,
 )
-from movate.playground.uploads import UploadOutcome, UploadStore, adapt_upload
+from movate.playground.uploads import (
+    UploadOutcome,
+    UploadStore,
+    adapt_upload,
+    configured_max_upload_mb,
+    configured_mime_allowlist,
+)
 from movate.playground.voice import (
     VoiceNotEnabledError,
     VoiceWSClient,
@@ -133,12 +141,24 @@ _K_FEEDBACK_SUBMITTED = "feedback_submitted"
 # per-turn chunk counter lets on_audio_end skip a no-audio recording.
 _K_VOICE_CLIENT = "voice_client"
 _K_VOICE_CHUNKS = "voice_chunks"
+# #220: timestamp of last capability fetch — used for staleness detection.
+_K_CAPS_FETCHED_AT = "caps_fetched_at"
+# #220: the target config (for bearer refresh on 401).
+_K_TARGET_CONFIG = "target_config"
 
 # Configured targets for multi-target mode, decoded ONCE at import from the
 # env var the CLI launcher sets (:data:`TARGETS_ENV_VAR`). Empty list →
 # single-runtime mode (the original behavior): no chat-profile picker, the
 # client is built from MDK_PLAYGROUND_RUNTIME_URL / _API_KEY as before.
 _TARGETS: list[PlaygroundTarget] = decode_targets(os.environ.get(TARGETS_ENV_VAR))
+
+# #218: upload hardening — resolve env-configurable limits ONCE at import.
+_UPLOAD_MAX_MB: int = configured_max_upload_mb()
+_UPLOAD_MIME_ALLOWLIST: frozenset[str] = configured_mime_allowlist()
+
+# #220: capability staleness threshold (seconds). When capabilities are older
+# than this, re-fetch on the next on_message and surface changes.
+_CAPS_STALENESS_S: float = 300.0  # 5 minutes
 
 
 def _targets_by_name() -> dict[str, PlaygroundTarget]:
@@ -325,6 +345,7 @@ async def _init_session() -> tuple[PlaygroundClient, RuntimeCapabilities]:
     if target is not None:
         client = _client_from_target(target)
         cl.user_session.set(_K_TARGET, target.name)
+        cl.user_session.set(_K_TARGET_CONFIG, target)
     else:
         client = _client_from_env()
     cl.user_session.set(_K_CLIENT, client)
@@ -334,6 +355,7 @@ async def _init_session() -> tuple[PlaygroundClient, RuntimeCapabilities]:
         raw_caps = None
     caps = parse_capabilities(raw_caps)
     cl.user_session.set(_K_CAPS, caps)
+    cl.user_session.set(_K_CAPS_FETCHED_AT, time.monotonic())
     cl.user_session.set(_K_CONVO, ConversationState())
     cl.user_session.set(_K_UPLOADS, UploadStore())
     # Item 1: connection monitor — probe the runtime on each turn.
@@ -588,6 +610,9 @@ async def _handle_uploads(message: cl.Message) -> None:
     reference the document. Images are held but noted as a deferred
     (text-only v1) capability. Each file gets an "Add to agent's KB
     permanently" action so RAG testing can persist it.
+
+    #218 upload hardening: MIME-type validation, configurable size limit,
+    and progress indication via an "uploading..." status message.
     """
     elements = [e for e in (message.elements or []) if getattr(e, "path", None)]
     if not elements:
@@ -604,19 +629,34 @@ async def _handle_uploads(message: cl.Message) -> None:
         ).send()
         elements = elements[: caps.max_upload_count]
 
+    # #218: use the playground's own configurable upload ceiling (the
+    # minimum of the env-configured limit and the runtime-advertised cap).
+    effective_max_mb = min(_UPLOAD_MAX_MB, caps.max_upload_mb)
+
     for el in elements:
         # ``path`` is guaranteed non-None by the filter above; bind it to a
         # str local so the open()/basename calls are type-clean.
         path = str(el.path)
         name = getattr(el, "name", None) or os.path.basename(path)
+
+        # #218: progress indication — show "uploading..." while processing.
+        progress = cl.Message(content=f"⏳ Processing **{name}**...")
+        await progress.send()
+
         try:
             with open(path, "rb") as fh:
                 content = fh.read()
         except OSError as exc:
-            await cl.Message(content=f"❌ Could not read {name!r}: {exc}").send()
+            progress.content = f"❌ Could not read {name!r}: {exc}"
+            await progress.update()
             continue
 
-        doc = adapt_upload(name, content, max_size_mb=caps.max_upload_mb)
+        doc = adapt_upload(
+            name,
+            content,
+            max_size_mb=effective_max_mb,
+            mime_allowlist=_UPLOAD_MIME_ALLOWLIST,
+        )
         store.add(doc)
 
         if doc.outcome == UploadOutcome.EXTRACTED:
@@ -630,23 +670,32 @@ async def _handle_uploads(message: cl.Message) -> None:
             )
         elif doc.outcome == UploadOutcome.EMPTY:
             msg = f"📎 **{name}** parsed but contained no text."
-        elif doc.outcome == UploadOutcome.TOO_LARGE:
-            msg = f"⚠ **{name}** — {doc.note}."
+        elif doc.outcome in {UploadOutcome.TOO_LARGE, UploadOutcome.MIME_REJECTED}:
+            msg = f"⚠️ **{name}** — {doc.note}."
         elif doc.outcome == UploadOutcome.UNSUPPORTED:
-            msg = f"⚠ **{name}** — unsupported file type; skipped."
+            msg = f"⚠️ **{name}** — unsupported file type; skipped."
         else:  # PARSE_FAILED
             msg = f"❌ **{name}** — {doc.note}."
 
-        ingestable = doc.outcome not in {UploadOutcome.TOO_LARGE, UploadOutcome.UNSUPPORTED}
+        rejected = doc.outcome in {
+            UploadOutcome.TOO_LARGE,
+            UploadOutcome.UNSUPPORTED,
+            UploadOutcome.MIME_REJECTED,
+        }
+        ingestable = not rejected
         # Stash the bytes so the persist action can forward them without a
         # re-read (the temp file may be gone by the time it's clicked).
-        cl.user_session.set(f"upload_bytes::{name}", content)
+        if ingestable:
+            cl.user_session.set(f"upload_bytes::{name}", content)
+
+        # Update the progress message with the outcome.
+        progress.content = msg
 
         # --persist-uploads: auto-ingest into the agent's KB. Otherwise
         # offer the opt-in action button (text docs + images via OCR —
         # the runtime's OCR may differ from the local parser).
         if ingestable and _auto_persist_uploads():
-            await cl.Message(content=msg).send()
+            await progress.update()
             await _ingest_to_kb(name, content)
             continue
         actions = []
@@ -659,7 +708,8 @@ async def _handle_uploads(message: cl.Message) -> None:
                     tooltip="Ingest this file into the agent's knowledge base for RAG",
                 )
             )
-        await cl.Message(content=msg, actions=actions).send()
+        progress.actions = actions
+        await progress.update()
 
 
 async def _ingest_to_kb(filename: str, content: bytes) -> None:
@@ -765,6 +815,62 @@ async def _check_connection() -> None:
         await cl.Message(content=slow_banner(monitor.last_duration_s)).send()
 
 
+async def _maybe_refresh_capabilities() -> None:
+    """#220: re-fetch capabilities if older than the staleness threshold.
+
+    When the runtime is redeployed mid-session its capabilities may change
+    (new features, removed features, updated limits). Rather than force the
+    operator to reload, we transparently re-detect on a timer. If the new
+    capabilities differ from the stored ones, a notice is surfaced.
+    """
+    fetched_at: float | None = cl.user_session.get(_K_CAPS_FETCHED_AT)
+    if fetched_at is not None and (time.monotonic() - fetched_at) < _CAPS_STALENESS_S:
+        return  # still fresh
+    client: PlaygroundClient | None = cl.user_session.get(_K_CLIENT)
+    if client is None:
+        return
+    old_caps: RuntimeCapabilities | None = cl.user_session.get(_K_CAPS)
+    try:
+        raw_caps = await client.get_capabilities()
+    except Exception:
+        raw_caps = None
+    new_caps = parse_capabilities(raw_caps)
+    cl.user_session.set(_K_CAPS, new_caps)
+    cl.user_session.set(_K_CAPS_FETCHED_AT, time.monotonic())
+    # Notify the operator only when something actually changed.
+    if old_caps is not None and old_caps != new_caps:
+        await cl.Message(content="ℹ️ Runtime updated — new capabilities detected.").send()
+
+
+async def _refresh_bearer_and_retry(
+    client: PlaygroundClient,
+) -> PlaygroundClient:
+    """#220: re-resolve the bearer token after a 401 and build a fresh client.
+
+    In the hosted multi-target playground the token may expire mid-session.
+    Rather than crashing, we re-read the token from the target config (which
+    may have been refreshed externally — e.g. via ``mdk auth login``), build
+    a fresh :class:`PlaygroundClient`, and store it in the session. Returns
+    the new client so the caller can retry.
+    """
+    target: PlaygroundTarget | None = cl.user_session.get(_K_TARGET_CONFIG)
+    if target is not None:
+        # Re-read the key from the env (it may have been rotated).
+        fresh_key = os.environ.get(target.key_env) or target.api_key
+        new_client = PlaygroundClient(
+            PlaygroundClientConfig(runtime_url=target.url, api_key=fresh_key)
+        )
+    else:
+        new_client = _client_from_env()
+    cl.user_session.set(_K_CLIENT, new_client)
+    return new_client
+
+
+def _make_request_id() -> str:
+    """Generate a unique X-Request-Id for a playground → runtime call (#220)."""
+    return f"pg-{uuid.uuid4().hex[:12]}"
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     """Handle one operator turn: uploads → run → render → feedback.
@@ -776,6 +882,9 @@ async def on_message(message: cl.Message) -> None:
     """
     # Item 1: probe the runtime before each turn; surface status changes.
     await _check_connection()
+
+    # #220: capability staleness — re-detect if the last fetch is stale.
+    await _maybe_refresh_capabilities()
 
     # Process any attached files first so this turn's context includes them.
     await _handle_uploads(message)
@@ -846,13 +955,41 @@ async def on_message(message: cl.Message) -> None:
             documents=docs,
         )
     except TimeoutError as exc:
-        thinking.content = f"⏱ Timed out: {exc}"
+        rid = getattr(client, "last_request_id", "")
+        rid_hint = f" (request_id: `{rid}`)" if rid else ""
+        thinking.content = f"⏱ Timed out: {exc}{rid_hint}"
         await thinking.update()
         return
     except Exception as exc:
-        thinking.content = f"❌ Run failed: {type(exc).__name__}: {exc}"
-        await thinking.update()
-        return
+        # #220: bearer refresh on 401 — re-resolve the token and retry once.
+        if _is_auth_error(exc):
+            await cl.Message(content="🔄 Re-authenticating...").send()
+            client = await _refresh_bearer_and_retry(client)
+            backend = select_backend(caps, client)
+            cl.user_session.set(_K_BACKEND, backend)
+            try:
+                result = await backend.send_turn(
+                    agent=agent_name,
+                    user_message=display_text,
+                    base_input=base_input,
+                    state=convo,
+                    documents=docs,
+                )
+            except Exception as retry_exc:
+                rid = getattr(client, "last_request_id", "")
+                rid_hint = f" (request_id: `{rid}`)" if rid else ""
+                thinking.content = (
+                    f"❌ Run failed after re-auth: "
+                    f"{type(retry_exc).__name__}: {retry_exc}{rid_hint}"
+                )
+                await thinking.update()
+                return
+        else:
+            rid = getattr(client, "last_request_id", "")
+            rid_hint = f" (request_id: `{rid}`)" if rid else ""
+            thinking.content = f"❌ Run failed: {type(exc).__name__}: {exc}{rid_hint}"
+            await thinking.update()
+            return
 
     text = result.output_text or "_(no output)_"
     if result.status not in {"success", "unknown"}:
