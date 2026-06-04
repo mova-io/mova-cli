@@ -13,6 +13,7 @@ Keep this dependency-light — only ``httpx`` (already in the
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,90 @@ from typing import Any
 import httpx
 
 from movate.playground.sse import StreamEvent, iter_sse_events
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Retry helpers (#216 — runtime-down resilience)
+# ---------------------------------------------------------------------------
+
+#: Default retry schedule (seconds between attempts). Three retries with
+#: exponential backoff: 1s → 2s → 4s. Generous enough for a cold-start;
+#: tight enough to keep the UI responsive.
+DEFAULT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+#: HTTP status codes that are retryable (transient server errors).
+_RETRYABLE_STATUS: frozenset[int] = frozenset({500, 502, 503, 504})
+
+#: Rate-limit status code.
+_RATE_LIMITED_STATUS: int = 429
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """True when ``exc`` is a transient failure worth retrying.
+
+    Covers ``httpx.HTTPStatusError`` with a 5xx status and any
+    ``httpx.ConnectError`` / ``httpx.ConnectTimeout`` (runtime not
+    reachable).  Rate-limit (429) is handled separately by the caller.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _RETRYABLE_STATUS
+    # ConnectError, ConnectTimeout, RemoteProtocolError — all transient.
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError))
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """True when ``exc`` is an HTTP 429 Too Many Requests."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == _RATE_LIMITED_STATUS
+    return False
+
+
+def _is_quota_exceeded(exc: Exception) -> bool:
+    """True when the 429 response body signals a hard quota limit (not a
+    transient rate-limit window).
+
+    The convention is ``{"error": {"code": "quota_exceeded", ...}}`` in
+    the response body, though we also accept a top-level ``code`` field.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    if exc.response.status_code != _RATE_LIMITED_STATUS:
+        return False
+    try:
+        body = exc.response.json()
+    except Exception:
+        return False
+    code = ""
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            code = str(err.get("code", ""))
+        if not code:
+            code = str(body.get("code", ""))
+    return code.lower() in {"quota_exceeded", "quota-exceeded"}
+
+
+def _parse_retry_after(exc: Exception) -> float | None:
+    """Extract the ``Retry-After`` header value in seconds, or ``None``.
+
+    Handles both the ``delta-seconds`` (integer) and HTTP-date forms
+    defined by RFC 9110 §10.2.3. Returns ``None`` when the header is
+    absent or unparseable — the caller falls back to its own backoff.
+    """
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    raw = exc.response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    raw = raw.strip()
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    # HTTP-date parsing is complex; for the playground use-case a numeric
+    # Retry-After is the expected case. Fall back to None for dates.
+    return None
 
 
 @dataclass
@@ -47,6 +132,32 @@ class PlaygroundClientConfig:
     finish. Beyond this, the UI shows a timeout card with a link to
     the job's admin page."""
 
+    retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS
+    """Exponential-backoff schedule for retryable errors (#216).
+    Length = max attempts; each entry = seconds to wait before the
+    next attempt.  ``(1.0, 2.0, 4.0)`` → up to 3 retries."""
+
+
+@dataclass(frozen=True)
+class RetryOutcome:
+    """Result of a retry-aware request (#216).
+
+    ``ok`` is True when the request ultimately succeeded; ``attempts``
+    counts how many times the request was tried (1 = first attempt
+    succeeded, no retry). On failure, ``error`` holds the final
+    exception for the caller to surface in the UI.
+
+    ``rate_limited`` and ``quota_exceeded`` are set on 429 responses so
+    the UI can show differentiated messages.
+    """
+
+    ok: bool
+    attempts: int
+    error: Exception | None = None
+    rate_limited: bool = False
+    quota_exceeded: bool = False
+    retry_after_s: float | None = None
+
 
 class PlaygroundClient:
     """Thin async client over httpx for the playground's needs."""
@@ -64,6 +175,80 @@ class PlaygroundClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    # ------------------------------------------------------------------
+    # Retry-aware request wrapper (#216)
+    # ------------------------------------------------------------------
+
+    async def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        on_retry: Any | None = None,
+        **kwargs: Any,
+    ) -> tuple[httpx.Response, RetryOutcome]:
+        """Issue an HTTP request with exponential-backoff retry on transient errors.
+
+        ``on_retry`` is an optional async callback ``(attempt: int, delay: float) -> None``
+        that the caller can use to update the UI (e.g. "retrying...").
+
+        Returns ``(response, outcome)`` on success.  On exhausted retries the
+        outcome has ``ok=False`` and the response is ``None`` (access via
+        ``outcome.error`` instead).
+
+        Rate-limit (429) handling:
+        * Quota-exceeded → immediate failure, no retry (hard limit).
+        * Transient rate-limit → honor ``Retry-After``, then retry.
+        """
+        delays = self._config.retry_delays
+        last_exc: Exception | None = None
+        for attempt in range(1, len(delays) + 2):  # +2: first try + len(delays) retries
+            try:
+                resp = await self._client.request(method, url, **kwargs)
+                resp.raise_for_status()
+                return resp, RetryOutcome(ok=True, attempts=attempt)
+            except Exception as exc:
+                last_exc = exc
+                # 429 — differentiate quota-exceeded from transient rate-limit.
+                if _is_rate_limited(exc):
+                    if _is_quota_exceeded(exc):
+                        return None, RetryOutcome(  # type: ignore[return-value]
+                            ok=False,
+                            attempts=attempt,
+                            error=exc,
+                            rate_limited=True,
+                            quota_exceeded=True,
+                        )
+                    # Transient rate-limit: honor Retry-After header.
+                    retry_after = _parse_retry_after(exc)
+                    fallback = delays[attempt - 1] if attempt <= len(delays) else delays[-1]
+                    wait = retry_after if retry_after is not None else fallback
+                    if on_retry is not None:
+                        await on_retry(attempt, wait)
+                    await asyncio.sleep(wait)
+                    continue
+                # Retryable 5xx / connection error — backoff and retry.
+                if _is_retryable(exc) and attempt <= len(delays):
+                    delay = delays[attempt - 1]
+                    if on_retry is not None:
+                        await on_retry(attempt, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                # Non-retryable error (4xx, etc.) — fail immediately.
+                return None, RetryOutcome(  # type: ignore[return-value]
+                    ok=False,
+                    attempts=attempt,
+                    error=exc,
+                    rate_limited=_is_rate_limited(exc),
+                    retry_after_s=_parse_retry_after(exc) if _is_rate_limited(exc) else None,
+                )
+        # Exhausted retries.
+        return None, RetryOutcome(  # type: ignore[return-value]
+            ok=False,
+            attempts=len(delays) + 1,
+            error=last_exc,
+        )
 
     async def list_agents(self) -> list[dict[str, Any]]:
         """Return the runtime's agent catalog as a list of
@@ -163,6 +348,29 @@ class PlaygroundClient:
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
+
+    async def submit_run_with_retry(
+        self,
+        *,
+        agent: str,
+        input_data: dict[str, Any],
+        on_retry: Any | None = None,
+    ) -> tuple[dict[str, Any] | None, RetryOutcome]:
+        """Submit an agent run with exponential-backoff retry (#216).
+
+        Wraps ``POST /api/v1/agents/{name}/runs`` through
+        :meth:`_request_with_retry`. Returns ``(result_dict, outcome)``
+        — the caller checks ``outcome.ok`` before reading the dict.
+        """
+        resp, outcome = await self._request_with_retry(
+            "POST",
+            f"/api/v1/agents/{agent}/runs",
+            json={"input": input_data},
+            on_retry=on_retry,
+        )
+        if outcome.ok and resp is not None:
+            return resp.json(), outcome
+        return None, outcome
 
     async def stream_run(
         self,
@@ -386,3 +594,50 @@ class PlaygroundClient:
         resp.raise_for_status()
         result: dict[str, Any] = resp.json()
         return result
+
+    async def post_feedback_with_retry(
+        self,
+        *,
+        run_id: str,
+        score: int,
+        comment: str | None = None,
+        dimensions: dict[str, float] | None = None,
+        user_id: str | None = None,
+        max_retries: int = 1,
+        retry_delay_s: float = 2.0,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Persist feedback with a single retry on failure (#219).
+
+        Returns ``(result_dict, success)``.  On final failure,
+        ``result_dict`` is ``None`` and ``success`` is ``False`` — the
+        caller shows a "try again" message and leaves buttons active.
+        """
+        payload: dict[str, Any] = {"score": score}
+        if comment is not None:
+            payload["comment"] = comment
+        if dimensions is not None:
+            payload["dimensions"] = dimensions
+        if user_id is not None:
+            payload["user_id"] = user_id
+
+        for attempt in range(1, max_retries + 2):
+            try:
+                resp = await self._client.post(f"/runs/{run_id}/feedback", json=payload)
+                resp.raise_for_status()
+                return resp.json(), True
+            except Exception:
+                if attempt <= max_retries:
+                    logger.warning(
+                        "Feedback POST failed (attempt %d/%d), retrying in %.1fs...",
+                        attempt,
+                        max_retries + 1,
+                        retry_delay_s,
+                    )
+                    await asyncio.sleep(retry_delay_s)
+                    continue
+                logger.warning(
+                    "Feedback POST failed after %d attempt(s).",
+                    attempt,
+                )
+                return None, False
+        return None, False  # unreachable but satisfies type checker

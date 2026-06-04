@@ -79,6 +79,8 @@ def _register_skill_backends() -> None:
         importlib.import_module("movate.core.skill_backend.mcp")
     with contextlib.suppress(ImportError):
         importlib.import_module("movate.core.skill_backend.agent")
+    with contextlib.suppress(ImportError):
+        importlib.import_module("movate.core.skill_backend.exec")
 
 
 console = Console()

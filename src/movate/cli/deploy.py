@@ -2528,6 +2528,16 @@ def _print_next_steps(
         "  [bold]traces:[/bold] App Insights → Transaction search "
         "[dim](paste a run's trace_id)[/dim]"
     )
+
+    # Knowledge graph — always shown since graph is now built by default on
+    # every KB ingest.  The ``mdk graph serve`` command lets operators browse
+    # interactively; the REST endpoint is the programmatic path.
+    err.print(
+        f"  [bold]graph:[/bold]  [cyan]{bin_name} graph serve "
+        f"--target {target_name}[/cyan] "
+        "[dim](populate with: mdk kb ingest <agent> <path>)[/dim]"
+    )
+
     # ADR 031 D1 — when Langfuse is configured for this shell, point operators
     # at the LLM-observability dashboard too (one click from a run's trace_id).
     # Omitted when Langfuse isn't wired (no host/keys) → no behavior change.

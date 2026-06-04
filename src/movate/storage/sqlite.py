@@ -1149,6 +1149,30 @@ _MIGRATIONS = [
     "ALTER TABLE runs ADD COLUMN audio_duration_s REAL",
     "ALTER TABLE runs ADD COLUMN stt_cost_usd REAL",
     "ALTER TABLE runs ADD COLUMN tts_cost_usd REAL",
+    # ADR 052: tool registry descriptors. Additive + idempotent
+    # (CREATE TABLE IF NOT EXISTS); no backfill needed.
+    (
+        "CREATE TABLE IF NOT EXISTS tool_descriptors ("
+        "  name TEXT NOT NULL,"
+        "  version TEXT NOT NULL,"
+        "  scope TEXT NOT NULL DEFAULT 'tenant',"
+        "  tenant_id TEXT NOT NULL,"
+        "  project_id TEXT,"
+        "  description TEXT NOT NULL DEFAULT '',"
+        "  tags TEXT NOT NULL DEFAULT '[]',"
+        "  input_schema TEXT NOT NULL DEFAULT '{}',"
+        "  output_schema TEXT NOT NULL DEFAULT '{}',"
+        "  backend TEXT NOT NULL DEFAULT '{}',"
+        "  credentials_ref TEXT,"
+        "  governance TEXT NOT NULL DEFAULT '{}',"
+        "  owner TEXT,"
+        "  created_at TEXT,"
+        "  updated_at TEXT,"
+        "  PRIMARY KEY (name, version, scope, tenant_id)"
+        ")"
+    ),
+    "CREATE INDEX IF NOT EXISTS idx_tool_descriptors_scope_tenant "
+    "ON tool_descriptors(scope, tenant_id)",
 ]
 
 
@@ -5143,6 +5167,116 @@ class SqliteProvider:
             judge_yaml_updated=judge_updated,
         )
 
+    # ------------------------------------------------------------------
+    # Tool registry (ADR 052)
+    # ------------------------------------------------------------------
+
+    async def save_tool_descriptor(self, descriptor: Any) -> None:
+        conn = self._db
+        await conn.execute(
+            "INSERT OR REPLACE INTO tool_descriptors"
+            " (name, version, scope, tenant_id, project_id, description,"
+            "  tags, input_schema, output_schema, backend, credentials_ref,"
+            "  governance, owner, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                descriptor.name,
+                descriptor.version,
+                descriptor.scope if isinstance(descriptor.scope, str) else descriptor.scope.value,
+                descriptor.tenant_id,
+                descriptor.project_id,
+                descriptor.description,
+                json.dumps(descriptor.tags),
+                json.dumps(descriptor.input_schema),
+                json.dumps(descriptor.output_schema),
+                (
+                    descriptor.backend.model_dump_json()
+                    if hasattr(descriptor.backend, "model_dump_json")
+                    else json.dumps(descriptor.backend)
+                ),
+                descriptor.credentials_ref,
+                (
+                    descriptor.governance.model_dump_json()
+                    if hasattr(descriptor.governance, "model_dump_json")
+                    else json.dumps(descriptor.governance)
+                ),
+                descriptor.owner,
+                descriptor.created_at.isoformat() if descriptor.created_at else None,
+                descriptor.updated_at.isoformat() if descriptor.updated_at else None,
+            ),
+        )
+        await conn.commit()
+
+    async def get_tool_descriptor(
+        self,
+        name: str,
+        version: str | None,
+        scope: str,
+        tenant_id: str,
+    ) -> Any | None:
+        conn = self._db
+        if version is not None:
+            cursor = await conn.execute(
+                "SELECT * FROM tool_descriptors"
+                " WHERE name = ? AND version = ? AND scope = ? AND tenant_id = ?",
+                (name, version, scope, tenant_id),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT * FROM tool_descriptors"
+                " WHERE name = ? AND scope = ? AND tenant_id = ?"
+                " ORDER BY updated_at DESC LIMIT 1",
+                (name, scope, tenant_id),
+            )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _row_to_tool_descriptor(row)
+
+    async def list_tool_descriptors(
+        self,
+        scope: str | None,
+        tenant_id: str,
+        tags: list[str] | None,
+    ) -> list[Any]:
+        conn = self._db
+        if scope is not None:
+            cursor = await conn.execute(
+                "SELECT * FROM tool_descriptors"
+                " WHERE scope = ? AND tenant_id = ?"
+                " ORDER BY name ASC, version DESC",
+                (scope, tenant_id),
+            )
+        else:
+            # List across all scopes visible to the tenant.
+            cursor = await conn.execute(
+                "SELECT * FROM tool_descriptors"
+                " WHERE tenant_id = ? OR scope = 'movate'"
+                " ORDER BY name ASC, version DESC",
+                (tenant_id,),
+            )
+        rows = await cursor.fetchall()
+        result = [_row_to_tool_descriptor(r) for r in rows]
+        if tags:
+            result = [d for d in result if all(t in d.tags for t in tags)]
+        return result
+
+    async def delete_tool_descriptor(
+        self,
+        name: str,
+        version: str,
+        scope: str,
+        tenant_id: str,
+    ) -> bool:
+        conn = self._db
+        cursor = await conn.execute(
+            "DELETE FROM tool_descriptors"
+            " WHERE name = ? AND version = ? AND scope = ? AND tenant_id = ?",
+            (name, version, scope, tenant_id),
+        )
+        await conn.commit()
+        return bool(cursor.rowcount > 0)
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()
@@ -5644,6 +5778,54 @@ def _loads_trace_context(raw: object) -> dict[str, str]:
         if isinstance(decoded, dict):
             return {str(k): str(v) for k, v in decoded.items()}
     return {}
+
+
+def _row_to_tool_descriptor(row: Any) -> Any:
+    """Convert a sqlite row to a ToolDescriptor."""
+    from movate.core.tool_registry.models import (  # noqa: PLC0415
+        ToolBackendConfig,
+        ToolDescriptor,
+        ToolGovernance,
+    )
+
+    def _json_or_raw(val: Any) -> Any:
+        return json.loads(val) if isinstance(val, str) else val
+
+    backend_data = _json_or_raw(row["backend"])
+    governance_data = _json_or_raw(row["governance"])
+    tags_data = _json_or_raw(row["tags"])
+    input_schema_data = _json_or_raw(row["input_schema"])
+    output_schema_data = _json_or_raw(row["output_schema"])
+
+    created_at = None
+    if row["created_at"]:
+        created_at = datetime.fromisoformat(row["created_at"])
+    updated_at = None
+    if row["updated_at"]:
+        updated_at = datetime.fromisoformat(row["updated_at"])
+
+    backend = ToolBackendConfig(**backend_data) if isinstance(backend_data, dict) else backend_data
+    governance = (
+        ToolGovernance(**governance_data) if isinstance(governance_data, dict) else governance_data
+    )
+
+    return ToolDescriptor(
+        name=row["name"],
+        version=row["version"],
+        scope=row["scope"],
+        description=row["description"],
+        tags=tags_data,
+        input_schema=input_schema_data,
+        output_schema=output_schema_data,
+        backend=backend,
+        credentials_ref=row["credentials_ref"],
+        governance=governance,
+        owner=row["owner"],
+        created_at=created_at,
+        updated_at=updated_at,
+        tenant_id=row["tenant_id"],
+        project_id=_opt_col(row, "project_id"),
+    )
 
 
 def _first_of_month_utc() -> datetime:

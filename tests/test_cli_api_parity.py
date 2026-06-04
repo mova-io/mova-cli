@@ -201,6 +201,11 @@ CONTROL_PLANE_ONLY: dict[str, str] = {
     # a local static check. It takes no ``--target`` so strict enumeration
     # already excludes it — documented here for the same belt-and-braces.
     "workflow lint": "local YAML compile/lint; no runtime HTTP call",
+    # ``workflow history`` and ``workflow replay`` (#697) query the Temporal
+    # workflow engine directly — they are control-plane ops tooling, not
+    # runtime API verbs.
+    "workflow history": "queries Temporal workflow history; control-plane only",
+    "workflow replay": "replays a Temporal workflow execution; control-plane only",
 }
 
 # ---------------------------------------------------------------------------

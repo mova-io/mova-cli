@@ -212,13 +212,19 @@ async def test_failover_tts_fails_over_to_next_provider() -> None:
 
 
 async def test_failover_tts_no_failover_after_audio_started() -> None:
-    # Once the first provider emitted audio, a mid-stream failure is re-raised
-    # rather than re-synthesized on another provider (no double audio).
+    # Mid-stream failover (#694/#211): if the first provider has emitted fewer
+    # than _TTS_COMMIT_FRAMES (3) audio frames, the composite silently degrades
+    # to the next provider instead of raising.  _MidStreamFailTTS yields 1 frame
+    # then dies — below the commit threshold, so the turn completes on the
+    # fallback and a midstream_failover event is emitted (not RuntimeError).
+    obs = _RecordingObserver()
     good = FakeTTS()
-    fo = FailoverTTS([_MidStreamFailTTS(), good], sleep=_no_sleep)
-    with pytest.raises(RuntimeError):
-        await _collect_audio(fo)
-    assert good.spoken == []  # the fallback was never invoked
+    fo = FailoverTTS([_MidStreamFailTTS(), good], observer=obs, sleep=_no_sleep)
+    result = await _collect_audio(fo)
+    # The fallback provider was invoked and produced the final audio.
+    assert good.spoken != []
+    assert b"speak this" in result
+    assert "midstream_failover" in obs.names() or "failover" in obs.names()
 
 
 async def test_failover_tts_auth_is_terminal() -> None:

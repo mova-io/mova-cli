@@ -794,16 +794,16 @@ async def on_message(message: cl.Message) -> None:
             await cl.Message(content="Pick an agent first from the buttons above.").send()
         return
 
-    # Item 1: if the runtime was found unreachable, show a friendly retry
-    # hint rather than letting the run attempt fail with a raw exception.
+    # #216: if the ConnectionMonitor says DISCONNECTED, skip retries and
+    # show the failure immediately -- no point burning backoff time when the
+    # runtime is confirmed down. Point the operator to ``mdk doctor``.
     conn_state: ConnectionState = cl.user_session.get(_K_CONN_STATE, ConnectionState.CONNECTED)
     if conn_state == ConnectionState.DISCONNECTED:
         await cl.Message(
             content=(
-                "⚠️ Runtime unreachable — retrying...\n\n"
-                "The last reachability check found the runtime unreachable. "
-                "Your message will be sent once the runtime is back — "
-                "or try again in a moment."
+                "❌ Runtime unavailable. Check `mdk doctor` or try again later.\n\n"
+                "_The last reachability check found the runtime unreachable "
+                "-- skipping retries to avoid a long wait._"
             )
         ).send()
         return
@@ -834,7 +834,7 @@ async def on_message(message: cl.Message) -> None:
         )
         return
 
-    # Buffered path (today's behavior) — through the backend.
+    # Buffered path -- through the backend, with 429/quota UX (#216).
     thinking = cl.Message(content="")
     await thinking.send()
     try:
@@ -850,6 +850,22 @@ async def on_message(message: cl.Message) -> None:
         await thinking.update()
         return
     except Exception as exc:
+        from movate.playground.client import (  # noqa: PLC0415
+            _is_quota_exceeded,
+            _is_rate_limited,
+            _parse_retry_after,
+        )
+
+        # #216: differentiate retryable vs. non-retryable errors.
+        if _is_rate_limited(exc):
+            if _is_quota_exceeded(exc):
+                thinking.content = "⚠️ Quota exceeded for this key. Contact your admin."
+            else:
+                retry_after = _parse_retry_after(exc)
+                wait_hint = f" -- waiting {retry_after:.0f}s" if retry_after else ""
+                thinking.content = f"⚠️ Rate limited{wait_hint}. Please try again shortly."
+            await thinking.update()
+            return
         thinking.content = f"❌ Run failed: {type(exc).__name__}: {exc}"
         await thinking.update()
         return
@@ -901,6 +917,7 @@ async def _run_streaming(
     run_id: str | None = None
     final_output: dict[str, Any] = {}
     status = "success"
+    truncated = False
     try:
         async for event in client.stream_run(agent=agent_name, input_data=run_input):
             if event.is_token:
@@ -915,11 +932,20 @@ async def _run_streaming(
                 err_text = event.data.get("message", "stream error")
                 await msg.stream_token(f"\n\n❌ {err_text}")
     except Exception as exc:
-        await msg.stream_token(f"\n\n❌ Stream failed: {type(exc).__name__}: {exc}")
-        await msg.update()
-        return
+        # #217: streaming-drop resilience -- finalize partial content with a
+        # truncation marker rather than leaving a half-rendered bubble.
+        truncated = True
+        logger.warning(
+            "SSE stream dropped mid-response (%s: %s); finalizing partial message.",
+            type(exc).__name__,
+            exc,
+        )
+        if collected:
+            await msg.stream_token("\n\n⚠️ [response truncated -- connection lost]")
+        else:
+            msg.content = "⚠️ [response truncated -- connection lost before any content arrived]"
 
-    # Reconstruct the assistant text — prefer the terminal output's text
+    # Reconstruct the assistant text -- prefer the terminal output's text
     # field; fall back to the concatenated token deltas. Record the
     # completed exchange (user + assistant) now that the turn is done.
     assistant_text = extract_output_text(final_output) or "".join(collected)
@@ -928,6 +954,9 @@ async def _run_streaming(
     cl.user_session.set("last_run_id", run_id)
     if status not in {"success", "unknown"} and not collected:
         msg.content = f"⚠ status `{status}`"
+    # #217: mark truncated messages visually.
+    if truncated and collected:
+        msg.content = f"⚠️ _(truncated)_ {msg.content}" if msg.content else "⚠️ _(truncated)_"
     msg.actions = _feedback_actions(run_id)
     await msg.update()
 
@@ -966,7 +995,7 @@ def _voice_client_for_session() -> VoiceWSClient | None:
     return VoiceWSClient(runtime_url=cfg.runtime_url, agent=agent_name, token=cfg.api_key)
 
 
-async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
+async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:  # noqa: PLR0912
     """Consume one voice turn off ``ws``, streaming text into ``msg`` + playing TTS.
 
     Item 3 — partial-transcript display:
@@ -998,42 +1027,49 @@ async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
             composed = f"{composed}\n\n`{latency_badge}`" if composed else f"`{latency_badge}`"
         return composed
 
-    async for frame in ws.iter_turn():
-        if frame.is_partial:
-            # Item 3: stream each partial into the live message so the operator
-            # sees STT progress in real-time (caption-style, updated in-place).
-            _last_caption = f"(listening) {frame.text}"
-            msg.content = _compose(_last_caption)
-            await msg.update()
-        elif frame.is_final_transcript:
-            # Final transcript replaces the last partial caption.
-            transcript = frame.text
-            _last_caption = f"you said: “{transcript}”"
-            msg.content = _compose(_last_caption)
-            await msg.update()
-        elif frame.is_agent_token:
-            # Item 3: use stream_token for agent tokens so the answer feels live.
-            answer_parts.append(frame.text)
-            # Rebuild full content to keep the transcript header visible.
-            caption = _last_caption if _last_caption else ""
-            msg.content = _compose(caption)
-            await msg.update()
-        elif frame.is_audio:
-            audio_frames.append(frame)
-        elif frame.is_latency:
-            # Latency badge frame — capture it; the terminal update renders it
-            # under the answer (and the next compose pins it live).
-            latency_badge = frame.latency_badge
-            msg.content = _compose(_last_caption if _last_caption else "")
-            await msg.update()
-        elif frame.is_error:
-            stage = frame.data.get("stage", "?")
-            message = frame.data.get("message", "voice error")
-            answer_parts.append(f"\n\n❌ voice {stage} error: {message}")
-            msg.content = _compose(_last_caption if _last_caption else "")
-            await msg.update()
-        elif frame.is_done:
-            run_id = frame.data.get("run_id") or None
+    try:
+        async for frame in ws.iter_turn():
+            if frame.is_partial:
+                _last_caption = f"(listening) {frame.text}"
+                msg.content = _compose(_last_caption)
+                await msg.update()
+            elif frame.is_final_transcript:
+                transcript = frame.text
+                _last_caption = f"you said: “{transcript}”"
+                msg.content = _compose(_last_caption)
+                await msg.update()
+            elif frame.is_agent_token:
+                answer_parts.append(frame.text)
+                caption = _last_caption if _last_caption else ""
+                msg.content = _compose(caption)
+                await msg.update()
+            elif frame.is_audio:
+                audio_frames.append(frame)
+            elif frame.is_latency:
+                latency_badge = frame.latency_badge
+                msg.content = _compose(_last_caption if _last_caption else "")
+                await msg.update()
+            elif frame.is_error:
+                stage = frame.data.get("stage", "?")
+                message = frame.data.get("message", "voice error")
+                answer_parts.append(f"\n\n❌ voice {stage} error: {message}")
+                msg.content = _compose(_last_caption if _last_caption else "")
+                await msg.update()
+            elif frame.is_done:
+                run_id = frame.data.get("run_id") or None
+    except Exception as exc:
+        # #217: voice TTS stream drop -- finalize partial content.
+        logger.warning(
+            "Voice WS dropped mid-turn (%s: %s); preserving partial content.",
+            type(exc).__name__,
+            exc,
+        )
+        if answer_parts:
+            answer_parts.append("\n\n⚠️ [response truncated -- connection lost]")
+        else:
+            answer_parts.append("⚠️ [voice stream dropped -- connection lost]")
+        msg.content = _compose(_last_caption if _last_caption else "")
+        await msg.update()
 
     # Play the synthesized audio back (one element, auto-played). Falls through
     # silently when TTS produced nothing (e.g. a degraded text-only turn).
@@ -1238,24 +1274,24 @@ async def on_feedback(action: cl.Action) -> None:
         if text:
             comment_text = text
 
-    try:
-        user = cl.user_session.get("user")
-        user_id = (
-            getattr(user, "identifier", None)
-            if user is not None
-            else os.environ.get("MDK_PLAYGROUND_USER_ID", "playground-anonymous")
-        )
-        await client.post_feedback(
-            run_id=run_id,
-            score=score,
-            comment=comment_text,
-            user_id=user_id,
-        )
-    except Exception as exc:
-        # Item 4: on failure, surface a toast-style message and leave buttons active.
-        await cl.Message(
-            content=f"⚠️ Feedback couldn't be saved — try again. ({type(exc).__name__}: {exc})"
-        ).send()
+    user = cl.user_session.get("user")
+    user_id = (
+        getattr(user, "identifier", None)
+        if user is not None
+        else os.environ.get("MDK_PLAYGROUND_USER_ID", "playground-anonymous")
+    )
+    # #219: feedback delivery robustness -- retry once on failure.
+    _fb_result, _fb_ok = await client.post_feedback_with_retry(
+        run_id=run_id,
+        score=score,
+        comment=comment_text,
+        user_id=user_id,
+        max_retries=1,
+        retry_delay_s=2.0,
+    )
+    if not _fb_ok:
+        # On failure after retry: leave buttons active so the user can try again.
+        await cl.Message(content="⚠️ Feedback couldn't be saved -- try again.").send()
         return
 
     # Item 4: mark this run+value as submitted (idempotency) + confirm visually.

@@ -107,6 +107,15 @@ TEMPORAL_KEY_ENV_VARS: tuple[str, ...] = (
     "TEMPORAL_NAMESPACE",
     "TEMPORAL_TLS_CERT",
     "TEMPORAL_TLS_KEY",
+    # Set via ``mdk auth login workday`` / ``salesforce`` / ``sap`` (or by hand)
+    # and consumed by the HTTP skill backend when dispatching connector skills.
+    # Each connector needs a bearer token/API key + a routing URL.
+    "WORKDAY_ACCESS_TOKEN",
+    "WORKDAY_BASE_URL",
+    "SALESFORCE_ACCESS_TOKEN",
+    "SALESFORCE_INSTANCE_URL",
+    "SAP_API_KEY",
+    "SAP_BASE_URL",
 )
 
 # Every env var the credentials store should autoload. Union of the

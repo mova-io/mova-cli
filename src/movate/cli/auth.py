@@ -865,12 +865,14 @@ _PROVIDERS_PROMPT_NAME = {
     # has its own multi-value login path (like telegram). DISTINCT from the
     # `azure` (Azure OpenAI) provider above — different Azure resource + key.
     "azure-speech": "Azure Speech (voice STT + TTS)",
-    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). ServiceNow
-    # needs two values (API key + instance URL) — handled via a dedicated
-    # multi-value code path like telegram/azure-speech. Microsoft Graph
-    # likewise needs two values (access token + tenant ID).
+    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). Each needs
+    # two values (API key/token + routing URL) — handled via a dedicated
+    # multi-value code path like telegram/azure-speech.
     "servicenow": "ServiceNow (enterprise connector)",
     "msgraph": "Microsoft Graph (enterprise connector)",
+    "workday": "Workday (enterprise connector)",
+    "salesforce": "Salesforce (enterprise connector)",
+    "sap": "SAP (enterprise connector)",
     # Temporal is the durable workflow backend (ADR 054). Per-workflow opt-in
     # via ``workflow.yaml: runtime: temporal``. Needs a host + namespace, and
     # optionally a TLS cert/key pair (Temporal Cloud only — self-hosted skips
@@ -905,7 +907,7 @@ _VOICE_PROVIDERS = frozenset({"azure-speech"})
 # Enterprise connector providers that need TWO values — same multi-value
 # pattern as telegram/azure-speech. Dispatched to their own code paths
 # in login(). Kept out of _PROVIDER_TO_ENV_VAR for the same reason.
-_CONNECTOR_PROVIDERS = frozenset({"servicenow", "msgraph"})
+_CONNECTOR_PROVIDERS = frozenset({"servicenow", "msgraph", "workday", "salesforce", "sap"})
 
 # Temporal (ADR 054) needs 2-4 values (host + namespace, plus optional TLS
 # cert/key for Temporal Cloud). Same multi-value pattern as telegram /
@@ -927,7 +929,8 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "[bold]deepgram[/bold], [bold]cartesia[/bold], "
             "[bold]elevenlabs[/bold], "
             "[bold]azure-speech[/bold] (voice), "
-            "[bold]servicenow[/bold], [bold]msgraph[/bold] (connectors), "
+            "[bold]servicenow[/bold], [bold]msgraph[/bold], "
+            "[bold]workday[/bold], [bold]salesforce[/bold], [bold]sap[/bold] (connectors), "
             "[bold]telegram[/bold], or "
             "[bold]temporal[/bold] (durable workflow backend). "
             "Omit to pick interactively."
@@ -2787,7 +2790,7 @@ def _login_connector(provider: str, *, key: str | None, save_to: str) -> None:
     """Guided enterprise-connector setup (ADR 052 Phase 1 — Action Fabric).
 
     Each connector needs TWO values — an API key/token and a routing value
-    (instance URL or tenant ID). Same multi-value pattern as azure-speech.
+    (instance URL, base URL, or tenant ID). Same multi-value pattern as azure-speech.
     No live verification: the HTTP skill backend surfaces a clear error at
     first use if the credentials are wrong.
     """
@@ -2823,6 +2826,44 @@ def _login_connector(provider: str, *, key: str | None, save_to: str) -> None:
                 "[bold]Directory.ReadWrite.All[/bold] permissions\n"
                 "  3. Generate a client secret and obtain an access token\n"
                 "  4. Note your tenant ID from the app registration overview[/dim]"
+            ),
+        },
+        "workday": {
+            "key_var": "WORKDAY_ACCESS_TOKEN",
+            "extra_var": "WORKDAY_BASE_URL",
+            "key_prompt": "Workday access token",
+            "extra_prompt": "Workday REST API base URL (e.g. https://wd3-impl-services1.workday.com)",
+            "hint_text": (
+                "[dim]Workday connector setup:\n"
+                "  1. Create an Integration System User (ISU) in Workday\n"
+                "  2. Register an API client and generate a bearer token\n"
+                "  3. Note your REST API base URL[/dim]"
+            ),
+        },
+        "salesforce": {
+            "key_var": "SALESFORCE_ACCESS_TOKEN",
+            "extra_var": "SALESFORCE_INSTANCE_URL",
+            "key_prompt": "Salesforce access token",
+            "extra_prompt": "Salesforce instance URL (e.g. https://mycompany.my.salesforce.com)",
+            "hint_text": (
+                "[dim]Salesforce connector setup:\n"
+                "  1. Create a Connected App in Setup > App Manager\n"
+                "  2. Enable OAuth and select the [bold]api[/bold] scope\n"
+                "  3. Obtain a bearer token via OAuth 2.0\n"
+                "  4. Note your instance URL from the login response[/dim]"
+            ),
+        },
+        "sap": {
+            "key_var": "SAP_API_KEY",
+            "extra_var": "SAP_BASE_URL",
+            "key_prompt": "SAP API key",
+            "extra_prompt": "SAP S/4HANA base URL (e.g. https://my-s4hana.sap-api.com)",
+            "hint_text": (
+                "[dim]SAP connector setup:\n"
+                "  1. Set up a Communication Arrangement (Cloud) or enable "
+                "OData services (on-premise)\n"
+                "  2. Create a communication user with the required authorizations\n"
+                "  3. Note your system base URL and API key[/dim]"
             ),
         },
     }
