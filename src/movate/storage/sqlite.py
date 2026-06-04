@@ -1171,8 +1171,8 @@ _MIGRATIONS = [
         "  PRIMARY KEY (name, version, scope, tenant_id)"
         ")"
     ),
-        "CREATE INDEX IF NOT EXISTS idx_tool_descriptors_scope_tenant "
-        "ON tool_descriptors(scope, tenant_id)"
+    "CREATE INDEX IF NOT EXISTS idx_tool_descriptors_scope_tenant "
+    "ON tool_descriptors(scope, tenant_id)",
 ]
 
 
