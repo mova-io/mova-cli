@@ -1790,6 +1790,7 @@ _twilio_config: dict[str, Any] = {
     "hedge_tts": False,
     "speculative": False,
     "budget_usd": None,
+    "lyzr_api_key": None,  # BYOK key from the browser session (if any)
     "updated_by": None,  # browser session_id that last pushed, for telemetry
 }
 
@@ -1797,6 +1798,10 @@ _twilio_config: dict[str, Any] = {
 def _apply_twilio_config(session: Session) -> Session:
     """Apply the playground's last-pushed Twilio config to a fresh Session."""
     cfg = _twilio_config
+    # BYOK: if the browser pushed a Lyzr key, inject it so the phone call
+    # can access the same agents the browser user selected.
+    if cfg.get("lyzr_api_key"):
+        session.set_user_keys({"lyzr": cfg["lyzr_api_key"]})
     if cfg.get("lyzr_agent_id"):
         session.set_lyzr_agent_id(cfg["lyzr_agent_id"])
     if cfg.get("agent_tier") and cfg["agent_tier"] != session.agent_tier:
@@ -2127,9 +2132,8 @@ async def voice(ws: WebSocket) -> None:
             if ev_name == "push_to_twilio":
                 # Snapshot the browser session's current settings into the
                 # module-level Twilio default. The NEXT inbound phone call
-                # will use these. Lyzr key is NOT pushed (per-session BYOK
-                # stays per-session); env-level Lyzr key is what the phone
-                # call will authenticate with.
+                # will use these — including the BYOK Lyzr key so the phone
+                # can access the same agents the browser user selected.
                 _twilio_config["agent_tier"] = session.agent_tier
                 _twilio_config["lyzr_agent_id"] = session.lyzr_agent_id
                 _twilio_config["tts_tier"] = session.tts_tier
@@ -2138,6 +2142,7 @@ async def voice(ws: WebSocket) -> None:
                 _twilio_config["hedge_tts"] = session.hedge_tts
                 _twilio_config["speculative"] = session.speculative
                 _twilio_config["budget_usd"] = session.budget_usd
+                _twilio_config["lyzr_api_key"] = session.user_keys.get("lyzr")
                 _twilio_config["updated_by"] = session.session_id
                 log.info(
                     "twilio config pushed: tier=%s tts=%s voice=%s lyzr=%s",
