@@ -29,9 +29,11 @@ from movate.credentials import CredentialsStore, autoload_credentials
 from movate.credentials.loader import (
     ALL_AUTOLOADED_ENV_VARS,
     CONNECTOR_KEY_ENV_VARS,
+    NEO4J_KEY_ENV_VARS,
     NOTIFICATION_KEY_ENV_VARS,
     OBSERVABILITY_KEY_ENV_VARS,
     PROVIDER_KEY_ENV_VARS,
+    TELEPHONY_KEY_ENV_VARS,
     TEMPORAL_KEY_ENV_VARS,
     VOICE_KEY_ENV_VARS,
 )
@@ -71,8 +73,10 @@ class TestAutoloadedRegistry:
             | set(NOTIFICATION_KEY_ENV_VARS)
             | set(OBSERVABILITY_KEY_ENV_VARS)
             | set(VOICE_KEY_ENV_VARS)
+            | set(TELEPHONY_KEY_ENV_VARS)
             | set(CONNECTOR_KEY_ENV_VARS)
             | set(TEMPORAL_KEY_ENV_VARS)
+            | set(NEO4J_KEY_ENV_VARS)
         )
         assert set(ALL_AUTOLOADED_ENV_VARS) == expected
 

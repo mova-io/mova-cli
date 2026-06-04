@@ -268,6 +268,10 @@ neo4j_mark = pytest.mark.neo4j
 
 
 @neo4j_mark
+@pytest.mark.skipif(
+    not os.environ.get("NEO4J_URI"),
+    reason="NEO4J_URI not set; skipping live Neo4j integration test",
+)
 async def test_neo4j_entity_roundtrip() -> None:
     """Upsert an entity, query it back, delete it -- round-trip on live Neo4j."""
     uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
