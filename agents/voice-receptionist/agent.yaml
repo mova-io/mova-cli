@@ -1,0 +1,39 @@
+api_version: movate/v1
+kind: Agent
+
+name: voice-receptionist
+version: 0.1.0
+description: A friendly voice receptionist for phone callers. Conversational, natural speech output.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.7
+    max_tokens: 256
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+# No schema — voice agents output free-form natural speech text.
+# The voice pipeline feeds transcribed speech as the input and
+# synthesizes the text response via TTS.
+
+timeouts:
+  call_ms: 15000
+  total_ms: 30000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+voice:
+  stt: deepgram
+  tts: cartesia
+  language: en
+  input_key: question
+
+tags:
+  - voice
+  - receptionist
+  - demo

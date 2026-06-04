@@ -51,7 +51,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import movate
 from movate.core.auth import (
@@ -15693,6 +15693,92 @@ def build_app(
             return
 
     # ------------------------------------------------------------------
+    # Twilio phone routing — configurable active agent
+    #
+    # One fixed webhook URL for Twilio: POST /api/v1/call/twilio
+    # The runtime keeps an in-memory "active voice agent" name (defaults
+    # to MDK_TWILIO_AGENT env or the first loaded agent).  A config
+    # endpoint lets callers switch it without touching Twilio console.
+    #
+    # GET  /api/v1/call/twilio/config  — read current active agent
+    # PUT  /api/v1/call/twilio/config  — set active agent {"agent":"name"}
+    # POST /api/v1/call/twilio         — Twilio webhook (routes to active)
+    # ------------------------------------------------------------------
+
+    # Initialise on first request (app.state is set after startup).
+    _twilio_active_agent_name: str | None = os.environ.get("MDK_TWILIO_AGENT")
+
+    @v1.get("/call/twilio/config", tags=["voice-v1"])
+    async def v1_call_twilio_config_get(request: Request) -> dict[str, Any]:
+        """Return the currently active voice agent for Twilio calls."""
+        nonlocal _twilio_active_agent_name
+        if _twilio_active_agent_name is None:
+            # Default to first loaded agent.
+            agents_reg: list[AgentBundle] = request.app.state.agents
+            _twilio_active_agent_name = agents_reg[0].agent.name if agents_reg else ""
+        return {"agent": _twilio_active_agent_name}
+
+    @v1.put("/call/twilio/config", tags=["voice-v1"])
+    async def v1_call_twilio_config_put(
+        request: Request,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Set the active voice agent for Twilio calls.
+
+        Body: ``{"agent": "voice-receptionist"}``
+        """
+        nonlocal _twilio_active_agent_name
+        agent_name = body.get("agent", "").strip()
+        if not agent_name:
+            raise HTTPException(status_code=400, detail="'agent' field required")
+
+        # Verify the agent exists.
+        store: StorageProvider = request.app.state.storage
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        bundle = await resolve_agent_bundle(
+            store, agent_name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            raise HTTPException(status_code=404, detail=f"Agent {agent_name!r} not found")
+
+        _twilio_active_agent_name = agent_name
+        return {"agent": _twilio_active_agent_name, "status": "active"}
+
+    @v1.post("/call/twilio", tags=["voice-v1"], response_class=Response)
+    async def v1_call_twilio_generic(request: Request) -> Response:
+        """Generic Twilio webhook — routes to the currently active agent.
+
+        Set once in Twilio console, then switch agents via
+        PUT /api/v1/call/twilio/config.
+        """
+        nonlocal _twilio_active_agent_name
+        if _twilio_active_agent_name is None:
+            agents_reg: list[AgentBundle] = request.app.state.agents
+            _twilio_active_agent_name = agents_reg[0].agent.name if agents_reg else ""
+        if not _twilio_active_agent_name:
+            return Response(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured.</Say></Response>',
+                media_type="application/xml",
+            )
+        # Redirect to the per-agent TwiML endpoint.
+        name = _twilio_active_agent_name
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        scheme = "wss" if proto == "https" else "ws"
+        stream_url = f"{scheme}://{host}/api/v1/agents/{name}/call/twilio/stream"
+
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Connect>"
+            f'<Stream url="{stream_url}" />'
+            "</Connect>"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    # ------------------------------------------------------------------
     # POST /api/v1/agents/{name}/call/twilio — TwiML webhook (ADR 074 D3/D4)
     #
     # Twilio hits this webhook when a call arrives on a configured number.
@@ -16359,6 +16445,217 @@ def build_app(
         return {"deleted": True}
 
     app.include_router(v1)
+
+    # ------------------------------------------------------------------
+    # GET / — Voice demo dashboard (inline HTML, no templates)
+    # ------------------------------------------------------------------
+    _DASHBOARD_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdk voice demo</title>
+<style>
+  :root { --bg: #0f172a; --card: #1e293b; --accent: #3b82f6;
+          --green: #22c55e; --text: #f1f5f9; --muted: #94a3b8;
+          --border: #334155; --red: #ef4444; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+         sans-serif; background: var(--bg); color: var(--text);
+         min-height: 100vh; display: flex; flex-direction: column;
+         align-items: center; padding: 2rem 1rem; }
+  .logo { font-size: 1.5rem; font-weight: 700; margin-bottom: .25rem; }
+  .logo span { color: var(--accent); }
+  .subtitle { color: var(--muted); font-size: .85rem; margin-bottom: 2rem; }
+  .card { background: var(--card); border: 1px solid var(--border);
+          border-radius: 12px; padding: 1.5rem; width: 100%;
+          max-width: 480px; margin-bottom: 1rem; }
+  .card h2 { font-size: 1rem; margin-bottom: 1rem; display: flex;
+             align-items: center; gap: .5rem; }
+  .card h2 .dot { width: 8px; height: 8px; border-radius: 50%;
+                  background: var(--green); display: inline-block; }
+  label { display: block; color: var(--muted); font-size: .8rem;
+          margin-bottom: .35rem; }
+  select, input { width: 100%; padding: .6rem .75rem; border-radius: 8px;
+                  border: 1px solid var(--border); background: var(--bg);
+                  color: var(--text); font-size: .9rem; outline: none;
+                  margin-bottom: 1rem; }
+  select:focus, input:focus { border-color: var(--accent); }
+  .btn { display: inline-flex; align-items: center; gap: .5rem;
+         padding: .6rem 1.25rem; border-radius: 8px; border: none;
+         font-size: .9rem; font-weight: 600; cursor: pointer;
+         transition: opacity .15s; }
+  .btn:hover { opacity: .85; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-green { background: var(--green); color: #fff; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .status { font-size: .8rem; margin-top: .75rem; padding: .5rem .75rem;
+            border-radius: 6px; display: none; }
+  .status.ok { display: block; background: #16a34a22; color: var(--green);
+               border: 1px solid #16a34a44; }
+  .status.err { display: block; background: #ef444422; color: var(--red);
+                border: 1px solid #ef444444; }
+  .phone-num { font-family: monospace; font-size: 1.3rem; font-weight: 700;
+               color: var(--green); margin: .5rem 0; }
+  .info { color: var(--muted); font-size: .8rem; line-height: 1.5; }
+  .info code { background: var(--bg); padding: .1rem .35rem;
+               border-radius: 4px; font-size: .75rem; }
+  .row { display: flex; gap: .75rem; align-items: end; }
+  .row > :first-child { flex: 1; }
+  .tabs { display: flex; gap: 0; margin-bottom: 0; width: 100%;
+          max-width: 480px; }
+  .tab { flex: 1; padding: .6rem; text-align: center; font-size: .85rem;
+         font-weight: 600; cursor: pointer; border: 1px solid var(--border);
+         background: var(--bg); color: var(--muted); transition: all .15s; }
+  .tab:first-child { border-radius: 8px 0 0 0; }
+  .tab:last-child { border-radius: 0 8px 0 0; }
+  .tab.active { background: var(--card); color: var(--text);
+                border-bottom-color: var(--card); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .card.tabbed { border-radius: 0 0 12px 12px; border-top: none; }
+</style>
+</head>
+<body>
+
+<div class="logo"><span>mdk</span> voice demo</div>
+<div class="subtitle">Declarative AI agent platform &mdash; voice telephony bridge</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('simple')">Simple</div>
+  <div class="tab" onclick="switchTab('advanced')">Advanced</div>
+</div>
+
+<div class="card tabbed">
+  <!-- SIMPLE TAB -->
+  <div id="tab-simple" class="panel active">
+    <h2><span class="dot" id="dot"></span> Phone Agent</h2>
+
+    <label for="agent-select">Active agent on phone</label>
+    <div class="row">
+      <select id="agent-select"><option>Loading...</option></select>
+      <button class="btn btn-green" id="sync-btn" onclick="syncAgent()">
+        Sync to Phone
+      </button>
+    </div>
+
+    <div class="phone-num" id="phone-display"></div>
+    <p class="info">
+      Callers to this number reach the selected agent via
+      Deepgram STT &rarr; Agent &rarr; Cartesia TTS.
+    </p>
+    <div class="status" id="sync-status"></div>
+  </div>
+
+  <!-- ADVANCED TAB -->
+  <div id="tab-advanced" class="panel">
+    <h2>Runtime Info</h2>
+    <label>Version</label>
+    <div id="adv-version" class="info" style="margin-bottom:.75rem">...</div>
+    <label>Agents loaded</label>
+    <div id="adv-agents" class="info" style="margin-bottom:.75rem">...</div>
+    <label>Twilio webhook (set once in Twilio console)</label>
+    <div class="info" style="margin-bottom:.75rem">
+      <code id="adv-webhook">POST /api/v1/call/twilio</code>
+    </div>
+    <label>Config endpoint</label>
+    <div class="info">
+      <code>PUT /api/v1/call/twilio/config</code> &nbsp;
+      <code>{"agent": "&lt;name&gt;"}</code>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = location.origin;
+const phoneNumber = '""" + os.environ.get("TWILIO_NUMBER", "") + """';
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    t.classList.toggle('active', (name==='simple' ? i===0 : i===1));
+  });
+  document.getElementById('tab-simple').classList.toggle('active', name==='simple');
+  document.getElementById('tab-advanced').classList.toggle('active', name==='advanced');
+}
+
+async function loadAgents() {
+  try {
+    const [agentsRes, configRes, capRes] = await Promise.all([
+      fetch(BASE + '/api/v1/agents'),
+      fetch(BASE + '/api/v1/call/twilio/config'),
+      fetch(BASE + '/api/v1/capabilities'),
+    ]);
+    const agents = await agentsRes.json();
+    const config = await configRes.json();
+    const caps = await capRes.json();
+
+    // Populate dropdown.
+    const sel = document.getElementById('agent-select');
+    sel.innerHTML = '';
+    const list = Array.isArray(agents) ? agents : (agents.agents || agents.items || []);
+    list.forEach(a => {
+      const name = typeof a === 'string' ? a : (a.name || a.agent_name || '');
+      if (!name) return;
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name;
+      if (name === config.agent) opt.selected = true;
+      sel.appendChild(opt);
+    });
+
+    // Phone number display.
+    if (phoneNumber) {
+      document.getElementById('phone-display').textContent = phoneNumber;
+    }
+
+    // Advanced tab.
+    document.getElementById('adv-version').textContent = caps.mdk_version || '?';
+    document.getElementById('adv-agents').textContent = list.map(
+      a => typeof a === 'string' ? a : a.name).join(', ');
+    document.getElementById('adv-webhook').textContent =
+      'POST ' + BASE + '/api/v1/call/twilio';
+  } catch (e) {
+    console.error('Load failed', e);
+  }
+}
+
+async function syncAgent() {
+  const btn = document.getElementById('sync-btn');
+  const status = document.getElementById('sync-status');
+  const agent = document.getElementById('agent-select').value;
+  btn.disabled = true; btn.textContent = 'Syncing...';
+  status.className = 'status'; status.style.display = 'none';
+
+  try {
+    const res = await fetch(BASE + '/api/v1/call/twilio/config', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({agent}),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      status.className = 'status ok';
+      status.textContent = 'Synced! Calls now routed to ' + data.agent;
+    } else {
+      status.className = 'status err';
+      status.textContent = data.detail || 'Sync failed';
+    }
+  } catch (e) {
+    status.className = 'status err';
+    status.textContent = 'Network error: ' + e.message;
+  }
+  btn.disabled = false; btn.textContent = 'Sync to Phone';
+}
+
+loadAgents();
+</script>
+</body>
+</html>
+"""
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def _dashboard() -> HTMLResponse:
+        return HTMLResponse(_DASHBOARD_HTML)
 
     # ------------------------------------------------------------------
     # Typed exception → HTTP code translator. AgentCreationError carries
