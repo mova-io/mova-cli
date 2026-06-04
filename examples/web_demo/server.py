@@ -1897,11 +1897,18 @@ async def twilio_voice(ws: WebSocket) -> None:
     def on_done(events: list[object]) -> None:
         lat = compute_turn_latency(events)  # type: ignore[arg-type]
         log.info("twilio turn done: %s", format_latency_badge(lat) or "(no audio)")
+        # Accumulate the full agent answer from token events so the browser
+        # mirror can display the complete response (not just latency badges).
+        answer = "".join(
+            getattr(e, "text", "") for e in events
+            if getattr(e, "kind", "") == "agent.token"
+        )
         # Also tell the live mirror so browser shows per-turn summary.
         asyncio.create_task(
             _broadcast_twilio(
                 kind="done",
                 badge=format_latency_badge(lat) or "",
+                answer=answer,
                 stt_final_ms=getattr(lat, "stt_final_ms", None),
                 agent_first_token_ms=getattr(lat, "agent_first_token_ms", None),
                 tts_first_audio_ms=getattr(lat, "tts_first_audio_ms", None),
