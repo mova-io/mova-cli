@@ -33,6 +33,15 @@ does **not** trigger that import until the class is constructed.
 
 from __future__ import annotations
 
+from movate.voice.abuse_guard import (
+    WS_CLOSE_IDLE,
+    WS_CLOSE_MAX_DURATION,
+    WS_CLOSE_TOO_MANY_SESSIONS,
+    ConcurrentSessionTracker,
+    IdleTimeoutGuard,
+    SessionDurationGuard,
+    SessionGuardConfig,
+)
 from movate.voice.adaptive import AdaptiveEndpointing
 from movate.voice.agent_turn import AgentTurn, AgentTurnError, AgentTurnResult
 from movate.voice.azure_speech import AzureNeuralTTS, AzureSpeechSTT
@@ -52,6 +61,14 @@ from movate.voice.cache import InMemoryVoiceCache, VoiceCache, cache_key, warm_c
 from movate.voice.cartesia import CartesiaTTS
 from movate.voice.cartesia_stt import CartesiaSTT
 from movate.voice.chunking import SentenceChunker
+from movate.voice.codec import (
+    UnsupportedCodecError,
+    available_codecs,
+    codec_info,
+    negotiate_codec,
+    resample,
+    transcode_to_pcm,
+)
 from movate.voice.deepgram import DeepgramSTT
 from movate.voice.deepgram_tts import DeepgramAuraTTS
 from movate.voice.doubles import FakeAgentTurn, FakeRealtime, FakeSTT, FakeTTS
@@ -96,9 +113,20 @@ from movate.voice.pipeline import (
     format_latency_badge,
     run_voice_pipeline,
 )
+from movate.voice.privacy import (
+    AudioRetentionManager,
+    RetentionPolicy,
+    privacy_capabilities,
+)
 from movate.voice.realtime_azure import AzureOpenAIRealtime
 from movate.voice.realtime_openai import OpenAIRealtime
 from movate.voice.speakify import speakify
+from movate.voice.stage_timeout import (
+    Heartbeat,
+    StageTimeoutResult,
+    StageTimeouts,
+    degradation_for_stage,
+)
 from movate.voice.stt_wrappers import ConfidenceGatedSTT, SilenceGatedSTT, warm_stt
 from movate.voice.telephony import (
     mulaw_to_pcm16,
@@ -114,24 +142,31 @@ from movate.voice.turn_detection import (
     TurnDetector,
 )
 from movate.voice.vad import frame_rms, is_silent
+from movate.voice.ws_resilience import AudioRingBuffer, VoiceSessionResumeState
 
 __all__ = [
     "DEFAULT_MANIFESTS",
     "DEFAULT_RETRY",
     "LYZR_PROVIDER_MAP",
     "LYZR_VOICE_BASE",
+    "WS_CLOSE_IDLE",
+    "WS_CLOSE_MAX_DURATION",
+    "WS_CLOSE_TOO_MANY_SESSIONS",
     "AdaptiveEndpointing",
     "AgentTurn",
     "AgentTurnError",
     "AgentTurnResult",
     "AudioChunk",
     "AudioCodec",
+    "AudioRetentionManager",
+    "AudioRingBuffer",
     "AzureNeuralTTS",
     "AzureOpenAIRealtime",
     "AzureSpeechSTT",
     "CartesiaSTT",
     "CartesiaTTS",
     "CircuitBreaker",
+    "ConcurrentSessionTracker",
     "ConfidenceGatedSTT",
     "DeepgramAuraTTS",
     "DeepgramSTT",
@@ -143,7 +178,9 @@ __all__ = [
     "FakeRealtime",
     "FakeSTT",
     "FakeTTS",
+    "Heartbeat",
     "HeuristicTurnDetector",
+    "IdleTimeoutGuard",
     "InMemoryVoiceCache",
     "LangGraphAgentTurn",
     "LyzrAgentTurn",
@@ -158,18 +195,24 @@ __all__ = [
     "RealtimeChunk",
     "RealtimeEventKind",
     "RealtimeVoiceProvider",
+    "RetentionPolicy",
     "RetryRule",
     "STTBenchItem",
     "STTBenchReport",
     "SentenceChunker",
+    "SessionDurationGuard",
+    "SessionGuardConfig",
     "SilenceGatedSTT",
     "SpeculationABVerdict",
     "SpeculationGuard",
     "SpeechToTextProvider",
+    "StageTimeoutResult",
+    "StageTimeouts",
     "StderrObserver",
     "TextToSpeechProvider",
     "TranscriptChunk",
     "TurnDetector",
+    "UnsupportedCodecError",
     "VoiceCache",
     "VoiceEvent",
     "VoiceFailureType",
@@ -177,13 +220,17 @@ __all__ = [
     "VoiceObserver",
     "VoicePipelineResult",
     "VoiceProviderError",
+    "VoiceSessionResumeState",
     "VoiceTurnLatency",
+    "available_codecs",
     "bench_stt",
     "cache_key",
     "check_lyzr_parity",
     "check_parity",
     "classify",
+    "codec_info",
     "compute_turn_latency",
+    "degradation_for_stage",
     "fetch_lyzr_voice_options",
     "format_latency_badge",
     "format_parity_report",
@@ -191,15 +238,19 @@ __all__ = [
     "is_silent",
     "manifest_for",
     "mulaw_to_pcm16",
+    "negotiate_codec",
     "pcm16_to_mulaw",
     "pcm16_to_wav",
+    "privacy_capabilities",
     "redact_pii",
+    "resample",
     "resample_pcm16",
     "run_voice_pipeline",
     "speakify",
     "speculation_ab_report",
     "telephony_inbound",
     "telephony_outbound",
+    "transcode_to_pcm",
     "voice_agent",
     "voice_agent_langgraph",
     "warm_cache",

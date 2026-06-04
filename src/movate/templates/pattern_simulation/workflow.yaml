@@ -33,6 +33,14 @@ kind: Workflow
 
 name: simulation
 version: 0.1.0
+
+# Execution runtime — picked per workflow.
+# native    = in-process (default, fast, ephemeral)
+# langgraph = export-and-execute via LangGraph (ADR 030)
+# temporal  = deterministic, durable, replayable (ADR 054)
+# Flip to `runtime: temporal` for durable multi-day execution + replay debugging.
+# runtime: native
+
 description: >
   Bounded multi-agent simulation: a fixed roster of two participants interacts
   under a supervisor for a hard-capped number of turns, terminating on a JUDGE

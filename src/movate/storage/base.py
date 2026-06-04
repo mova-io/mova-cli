@@ -26,7 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from movate.core.tool_registry.models import ToolDescriptor
 
 from movate.core.dr_backup import ImportResult
 from movate.core.eval_generator import EvalGenerationJob
@@ -2431,5 +2434,64 @@ class StorageProvider(Protocol):
         different tenant — same 404-not-403 contract as the other
         single-record getters, so a caller can't probe for the existence
         of another tenant's diagnoses."""
+
+    # ------------------------------------------------------------------
+    # Tool registry (ADR 052) -- shared, versioned, governed tool
+    # descriptors. Additive new table ``tool_descriptors``, keyed by
+    # ``(name, version, scope, tenant_id)``. Phase 1: CRUD + list/filter;
+    # the sync protocol for ``movate``-tier tools defers to a follow-up.
+    # ------------------------------------------------------------------
+
+    async def save_tool_descriptor(
+        self,
+        descriptor: ToolDescriptor,
+    ) -> None:
+        """Upsert one tool descriptor keyed by ``(name, version, scope, tenant_id)``.
+
+        Re-publishing the same ``(name, version)`` in the same scope + tenant
+        overwrites the prior row (last write wins). Used by the publish
+        endpoint and ``mdk tools publish``.
+        """
+
+    async def get_tool_descriptor(
+        self,
+        name: str,
+        version: str | None,
+        scope: str,
+        tenant_id: str,
+    ) -> ToolDescriptor | None:
+        """Fetch one tool descriptor.
+
+        ``version=None`` returns the **latest** version (newest ``updated_at``)
+        for ``(name, scope, tenant_id)``; an explicit ``version`` returns that
+        exact version. Returns ``None`` if no match -- same no-leak contract as
+        the other single-record getters.
+        """
+
+    async def list_tool_descriptors(
+        self,
+        scope: str | None,
+        tenant_id: str,
+        tags: list[str] | None,
+    ) -> list[ToolDescriptor]:
+        """List tool descriptors, optionally filtered by scope and/or tags.
+
+        ``scope=None`` lists across all scopes visible to the tenant
+        (project + tenant + movate). ``tags`` filters to descriptors
+        containing ALL specified tags. Ordered by name ASC, version DESC.
+        """
+
+    async def delete_tool_descriptor(
+        self,
+        name: str,
+        version: str,
+        scope: str,
+        tenant_id: str,
+    ) -> bool:
+        """Delete one tool descriptor by ``(name, version, scope, tenant_id)``.
+
+        Returns ``True`` if a row was deleted, ``False`` if none matched.
+        Tenant-scoped: a wrong-tenant delete is a no-op.
+        """
 
     async def close(self) -> None: ...

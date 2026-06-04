@@ -27,6 +27,14 @@ kind: Workflow
 
 name: monitor
 version: 0.1.0
+
+# Execution runtime — picked per workflow.
+# native    = in-process (default, fast, ephemeral)
+# langgraph = export-and-execute via LangGraph (ADR 030)
+# temporal  = deterministic, durable, replayable (ADR 054)
+# Flip to `runtime: temporal` for durable multi-day execution + replay debugging.
+# runtime: native
+
 description: >
   Observe a signal, gate it against a threshold, and on breach invoke an
   allowlisted action (stub). Schedule/trigger-friendly.

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>mdk graph dashboard — knowledge graph explorer</title>
+  <link rel="stylesheet" href="/static/dashboard/dashboard.css" />
+</head>
+<body>
+  <!--
+    mdk graph dashboard — hosted knowledge graph explorer (sigma.js + graphology).
+    Extends the base mdk graph viewer with: full-text entity search via the
+    runtime API, an analytics sidebar (centrality leaderboard, shortest-path
+    finder, community browser), a growth timeline sparkline, a project switcher,
+    and KB provenance view on node drill-down.
+
+    The bearer key is NEVER present in this page or in dashboard.js. The local
+    `mdk graph dashboard` process (or the ACA-hosted container) holds it and
+    proxies /api/* calls to the runtime, injecting Authorization server-side.
+  -->
+  <div id="app">
+    <header id="topbar">
+      <div class="brand">
+        <span class="logo">mdk</span>
+        <span class="title">knowledge graph</span>
+        <span id="target-badge" class="badge"></span>
+      </div>
+      <div id="project-switcher" class="project-switcher">
+        <select id="project-select" title="Switch project">
+          <option value="">loading projects...</option>
+        </select>
+      </div>
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Search entities..." autocomplete="off" spellcheck="false" />
+        <div id="search-indicator" class="search-indicator"></div>
+        <ul id="suggestions"></ul>
+      </div>
+      <div class="toolbar">
+        <label class="toggle" title="Color nodes by their type or by detected community">
+          color:
+          <select id="color-mode">
+            <option value="type">by type</option>
+            <option value="community">by community</option>
+          </select>
+        </label>
+        <label class="toggle" title="Scale node size by its degree (number of connections)">
+          <input type="checkbox" id="size-by-degree" checked /> size by degree
+        </label>
+        <label class="toggle" title="Size + color nodes by centrality computed server-side (analytics)">
+          <input type="checkbox" id="centrality-toggle" /> centrality
+          <select id="centrality-measure" title="Which centrality measure to compute">
+            <option value="degree">degree</option>
+            <option value="betweenness">betweenness</option>
+          </select>
+        </label>
+        <label class="toggle" title="Tint nodes by detected community (connected components)">
+          <input type="checkbox" id="community-toggle" /> communities
+        </label>
+        <label class="toggle" title="Fade nodes whose extraction confidence is below the threshold. 0 shows everything.">
+          min conf:
+          <input type="range" id="min-confidence" min="0" max="1" step="0.05" value="0" />
+          <span id="min-confidence-val" class="range-val">0.00</span>
+        </label>
+        <button id="replay-btn" class="toggle replay-btn" title="Clear and re-assemble the graph node-by-node">&#9654; replay growth</button>
+        <label class="toggle live" title="Stream node/edge additions as documents are ingested">
+          <input type="checkbox" id="live-toggle" /> <span class="live-dot"></span> live growth
+        </label>
+      </div>
+    </header>
+
+    <aside id="filters">
+      <h3>Node types</h3>
+      <div id="type-filters" class="type-list"></div>
+      <div class="legend-spacer"></div>
+      <h3>Stats</h3>
+      <dl id="stats">
+        <dt>nodes</dt><dd id="stat-nodes">0</dd>
+        <dt>edges</dt><dd id="stat-edges">0</dd>
+        <dt>communities</dt><dd id="stat-communities">&mdash;</dd>
+      </dl>
+
+      <div class="legend-spacer"></div>
+      <h3>Analytics</h3>
+      <div id="analytics" class="analytics">
+        <div class="analytics-row">
+          <button id="hubs-btn" class="analytics-btn" title="Rank nodes by the selected centrality measure">Top hubs</button>
+        </div>
+        <ol id="hubs-list" class="hubs-list"></ol>
+
+        <div class="analytics-sep"></div>
+        <div class="path-controls" title="Highlight the shortest path between two nodes">
+          <input id="path-from" class="path-input" type="text" placeholder="from node..." autocomplete="off" spellcheck="false" />
+          <input id="path-to" class="path-input" type="text" placeholder="to node..." autocomplete="off" spellcheck="false" />
+          <div class="analytics-row">
+            <button id="path-btn" class="analytics-btn">Shortest path</button>
+            <button id="path-clear" class="analytics-btn ghost" title="Clear the highlighted path">clear</button>
+          </div>
+          <div id="path-result" class="path-result"></div>
+        </div>
+      </div>
+    </aside>
+
+    <main id="graph-container"></main>
+
+    <!-- Analytics sidebar (collapsible right panel) -->
+    <aside id="analytics-sidebar" class="analytics-sidebar">
+      <button id="analytics-sidebar-toggle" class="sidebar-toggle" title="Toggle analytics sidebar">&#9666;</button>
+      <div class="sidebar-content">
+        <h3>Centrality Leaderboard</h3>
+        <div class="sidebar-section">
+          <div class="leaderboard-controls">
+            <select id="leaderboard-measure">
+              <option value="degree">degree</option>
+              <option value="betweenness">betweenness</option>
+            </select>
+            <button id="leaderboard-refresh" class="analytics-btn" title="Refresh leaderboard">Refresh</button>
+          </div>
+          <ol id="leaderboard-list" class="leaderboard-list"></ol>
+        </div>
+
+        <div class="sidebar-sep"></div>
+
+        <h3>Shortest Path Finder</h3>
+        <div class="sidebar-section">
+          <input id="sidebar-path-from" class="sidebar-input" type="text" placeholder="from node..." autocomplete="off" spellcheck="false" />
+          <input id="sidebar-path-to" class="sidebar-input" type="text" placeholder="to node..." autocomplete="off" spellcheck="false" />
+          <div class="sidebar-row">
+            <button id="sidebar-path-btn" class="analytics-btn">Find path</button>
+            <button id="sidebar-path-clear" class="analytics-btn ghost">clear</button>
+          </div>
+          <div id="sidebar-path-result" class="path-result"></div>
+        </div>
+
+        <div class="sidebar-sep"></div>
+
+        <h3>Community Browser</h3>
+        <div class="sidebar-section">
+          <div id="community-list" class="community-list"></div>
+          <button id="community-clear" class="analytics-btn ghost" style="margin-top:6px;display:none;">Show all</button>
+        </div>
+      </div>
+    </aside>
+
+    <section id="detail-panel" class="hidden" aria-hidden="true">
+      <button id="detail-close" title="Close">&times;</button>
+      <h2 id="detail-label">&mdash;</h2>
+      <span id="detail-type" class="detail-type"></span>
+      <button id="expand-btn" class="expand-btn">Expand neighbors &#8615;</button>
+
+      <h3>Properties</h3>
+      <dl id="detail-props" class="kv"></dl>
+
+      <h3>Connected entities</h3>
+      <div id="detail-relations" class="relations"></div>
+
+      <h3>KB Provenance</h3>
+      <div id="detail-provenance" class="provenance"></div>
+
+      <h3>Referenced by agents</h3>
+      <ul id="detail-agents" class="agent-list"></ul>
+    </section>
+
+    <!-- Growth timeline sparkline -->
+    <div id="growth-timeline" class="growth-timeline">
+      <canvas id="sparkline-canvas" width="360" height="48"></canvas>
+      <span id="sparkline-label" class="sparkline-label">growth timeline</span>
+    </div>
+
+    <div id="status-bar"></div>
+    <div id="banner" class="hidden"></div>
+
+    <!-- Watermark -->
+    <div id="watermark" class="watermark">mdk graph</div>
+  </div>
+
+  <!--
+    Vendored, MIT-licensed, served locally (no CDN) so this works air-gapped.
+    Load order matters: graphology -> forceatlas2 -> sigma -> dashboard app.
+  -->
+  <script src="/static/vendor/graphology.umd.min.js"></script>
+  <script src="/static/vendor/graphology-layout-forceatlas2.umd.js"></script>
+  <script src="/static/vendor/sigma.min.js"></script>
+  <!-- Server-injected, NON-SECRET config (project id + display hints only). -->
+  <script>
+    /* __MDK_GRAPH_CONFIG__ */
+    window.MDK_GRAPH_CONFIG = window.MDK_GRAPH_CONFIG || { project: null, target: "" };
+  </script>
+  <script src="/static/dashboard/dashboard.js"></script>
+</body>
+</html>

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.6.3.12"
+version = "2026.6.4.2"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -123,6 +123,13 @@ cross-encoder = [
     # the default cross-encoder/ms-marco-MiniLM-L-6-v2). Opt-in only
     # so the vast majority of operators don't pay the disk/memory cost.
     "sentence-transformers>=2.7,<4",
+]
+neo4j = [
+    # Optional Neo4j graph adapter for customers who want a dedicated
+    # graph database at scale for the GraphRAG knowledge graph. The
+    # adapter is lazy-imported — only loaded when NEO4J_URI is
+    # configured. Apache-2.0 licensed. See src/movate/storage/neo4j.py.
+    "neo4j>=5.0,<6",
 ]
 ocr = [
     # Scanned-image PDF support: pdf2image wraps Poppler's pdftoppm
@@ -251,6 +258,18 @@ voice = [
     # permissive-only, justified in its own PR): Gemini Live realtime (a
     # fast-follow), and any audio lib for edge transcoding or VAD when needed.
 ]
+telephony = [
+    # Twilio telephony transport (ADR 074 D3/D5). Twilio is the enterprise-PSTN
+    # path: global phone numbers, carrier-grade SIP trunking, established
+    # enterprise billing. The ``twilio`` SDK is MIT-licensed (permissive,
+    # passes ``scripts/check_licenses.py --strict``). Imported LAZILY inside
+    # ``movate.voice.transports.twilio`` -- a runtime without ``mdk[telephony]``
+    # never loads it (same posture as the voice/langfuse/keychain extras).
+    # Separate from the ``[voice]`` extra (which stays lean: STT/TTS provider
+    # SDKs only) so operators who need web-WS voice but not phone calls pay
+    # nothing for the Twilio SDK.
+    "twilio>=9.0,<10",
+]
 langchain = [
     "langchain-core>=0.3,<1",
 ]
@@ -307,16 +326,20 @@ airflow = [
     # unrelated stub). The import package, however, is `airflow`.
     "apache-airflow>=2.7,<3",
 ]
+# Temporal — opt-in deterministic, durable workflow backend (ADR 054).
+# Per-workflow opt-in via `workflow.yaml: runtime: temporal`. The native
+# runner is the default; this extra is only needed when running workflows
+# with `runtime: temporal` and/or running `mdk worker --backend temporal`
+# (Phase 1 in progress; see docs/adr/054-temporal-backend.md).
+#
+# Single shipped dep: `temporalio` is the ONLY Python SDK for Temporal —
+# hand-rolling JSON-over-gRPC against the Temporal Service API is not viable
+# (ADR 054 D7). MIT-licensed (PyPI: "License :: OSI Approved :: MIT License")
+# — passes scripts/check_licenses.py. OPT-IN only, NOT in SHIPPED_EXTRAS:
+# nothing in core/cli/runtime imports `temporalio` at module scope (import
+# isolation per ADR 054 D7 / ADR 030 D1). Same posture as [prefect] /
+# [airflow] / [voice] — listed here, not policed by the strict gate.
 temporal = [
-    # ADR 054 — Temporal as a first-class OPTIONAL execution backend behind
-    # the runner Protocol. Phase 1 ships the workflow compiler skeleton +
-    # activity wrappers; this extra installs the only Python SDK for Temporal
-    # (no JSON-over-gRPC hand-rolling — see ADR 054 D7). MIT-licensed; passes
-    # the license gate; ~50 MB installed. Imported LAZILY inside
-    # movate.core.workflow.compilers.temporal (and the Track C activity
-    # wrappers / Track D worker entry), so the base install + every existing
-    # command + the native runner + the LangGraph backend are unaffected.
-    # OPT-IN only — NOT in the license gate's SHIPPED_EXTRAS.
     "temporalio>=1.7,<2",
 ]
 playground = [
@@ -472,6 +495,9 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # skills_cmd search/info/validate each have branchy filter+render pipelines;
 # extracting branches would obscure the linear operator-facing control flow.
 "src/movate/cli/skills_cmd.py" = ["PLR0912"]
+# _handle_uploads has one branch per UploadOutcome; RUF001 fires on the
+# Unicode info-source emoji (ℹ️) which is intentional operator-facing text.
+"src/movate/playground/app.py" = ["PLR0912", "RUF001"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 
@@ -522,6 +548,10 @@ module = [
     # movate.cli.voice_cmd._voice_try_async, so mypy on `src` is clean when
     # the [voice] extra is absent.
     "sounddevice.*",
+    # Twilio SDK — optional [telephony] extra (ADR 074). No type stubs shipped;
+    # imported LAZILY inside movate.voice.transports.twilio, so mypy on `src`
+    # stays clean whether or not the extra is installed.
+    "twilio.*",
     # External-orchestrator adapters (ADR 017 D3) — optional extras with no
     # type stubs. Imported LAZILY inside the adapter functions/factory; this
     # keeps mypy on `src` clean whether or not the extras are installed.
@@ -539,6 +569,12 @@ module = [
     "azure.cognitiveservices.speech.*",
     "azure.cognitiveservices.*",
     "azure.*",
+    # Temporal SDK — optional [temporal] extra (ADR 054 Phase 1). The SDK
+    # ships its own type stubs, but mypy on `src` should stay clean whether
+    # or not the [temporal] extra is installed. Imported LAZILY inside the
+    # Temporal compiler / worker glue (Phase 1 Track B/C), so a base install
+    # is unaffected.
+    "temporalio.*",
 ]
 ignore_missing_imports = true
 
@@ -609,7 +645,11 @@ markers = [
     "integration: integration tests using local mode",
     "smoke: live API smoke tests (opt-in, env-gated)",
     "postgres: tests that require a real Postgres at MOVATE_PG_TEST_URL",
+    "temporal: tests requiring the [temporal] extra (skip by default)",
     "no_preflight_stub: opts out of the eval-scorecard preflight autouse no-op",
     "acceptance: hermetic end-to-end slice guards (run in the normal suite)",
+    "temporal: Temporal integration tests requiring `temporal server start-dev` (opt-in, run with pytest -m temporal)",
+    "voice_bench: voice eval/regression harness tests (ADR 049 D5)",
+    "neo4j: Neo4j integration tests requiring a running Neo4j instance (opt-in, run with pytest -m neo4j)",
 ]
 addopts = "-ra --strict-markers"

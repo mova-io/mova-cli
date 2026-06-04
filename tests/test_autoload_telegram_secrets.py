@@ -28,9 +28,13 @@ from movate.cli.main import app
 from movate.credentials import CredentialsStore, autoload_credentials
 from movate.credentials.loader import (
     ALL_AUTOLOADED_ENV_VARS,
+    CONNECTOR_KEY_ENV_VARS,
+    NEO4J_KEY_ENV_VARS,
     NOTIFICATION_KEY_ENV_VARS,
     OBSERVABILITY_KEY_ENV_VARS,
     PROVIDER_KEY_ENV_VARS,
+    TELEPHONY_KEY_ENV_VARS,
+    TEMPORAL_KEY_ENV_VARS,
     VOICE_KEY_ENV_VARS,
 )
 
@@ -62,13 +66,17 @@ class TestAutoloadedRegistry:
 
     def test_all_autoloaded_is_union(self) -> None:
         """ALL_AUTOLOADED_ENV_VARS should be the union of the provider,
-        notification, observability, and voice groups. Catches accidental
-        dropping when any list is edited in isolation."""
+        notification, observability, voice, and temporal groups. Catches
+        accidental dropping when any list is edited in isolation."""
         expected = (
             set(PROVIDER_KEY_ENV_VARS)
             | set(NOTIFICATION_KEY_ENV_VARS)
             | set(OBSERVABILITY_KEY_ENV_VARS)
             | set(VOICE_KEY_ENV_VARS)
+            | set(TELEPHONY_KEY_ENV_VARS)
+            | set(CONNECTOR_KEY_ENV_VARS)
+            | set(TEMPORAL_KEY_ENV_VARS)
+            | set(NEO4J_KEY_ENV_VARS)
         )
         assert set(ALL_AUTOLOADED_ENV_VARS) == expected
 
@@ -79,6 +87,14 @@ class TestAutoloadedRegistry:
     def test_voice_env_vars_include_elevenlabs(self) -> None:
         # T2 premium-voice TTS (ADR 048/049) autoloads the same way.
         assert "ELEVENLABS_API_KEY" in VOICE_KEY_ENV_VARS
+
+    def test_temporal_env_vars_include_host_namespace_and_tls(self) -> None:
+        # Temporal connection (ADR 054) autoloads the same way: host +
+        # namespace required, TLS cert/key optional (Temporal Cloud only).
+        assert "TEMPORAL_HOST" in TEMPORAL_KEY_ENV_VARS
+        assert "TEMPORAL_NAMESPACE" in TEMPORAL_KEY_ENV_VARS
+        assert "TEMPORAL_TLS_CERT" in TEMPORAL_KEY_ENV_VARS
+        assert "TEMPORAL_TLS_KEY" in TEMPORAL_KEY_ENV_VARS
 
 
 # ---------------------------------------------------------------------------

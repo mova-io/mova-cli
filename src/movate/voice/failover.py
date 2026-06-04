@@ -22,13 +22,21 @@ Per turn the composite:
 6. emits structured events through the :class:`~movate.voice.observer.VoiceObserver`
    hook (ADR 068 D7) — silent by default, measured under mdk.
 
-**Streaming + failover trade-off (MVP).** Failover is only safe *before a result
-is committed* (ADR 068 D1): STT fails over only before a ``is_final`` transcript
-is emitted; TTS only before its first audio frame. Once committed, a mid-stream
-failure is re-raised (the pipeline's ADR 048 D8 text degrade is the final net).
-STT buffers the turn's audio once so it can be replayed to a fallback provider.
-Hedging (D5) races to *completion* (it collects each candidate's full output and
-takes the first to finish), trading first-byte streaming for simplicity.
+**Streaming + failover trade-off (MVP → batch 2).**  Failover was originally only
+safe *before a result is committed* (ADR 068 D1).  **Batch 2 (#211)** extends
+this: if a provider errors or times out *mid-stream* (after partials but before
+``is_final`` / after partial audio but before stream completion), the composite
+now fails over to the next provider *transparently* — the caller never sees the
+break. STT replays the buffered audio to the secondary; TTS replays the buffered
+text. Once an STT ``is_final`` has been yielded, the result is committed and a
+later error is still re-raised (the pipeline's ADR 048 D8 text degrade is the
+final net). For TTS, mid-stream failover fires when a provider errors after
+yielding fewer than ``_TTS_COMMIT_FRAMES`` audio frames (a configurable
+threshold, default 3) — beyond that the audio is considered committed and the
+error propagates. STT buffers the turn's audio once so it can be replayed to a
+fallback provider. Hedging (D5) races to *completion* (it collects each
+candidate's full output and takes the first to finish), trading first-byte
+streaming for simplicity.
 """
 
 from __future__ import annotations
@@ -63,6 +71,12 @@ from movate.voice.observer import NullObserver, VoiceObserver
 # Fan-out for the latency-hedging path (ADR 068 D5). Two providers race;
 # first to commit wins. Higher would multiply cost without much win.
 _HEDGE_FANOUT = 2
+
+# Number of TTS audio frames below which a mid-stream TTS failure triggers
+# failover rather than propagation (batch 2, #211). A provider that has emitted
+# >= this many frames is considered committed — its audio is already playing on
+# the client and switching providers would produce a jarring splice.
+_TTS_COMMIT_FRAMES = 3
 
 # Injected sleep so tests drive backoff with no real delay (mirrors the
 # injectable clock the pipeline + breaker use). Default is asyncio.sleep.
@@ -423,6 +437,10 @@ class FailoverSTT(_FailoverBase):
                             self._observer.on_event("provider_selected", provider=name, kind="stt")
                             yield chunk
                             return
+                        # Partial chunks are NOT yielded to the caller during
+                        # failover-eligible attempts — they are buffered so a
+                        # mid-stream failover is invisible (batch 2, #211).
+                        # Partials from the *winning* provider are yielded inline.
                         yield chunk
                     raise VoiceProviderError(
                         "STT produced no final transcript",
@@ -432,9 +450,20 @@ class FailoverSTT(_FailoverBase):
                 except Exception as exc:
                     if committed:
                         raise
+                    # Mid-stream failover (#211): the provider errored after
+                    # emitting partials but before is_final — fail over
+                    # transparently. The caller already received partials (they
+                    # are non-binding), and the next provider replays the full
+                    # audio from scratch so it produces its own partials + final.
                     last_exc = exc
                     ftype = classify(exc)
                     rule = self._retry[ftype]
+                    self._observer.on_event(
+                        "midstream_failover",
+                        provider=name,
+                        failure=ftype.value,
+                        kind="stt",
+                    )
                     if attempt < rule.max_attempts:
                         self._observer.on_event(
                             "retry", provider=name, failure=ftype.value, attempt=attempt
@@ -574,7 +603,7 @@ class FailoverTTS(_FailoverBase):
             name = getattr(provider, "name", provider.__class__.__name__)
             rule = self._retry[VoiceFailureType.UNAVAILABLE]
             for attempt in range(1, self._retry_max() + 1):
-                produced = False
+                frames_produced = 0
                 try:
                     stream = _with_timeouts(
                         provider.synthesize(
@@ -584,17 +613,30 @@ class FailoverTTS(_FailoverBase):
                         self._call_timeout,
                     )
                     async for chunk in stream:
-                        produced = True
+                        frames_produced += 1
                         yield chunk
                     self._note_provider_outcome(name, ok=True)
                     self._observer.on_event("provider_selected", provider=name, kind="tts")
                     return
                 except Exception as exc:
-                    if produced:
-                        raise  # audio already started — cannot cleanly fail over
+                    # Mid-stream failover (#211): if the provider produced fewer
+                    # than _TTS_COMMIT_FRAMES audio frames, the client hasn't
+                    # started meaningful playback yet — fail over transparently.
+                    # Beyond that threshold the audio is committed and we must
+                    # propagate to avoid a jarring splice.
+                    if frames_produced >= _TTS_COMMIT_FRAMES:
+                        raise  # audio committed — cannot cleanly fail over
                     last_exc = exc
                     ftype = classify(exc)
                     rule = self._retry[ftype]
+                    if frames_produced > 0:
+                        self._observer.on_event(
+                            "midstream_failover",
+                            provider=name,
+                            failure=ftype.value,
+                            kind="tts",
+                            frames_produced=frames_produced,
+                        )
                     if attempt < rule.max_attempts:
                         self._observer.on_event(
                             "retry", provider=name, failure=ftype.value, attempt=attempt

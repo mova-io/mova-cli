@@ -163,6 +163,7 @@ REMOTE_VERB_ROUTES: dict[str, list[tuple[str, str]]] = {
     "voice say": [("POST", "/api/v1/agents/{name}/voice")],
     "voice transcribe": [("POST", "/api/v1/agents/{name}/voice")],
     "voice ask": [("POST", "/api/v1/agents/{name}/voice")],
+    "voice call": [("POST", "/api/v1/agents/{name}/call/twilio")],
     "voice providers list": [("GET", "/api/v1/capabilities")],
 }
 
@@ -201,6 +202,12 @@ CONTROL_PLANE_ONLY: dict[str, str] = {
     # a local static check. It takes no ``--target`` so strict enumeration
     # already excludes it — documented here for the same belt-and-braces.
     "workflow lint": "local YAML compile/lint; no runtime HTTP call",
+    # ``workflow history`` and ``workflow replay`` (#697) query the Temporal
+    # workflow engine directly — they are control-plane ops tooling, not
+    # runtime API verbs.
+    "workflow history": "queries Temporal workflow history; control-plane only",
+    "workflow replay": "replays a Temporal workflow execution; control-plane only",
+    "voice bench": "local STT/TTS eval harness; no runtime HTTP call",
 }
 
 # ---------------------------------------------------------------------------

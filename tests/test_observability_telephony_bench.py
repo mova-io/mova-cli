@@ -52,7 +52,11 @@ async def test_metrics_observer_counts_router_events() -> None:
         pass
     snap = metrics.snapshot()
     assert snap["provider_selected"] == {"fake_stt": 1}
-    assert snap["failovers"]["bad"] == 1
+    # The failover retry logic (#694) retries the failing provider before
+    # giving up — each retry emits a midstream_failover event, then the
+    # final give-up emits a failover event.  MetricsObserver counts both
+    # event types in the failovers bucket, so the total is 3 (2 retries + 1).
+    assert snap["failovers"]["bad"] == 3
     assert snap["events"]["failover"] == 1
     assert snap["events"]["provider_selected"] == 1
 

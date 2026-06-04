@@ -473,6 +473,13 @@ class SkillImplementationKind(StrEnum):
     up in the runtime registry and called synchronously. Enables
     cross-agent orchestration without the v1.1 LangGraph machinery."""
 
+    EXEC = "exec"
+    """Run any executable as a tool via subprocess + JSON stdin/stdout.
+    The raw-script escape hatch per ADR 052 D2 -- how a Node CLI, a Java
+    jar, a Go binary, or a bare Python script becomes a tool without an
+    MCP server or an HTTP service. Sandboxed: configurable timeout,
+    resource limits."""
+
 
 class SkillImplementation(BaseModel):
     """Backend declaration for a skill.
@@ -791,19 +798,17 @@ class SkillSpec(BaseModel):
                     f"http skill implementation.auth must be 'bearer-from-env:<VAR>'; "
                     f"got {v.auth!r}"
                 )
-        if v.kind == SkillImplementationKind.MCP:
-            if not v.entry:
-                raise ValueError(
-                    "mcp skill implementation.entry must be the subprocess "
-                    "command for the MCP server (e.g. './mcp-servers/github' "
-                    "or 'npx -y @some/mcp-package'); got empty string"
-                )
-            if not v.tool:
-                raise ValueError(
-                    "mcp skill implementation.tool is required (the name "
-                    "of the tool to invoke on the MCP server); empty tool "
-                    "would mean 'no tool selected'"
-                )
+        # MCP: entry is required; tool: is OPTIONAL — when omitted, the
+        # backend operates in multi-tool mode (all tools from tools/list
+        # are registered as namespaced callables). When specified,
+        # single-tool mode (backward-compatible).
+        if v.kind == SkillImplementationKind.MCP and not v.entry:
+            raise ValueError(
+                "mcp skill implementation.entry must be the server "
+                "command (e.g. 'npx -y @some/mcp-package') or an "
+                "HTTP/SSE URL (e.g. 'https://mcp.example.com/api'); "
+                "got empty string"
+            )
         if v.kind == SkillImplementationKind.AGENT and not v.target_agent:
             raise ValueError(
                 "agent skill implementation.target_agent is required "
@@ -1562,12 +1567,34 @@ class AgentSpec(BaseModel):
             result.append(SkillRef._from_raw(item))
         return result
 
+    # ---- ADR 052: shared tool registry references ----
+    # Optional ``tools: [name@version]`` block for the tool registry.
+    # Each entry is a ``name@version`` string (or bare name for any
+    # version) that the ToolResolver late-binds to a ToolDescriptor at
+    # agent-load time. Resolved descriptors are converted to SkillBundles
+    # the executor can dispatch alongside the per-agent skills.
+    # SCHEMA FLAG (additive, backward-compatible): empty list is the
+    # default; existing agent.yaml files that omit this block load
+    # unchanged.
+
+    tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tool registry references this agent depends on (ADR 052). "
+            "Each entry is a ``name@version`` string (e.g. "
+            "``'jira.create-issue@^1.2.0'``) or a bare name (any version). "
+            "Resolved at agent-load time via the ToolResolver against the "
+            "tenant's tool registry. Empty list (the default) means no "
+            "registry tools; the agent uses only its per-agent skills."
+        ),
+    )
+
     # ---- v0.6 shared contexts (ADR 002) ----
     # Names referencing `contexts/<name>.md` files in the project's
     # contexts/ folder. Each named context's body is prepended to the
     # rendered prompt at execution time, in declaration order, with a
     # `\n\n---\n\n` separator. Solves the "stop copy-pasting the style
-    # guide into every prompt.md" pain. Pure markdown — no templating,
+    # guide into every prompt.md" pain. Pure markdown -- no templating,
     # no Python, no Jinja side effects. See docs/adr/002-skills-and-contexts.md.
 
     contexts: list[str] = Field(
@@ -2154,6 +2181,58 @@ class RunRecord(BaseModel):
             "as a single node — additive, backward-compatible. Persisted as a JSON "
             "blob so `mdk explain` can reconstruct the per-step breakdown offline, "
             "without a Langfuse / OTel backend."
+        ),
+    )
+
+    # ---- ADR 050 D1 / D7 / D8 — voice-as-run parity (ADDITIVE, OPTIONAL) ----
+    # All fields below default to ``None`` so text runs serialize identically to
+    # before; voice turns set them after the pipeline completes. ``modality``
+    # distinguishes voice vs text in ``mdk runs list``; the ``stt_*`` / ``tts_*``
+    # / ``audio_*`` fields carry voice-specific economics for the usage API.
+    modality: str | None = Field(
+        default=None,
+        description=(
+            "Run modality: ``'voice'`` for voice turns, ``None`` (the default) for "
+            "text. Additive: every existing RunRecord is ``None`` and renders as "
+            "text. Voice turns set this when the WS handler persists them."
+        ),
+    )
+    stt_latency_ms: float | None = Field(
+        default=None,
+        description=(
+            "STT stage latency in milliseconds (voice turns only). Time from "
+            "audio-in start to the final transcript. ``None`` for text runs."
+        ),
+    )
+    tts_latency_ms: float | None = Field(
+        default=None,
+        description=(
+            "TTS stage latency in milliseconds (voice turns only). Time from "
+            "agent answer to first audio frame. ``None`` for text runs."
+        ),
+    )
+    audio_duration_s: float | None = Field(
+        default=None,
+        description=(
+            "Duration of the inbound audio in seconds (voice turns only). "
+            "Derived from the STT transcript length or audio frame count. "
+            "``None`` for text runs."
+        ),
+    )
+    stt_cost_usd: float | None = Field(
+        default=None,
+        description=(
+            "STT cost in USD for this voice turn (ADR 050 D7). Computed as "
+            "``audio_duration_s * provider_rate_per_second``. ``None`` for "
+            "text runs. Flows into the usage API alongside ``metrics.cost_usd``."
+        ),
+    )
+    tts_cost_usd: float | None = Field(
+        default=None,
+        description=(
+            "TTS cost in USD for this voice turn (ADR 050 D7). Computed as "
+            "``answer_chars * provider_rate_per_char``. ``None`` for text "
+            "runs. Flows into the usage API alongside ``metrics.cost_usd``."
         ),
     )
 

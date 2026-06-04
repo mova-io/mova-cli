@@ -612,12 +612,20 @@ class _VoiceTurnConfig:
     Defaults reproduce the zero-change promise (the common single-text-field
     agent, tenant-default voice). ``mock`` mirrors the SSE run-stream route's
     ``body.mock`` so a turn can run offline without a live LLM key.
+
+    ``session_id`` (ADR 050 D1/D8 — voice session threading): when set on the
+    initial ``config`` frame, the voice handler threads prior session turns as
+    context and appends completed voice turns — the same ``_assemble_session_input``
+    + ``_append_session_turn`` pattern the text run endpoint uses. This means
+    a client can start a text conversation, switch to voice, and the agent has
+    full context from both modalities.
     """
 
     input_key: str = "text"
     language: str | None = None
     voice_id: str = ""
     mock: bool = False
+    session_id: str | None = None
     # Sentence-level TTS overlap (ADR 048 D7 / pipeline ``tts_streaming``): speak
     # sentence one while the agent is still generating sentence two — the biggest
     # time-to-first-audio win. Defaults ON so production mdk voice agents get the
@@ -711,6 +719,13 @@ async def _collect_voice_turn(
             config.language = ctrl.get("language") or config.language
             config.voice_id = str(ctrl.get("voice_id") or config.voice_id)
             config.mock = bool(ctrl.get("mock", config.mock))
+            # ADR 050 D1/D8 — session_id threading through voice WS. Set
+            # once on the initial config frame; subsequent config frames in
+            # the same connection can update it (e.g. to start a new session
+            # mid-connection). ``None`` (the default / absent) is the
+            # stateless path, byte-for-byte unchanged.
+            if "session_id" in ctrl:
+                config.session_id = ctrl["session_id"] or None
             config.tts_streaming = bool(ctrl.get("tts_streaming", config.tts_streaming))
             config.speculative = bool(ctrl.get("speculative", config.speculative))
             # ADR 073 D3: a client may pin the silence-hold per-turn. An explicit
@@ -832,6 +847,29 @@ async def _watch_voice_barge_in(
                 buffered.append(ctrl)
 
 
+@dataclass
+class _VoicePipelineTurnResult:
+    """What :func:`_stream_voice_pipeline_turn` returns after streaming one turn.
+
+    Captures the outcome (stop / continue, events for latency + cost, and the
+    ``done`` frame data) so the caller (the WS handler loop) can persist a
+    RunRecord and thread session state WITHOUT re-parsing the event stream.
+    """
+
+    stop: bool
+    """True when the session should end (the watcher saw a ``close``)."""
+    events: list[Any]
+    """All VoiceEvents emitted during the turn (for latency + cost derivation)."""
+    run_id: str
+    """The Executor's run_id from the ``done`` event (empty on error)."""
+    status: str
+    """The turn's terminal status from ``done`` (empty on error)."""
+    transcript: str
+    """The final STT transcript (the user's words)."""
+    answer_text: str
+    """The agent's answer text (concatenated agent.token deltas)."""
+
+
 async def _stream_voice_pipeline_turn(
     websocket: WebSocket,
     *,
@@ -844,9 +882,10 @@ async def _stream_voice_pipeline_turn(
     config: Any,
     stt_api_key: str | None,
     tts_api_key: str | None,
+    extra_input: dict[str, Any] | None = None,
     guard: Any = None,
     adaptive: Any = None,
-) -> bool:
+) -> _VoicePipelineTurnResult:
     """Stream one pipeline voice turn with barge-in + a latency badge.
 
     Wraps :func:`movate.voice.run_voice_pipeline` with two pieces of demo
@@ -860,8 +899,8 @@ async def _stream_voice_pipeline_turn(
       frame carrying the turn's per-stage timings is emitted (the demo's
       "responded in {X}ms" UI + the voice-latency observability win).
 
-    Returns ``True`` when the session should end (the watcher saw a ``close``
-    during the turn), else ``False`` to run the next turn.
+    Returns a :class:`_VoicePipelineTurnResult` with the stop signal plus the
+    data needed to persist a RunRecord and thread session state.
     """
     from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
     from movate.voice import run_voice_pipeline  # noqa: PLC0415
@@ -871,6 +910,10 @@ async def _stream_voice_pipeline_turn(
     buffered: list[dict[str, Any]] = []
     watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
     latency_events: list[Any] = []
+    run_id = ""
+    status = ""
+    transcript = ""
+    answer_parts: list[str] = []
     # Per-turn observer: tallies this turn's speculation outcomes (started /
     # committed / cancelled + head-start) so the latency badge can carry the
     # ADR 070/073 A/B signal alongside the per-stage timings. Off-path for any
@@ -911,9 +954,16 @@ async def _stream_voice_pipeline_turn(
             speculative=effective_speculative,
             observer=metrics,
             cancel=cancel,
+            extra_input=extra_input,
         ):
             latency_events.append(event)
-            if event.kind == "done":
+            if event.kind == "transcript.final":
+                transcript = event.text
+            elif event.kind == "agent.token" and event.text:
+                answer_parts.append(event.text)
+            elif event.kind == "done":
+                run_id = event.run_id
+                status = event.status
                 # Emit the latency badge just BEFORE done so it lands inside the
                 # turn (a client draining to ``done`` still sees it).
                 await _send_voice_latency(websocket, latency_events, metrics)
@@ -944,7 +994,88 @@ async def _stream_voice_pipeline_turn(
             await watcher
 
     # A ``close`` the watcher read mid-turn ends the session after this turn.
-    return any(b.get("type") == "close" for b in buffered)
+    stop = any(b.get("type") == "close" for b in buffered)
+    return _VoicePipelineTurnResult(
+        stop=stop,
+        events=latency_events,
+        run_id=run_id,
+        status=status,
+        transcript=transcript,
+        answer_text="".join(answer_parts),
+    )
+
+
+async def _finalize_voice_turn(
+    *,
+    websocket: WebSocket,
+    store: StorageProvider,
+    result: _VoicePipelineTurnResult,
+    tenant_id: str,
+    config: _VoiceTurnConfig,
+    session: Session | None,
+) -> None:
+    """Post-turn processing: patch voice metrics, emit cost, append session.
+
+    Called after each pipeline voice turn completes (ADR 050 D1/D7/D8). Extracted
+    from the main handler loop to keep the branch count manageable.
+    """
+    if not result.run_id:
+        return
+
+    from movate.voice.cost import compute_voice_turn_cost  # noqa: PLC0415
+    from movate.voice.pipeline import compute_turn_latency  # noqa: PLC0415
+
+    latency = compute_turn_latency(result.events)
+    audio_dur_s = (latency.stt_final_ms or 0.0) / 1000.0
+
+    run_record = await store.get_run(result.run_id, tenant_id=tenant_id)
+    if run_record is None:
+        return
+
+    voice_cost = compute_voice_turn_cost(
+        audio_duration_s=audio_dur_s,
+        answer_chars=len(result.answer_text),
+        llm_cost_usd=run_record.metrics.cost_usd,
+    )
+    patched = run_record.model_copy(
+        update={
+            "modality": "voice",
+            "stt_latency_ms": latency.stt_final_ms,
+            "tts_latency_ms": latency.tts_ms,
+            "audio_duration_s": audio_dur_s,
+            "stt_cost_usd": voice_cost.stt_cost_usd,
+            "tts_cost_usd": voice_cost.tts_cost_usd,
+        }
+    )
+    await store.save_run(patched)
+
+    # ADR 050 D7: voice cost in the usage frame.
+    await websocket.send_json(
+        _voice_ctrl(
+            "usage",
+            run_id=result.run_id,
+            llm_cost_usd=voice_cost.llm_cost_usd,
+            stt_cost_usd=voice_cost.stt_cost_usd,
+            tts_cost_usd=voice_cost.tts_cost_usd,
+            total_cost_usd=voice_cost.total_cost_usd,
+            session_id=config.session_id,
+        )
+    )
+
+    # ADR 050 D1/D8: append to session (same pattern as text runs).
+    if session is not None and run_record.status == JobStatus.SUCCESS:
+        await _append_session_turn(
+            store,
+            session=session,
+            user_input={config.input_key: result.transcript},
+            run_id=run_record.run_id,
+            output=run_record.output,
+            cost_usd=(
+                run_record.metrics.cost_usd + voice_cost.stt_cost_usd + voice_cost.tts_cost_usd
+            ),
+            tokens_in=run_record.metrics.tokens.input,
+            tokens_out=run_record.metrics.tokens.output,
+        )
 
 
 @dataclass
@@ -4236,6 +4367,9 @@ async def _ingest_upload(
             tenant_id=ctx.tenant_id,
             embedding_model=embedding_model(),
             ocr=parse_result.ocr_used,
+            build_graph=True,
+            emit_growth_events=True,
+            project_id=getattr(ctx, "project_id", None),
         )
         if summary is None:
             per_file.append(KbIngestFileResult(source=basename, status="empty"))
@@ -15481,6 +15615,15 @@ def build_app(
                 if closed:
                     return
 
+                # ── ADR 050 D1/D8: resolve session for voice (same pattern as
+                # the text run path). ``None`` = stateless, byte-for-byte. ──
+                session: Session | None = None
+                if config.session_id is not None:
+                    session = await store.get_session(config.session_id, tenant_id=ctx.tenant_id)
+                    # If the session doesn't exist / cross-tenant, silently
+                    # fall back to stateless rather than dropping the voice
+                    # connection (failure-mode rule; WS can't 404).
+
                 # ── Drive STT → unchanged Executor → TTS, stream the events ──
                 # `mock` drives the agent stage with MockProvider — the same
                 # offline hook the SSE run-stream route exposes via `body.mock`.
@@ -15498,7 +15641,25 @@ def build_app(
                     for raw_bytes in frames:
                         yield _AudioChunk(data=raw_bytes)
 
-                stop = await _stream_voice_pipeline_turn(
+                # ADR 050 D1/D8: when a session is active, assemble prior
+                # turns as conversation_history (same pattern as the text
+                # ``POST /runs`` path). The history dict is passed to the
+                # pipeline as ``extra_input`` and merged into the RunRequest
+                # input alongside the transcript.
+                voice_extra_input: dict[str, Any] | None = None
+                if session is not None:
+                    # Build a stub input dict that _assemble_session_input
+                    # augments with conversation_history. We pass an empty
+                    # user_input because the actual transcript (input_key)
+                    # is set by the pipeline after STT.
+                    voice_extra_input = await _assemble_session_input(
+                        store,
+                        session_id=session.session_id,
+                        tenant_id=ctx.tenant_id,
+                        user_input={},
+                    )
+
+                result = await _stream_voice_pipeline_turn(
                     websocket,
                     audio_in=_audio_in(),
                     stt=stt,
@@ -15509,15 +15670,195 @@ def build_app(
                     config=config,
                     stt_api_key=stt_api_key,
                     tts_api_key=tts_api_key,
+                    extra_input=voice_extra_input,
                     guard=speculation_guard,
                     adaptive=adaptive_endpointing,
                 )
-                if stop:
+
+                # ADR 050 D1/D7/D8 — patch voice metrics + emit cost + session.
+                await _finalize_voice_turn(
+                    websocket=websocket,
+                    store=store,
+                    result=result,
+                    tenant_id=ctx.tenant_id,
+                    config=config,
+                    session=session,
+                )
+
+                if result.stop:
                     return
         except WebSocketDisconnect:
             # Client hung up — nothing to clean up beyond the executor task,
             # which run_voice_pipeline reaps in its own finally. Normal exit.
             return
+
+    # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/call/twilio — TwiML webhook (ADR 074 D3/D4)
+    #
+    # Twilio hits this webhook when a call arrives on a configured number.
+    # Returns TwiML XML that tells Twilio to open a Media Stream back to
+    # the WS endpoint below. No bearer auth — Twilio can't send one; the
+    # webhook is callable by Twilio (and anyone who knows the URL).
+    # TODO: Twilio signature validation (X-Twilio-Signature + TWILIO_AUTH_TOKEN)
+    #
+    # New surface — flag (CLAUDE.md rule 5): a NEW additive ``/api/v1``
+    # endpoint. Changes no existing endpoint.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/call/twilio",
+        tags=["agents-v1"],
+        response_class=Response,
+    )
+    async def v1_agent_call_twilio(
+        name: str,
+        request: Request,
+    ) -> Response:
+        """TwiML webhook: Twilio calls this when a phone call arrives.
+
+        Returns TwiML XML that tells Twilio to open a bidirectional Media
+        Stream WebSocket back to the ``/call/twilio/stream`` endpoint,
+        where the call audio is bridged into the mdk voice pipeline
+        (ADR 074 D3/D4).
+        """
+        # Derive the WS URL from the incoming request's host.
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        # Use wss:// if the request came over HTTPS, ws:// otherwise.
+        scheme = "wss" if request.url.scheme == "https" else "ws"
+        stream_url = f"{scheme}://{host}/api/v1/agents/{name}/call/twilio/stream"
+
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Connect>"
+            f'<Stream url="{stream_url}" />'
+            "</Connect>"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    # ------------------------------------------------------------------
+    # WS /api/v1/agents/{name}/call/twilio/stream — Twilio Media Stream
+    #
+    # Accepts the Twilio Media Stream WebSocket opened by the TwiML
+    # <Connect><Stream> above. Bridges the call audio into the mdk voice
+    # pipeline via TwilioTransport (ADR 074 D3).
+    #
+    # Auth: Twilio opens this WS itself (from its media gateway), so no
+    # bearer token or API key. The security boundary is the TwiML webhook
+    # (which Twilio calls with a signature we can validate — deferred to
+    # the TODO above).
+    # ------------------------------------------------------------------
+    @v1.websocket("/agents/{name}/call/twilio/stream")
+    async def v1_agent_call_twilio_stream(websocket: WebSocket, name: str) -> None:
+        """Twilio Media Stream WS: bridge phone audio to the voice pipeline.
+
+        Twilio opens this WebSocket after the TwiML webhook returns a
+        ``<Connect><Stream>`` directive. The call's mu-law audio arrives as
+        ``media`` events; TTS output is sent back as ``media`` events. The
+        pipeline (STT -> unchanged Executor -> TTS) runs identically to the
+        browser WebSocket path (ADR 074 D8).
+        """
+        store: StorageProvider = websocket.app.state.storage
+
+        # ---- Resolve the agent (same routing as the WS voice path) ----
+        # For telephony, tenant resolution is simplified: use the default
+        # tenant or a configured Twilio-number -> tenant mapping. For now,
+        # resolve from a default tenant or the first available.
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        agents_reg: list[AgentBundle] = websocket.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            await websocket.accept()
+            await websocket.send_json({"event": "error", "message": f"agent {name!r} not found"})
+            await websocket.close(code=1008, reason="agent not found")
+            return
+
+        await websocket.accept()
+
+        # ---- Lazy import: voice + telephony extras (ADR 074 D5) ----
+        try:
+            from movate.core.executor import Executor  # noqa: PLC0415
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+            from movate.providers.pricing import load_pricing  # noqa: PLC0415
+            from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
+            from movate.tracing import build_tracer  # noqa: PLC0415
+            from movate.voice import run_voice_pipeline  # noqa: PLC0415
+            from movate.voice.transports.twilio import TwilioTransport  # noqa: PLC0415
+        except ImportError:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": ("mdk[voice] extra not installed; telephony bridge unavailable"),
+                }
+            )
+            await websocket.close(code=1011, reason="voice extra not installed")
+            return
+
+        # ---- Wire the transport + pipeline ----
+        transport = TwilioTransport(websocket)
+
+        # Build STT/TTS from the runtime's factories (same as the WS path).
+        stt = websocket.app.state.voice_stt_factory()
+        tts = websocket.app.state.voice_tts_factory()
+
+        # BYOK key resolution (same as WS path).
+        stt_api_key = await _resolve_voice_api_key(store, default_tenant, stt)
+        tts_api_key = await _resolve_voice_api_key(store, default_tenant, tts)
+
+        executor = Executor(
+            provider=LiteLLMProvider(),
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=default_tenant,
+            cache=websocket.app.state.llm_cache,
+        )
+
+        # Seed voice config from the agent's voice block.
+        config = _VoiceTurnConfig()
+        _seed_voice_turn_config(config, bundle)
+
+        agent = ExecutorAgentTurn(
+            executor=executor,
+            bundle=bundle,
+            tenant_id=default_tenant,
+            input_key=config.input_key,
+        )
+
+        try:
+            # Drive the pipeline: transport.receive_audio() -> STT -> agent -> TTS
+            audio_in = transport.receive_audio()
+
+            async for event in run_voice_pipeline(
+                audio_in=audio_in,
+                stt=stt,
+                tts=tts,
+                agent=agent,
+                language=config.language,
+                voice_id=config.voice_id,
+                stt_api_key=stt_api_key,
+                tts_api_key=tts_api_key,
+                keyterms=config.keyterms or None,
+                endpointing_ms=config.endpointing_ms,
+                tts_streaming=config.tts_streaming,
+            ):
+                if event.kind == "tts.audio" and event.audio is not None:
+                    await transport.send_audio(event.audio)
+                elif event.kind == "done":
+                    logger.info(
+                        "Twilio call turn done (agent=%s, run_id=%s, status=%s)",
+                        name,
+                        event.run_id,
+                        event.status,
+                    )
+        except WebSocketDisconnect:
+            logger.info("Twilio stream disconnected (agent=%s)", name)
+        except Exception:
+            logger.exception("Error in Twilio stream handler (agent=%s)", name)
+        finally:
+            await transport.disconnect()
 
     # ------------------------------------------------------------------
     # POST /api/v1/agents/{name}/voice — One-shot / batch voice (ADR 050 D2)
@@ -15813,6 +16154,118 @@ def build_app(
             error=turn.error_message or None,
         )
         return view
+
+    # ------------------------------------------------------------------
+    # /api/v1/tools — Tool Registry (ADR 052 Phase 1)
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/tools",
+        tags=["tools"],
+        dependencies=[_scope("read")],
+    )
+    async def list_tools(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        scope: str | None = None,
+        tag: str | None = None,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        """List tool descriptors (filterable by scope, tags, name pattern)."""
+        store: StorageProvider = request.app.state.storage
+        tags_filter = [tag] if tag else None
+        descriptors = await store.list_tool_descriptors(
+            scope=scope,
+            tenant_id=ctx.tenant_id,
+            tags=tags_filter,
+        )
+        if q:
+            q_lower = q.lower()
+            descriptors = [
+                d
+                for d in descriptors
+                if q_lower in d.name.lower() or q_lower in d.description.lower()
+            ]
+        return {
+            "tools": [d.model_dump(mode="json") for d in descriptors],
+            "count": len(descriptors),
+        }
+
+    @v1.get(
+        "/tools/{name}",
+        tags=["tools"],
+        dependencies=[_scope("read")],
+    )
+    async def get_tool(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        version: str | None = None,
+    ) -> dict[str, Any]:
+        """Get tool detail (with optional version resolution)."""
+        store: StorageProvider = request.app.state.storage
+        # Walk scope precedence: project -> tenant -> movate.
+        descriptor = None
+        for scope_val in ("project", "tenant", "movate"):
+            descriptor = await store.get_tool_descriptor(
+                name=name,
+                version=version,
+                scope=scope_val,
+                tenant_id=ctx.tenant_id,
+            )
+            if descriptor is not None:
+                break
+        if descriptor is None:
+            raise not_found("tool", name)
+        return {"tool": descriptor.model_dump(mode="json")}
+
+    @v1.post(
+        "/tools",
+        tags=["tools"],
+        dependencies=[_scope("admin")],
+        status_code=201,
+    )
+    async def publish_tool(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Publish a tool descriptor (tenant-scoped)."""
+        from movate.core.tool_registry.models import ToolDescriptor  # noqa: PLC0415
+
+        body = await request.json()
+        try:
+            descriptor = ToolDescriptor.model_validate(body)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        descriptor = descriptor.model_copy(update={"tenant_id": ctx.tenant_id})
+        descriptor = descriptor.stamp_now()
+        store: StorageProvider = request.app.state.storage
+        await store.save_tool_descriptor(descriptor)
+        return {"tool": descriptor.model_dump(mode="json")}
+
+    @v1.delete(
+        "/tools/{name}/{version}",
+        tags=["tools"],
+        dependencies=[_scope("admin")],
+    )
+    async def delete_tool(
+        name: str,
+        version: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        scope: str = "tenant",
+    ) -> dict[str, Any]:
+        """Remove a tool descriptor."""
+        store: StorageProvider = request.app.state.storage
+        deleted = await store.delete_tool_descriptor(
+            name=name,
+            version=version,
+            scope=scope,
+            tenant_id=ctx.tenant_id,
+        )
+        if not deleted:
+            raise not_found("tool", f"{name}@{version}")
+        return {"deleted": True}
 
     app.include_router(v1)
 
