@@ -877,6 +877,9 @@ _PROVIDERS_PROMPT_NAME = {
     # them). Multi-value flow like telegram / azure-speech. Same BYOK seam as
     # every other provider credential (ADR 054 D8).
     "temporal": "Temporal (durable workflow backend)",
+    # Neo4j is the opt-in graph database adapter for GraphRAG at scale.
+    # Needs URI + user + password — multi-value flow like temporal.
+    "neo4j": "Neo4j (graph database)",
 }
 
 _PROVIDER_TO_ENV_VAR = {
@@ -914,6 +917,11 @@ _CONNECTOR_PROVIDERS = frozenset({"servicenow", "msgraph"})
 # vars don't fit the one-key-per-provider shape, and it isn't an LLM provider
 # the picker should live-verify against an LLM endpoint.
 _TEMPORAL_PROVIDERS = frozenset({"temporal"})
+
+# Neo4j (opt-in graph DB, [neo4j] extra). Needs URI + user + password —
+# same multi-value pattern as temporal. Kept out of _PROVIDER_TO_ENV_VAR
+# (single-key LLM table) for the same reason.
+_NEO4J_PROVIDERS = frozenset({"neo4j"})
 
 
 @auth_app.command("login")
@@ -1062,6 +1070,12 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_temporal(key=key, save_to=save_to)
         return
 
+    # Neo4j (opt-in graph DB) — needs URI + user + password. Its own
+    # multi-value path, same as temporal / azure-speech.
+    if provider in _NEO4J_PROVIDERS:
+        _login_neo4j(key=key, save_to=save_to)
+        return
+
     if provider not in _PROVIDER_TO_ENV_VAR:
         valid = ", ".join(
             sorted(
@@ -1070,6 +1084,7 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
                 | _VOICE_PROVIDERS
                 | _CONNECTOR_PROVIDERS
                 | _TEMPORAL_PROVIDERS
+                | _NEO4J_PROVIDERS
             )
         )
         error(f"unknown provider {provider!r}. Valid: {valid}")
@@ -2564,6 +2579,7 @@ def _prompt_for_provider() -> str:
         ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
         ("azure-speech", _PROVIDERS_PROMPT_NAME["azure-speech"]),
         ("temporal", _PROVIDERS_PROMPT_NAME["temporal"]),
+        ("neo4j", _PROVIDERS_PROMPT_NAME["neo4j"]),
     ]
     stdout.print("[bold]Which provider would you like to set up?[/bold]")
     # Live-verify every configured provider in parallel BEFORE rendering
@@ -2983,6 +2999,63 @@ def _login_temporal(*, key: str | None, save_to: str) -> None:
             if tls_cert:
                 fh.write(f"TEMPORAL_TLS_CERT={tls_cert}\n")
                 fh.write(f"TEMPORAL_TLS_KEY={tls_key}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_neo4j(*, key: str | None, save_to: str) -> None:
+    """Multi-value login for Neo4j (opt-in graph database adapter).
+
+    Prompts for URI (bolt:// or neo4j://), user, and password. No live
+    verification: a connect call would need the optional ``neo4j`` SDK
+    (``mdk[neo4j]``) and a running instance; the adapter validates on
+    ``init()``.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    if key is not None:
+        error(
+            "[bold]--key[/bold] doesn't apply to neo4j (we need a URI AND "
+            "user AND password); please use the interactive prompts instead."
+        )
+        raise typer.Exit(code=2)
+
+    uri = typer.prompt(
+        "Neo4j URI (e.g. bolt://localhost:7687 or neo4j+s://host:7687)",
+    )
+    user = typer.prompt("Neo4j user", default="neo4j")
+    password = typer.prompt("Neo4j password", hide_input=True)
+
+    if not uri.strip():
+        error("URI cannot be empty.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("NEO4J_URI", uri.strip())
+        store.set("NEO4J_USER", user.strip())
+        store.set("NEO4J_PASSWORD", password.strip())
+        success(
+            "saved [bold]NEO4J_URI[/bold] + [bold]NEO4J_USER[/bold] + "
+            f"[bold]NEO4J_PASSWORD[/bold] to [cyan]{store.path}[/cyan] "
+            "(mode 0600)."
+        )
+        hint(
+            "[dim]Set [bold]MOVATE_GRAPH_BACKEND=neo4j[/bold] to route graph "
+            "operations to Neo4j. Install the driver with "
+            "[bold]uv add 'movate-cli[neo4j]'[/bold].[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"NEO4J_URI={uri.strip()}\n")
+            fh.write(f"NEO4J_USER={user.strip()}\n")
+            fh.write(f"NEO4J_PASSWORD={password.strip()}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")

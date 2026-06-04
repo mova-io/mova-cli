@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.6.3.16"
+version = "2026.6.3.17"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -123,6 +123,13 @@ cross-encoder = [
     # the default cross-encoder/ms-marco-MiniLM-L-6-v2). Opt-in only
     # so the vast majority of operators don't pay the disk/memory cost.
     "sentence-transformers>=2.7,<4",
+]
+neo4j = [
+    # Optional Neo4j graph adapter for customers who want a dedicated
+    # graph database at scale for the GraphRAG knowledge graph. The
+    # adapter is lazy-imported — only loaded when NEO4J_URI is
+    # configured. Apache-2.0 licensed. See src/movate/storage/neo4j.py.
+    "neo4j>=5.0,<6",
 ]
 ocr = [
     # Scanned-image PDF support: pdf2image wraps Poppler's pdftoppm
@@ -622,5 +629,6 @@ markers = [
     "no_preflight_stub: opts out of the eval-scorecard preflight autouse no-op",
     "acceptance: hermetic end-to-end slice guards (run in the normal suite)",
     "temporal: Temporal integration tests requiring `temporal server start-dev` (opt-in, run with pytest -m temporal)",
+    "neo4j: Neo4j integration tests requiring a running Neo4j instance (opt-in, run with pytest -m neo4j)",
 ]
 addopts = "-ra --strict-markers"
