@@ -124,6 +124,13 @@ cross-encoder = [
     # so the vast majority of operators don't pay the disk/memory cost.
     "sentence-transformers>=2.7,<4",
 ]
+neo4j = [
+    # Optional Neo4j graph adapter for customers who want a dedicated
+    # graph database at scale for the GraphRAG knowledge graph. The
+    # adapter is lazy-imported — only loaded when NEO4J_URI is
+    # configured. Apache-2.0 licensed. See src/movate/storage/neo4j.py.
+    "neo4j>=5.0,<6",
+]
 ocr = [
     # Scanned-image PDF support: pdf2image wraps Poppler's pdftoppm
     # renderer to rasterise each PDF page at 300 DPI before passing to
@@ -643,5 +650,6 @@ markers = [
     "acceptance: hermetic end-to-end slice guards (run in the normal suite)",
     "temporal: Temporal integration tests requiring `temporal server start-dev` (opt-in, run with pytest -m temporal)",
     "voice_bench: voice eval/regression harness tests (ADR 049 D5)",
+    "neo4j: Neo4j integration tests requiring a running Neo4j instance (opt-in, run with pytest -m neo4j)",
 ]
 addopts = "-ra --strict-markers"
