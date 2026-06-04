@@ -141,9 +141,20 @@ class ElevenLabsTTS:
         if not utterance.strip():
             return  # nothing to say → no audio frames
 
+        # Guard: ElevenLabs voice IDs are alphanumeric ~20-char strings (no
+        # dashes). If the failover chain passes a Cartesia UUID (has dashes),
+        # fall back to our default rather than 400-ing (ADR 049 portability).
+        import re  # noqa: PLC0415
+
+        _is_uuid = bool(voice_id and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            voice_id.lower(),
+        ))
+        resolved_voice = self._default_voice if _is_uuid else (voice_id or self._default_voice)
+
         client = self._resolve_client(api_key)
         stream = client.text_to_speech.stream(
-            voice_id=voice_id or self._default_voice,
+            voice_id=resolved_voice,
             text=utterance,
             model_id=self._model,
             output_format=_ELEVENLABS_OUTPUT_FORMAT,
