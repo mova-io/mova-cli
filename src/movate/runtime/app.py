@@ -15998,11 +15998,22 @@ def build_app(
         config = _VoiceTurnConfig()
         _seed_voice_turn_config(config, bundle)
 
+        # Voice-context cue: nudge the agent to respond conversationally
+        # (short sentences, no markdown) so TTS sounds natural. Same hint
+        # used by the standalone demo server (server.py _LYZR_VOICE_HINT).
+        _VOICE_HINT = (
+            "please respond conversationally in 1-3 short sentences suitable "
+            "for text-to-speech playback. Do not use markdown, headers, bullet "
+            "lists, numbered steps, or section labels. Summarize key info "
+            "inline. If a long procedure is needed, offer to send detailed "
+            "steps separately."
+        )
         agent = ExecutorAgentTurn(
             executor=executor,
             bundle=bundle,
             tenant_id=default_tenant,
             input_key=config.input_key,
+            voice_hint=_VOICE_HINT,
         )
 
         try:
@@ -16446,6 +16457,97 @@ def build_app(
         return {"deleted": True}
 
     app.include_router(v1)
+
+    # ------------------------------------------------------------------
+    # GET /lyzr/agents — List agents from the user's Lyzr account.
+    # Drives the Mova-iO agent picker dropdown in the voice demo UI.
+    # Honors BYOK via X-Lyzr-Api-Key header; falls back to LYZR_API_KEY env.
+    # ------------------------------------------------------------------
+    import time as _time_mod  # noqa: PLC0415
+
+    _lyzr_agents_cache: dict[str, tuple[float, dict[str, object]]] = {}
+    _LYZR_AGENTS_TTL_S = 60.0
+
+    def _resolve_lyzr_key(request: Request) -> str:
+        header_key = (request.headers.get("x-lyzr-api-key") or "").strip()
+        return header_key or os.environ.get("LYZR_API_KEY", "").strip()
+
+    @app.get("/lyzr/agents", tags=["voice"], include_in_schema=False)
+    async def _lyzr_agents(request: Request) -> dict[str, object]:
+        """List agents from the caller's Lyzr account for the agent picker."""
+        key = _resolve_lyzr_key(request)
+        if not key:
+            return {
+                "ok": False,
+                "error": "LYZR_API_KEY not set",
+                "tip": "Paste a Mova-iO API key in the key panel, or set LYZR_API_KEY env",
+            }
+        now = _time_mod.monotonic()
+        cached = _lyzr_agents_cache.get(key)
+        if cached and now - cached[0] < _LYZR_AGENTS_TTL_S:
+            return cached[1]
+        try:
+            import httpx  # noqa: PLC0415
+
+            r = httpx.get(
+                "https://agent-prod.studio.lyzr.ai/v3/agents/",
+                headers={"x-api-key": key},
+                timeout=5.0,
+            )
+            r.raise_for_status()
+            raw = r.json() or []
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        def _summary(a: dict[str, object]) -> dict[str, object]:
+            tools = a.get("tools") or []
+            tool_names = [t.get("name") for t in tools if isinstance(t, dict)]
+            instructions = str(a.get("agent_instructions") or "")
+            return {
+                "id": a.get("_id"),
+                "name": a.get("name") or "(unnamed)",
+                "description": (str(a.get("description") or ""))[:200],
+                "role": a.get("agent_role") or "",
+                "instructions_snippet": instructions[:280] + ("..." if len(instructions) > 280 else ""),
+                "tools": tool_names,
+                "features": a.get("features") or [],
+            }
+
+        agents = sorted(
+            (_summary(a) for a in raw if isinstance(a, dict) and a.get("_id")),
+            key=lambda x: str(x.get("name") or "").lower(),
+        )
+        payload: dict[str, object] = {"ok": True, "agents": agents, "count": len(agents)}
+        _lyzr_agents_cache[key] = (now, payload)
+        return payload
+
+    @app.get("/lyzr/agents/{agent_id}", tags=["voice"], include_in_schema=False)
+    async def _lyzr_agent_detail(agent_id: str, request: Request) -> dict[str, object]:
+        """Validate + fetch metadata for a single Lyzr agent (L5 badge)."""
+        key = _resolve_lyzr_key(request)
+        if not key:
+            return {"ok": False, "error": "no key"}
+        try:
+            import httpx  # noqa: PLC0415
+
+            r = httpx.get(
+                f"https://agent-prod.studio.lyzr.ai/v3/agents/{agent_id}",
+                headers={"x-api-key": key},
+                timeout=5.0,
+            )
+            r.raise_for_status()
+            a = r.json()
+            return {"ok": True, "agent": {
+                "id": a.get("_id"),
+                "name": a.get("name"),
+                "description": (str(a.get("description") or ""))[:200],
+                "role": a.get("agent_role") or "",
+                "instructions_snippet": (str(a.get("agent_instructions") or ""))[:280],
+                "tools": [t.get("name") for t in (a.get("tools") or []) if isinstance(t, dict)],
+                "features": a.get("features") or [],
+            }}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
     # GET /tts/voices — Voice catalog for the demo UI's voice picker.
