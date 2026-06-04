@@ -16448,6 +16448,33 @@ def build_app(
     app.include_router(v1)
 
     # ------------------------------------------------------------------
+    # GET /tts/voices — Voice catalog for the demo UI's voice picker.
+    # Hardcoded subset; the standalone demo server fetches live from
+    # Cartesia but the runtime keeps it simple.
+    # ------------------------------------------------------------------
+    _TTS_VOICES: dict[str, list[dict[str, str]]] = {
+        "openai": [
+            {"id": "alloy", "label": "Alloy", "description": "neutral, balanced", "use_case": "general support, default"},
+            {"id": "echo", "label": "Echo", "description": "calm, measured male", "use_case": "customer service, IVR"},
+            {"id": "fable", "label": "Fable", "description": "warm British accent", "use_case": "storytelling, training"},
+            {"id": "onyx", "label": "Onyx", "description": "deep, authoritative male", "use_case": "announcements, alerts"},
+            {"id": "nova", "label": "Nova", "description": "bright, friendly female", "use_case": "help desk, assistant"},
+            {"id": "shimmer", "label": "Shimmer", "description": "soft, expressive female", "use_case": "wellness, calm settings"},
+        ],
+        "cartesia": [
+            {"id": "a0e99841-438c-4a64-b679-ae501e7d6091", "label": "Clara (F)", "description": "Middle-aged American female with a clear tone and precise enunciation", "use_case": "general use"},
+            {"id": "79a125e8-cd45-4c13-8a67-188112f4dd22", "label": "British Lady (F)", "description": "Professional, clear female British accent", "use_case": "enterprise voice"},
+            {"id": "b7d50908-b17c-442d-ad8d-810c63997ed9", "label": "California Girl (F)", "description": "Bright, upbeat young female", "use_case": "casual, help desk"},
+            {"id": "c8fff9e7-1b78-4e52-b5d7-f2b3e0b28c94", "label": "Confident Male (M)", "description": "Authoritative, steady male voice", "use_case": "announcements, IVR"},
+            {"id": "638efaaa-4d0c-442e-b701-3fae16aad012", "label": "Sarah (F)", "description": "Warm, professional female", "use_case": "customer support"},
+        ],
+    }
+
+    @app.get("/tts/voices", tags=["voice"], include_in_schema=False)
+    async def _tts_voices() -> dict[str, Any]:
+        return {"ok": True, "voices": _TTS_VOICES, "cartesia_live": False}
+
+    # ------------------------------------------------------------------
     # GET / — Serve the voice demo app (examples/web_demo/index.html).
     # The file is baked into the image at /app/web_demo/index.html by the
     # Dockerfile.  Falls back to a project-root lookup for local dev.
