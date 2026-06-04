@@ -150,6 +150,11 @@ COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate
 COPY agents/ /app/agents/
 ENV MOVATE_AGENTS_PATH=/app/agents
 
+# Voice demo web app (same COPY as the runtime/app stage — the default
+# build target is this playground stage, and ACA overrides CMD to
+# `mdk serve`, so the runtime serves this HTML at GET /).
+COPY examples/web_demo/index.html /app/web_demo/index.html
+
 # Non-root user (defense in depth — matches the runtime/worker stages).
 RUN useradd --create-home --home-dir /home/movate --shell /bin/bash movate \
     && chown -R movate:movate /opt/movate /app
