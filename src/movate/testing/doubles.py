@@ -180,6 +180,13 @@ class InMemoryStorage:
         return None
 
     async def save_run(self, run: RunRecord) -> None:
+        # Upsert: replace an existing record with the same run_id so voice-
+        # parity patching (ADR 050 D1 — adding modality + voice metrics after
+        # the Executor's initial save) works without a separate update path.
+        for i, existing in enumerate(self.runs):
+            if existing.run_id == run.run_id:
+                self.runs[i] = run
+                return
         self.runs.append(run)
 
     async def save_failure(self, f: FailureRecord) -> None:

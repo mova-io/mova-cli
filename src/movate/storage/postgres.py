@@ -1157,6 +1157,15 @@ CREATE TABLE IF NOT EXISTS session_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_session_messages_session
     ON session_messages(session_id, tenant_id, created_at);
+
+-- ADR 050 D1 — voice-as-run parity: voice-specific columns on runs.
+-- All nullable (NULL for text runs); additive, no backfill needed.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS modality TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS stt_latency_ms DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS tts_latency_ms DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS audio_duration_s DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS stt_cost_usd DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS tts_cost_usd DOUBLE PRECISION;
 """
 
 
@@ -1589,17 +1598,31 @@ class PostgresProvider:
     # ------------------------------------------------------------------
 
     async def save_run(self, run: RunRecord) -> None:
+        # ON CONFLICT DO UPDATE so the voice-parity handler (ADR 050 D1) can
+        # re-save a RunRecord with voice-specific fields after the Executor's
+        # initial insert. The UPDATE SET list covers only the voice-additive
+        # columns — the Executor-written columns are untouched on conflict.
         await self._db.execute(
             """
             INSERT INTO runs (
                 run_id, job_id, tenant_id, agent, agent_version, prompt_hash,
                 provider, provider_version, pricing_version, status,
                 input, output, metrics, error, created_at,
-                workflow_run_id, node_id, thread_id, skill_calls, turns
+                workflow_run_id, node_id, thread_id, skill_calls, turns,
+                modality, stt_latency_ms, tts_latency_ms, audio_duration_s,
+                stt_cost_usd, tts_cost_usd
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                $21, $22, $23, $24, $25, $26
             )
+            ON CONFLICT (run_id) DO UPDATE SET
+                modality = EXCLUDED.modality,
+                stt_latency_ms = EXCLUDED.stt_latency_ms,
+                tts_latency_ms = EXCLUDED.tts_latency_ms,
+                audio_duration_s = EXCLUDED.audio_duration_s,
+                stt_cost_usd = EXCLUDED.stt_cost_usd,
+                tts_cost_usd = EXCLUDED.tts_cost_usd
             """,
             run.run_id,
             run.job_id,
@@ -1622,6 +1645,13 @@ class PostgresProvider:
             # ADR 024 D2 — per-step retention (JSONB codec wraps json.dumps).
             [c.model_dump() for c in run.skill_calls],
             [t.model_dump() for t in run.turns],
+            # ADR 050 D1 — voice-specific fields (all None for text runs).
+            run.modality,
+            run.stt_latency_ms,
+            run.tts_latency_ms,
+            run.audio_duration_s,
+            run.stt_cost_usd,
+            run.tts_cost_usd,
         )
 
     async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
@@ -5226,6 +5256,14 @@ def _row_to_run(row: asyncpg.Record) -> RunRecord:
         thread_id=row["thread_id"],
         skill_calls=skill_calls,
         turns=turns,
+        # ADR 050 D1 — voice-specific fields. NULL on pre-migration or
+        # text-only rows → None, so existing records load unchanged.
+        modality=row.get("modality"),
+        stt_latency_ms=row.get("stt_latency_ms"),
+        tts_latency_ms=row.get("tts_latency_ms"),
+        audio_duration_s=row.get("audio_duration_s"),
+        stt_cost_usd=row.get("stt_cost_usd"),
+        tts_cost_usd=row.get("tts_cost_usd"),
     )
 
 

@@ -2157,6 +2157,58 @@ class RunRecord(BaseModel):
         ),
     )
 
+    # ---- ADR 050 D1 / D7 / D8 — voice-as-run parity (ADDITIVE, OPTIONAL) ----
+    # All fields below default to ``None`` so text runs serialize identically to
+    # before; voice turns set them after the pipeline completes. ``modality``
+    # distinguishes voice vs text in ``mdk runs list``; the ``stt_*`` / ``tts_*``
+    # / ``audio_*`` fields carry voice-specific economics for the usage API.
+    modality: str | None = Field(
+        default=None,
+        description=(
+            "Run modality: ``'voice'`` for voice turns, ``None`` (the default) for "
+            "text. Additive: every existing RunRecord is ``None`` and renders as "
+            "text. Voice turns set this when the WS handler persists them."
+        ),
+    )
+    stt_latency_ms: float | None = Field(
+        default=None,
+        description=(
+            "STT stage latency in milliseconds (voice turns only). Time from "
+            "audio-in start to the final transcript. ``None`` for text runs."
+        ),
+    )
+    tts_latency_ms: float | None = Field(
+        default=None,
+        description=(
+            "TTS stage latency in milliseconds (voice turns only). Time from "
+            "agent answer to first audio frame. ``None`` for text runs."
+        ),
+    )
+    audio_duration_s: float | None = Field(
+        default=None,
+        description=(
+            "Duration of the inbound audio in seconds (voice turns only). "
+            "Derived from the STT transcript length or audio frame count. "
+            "``None`` for text runs."
+        ),
+    )
+    stt_cost_usd: float | None = Field(
+        default=None,
+        description=(
+            "STT cost in USD for this voice turn (ADR 050 D7). Computed as "
+            "``audio_duration_s * provider_rate_per_second``. ``None`` for "
+            "text runs. Flows into the usage API alongside ``metrics.cost_usd``."
+        ),
+    )
+    tts_cost_usd: float | None = Field(
+        default=None,
+        description=(
+            "TTS cost in USD for this voice turn (ADR 050 D7). Computed as "
+            "``answer_chars * provider_rate_per_char``. ``None`` for text "
+            "runs. Flows into the usage API alongside ``metrics.cost_usd``."
+        ),
+    )
+
 
 class ConversationThread(BaseModel):
     """A multi-turn conversation with a single agent (Tier 10.5, PR-N).

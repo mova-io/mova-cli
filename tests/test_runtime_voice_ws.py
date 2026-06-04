@@ -638,6 +638,32 @@ async def test_voice_ws_realtime_uses_tenant_byok_key(
     assert rt.api_keys == ["sk-rt"]
 
 
+def _drain_turn_with_usage(ws) -> list[dict | bytes]:
+    """Like :func:`_drain_turn` but continues past ``done`` to capture the
+    ``usage`` control frame that the voice-runs-parity handler emits after the
+    turn completes (ADR 050 D7). Stops after ``usage`` or a second ``done``/
+    ``error`` or socket close."""
+    frames: list[dict | bytes] = []
+    past_done = False
+    while True:
+        msg = ws.receive()
+        if "bytes" in msg and msg["bytes"] is not None:
+            frames.append(msg["bytes"])
+            continue
+        if "text" in msg and msg["text"] is not None:
+            ctrl = json.loads(msg["text"])
+            frames.append(ctrl)
+            if ctrl.get("type") == "done":
+                past_done = True
+                continue
+            if past_done and ctrl.get("type") == "usage":
+                return frames
+            if ctrl.get("type") == "error":
+                return frames
+        if msg.get("type") == "websocket.close":
+            return frames
+
+
 # ── ADR 071 — per-agent voice block seeds the per-turn config ──────────────────
 
 
@@ -704,6 +730,21 @@ def test_seed_voice_turn_config_endpointing() -> None:
     assert cfg2.endpointing_ms is None
 
 
+# ---------------------------------------------------------------------------
+# Gap 1: Voice turns recorded as RunRecords (ADR 050 D1)
+# ---------------------------------------------------------------------------
+
+
+async def test_voice_turn_persisted_as_run_record_with_modality(
+    client: TestClient, storage, auth_setup, app_and_fakes
+) -> None:
+    """A voice turn writes a RunRecord with ``modality='voice'`` and voice-
+    specific metrics (stt_latency_ms, tts_latency_ms, audio_duration_s,
+    stt_cost_usd, tts_cost_usd)."""
+    token, _tenant_id = auth_setup
+    _create_agent(client, token)
+
+
 def test_seed_voice_turn_config_adaptive_endpointing() -> None:
     """ADR 073 Phase 3: endpointing_adaptive seeds from the agent block (default False)."""
     cfg = _VoiceTurnConfig()
@@ -719,7 +760,7 @@ async def test_voice_ws_threads_agent_endpointing_to_stt(storage, agents_path, a
     stt = FakeSTT("turn the lights on")
     app.state.voice_stt_factory = lambda: stt
     app.state.voice_tts_factory = FakeTTS
-    token, _ = auth_setup
+    token, tenant_id = auth_setup
     client = TestClient(app)
     agent_yaml = _AGENT_YAML.replace(
         b"description: demo agent for the voice WS transport",
@@ -742,10 +783,127 @@ async def test_voice_ws_threads_agent_endpointing_to_stt(storage, agents_path, a
         ws.send_json({"type": "config", "mock": True})
         ws.send_bytes(b"\x00\x01\x02\x03")
         ws.send_json({"type": "end"})
-        _drain_turn(ws)
+        frames = _drain_turn(ws)
         ws.send_json({"type": "close"})
 
     assert stt.endpointing_seen == [700]
+
+    ctrl = [f for f in frames if isinstance(f, dict)]
+    done = next(c for c in ctrl if c["type"] == "done")
+    assert done["status"] == "success"
+
+    # The RunRecord now has voice-specific fields.
+    record = await storage.get_run(done["run_id"], tenant_id=tenant_id)
+    assert record is not None
+    assert record.modality == "voice"
+    assert record.stt_latency_ms is not None
+    assert record.audio_duration_s is not None
+    assert record.stt_cost_usd is not None and record.stt_cost_usd >= 0.0
+    assert record.tts_cost_usd is not None and record.tts_cost_usd >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Gap 2: session_id threading through voice WS (ADR 050 D1/D8)
+# ---------------------------------------------------------------------------
+
+
+async def test_voice_ws_session_threading(storage, agents_path, auth_setup) -> None:
+    """Two voice turns with the same ``session_id``: the second turn sees the
+    first turn's context (the session's message count and cost increase)."""
+    from movate.core.models import Session  # noqa: PLC0415
+
+    token, tenant_id = auth_setup
+    # Create a session to thread through.
+    session = Session(session_id=uuid4().hex, tenant_id=tenant_id, agent="voice-demo")
+    await storage.save_session(session)
+
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("hello there")
+    tts = FakeTTS()
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = lambda: tts
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    # Turn 1 — with session_id in the config frame.
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True, "session_id": session.session_id})
+        ws.send_bytes(b"\x00\x01")
+        ws.send_json({"type": "end"})
+        _drain_turn_with_usage(ws)
+        ws.send_json({"type": "close"})
+
+    # The session should now have 1 turn appended.
+    updated_session = await storage.get_session(session.session_id, tenant_id=tenant_id)
+    assert updated_session is not None
+    assert updated_session.turn_count == 1
+    assert updated_session.total_cost_usd > 0.0
+
+    # Turn 2 — same session_id; the agent gets context from turn 1.
+    stt2 = FakeSTT("what about now")
+    app.state.voice_stt_factory = lambda: stt2
+    client2 = TestClient(app)
+    with client2.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True, "session_id": session.session_id})
+        ws.send_bytes(b"\x00\x01")
+        ws.send_json({"type": "end"})
+        _drain_turn_with_usage(ws)
+        ws.send_json({"type": "close"})
+
+    # Two turns recorded on the session.
+    final_session = await storage.get_session(session.session_id, tenant_id=tenant_id)
+    assert final_session is not None
+    assert final_session.turn_count == 2
+
+    # The session messages contain both user and assistant rows for each turn.
+    messages = await storage.list_session_messages(session.session_id, tenant_id=tenant_id)
+    # 2 turns * 2 rows (user + assistant) = 4 messages.
+    assert len(messages) == 4
+    user_msgs = [m for m in messages if m.role == "user"]
+    assert len(user_msgs) == 2
+    assert user_msgs[0].content == {"text": "hello there"}
+    assert user_msgs[1].content == {"text": "what about now"}
+
+
+# ---------------------------------------------------------------------------
+# Gap 3: Voice cost in metering envelope (ADR 050 D7)
+# ---------------------------------------------------------------------------
+
+
+async def test_voice_turn_emits_usage_frame_with_cost(
+    client: TestClient, storage, auth_setup, app_and_fakes
+) -> None:
+    """The voice turn emits a ``usage`` control frame with stt_cost_usd,
+    tts_cost_usd, and total_cost_usd after the ``done`` frame."""
+    token, tenant_id = auth_setup
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "end"})
+        frames = _drain_turn_with_usage(ws)
+        ws.send_json({"type": "close"})
+
+    ctrl = [f for f in frames if isinstance(f, dict)]
+    usage = next((c for c in ctrl if c["type"] == "usage"), None)
+    assert usage is not None, f"no usage frame; types={[c.get('type') for c in ctrl]}"
+    assert "stt_cost_usd" in usage
+    assert "tts_cost_usd" in usage
+    assert "llm_cost_usd" in usage
+    assert "total_cost_usd" in usage
+    assert usage["total_cost_usd"] >= 0.0
+    # The run_id in the usage frame matches the done frame.
+    done = next(c for c in ctrl if c["type"] == "done")
+    assert usage["run_id"] == done["run_id"]
+
+    # Voice cost flows into the RunRecord for the usage API (build_usage reads
+    # metrics.cost_usd which already includes LLM cost; stt/tts are additive
+    # voice-specific fields).
+    record = await storage.get_run(done["run_id"], tenant_id=tenant_id)
+    assert record is not None
+    assert record.stt_cost_usd == usage["stt_cost_usd"]
+    assert record.tts_cost_usd == usage["tts_cost_usd"]
 
 
 async def test_voice_ws_config_frame_overrides_endpointing(
