@@ -261,8 +261,8 @@ button.active { background:var(--accent); color:white; }
   <!-- 📞 Sync-to-phone button — pushes the playground's current settings
        (agent tier, Mova-iO agent_id, TTS tier, voice, hedge, budget) to the
        module-level config the next inbound Twilio call will use. -->
-  <button id="twilio-sync" class="badge detailed-only"
-          title="Copy current playground settings to the Twilio phone number — the NEXT call to this number will use these"
+  <button id="twilio-sync" class="badge"
+          title="Sync the selected agent to the Twilio phone number — the NEXT call to this number will use this agent"
           style="cursor:pointer;color:var(--text);padding:2px 8px;border:0;">📞 Sync to phone</button>
   <!-- BYOK header badge — click to paste your own Mova-iO API key.
        Shows "Lyzr: demo key" by default, "Lyzr: your key" when BYOK active. -->
@@ -319,6 +319,34 @@ button.active { background:var(--accent); color:white; }
     Tip: once your key is applied, the Mova-iO agent dropdown reloads with
     <em>your</em> account's agents.
   </p>
+</div>
+
+<!-- Phone Sync panel — visible in Simple view once the Mova-iO agent dropdown
+     has loaded. Lets the user pick an agent and attach it to the Twilio phone
+     number without switching to Detailed view. -->
+<div id="phone-sync-panel" class="panel"
+     style="display:none;margin:12px 16px;padding:12px 16px;
+            border-left:3px solid var(--ok);background:var(--panel);
+            border-radius:0 8px 8px 0;">
+  <h2 style="margin:0 0 8px 0;font-size:13px;display:flex;align-items:center;gap:6px;">
+    📞 Sync Agent to Phone
+  </h2>
+  <p class="muted" style="font-size:11px;margin:0 0 10px 0;font-style:normal;">
+    Select an agent and attach it to <strong id="phone-sync-number" style="color:var(--ok);font-family:'SF Mono',Menlo,monospace;"></strong>.
+    The next call to this number will be answered by the selected agent.
+  </p>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <select id="phone-agent-select"
+            style="background:var(--surface);color:var(--text);border:1px solid var(--border);
+                   border-radius:6px;padding:6px 10px;font-size:12px;min-width:220px;max-width:320px;flex:1;">
+      <option value="">— select agent —</option>
+    </select>
+    <button id="phone-sync-btn" class="active"
+            style="font-size:12px;padding:6px 14px;white-space:nowrap;"
+            title="Attach the selected agent to the phone number">📞 Sync to Phone</button>
+  </div>
+  <div id="phone-sync-status" style="margin-top:8px;font-size:11px;display:none;
+       padding:6px 10px;border-radius:6px;"></div>
 </div>
 
 <!-- L2: "Currently voicing" — Mova-iO agent metadata panel. Shows when an agent
@@ -1536,6 +1564,10 @@ async function loadLyzrAgents(force = false) {
     // If a currentLyzrAgentId was already set (server-side default), select it.
     if (currentLyzrAgentId) sel.value = currentLyzrAgentId;
     lyzrAgentsLoaded = true;
+    // In Simple view the agent picker should always be visible once loaded.
+    if (document.documentElement.getAttribute('data-view') === 'simple') {
+      showLyzrIdInput(true);
+    }
   } catch (e) {
     sel.innerHTML = `<option value="">err: ${String(e)}</option>`;
   }
@@ -2256,6 +2288,78 @@ $('twilio-sync').addEventListener('click', () => {
   $('twilio-sync').textContent = '📞 Syncing…';
   setTimeout(() => { $('twilio-sync').textContent = '📞 Sync to phone'; }, 1500);
 });
+
+// ─── Phone Sync panel (Simple tab) ───────────────────────────────────────
+// Shows once the Mova-iO agent dropdown has loaded (i.e. user has a key).
+// Mirrors the agent list from #lyzr-agent-select into #phone-agent-select
+// and calls PUT /api/v1/call/twilio/config to attach the chosen agent.
+function _phoneSyncPopulate() {
+  const src = $('lyzr-agent-select');
+  const dst = $('phone-agent-select');
+  if (!src || !dst) return;
+  // Copy options from the Mova-iO agent picker.
+  dst.innerHTML = '<option value="">— select agent —</option>';
+  for (const opt of src.options) {
+    if (!opt.value) continue;
+    const o = document.createElement('option');
+    o.value = opt.value;
+    o.textContent = opt.textContent;
+    dst.appendChild(o);
+  }
+  // Show the panel if we have agents and a phone number.
+  const num = $('twilio-dial')?.dataset?.number;
+  if (dst.options.length > 1 && num) {
+    $('phone-sync-panel').style.display = '';
+    $('phone-sync-number').textContent = formatPhone(num);
+  }
+}
+// Re-populate whenever the Mova-iO dropdown changes (after BYOK apply, refresh, etc.)
+const _lyzrSelObs = new MutationObserver(_phoneSyncPopulate);
+if ($('lyzr-agent-select')) {
+  _lyzrSelObs.observe($('lyzr-agent-select'), { childList: true });
+}
+
+$('phone-sync-btn').addEventListener('click', async () => {
+  const agent = $('phone-agent-select').value;
+  const status = $('phone-sync-status');
+  if (!agent) {
+    status.style.display = '';
+    status.style.background = 'rgba(239,68,68,0.12)';
+    status.style.color = 'var(--err)';
+    status.textContent = 'Please select an agent first.';
+    return;
+  }
+  $('phone-sync-btn').disabled = true;
+  $('phone-sync-btn').textContent = '📞 Syncing…';
+  status.style.display = 'none';
+
+  try {
+    const res = await fetch('/api/v1/call/twilio/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent }),
+    });
+    const data = await res.json();
+    status.style.display = '';
+    if (res.ok) {
+      status.style.background = 'rgba(52,208,88,0.12)';
+      status.style.color = 'var(--ok)';
+      status.textContent = '✓ Synced! Calls to ' + ($('phone-sync-number')?.textContent || 'the number') + ' now reach ' + data.agent;
+    } else {
+      status.style.background = 'rgba(239,68,68,0.12)';
+      status.style.color = 'var(--err)';
+      status.textContent = data.detail || 'Sync failed';
+    }
+  } catch (e) {
+    status.style.display = '';
+    status.style.background = 'rgba(239,68,68,0.12)';
+    status.style.color = 'var(--err)';
+    status.textContent = 'Network error: ' + e.message;
+  }
+  $('phone-sync-btn').disabled = false;
+  $('phone-sync-btn').textContent = '📞 Sync to Phone';
+});
+
 // BYOK: panel toggle + apply/clear/show controls. Keys are kept in DOM only
 // (no localStorage by default — opt-in could be a future enhancement) and
 // sent to the server inside one set_user_keys WS message.
@@ -2401,11 +2505,17 @@ function applyView(view) {
     };
     if (ws && ws.readyState === 1) enforceSimpleDefaults();
     else setTimeout(enforceSimpleDefaults, 800);
+    // Simple view always uses Lyzr — show the agent picker so the user
+    // can select which agent to speak with (same dropdown as Detailed).
+    showLyzrIdInput(true);
     // Also auto-open the BYOK panel if no Mova-iO key is set yet — Simple view
     // calls out that "the user needs to add a Mova-iO API key, no other keys".
     if (!($('byok-lyzr').value || '').trim()) {
       $('byok-panel').style.display = '';
     }
+  } else {
+    // Detailed view: re-sync picker visibility with the current tier.
+    showLyzrIdInput((agentTier === 'lyzr' || agentTier === 'lyzr_sdk'));
   }
   // Re-render the live activity chart after layout shifts (canvas dims change).
   if (typeof drawMonitor === 'function') setTimeout(drawMonitor, 50);

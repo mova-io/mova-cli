@@ -16452,24 +16452,46 @@ def build_app(
     # The file is baked into the image at /app/web_demo/index.html by the
     # Dockerfile.  Falls back to a project-root lookup for local dev.
     # ------------------------------------------------------------------
-    _DEMO_HTML_PATHS = [
-        "/app/web_demo/index.html",            # Docker image (COPY in Dockerfile)
-        str(pathlib.Path(__file__).resolve().parents[2] / "examples" / "web_demo" / "index.html"),
+    # Eagerly load the voice demo HTML at startup so the GET / route
+    # never hits a file-not-found at request time.
+    _demo_html: str = ""
+    _demo_candidates = [
+        "/app/web_demo/index.html",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "index.html"),
+        os.path.join(os.environ.get("MOVATE_AGENTS_PATH", "/app/agents"), "..", "web_demo", "index.html"),
     ]
-    _demo_html_cache: str | None = None
+    for _p in _demo_candidates:
+        _p = os.path.normpath(_p)
+        if os.path.isfile(_p):
+            with open(_p) as _f:
+                _demo_html = _f.read()
+            logger.info("Voice demo HTML loaded from %s (%d bytes)", _p, len(_demo_html))
+            break
+    else:
+        logger.warning("Voice demo HTML not found; checked: %s", _demo_candidates)
+
+    # Mount /static for voice demo assets (logos, etc.).
+    _static_candidates = [
+        "/app/web_demo/static",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "static"),
+    ]
+    for _sp in _static_candidates:
+        _sp = os.path.normpath(_sp)
+        if os.path.isdir(_sp):
+            from starlette.staticfiles import StaticFiles  # noqa: PLC0415
+
+            app.mount("/static", StaticFiles(directory=_sp), name="demo-static")
+            logger.info("Mounted /static from %s", _sp)
+            break
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def _voice_demo() -> HTMLResponse:
-        nonlocal _demo_html_cache
-        if _demo_html_cache is None:
-            for p in _DEMO_HTML_PATHS:
-                if os.path.isfile(p):
-                    with open(p) as f:
-                        _demo_html_cache = f.read()
-                    break
-        if _demo_html_cache is None:
-            raise HTTPException(status_code=404, detail="Voice demo HTML not found")
-        return HTMLResponse(_demo_html_cache)
+        if not _demo_html:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice demo HTML not found. Checked: {_demo_candidates}",
+            )
+        return HTMLResponse(_demo_html)
 
     # ------------------------------------------------------------------
     # Typed exception → HTTP code translator. AgentCreationError carries
