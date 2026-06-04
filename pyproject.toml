@@ -619,6 +619,7 @@ markers = [
     "integration: integration tests using local mode",
     "smoke: live API smoke tests (opt-in, env-gated)",
     "postgres: tests that require a real Postgres at MOVATE_PG_TEST_URL",
+    "temporal: tests requiring the [temporal] extra (skip by default)",
     "no_preflight_stub: opts out of the eval-scorecard preflight autouse no-op",
     "acceptance: hermetic end-to-end slice guards (run in the normal suite)",
     "temporal: Temporal integration tests requiring `temporal server start-dev` (opt-in, run with pytest -m temporal)",
