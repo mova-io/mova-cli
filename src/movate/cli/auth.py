@@ -865,6 +865,12 @@ _PROVIDERS_PROMPT_NAME = {
     # has its own multi-value login path (like telegram). DISTINCT from the
     # `azure` (Azure OpenAI) provider above — different Azure resource + key.
     "azure-speech": "Azure Speech (voice STT + TTS)",
+    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). ServiceNow
+    # needs two values (API key + instance URL) — handled via a dedicated
+    # multi-value code path like telegram/azure-speech. Microsoft Graph
+    # likewise needs two values (access token + tenant ID).
+    "servicenow": "ServiceNow (enterprise connector)",
+    "msgraph": "Microsoft Graph (enterprise connector)",
     # Temporal is the durable workflow backend (ADR 054). Per-workflow opt-in
     # via ``workflow.yaml: runtime: temporal``. Needs a host + namespace, and
     # optionally a TLS cert/key pair (Temporal Cloud only — self-hosted skips
@@ -896,6 +902,11 @@ _TELEGRAM_PROVIDERS = frozenset({"telegram"})
 # provider the picker should live-verify against an LLM endpoint.
 _VOICE_PROVIDERS = frozenset({"azure-speech"})
 
+# Enterprise connector providers that need TWO values — same multi-value
+# pattern as telegram/azure-speech. Dispatched to their own code paths
+# in login(). Kept out of _PROVIDER_TO_ENV_VAR for the same reason.
+_CONNECTOR_PROVIDERS = frozenset({"servicenow", "msgraph"})
+
 # Temporal (ADR 054) needs 2-4 values (host + namespace, plus optional TLS
 # cert/key for Temporal Cloud). Same multi-value pattern as telegram /
 # azure-speech, dispatched to its own code path. Kept out of
@@ -915,7 +926,9 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "[bold]azure[/bold], [bold]gemini[/bold], [bold]lyzr[/bold], "
             "[bold]deepgram[/bold], [bold]cartesia[/bold], "
             "[bold]elevenlabs[/bold], "
-            "[bold]azure-speech[/bold] (voice), [bold]telegram[/bold], or "
+            "[bold]azure-speech[/bold] (voice), "
+            "[bold]servicenow[/bold], [bold]msgraph[/bold] (connectors), "
+            "[bold]telegram[/bold], or "
             "[bold]temporal[/bold] (durable workflow backend). "
             "Omit to pick interactively."
         ),
@@ -1037,6 +1050,11 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_azure_speech(key=key, save_to=save_to)
         return
 
+    # Enterprise connectors (ADR 052 Phase 1) — each needs two values.
+    if provider in _CONNECTOR_PROVIDERS:
+        _login_connector(provider, key=key, save_to=save_to)
+        return
+
     # Temporal (ADR 054) is the durable workflow backend — needs host +
     # namespace, plus optional TLS cert/key for Temporal Cloud. Its own
     # multi-value path, same as telegram / azure-speech.
@@ -1050,6 +1068,7 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
                 set(_PROVIDER_TO_ENV_VAR)
                 | _TELEGRAM_PROVIDERS
                 | _VOICE_PROVIDERS
+                | _CONNECTOR_PROVIDERS
                 | _TEMPORAL_PROVIDERS
             )
         )
@@ -2758,6 +2777,94 @@ def _login_azure_speech(*, key: str | None, save_to: str) -> None:
         with dotenv.open("a") as fh:
             fh.write(f"AZURE_SPEECH_KEY={speech_key}\n")
             fh.write(f"AZURE_SPEECH_REGION={region}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_connector(provider: str, *, key: str | None, save_to: str) -> None:
+    """Guided enterprise-connector setup (ADR 052 Phase 1 — Action Fabric).
+
+    Each connector needs TWO values — an API key/token and a routing value
+    (instance URL or tenant ID). Same multi-value pattern as azure-speech.
+    No live verification: the HTTP skill backend surfaces a clear error at
+    first use if the credentials are wrong.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    if key is not None and not key.strip():
+        error("empty key -- aborted.")
+        raise typer.Exit(code=2)
+
+    # Connector-specific prompts and env var names.
+    connector_config: dict[str, dict[str, str]] = {
+        "servicenow": {
+            "key_var": "SERVICENOW_API_KEY",
+            "extra_var": "SERVICENOW_INSTANCE_URL",
+            "key_prompt": "ServiceNow API key",
+            "extra_prompt": "ServiceNow instance URL (e.g. https://mycompany.service-now.com)",
+            "hint_text": (
+                "[dim]ServiceNow connector setup:\n"
+                "  1. Create an integration user with the [bold]itil[/bold] role\n"
+                "  2. Generate an API key or configure OAuth\n"
+                "  3. Note your instance URL (e.g. https://mycompany.service-now.com)[/dim]"
+            ),
+        },
+        "msgraph": {
+            "key_var": "MSGRAPH_ACCESS_TOKEN",
+            "extra_var": "MSGRAPH_TENANT_ID",
+            "key_prompt": "Microsoft Graph access token",
+            "extra_prompt": "Azure AD tenant ID",
+            "hint_text": (
+                "[dim]Microsoft Graph connector setup:\n"
+                "  1. Register an app in Azure AD\n"
+                "  2. Grant [bold]User.ReadWrite.All[/bold] + "
+                "[bold]Directory.ReadWrite.All[/bold] permissions\n"
+                "  3. Generate a client secret and obtain an access token\n"
+                "  4. Note your tenant ID from the app registration overview[/dim]"
+            ),
+        },
+    }
+
+    cfg = connector_config.get(provider)
+    if cfg is None:
+        error(f"unknown connector provider {provider!r}.")
+        raise typer.Exit(code=2)
+
+    hint(cfg["hint_text"])
+
+    api_key = (
+        key.strip()
+        if key is not None
+        else typer.prompt(cfg["key_prompt"], hide_input=True, confirmation_prompt=False).strip()
+    )
+    if not api_key:
+        error("empty key -- aborted.")
+        raise typer.Exit(code=2)
+
+    extra_value = typer.prompt(cfg["extra_prompt"]).strip()
+    if not extra_value:
+        error(f"empty {cfg['extra_var']} -- aborted.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set(cfg["key_var"], api_key)
+        store.set(cfg["extra_var"], extra_value)
+        success(
+            f"saved [bold]{cfg['key_var']}[/bold] + "
+            f"[bold]{cfg['extra_var']}[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"{cfg['key_var']}={api_key}\n")
+            fh.write(f"{cfg['extra_var']}={extra_value}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
