@@ -15742,6 +15742,92 @@ def build_app(
         return Response(content=twiml, media_type="application/xml")
 
     # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/call/twilio/sync — Sync phone number
+    #
+    # Updates the Twilio phone number's Voice webhook to point at this
+    # agent's /call/twilio endpoint.  Requires TWILIO_ACCOUNT_SID,
+    # TWILIO_AUTH_TOKEN, and TWILIO_NUMBER env vars.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/call/twilio/sync",
+        tags=["agents-v1"],
+    )
+    async def v1_agent_call_twilio_sync(
+        name: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Sync a Twilio phone number to route calls to this agent.
+
+        Updates the Twilio Incoming Phone Number's VoiceUrl to
+        ``https://<host>/api/v1/agents/{name}/call/twilio`` so incoming
+        calls are handled by the named agent's voice pipeline.
+        """
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+        auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+        phone_number = os.environ.get("TWILIO_NUMBER", "").strip()
+
+        if not account_sid or not auth_token or not phone_number:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_NUMBER "
+                    "must all be set as environment variables."
+                ),
+            )
+
+        # Verify the agent exists.
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        store: StorageProvider = request.app.state.storage
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            raise HTTPException(status_code=404, detail=f"Agent {name!r} not found")
+
+        # Build the webhook URL for this agent.
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        webhook_url = f"{proto}://{host}/api/v1/agents/{name}/call/twilio"
+
+        # Use the Twilio REST API to find the phone number SID and update it.
+        try:
+            from twilio.rest import Client as TwilioClient  # noqa: PLC0415
+        except ImportError:
+            raise HTTPException(
+                status_code=501,
+                detail="twilio SDK not installed; add mdk[telephony]",
+            )
+
+        try:
+            client = TwilioClient(account_sid, auth_token)
+            # Look up the phone number SID.
+            numbers = client.incoming_phone_numbers.list(phone_number=phone_number)
+            if not numbers:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No Twilio number matching {phone_number}",
+                )
+            pn = numbers[0]
+            # Update the voice webhook URL.
+            pn.update(voice_url=webhook_url, voice_method="POST")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Twilio API error: {exc}",
+            )
+
+        return {
+            "status": "synced",
+            "agent": name,
+            "phone_number": phone_number,
+            "webhook_url": webhook_url,
+            "phone_number_sid": pn.sid,
+        }
+
+    # ------------------------------------------------------------------
     # WS /api/v1/agents/{name}/call/twilio/stream — Twilio Media Stream
     #
     # Accepts the Twilio Media Stream WebSocket opened by the TwiML
