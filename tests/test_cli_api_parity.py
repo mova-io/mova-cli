@@ -163,6 +163,7 @@ REMOTE_VERB_ROUTES: dict[str, list[tuple[str, str]]] = {
     "voice say": [("POST", "/api/v1/agents/{name}/voice")],
     "voice transcribe": [("POST", "/api/v1/agents/{name}/voice")],
     "voice ask": [("POST", "/api/v1/agents/{name}/voice")],
+    "voice call": [("POST", "/api/v1/agents/{name}/call/twilio")],
     "voice providers list": [("GET", "/api/v1/capabilities")],
 }
 
@@ -206,6 +207,7 @@ CONTROL_PLANE_ONLY: dict[str, str] = {
     # runtime API verbs.
     "workflow history": "queries Temporal workflow history; control-plane only",
     "workflow replay": "replays a Temporal workflow execution; control-plane only",
+    "voice bench": "local STT/TTS eval harness; no runtime HTTP call",
 }
 
 # ---------------------------------------------------------------------------

@@ -865,9 +865,13 @@ _PROVIDERS_PROMPT_NAME = {
     # has its own multi-value login path (like telegram). DISTINCT from the
     # `azure` (Azure OpenAI) provider above — different Azure resource + key.
     "azure-speech": "Azure Speech (voice STT + TTS)",
-    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). Each needs
-    # two values (API key/token + routing URL) — handled via a dedicated
-    # multi-value code path like telegram/azure-speech.
+    # Twilio is the telephony transport (ADR 074) — phone calls to mdk voice
+    # agents. Needs an account SID + auth token (multi-value path).
+    "twilio": "Twilio (telephony transport)",
+    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). ServiceNow
+    # needs two values (API key + instance URL) — handled via a dedicated
+    # multi-value code path like telegram/azure-speech. Microsoft Graph
+    # likewise needs two values (access token + tenant ID).
     "servicenow": "ServiceNow (enterprise connector)",
     "msgraph": "Microsoft Graph (enterprise connector)",
     "workday": "Workday (enterprise connector)",
@@ -879,6 +883,9 @@ _PROVIDERS_PROMPT_NAME = {
     # them). Multi-value flow like telegram / azure-speech. Same BYOK seam as
     # every other provider credential (ADR 054 D8).
     "temporal": "Temporal (durable workflow backend)",
+    # Neo4j is the opt-in graph database adapter for GraphRAG at scale.
+    # Needs URI + user + password — multi-value flow like temporal.
+    "neo4j": "Neo4j (graph database)",
 }
 
 _PROVIDER_TO_ENV_VAR = {
@@ -904,6 +911,12 @@ _TELEGRAM_PROVIDERS = frozenset({"telegram"})
 # provider the picker should live-verify against an LLM endpoint.
 _VOICE_PROVIDERS = frozenset({"azure-speech"})
 
+# Twilio needs TWO values (account SID + auth token) -- same multi-value
+# pattern as telegram and azure-speech. Dispatched to its own code path.
+# Kept out of _PROVIDER_TO_ENV_VAR for the same reason: its env vars
+# don't fit the one-key shape, and it isn't an LLM provider.
+_TELEPHONY_PROVIDERS = frozenset({"twilio"})
+
 # Enterprise connector providers that need TWO values — same multi-value
 # pattern as telegram/azure-speech. Dispatched to their own code paths
 # in login(). Kept out of _PROVIDER_TO_ENV_VAR for the same reason.
@@ -916,6 +929,11 @@ _CONNECTOR_PROVIDERS = frozenset({"servicenow", "msgraph", "workday", "salesforc
 # vars don't fit the one-key-per-provider shape, and it isn't an LLM provider
 # the picker should live-verify against an LLM endpoint.
 _TEMPORAL_PROVIDERS = frozenset({"temporal"})
+
+# Neo4j (opt-in graph DB, [neo4j] extra). Needs URI + user + password —
+# same multi-value pattern as temporal. Kept out of _PROVIDER_TO_ENV_VAR
+# (single-key LLM table) for the same reason.
+_NEO4J_PROVIDERS = frozenset({"neo4j"})
 
 
 @auth_app.command("login")
@@ -1053,6 +1071,11 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_azure_speech(key=key, save_to=save_to)
         return
 
+    # Twilio (ADR 074) — the telephony transport. Needs account SID + auth token.
+    if provider in _TELEPHONY_PROVIDERS:
+        _login_twilio(key=key, save_to=save_to)
+        return
+
     # Enterprise connectors (ADR 052 Phase 1) — each needs two values.
     if provider in _CONNECTOR_PROVIDERS:
         _login_connector(provider, key=key, save_to=save_to)
@@ -1065,14 +1088,22 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_temporal(key=key, save_to=save_to)
         return
 
+    # Neo4j (opt-in graph DB) — needs URI + user + password. Its own
+    # multi-value path, same as temporal / azure-speech.
+    if provider in _NEO4J_PROVIDERS:
+        _login_neo4j(key=key, save_to=save_to)
+        return
+
     if provider not in _PROVIDER_TO_ENV_VAR:
         valid = ", ".join(
             sorted(
                 set(_PROVIDER_TO_ENV_VAR)
                 | _TELEGRAM_PROVIDERS
                 | _VOICE_PROVIDERS
+                | _TELEPHONY_PROVIDERS
                 | _CONNECTOR_PROVIDERS
                 | _TEMPORAL_PROVIDERS
+                | _NEO4J_PROVIDERS
             )
         )
         error(f"unknown provider {provider!r}. Valid: {valid}")
@@ -2566,7 +2597,9 @@ def _prompt_for_provider() -> str:
         ("elevenlabs", _PROVIDERS_PROMPT_NAME["elevenlabs"]),
         ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
         ("azure-speech", _PROVIDERS_PROMPT_NAME["azure-speech"]),
+        ("twilio", _PROVIDERS_PROMPT_NAME["twilio"]),
         ("temporal", _PROVIDERS_PROMPT_NAME["temporal"]),
+        ("neo4j", _PROVIDERS_PROMPT_NAME["neo4j"]),
     ]
     stdout.print("[bold]Which provider would you like to set up?[/bold]")
     # Live-verify every configured provider in parallel BEFORE rendering
@@ -3024,6 +3057,126 @@ def _login_temporal(*, key: str | None, save_to: str) -> None:
             if tls_cert:
                 fh.write(f"TEMPORAL_TLS_CERT={tls_cert}\n")
                 fh.write(f"TEMPORAL_TLS_KEY={tls_key}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_twilio(*, key: str | None, save_to: str) -> None:
+    """Guided Twilio setup for telephony transport (ADR 074).
+
+    Twilio needs TWO values:
+      * ``TWILIO_ACCOUNT_SID`` -- the Account SID from the Twilio console.
+      * ``TWILIO_AUTH_TOKEN`` -- the Auth Token from the Twilio console.
+
+    No live verification: verifying would need the optional ``twilio`` SDK
+    (``mdk[telephony]``) and a billable roundtrip; the transport surfaces a
+    clear error at first use if the pair is wrong. Persists to
+    ``~/.movate/credentials`` (default) or project ``.env``.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    hint(
+        "[dim]Twilio telephony setup:\n"
+        "  1. Log in to [bold]console.twilio.com[/bold]\n"
+        "  2. Copy your [bold]Account SID[/bold] from the dashboard\n"
+        "  3. Copy your [bold]Auth Token[/bold] (click 'Show' to reveal)[/dim]"
+    )
+
+    # Accept --key as the account SID when passed (CI ergonomics),
+    # otherwise prompt for it.
+    account_sid = key.strip() if key is not None else typer.prompt("Twilio Account SID").strip()
+    if not account_sid:
+        error("empty Account SID -- aborted.")
+        raise typer.Exit(code=2)
+
+    auth_token = typer.prompt(
+        "Twilio Auth Token", hide_input=True, confirmation_prompt=False
+    ).strip()
+    if not auth_token:
+        error("empty Auth Token -- aborted.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("TWILIO_ACCOUNT_SID", account_sid)
+        store.set("TWILIO_AUTH_TOKEN", auth_token)
+        success(
+            f"saved [bold]TWILIO_ACCOUNT_SID[/bold] + "
+            f"[bold]TWILIO_AUTH_TOKEN[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+        hint(
+            "[dim]Every [bold]mdk[/bold] invocation on this machine now picks "
+            "up these for the Twilio telephony transport. Install the SDK with "
+            "[bold]uv add 'movate-cli[telephony]'[/bold] to use it.[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"TWILIO_ACCOUNT_SID={account_sid}\n")
+            fh.write(f"TWILIO_AUTH_TOKEN={auth_token}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_neo4j(*, key: str | None, save_to: str) -> None:
+    """Multi-value login for Neo4j (opt-in graph database adapter).
+
+    Prompts for URI (bolt:// or neo4j://), user, and password. No live
+    verification: a connect call would need the optional ``neo4j`` SDK
+    (``mdk[neo4j]``) and a running instance; the adapter validates on
+    ``init()``.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    if key is not None:
+        error(
+            "[bold]--key[/bold] doesn't apply to neo4j (we need a URI AND "
+            "user AND password); please use the interactive prompts instead."
+        )
+        raise typer.Exit(code=2)
+
+    uri = typer.prompt(
+        "Neo4j URI (e.g. bolt://localhost:7687 or neo4j+s://host:7687)",
+    )
+    user = typer.prompt("Neo4j user", default="neo4j")
+    password = typer.prompt("Neo4j password", hide_input=True)
+
+    if not uri.strip():
+        error("URI cannot be empty.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("NEO4J_URI", uri.strip())
+        store.set("NEO4J_USER", user.strip())
+        store.set("NEO4J_PASSWORD", password.strip())
+        success(
+            "saved [bold]NEO4J_URI[/bold] + [bold]NEO4J_USER[/bold] + "
+            f"[bold]NEO4J_PASSWORD[/bold] to [cyan]{store.path}[/cyan] "
+            "(mode 0600)."
+        )
+        hint(
+            "[dim]Set [bold]MOVATE_GRAPH_BACKEND=neo4j[/bold] to route graph "
+            "operations to Neo4j. Install the driver with "
+            "[bold]uv add 'movate-cli[neo4j]'[/bold].[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"NEO4J_URI={uri.strip()}\n")
+            fh.write(f"NEO4J_USER={user.strip()}\n")
+            fh.write(f"NEO4J_PASSWORD={password.strip()}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.6.3.20"
+version = "2026.6.4.1"
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -123,6 +123,13 @@ cross-encoder = [
     # the default cross-encoder/ms-marco-MiniLM-L-6-v2). Opt-in only
     # so the vast majority of operators don't pay the disk/memory cost.
     "sentence-transformers>=2.7,<4",
+]
+neo4j = [
+    # Optional Neo4j graph adapter for customers who want a dedicated
+    # graph database at scale for the GraphRAG knowledge graph. The
+    # adapter is lazy-imported — only loaded when NEO4J_URI is
+    # configured. Apache-2.0 licensed. See src/movate/storage/neo4j.py.
+    "neo4j>=5.0,<6",
 ]
 ocr = [
     # Scanned-image PDF support: pdf2image wraps Poppler's pdftoppm
@@ -250,6 +257,18 @@ voice = [
     # Deferred to further fast-follows (each behind this same extra,
     # permissive-only, justified in its own PR): Gemini Live realtime (a
     # fast-follow), and any audio lib for edge transcoding or VAD when needed.
+]
+telephony = [
+    # Twilio telephony transport (ADR 074 D3/D5). Twilio is the enterprise-PSTN
+    # path: global phone numbers, carrier-grade SIP trunking, established
+    # enterprise billing. The ``twilio`` SDK is MIT-licensed (permissive,
+    # passes ``scripts/check_licenses.py --strict``). Imported LAZILY inside
+    # ``movate.voice.transports.twilio`` -- a runtime without ``mdk[telephony]``
+    # never loads it (same posture as the voice/langfuse/keychain extras).
+    # Separate from the ``[voice]`` extra (which stays lean: STT/TTS provider
+    # SDKs only) so operators who need web-WS voice but not phone calls pay
+    # nothing for the Twilio SDK.
+    "twilio>=9.0,<10",
 ]
 langchain = [
     "langchain-core>=0.3,<1",
@@ -476,6 +495,9 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 # skills_cmd search/info/validate each have branchy filter+render pipelines;
 # extracting branches would obscure the linear operator-facing control flow.
 "src/movate/cli/skills_cmd.py" = ["PLR0912"]
+# _handle_uploads has one branch per UploadOutcome; RUF001 fires on the
+# Unicode info-source emoji (ℹ️) which is intentional operator-facing text.
+"src/movate/playground/app.py" = ["PLR0912", "RUF001"]
 # Tests freely use literals in assertions, broad-catch raises, and slf-private access.
 "tests/*.py" = ["PLR2004", "PLR0915", "B017", "SLF001"]
 
@@ -526,6 +548,10 @@ module = [
     # movate.cli.voice_cmd._voice_try_async, so mypy on `src` is clean when
     # the [voice] extra is absent.
     "sounddevice.*",
+    # Twilio SDK — optional [telephony] extra (ADR 074). No type stubs shipped;
+    # imported LAZILY inside movate.voice.transports.twilio, so mypy on `src`
+    # stays clean whether or not the extra is installed.
+    "twilio.*",
     # External-orchestrator adapters (ADR 017 D3) — optional extras with no
     # type stubs. Imported LAZILY inside the adapter functions/factory; this
     # keeps mypy on `src` clean whether or not the extras are installed.
@@ -623,5 +649,7 @@ markers = [
     "no_preflight_stub: opts out of the eval-scorecard preflight autouse no-op",
     "acceptance: hermetic end-to-end slice guards (run in the normal suite)",
     "temporal: Temporal integration tests requiring `temporal server start-dev` (opt-in, run with pytest -m temporal)",
+    "voice_bench: voice eval/regression harness tests (ADR 049 D5)",
+    "neo4j: Neo4j integration tests requiring a running Neo4j instance (opt-in, run with pytest -m neo4j)",
 ]
 addopts = "-ra --strict-markers"

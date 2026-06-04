@@ -80,6 +80,16 @@ VOICE_KEY_ENV_VARS: tuple[str, ...] = (
     "AZURE_SPEECH_REGION",
 )
 
+# Telephony-provider env vars (ADR 074, the ``[telephony]`` extra). Set via
+# ``mdk auth login twilio`` (or by hand) and consumed by the Twilio transport
+# in ``movate.voice.transports.twilio``. Kept SEPARATE from VOICE_KEY_ENV_VARS
+# because telephony is a transport concern, not a speech-adapter concern --
+# but they need the same autoload-from-credentials-file treatment.
+TELEPHONY_KEY_ENV_VARS: tuple[str, ...] = (
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+)
+
 # Enterprise connector env vars (ADR 052 Phase 1 — Action Fabric).
 # Set via ``mdk auth login servicenow`` / ``msgraph`` (or by hand) and
 # consumed by the HTTP skill backend when dispatching connector skills.
@@ -118,6 +128,18 @@ TEMPORAL_KEY_ENV_VARS: tuple[str, ...] = (
     "SAP_BASE_URL",
 )
 
+# Neo4j graph adapter env vars (opt-in [neo4j] extra). Set via
+# ``mdk auth login neo4j`` (or by hand) and consumed by the Neo4j
+# storage adapter when ``MOVATE_GRAPH_BACKEND=neo4j`` is configured.
+# ``NEO4J_URI`` is the bolt:// or neo4j:// connection string;
+# ``NEO4J_USER`` + ``NEO4J_PASSWORD`` are the auth pair. Separate from
+# PROVIDER_KEY_ENV_VARS (those are LLM keys, not graph-DB keys).
+NEO4J_KEY_ENV_VARS: tuple[str, ...] = (
+    "NEO4J_URI",
+    "NEO4J_USER",
+    "NEO4J_PASSWORD",
+)
+
 # Every env var the credentials store should autoload. Union of the
 # groups above; surfaced as a constant so `autoload_credentials`
 # and any future "what does mdk track?" enumeration agree on the
@@ -127,8 +149,10 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
     *VOICE_KEY_ENV_VARS,
+    *TELEPHONY_KEY_ENV_VARS,
     *CONNECTOR_KEY_ENV_VARS,
     *TEMPORAL_KEY_ENV_VARS,
+    *NEO4J_KEY_ENV_VARS,
 )
 
 
