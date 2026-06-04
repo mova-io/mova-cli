@@ -155,8 +155,7 @@ ENV MOVATE_AGENTS_PATH=/app/agents
 # Voice demo web app (same COPY as the runtime/app stage — the default
 # build target is this playground stage, and ACA overrides CMD to
 # `mdk serve`, so the runtime serves this HTML at GET /).
-COPY examples/web_demo/index.html /app/web_demo/index.html
-COPY examples/web_demo/static/ /app/web_demo/static/
+COPY examples/web_demo/ /app/web_demo/
 
 # Non-root user (defense in depth — matches the runtime/worker stages).
 RUN useradd --create-home --home-dir /home/movate --shell /bin/bash movate \
