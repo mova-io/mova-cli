@@ -877,6 +877,12 @@ _PROVIDERS_PROMPT_NAME = {
     # them). Multi-value flow like telegram / azure-speech. Same BYOK seam as
     # every other provider credential (ADR 054 D8).
     "temporal": "Temporal (durable workflow backend)",
+    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). Each needs
+    # two values (API key/token + routing URL) — handled via a dedicated
+    # multi-value code path like telegram/azure-speech.
+    "workday": "Workday (enterprise connector)",
+    "salesforce": "Salesforce (enterprise connector)",
+    "sap": "SAP (enterprise connector)",
 }
 
 _PROVIDER_TO_ENV_VAR = {
@@ -914,6 +920,7 @@ _CONNECTOR_PROVIDERS = frozenset({"servicenow", "msgraph"})
 # vars don't fit the one-key-per-provider shape, and it isn't an LLM provider
 # the picker should live-verify against an LLM endpoint.
 _TEMPORAL_PROVIDERS = frozenset({"temporal"})
+_CONNECTOR_PROVIDERS = frozenset({"workday", "salesforce", "sap"})
 
 
 @auth_app.command("login")
@@ -930,6 +937,8 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "[bold]servicenow[/bold], [bold]msgraph[/bold] (connectors), "
             "[bold]telegram[/bold], or "
             "[bold]temporal[/bold] (durable workflow backend). "
+            "[bold]workday[/bold], [bold]salesforce[/bold], [bold]sap[/bold] (connectors), "
+            "or [bold]telegram[/bold]. "
             "Omit to pick interactively."
         ),
     ),
@@ -2788,6 +2797,7 @@ def _login_connector(provider: str, *, key: str | None, save_to: str) -> None:
 
     Each connector needs TWO values — an API key/token and a routing value
     (instance URL or tenant ID). Same multi-value pattern as azure-speech.
+    (instance URL or base URL). Same multi-value pattern as azure-speech.
     No live verification: the HTTP skill backend surfaces a clear error at
     first use if the credentials are wrong.
     """
@@ -2816,13 +2826,41 @@ def _login_connector(provider: str, *, key: str | None, save_to: str) -> None:
             "extra_var": "MSGRAPH_TENANT_ID",
             "key_prompt": "Microsoft Graph access token",
             "extra_prompt": "Azure AD tenant ID",
-            "hint_text": (
                 "[dim]Microsoft Graph connector setup:\n"
                 "  1. Register an app in Azure AD\n"
                 "  2. Grant [bold]User.ReadWrite.All[/bold] + "
                 "[bold]Directory.ReadWrite.All[/bold] permissions\n"
                 "  3. Generate a client secret and obtain an access token\n"
                 "  4. Note your tenant ID from the app registration overview[/dim]"
+        "workday": {
+            "key_var": "WORKDAY_ACCESS_TOKEN",
+            "extra_var": "WORKDAY_BASE_URL",
+            "key_prompt": "Workday access token",
+            "extra_prompt": "Workday REST API base URL (e.g. https://wd3-impl-services1.workday.com)",
+                "[dim]Workday connector setup:\n"
+                "  1. Create an Integration System User (ISU) in Workday\n"
+                "  2. Register an API client and generate a bearer token\n"
+                "  3. Note your REST API base URL[/dim]"
+        "salesforce": {
+            "key_var": "SALESFORCE_ACCESS_TOKEN",
+            "extra_var": "SALESFORCE_INSTANCE_URL",
+            "key_prompt": "Salesforce access token",
+            "extra_prompt": "Salesforce instance URL (e.g. https://mycompany.my.salesforce.com)",
+                "[dim]Salesforce connector setup:\n"
+                "  1. Create a Connected App in Setup > App Manager\n"
+                "  2. Enable OAuth and select the [bold]api[/bold] scope\n"
+                "  3. Obtain a bearer token via OAuth 2.0\n"
+                "  4. Note your instance URL from the login response[/dim]"
+        "sap": {
+            "key_var": "SAP_API_KEY",
+            "extra_var": "SAP_BASE_URL",
+            "key_prompt": "SAP API key",
+            "extra_prompt": "SAP S/4HANA base URL (e.g. https://my-s4hana.sap-api.com)",
+                "[dim]SAP connector setup:\n"
+                "  1. Set up a Communication Arrangement (Cloud) or enable "
+                "OData services (on-premise)\n"
+                "  2. Create a communication user with the required authorizations\n"
+                "  3. Note your system base URL and API key[/dim]"
             ),
         },
     }
@@ -2876,21 +2914,17 @@ def _login_temporal(*, key: str | None, save_to: str) -> None:
 
     Temporal needs 2-4 values (multi-value flow like telegram / azure-speech;
     same BYOK seam per ADR 054 D8):
-
       * ``TEMPORAL_HOST`` — gRPC endpoint (e.g. ``localhost:7233`` for
         ``temporal server start-dev`` or ``<ns>.tmprl.cloud:7233`` for
         Temporal Cloud).
       * ``TEMPORAL_NAMESPACE`` — workflow namespace (defaults to ``default``
         on a vanilla self-hosted server; named ``<account>.<region>`` on
-        Temporal Cloud).
       * ``TEMPORAL_TLS_CERT`` *(optional, Temporal Cloud only)* — filesystem
         path to the client TLS certificate.
       * ``TEMPORAL_TLS_KEY`` *(optional, Temporal Cloud only)* — filesystem
         path to the client TLS private key.
-
     Self-hosted Temporal (``temporal server start-dev`` locally, AKS,
     docker-compose) skips the TLS pair — press Enter to leave them unset.
-
     No live verification: a connect call would need the optional ``temporalio``
     SDK (``mdk[temporal]``) AND a server round-trip; the worker / compiler
     surface a clear error at first use if the values are wrong. Persists to
@@ -2898,7 +2932,6 @@ def _login_temporal(*, key: str | None, save_to: str) -> None:
     save-to dispatch as the LLM-provider flow.
     """
     from movate.credentials import CredentialsStore  # noqa: PLC0415
-
     # ``--key`` doesn't apply — Temporal needs at minimum two values (host +
     # namespace). Same rationale as telegram: rather than invent a parsing
     # convention for an N-tuple flag, require interactive input.
@@ -2912,7 +2945,6 @@ def _login_temporal(*, key: str | None, save_to: str) -> None:
             "/ your shell."
         )
         raise typer.Exit(code=2)
-
     hint(
         "[dim]Temporal setup (ADR 054 — durable workflow backend):\n"
         "  • Self-hosted (recommended for local dev): run "
@@ -2921,18 +2953,12 @@ def _login_temporal(*, key: str | None, save_to: str) -> None:
         "  • Temporal Cloud: copy host + namespace from the Cloud UI's "
         "[bold]Namespaces[/bold] page; download the client TLS cert + key from "
         "the namespace's [bold]Settings[/bold] tab[/dim]"
-    )
-
     host = typer.prompt("Temporal host (e.g. localhost:7233)").strip()
     if not host:
         error("empty host — aborted.")
-        raise typer.Exit(code=2)
-
     namespace = typer.prompt("Temporal namespace", default="default").strip()
     if not namespace:
         error("empty namespace — aborted.")
-        raise typer.Exit(code=2)
-
     # TLS cert/key are optional — Temporal Cloud needs them; self-hosted does
     # not. Prompt with empty default so the operator can press Enter to skip.
     tls_cert = typer.prompt(
@@ -2945,50 +2971,35 @@ def _login_temporal(*, key: str | None, save_to: str) -> None:
     if tls_cert:
         tls_key = typer.prompt(
             "Temporal TLS key path (matches the cert above)",
-            default="",
-            show_default=False,
-        ).strip()
         if not tls_key:
-            error(
                 "TLS cert was supplied but TLS key was empty — Temporal Cloud "
                 "needs BOTH (or neither, for self-hosted). Aborted."
-            )
-            raise typer.Exit(code=2)
-
     save_to = save_to.lower().strip()
     if save_to == "global":
         store = CredentialsStore()
         store.set("TEMPORAL_HOST", host)
         store.set("TEMPORAL_NAMESPACE", namespace)
         saved_vars = ["TEMPORAL_HOST", "TEMPORAL_NAMESPACE"]
-        if tls_cert:
             store.set("TEMPORAL_TLS_CERT", tls_cert)
             store.set("TEMPORAL_TLS_KEY", tls_key)
             saved_vars += ["TEMPORAL_TLS_CERT", "TEMPORAL_TLS_KEY"]
         pretty = " + ".join(f"[bold]{v}[/bold]" for v in saved_vars)
         success(f"saved {pretty} to [cyan]{store.path}[/cyan] (mode 0600).")
-        hint(
             "[dim]Every [bold]mdk[/bold] invocation on this machine now picks "
             "up these for the Temporal backend. Install the SDK with "
             "[bold]uv add 'movate-cli[temporal]'[/bold] to run workflows with "
             "[bold]runtime: temporal[/bold] (ADR 054).[/dim]"
-        )
     elif save_to == "project":
         from pathlib import Path  # noqa: PLC0415
-
         dotenv = Path(".env")
         with dotenv.open("a") as fh:
             fh.write(f"TEMPORAL_HOST={host}\n")
             fh.write(f"TEMPORAL_NAMESPACE={namespace}\n")
-            if tls_cert:
                 fh.write(f"TEMPORAL_TLS_CERT={tls_cert}\n")
                 fh.write(f"TEMPORAL_TLS_KEY={tls_key}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
-        raise typer.Exit(code=2)
-
-
 class BootstrapSeedError(Exception):
     """Raised by :func:`bootstrap_seed_inline` on any failure.
 

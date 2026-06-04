@@ -1,0 +1,172 @@
+# SAP S/4HANA OData API connector -- business partner + purchase order (ADR 052 Phase 1).
+#
+# Two skill variants against the SAP OData APIs. Each uses
+# kind: http through the existing HttpSkillBackend. The S/4HANA host
+# is passed as an input field and templated into the URL at call time.
+# Auth is bearer-from-env:SAP_API_KEY.
+#
+# Usage in agent.yaml:
+#   tools:
+#     - sap-employee-get@1.0.0
+#     - sap-purchaseorder-create@1.0.0
+
+actions:
+
+  # -----------------------------------------------------------------------
+  # sap-employee-get -- GET /sap/opu/odata/sap/API_BUSINESS_PARTNER/A_BusinessPartner('{id}')
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: sap-employee-get
+    version: 1.0.0
+    description: >-
+      Retrieve a business partner (employee) record from SAP S/4HANA
+      by partner ID. Returns the partner profile including name,
+      organization data, and address information via the OData API.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "SAP S/4HANA hostname (e.g. my-s4hana.sap-api.com)."
+          partner_id:
+            type: string
+            description: "SAP Business Partner number (e.g. 1000000)."
+        required:
+          - instance_host
+          - partner_id
+      output:
+        type: object
+        properties:
+          BusinessPartner:
+            type: string
+          FirstName:
+            type: string
+          LastName:
+            type: string
+          BusinessPartnerFullName:
+            type: string
+          BusinessPartnerCategory:
+            type: string
+            description: "1=Organization, 2=Person, 3=Group."
+          OrganizationBPName1:
+            type: string
+          Industry:
+            type: string
+          CreatedByUser:
+            type: string
+          CreationDate:
+            type: string
+            description: "ISO 8601 date."
+          IsFemale:
+            type: boolean
+          IsMale:
+            type: boolean
+          Language:
+            type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/sap/opu/odata/sap/API_BUSINESS_PARTNER/A_BusinessPartner('{{ input.partner_id }}')"
+      method: GET
+      auth: bearer-from-env:SAP_API_KEY
+      headers:
+        Accept: application/json
+    side_effects: read-only
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # sap-purchaseorder-create -- POST .../API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: sap-purchaseorder-create
+    version: 1.0.0
+    description: >-
+      Create a new purchase order in SAP S/4HANA. Populates the PO
+      with the provided fields and returns the created record
+      including the system-generated PO number.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "SAP S/4HANA hostname (e.g. my-s4hana.sap-api.com)."
+          CompanyCode:
+            type: string
+            description: "SAP company code (e.g. 1000)."
+          PurchaseOrderType:
+            type: string
+            description: "PO type (e.g. NB for Standard PO)."
+          Supplier:
+            type: string
+            description: "Supplier (vendor) number."
+          PurchasingOrganization:
+            type: string
+            description: "Purchasing organization code."
+          PurchasingGroup:
+            type: string
+            description: "Purchasing group code."
+          DocumentCurrency:
+            type: string
+            description: "Currency code (e.g. USD, EUR)."
+          items:
+            type: array
+            description: "Line items for the purchase order."
+            items:
+              type: object
+              properties:
+                Material:
+                  type: string
+                  description: "Material number."
+                OrderQuantity:
+                  type: number
+                  description: "Quantity to order."
+                NetPriceAmount:
+                  type: number
+                  description: "Net price per unit."
+                Plant:
+                  type: string
+                  description: "Plant code."
+                StorageLocation:
+                  type: string
+                  description: "Storage location code."
+              required:
+                - Material
+                - OrderQuantity
+        required:
+          - instance_host
+          - CompanyCode
+          - Supplier
+          - PurchasingOrganization
+      output:
+        type: object
+        properties:
+          PurchaseOrder:
+            type: string
+            description: "System-generated PO number."
+          CompanyCode:
+            type: string
+          PurchaseOrderType:
+            type: string
+          Supplier:
+            type: string
+          PurchasingOrganization:
+            type: string
+          CreationDate:
+            type: string
+            description: "ISO 8601 date."
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/sap/opu/odata/sap/API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder"
+      method: POST
+      auth: bearer-from-env:SAP_API_KEY
+      headers:
+        Content-Type: application/json
+        Accept: application/json
+        X-CSRF-Token: Fetch
+    side_effects: mutates-state
+    cost:
+      per_call_usd: 0.0
