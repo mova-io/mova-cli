@@ -15987,6 +15987,118 @@ def build_app(
         )
         return view
 
+    # ------------------------------------------------------------------
+    # /api/v1/tools — Tool Registry (ADR 052 Phase 1)
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/tools",
+        tags=["tools"],
+        dependencies=[_scope("read")],
+    )
+    async def list_tools(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        scope: str | None = None,
+        tag: str | None = None,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        """List tool descriptors (filterable by scope, tags, name pattern)."""
+        store: StorageProvider = request.app.state.storage
+        tags_filter = [tag] if tag else None
+        descriptors = await store.list_tool_descriptors(
+            scope=scope,
+            tenant_id=ctx.tenant_id,
+            tags=tags_filter,
+        )
+        if q:
+            q_lower = q.lower()
+            descriptors = [
+                d
+                for d in descriptors
+                if q_lower in d.name.lower() or q_lower in d.description.lower()
+            ]
+        return {
+            "tools": [d.model_dump(mode="json") for d in descriptors],
+            "count": len(descriptors),
+        }
+
+    @v1.get(
+        "/tools/{name}",
+        tags=["tools"],
+        dependencies=[_scope("read")],
+    )
+    async def get_tool(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        version: str | None = None,
+    ) -> dict[str, Any]:
+        """Get tool detail (with optional version resolution)."""
+        store: StorageProvider = request.app.state.storage
+        # Walk scope precedence: project -> tenant -> movate.
+        descriptor = None
+        for scope_val in ("project", "tenant", "movate"):
+            descriptor = await store.get_tool_descriptor(
+                name=name,
+                version=version,
+                scope=scope_val,
+                tenant_id=ctx.tenant_id,
+            )
+            if descriptor is not None:
+                break
+        if descriptor is None:
+            raise not_found("tool", name)
+        return {"tool": descriptor.model_dump(mode="json")}
+
+    @v1.post(
+        "/tools",
+        tags=["tools"],
+        dependencies=[_scope("admin")],
+        status_code=201,
+    )
+    async def publish_tool(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Publish a tool descriptor (tenant-scoped)."""
+        from movate.core.tool_registry.models import ToolDescriptor  # noqa: PLC0415
+
+        body = await request.json()
+        try:
+            descriptor = ToolDescriptor.model_validate(body)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        descriptor = descriptor.model_copy(update={"tenant_id": ctx.tenant_id})
+        descriptor = descriptor.stamp_now()
+        store: StorageProvider = request.app.state.storage
+        await store.save_tool_descriptor(descriptor)
+        return {"tool": descriptor.model_dump(mode="json")}
+
+    @v1.delete(
+        "/tools/{name}/{version}",
+        tags=["tools"],
+        dependencies=[_scope("admin")],
+    )
+    async def delete_tool(
+        name: str,
+        version: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        scope: str = "tenant",
+    ) -> dict[str, Any]:
+        """Remove a tool descriptor."""
+        store: StorageProvider = request.app.state.storage
+        deleted = await store.delete_tool_descriptor(
+            name=name,
+            version=version,
+            scope=scope,
+            tenant_id=ctx.tenant_id,
+        )
+        if not deleted:
+            raise not_found("tool", f"{name}@{version}")
+        return {"deleted": True}
+
     app.include_router(v1)
 
     # ------------------------------------------------------------------
