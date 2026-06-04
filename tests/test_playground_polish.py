@@ -525,7 +525,13 @@ class TestFeedbackConfirmation:
                 posted.append({"run_id": run_id, "score": score})
                 return {"ok": True}
 
-            async def post_feedback_with_retry(self, *, run_id: str, score: int, **_: object) -> tuple:
+            async def post_feedback_with_retry(
+                self,
+                *,
+                run_id: str,
+                score: int,
+                **_: object,
+            ) -> tuple:
                 posted.append({"run_id": run_id, "score": score})
                 return {"ok": True}, True
 

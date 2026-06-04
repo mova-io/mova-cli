@@ -1065,7 +1065,6 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_temporal(key=key, save_to=save_to)
         return
 
-
     if provider not in _PROVIDER_TO_ENV_VAR:
         valid = ", ".join(
             sorted(
