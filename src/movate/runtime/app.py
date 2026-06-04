@@ -17293,6 +17293,217 @@ def build_app(  # noqa: PLR0912
         return view
 
     # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/call — Telephony session provisioning
+    #
+    # ADR 074 D4: provisions a LiveKit room (or Twilio stream in Phase 3b)
+    # and dispatches the mdk voice worker into it. Returns join credentials
+    # so the caller (browser WebRTC client, SIP gateway, or CLI) can
+    # connect to the session. The pipeline runs inside the room — the same
+    # ``run_voice_pipeline`` the WS and oneshot paths drive, with a
+    # ``TelephonyTransport`` as the audio I/O edge.
+    #
+    # New surface — flag (CLAUDE.md rule 5): ``POST /api/v1/agents/{name}/call``
+    # is a NEW additive ``/api/v1`` endpoint (scope ``run``). No existing
+    # endpoint changes.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/call",
+        tags=["agents-v1"],
+        dependencies=[_scope("run")],
+        responses={
+            200: {
+                "description": (
+                    "Telephony session provisioned. Returns join credentials "
+                    "for the selected transport (LiveKit room name + token + "
+                    "URL, or Twilio stream URL + call SID)."
+                ),
+            },
+        },
+    )
+    async def v1_agent_call(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Provision a telephony voice session for ``{name}`` (ADR 074 D4).
+
+        Creates a LiveKit room, generates a participant token for the
+        caller, and starts the voice pipeline as an agent worker in the
+        room. Returns ``{room_name, participant_token, livekit_url}`` —
+        the caller joins with these credentials. For inbound SIP calls,
+        LiveKit routes the call to the room automatically via SIP trunk
+        configuration.
+        """
+        import os  # noqa: PLC0415
+        import secrets  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        body: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            body = await request.json()
+
+        transport = str(body.get("transport", "livekit")).strip().lower()
+        if transport != "livekit":
+            raise AgentCreationError(
+                f"unsupported transport {transport!r}; only 'livekit' is "
+                "available in Phase 3a (ADR 074 Phasing)",
+                status_code=400,
+            )
+
+        # Validate LiveKit credentials are configured.
+        livekit_url = os.environ.get("LIVEKIT_URL", "").strip()
+        livekit_api_key = os.environ.get("LIVEKIT_API_KEY", "").strip()
+        livekit_api_secret = os.environ.get("LIVEKIT_API_SECRET", "").strip()
+        if not livekit_url or not livekit_api_key or not livekit_api_secret:
+            raise AgentCreationError(
+                "LiveKit credentials not configured. Set LIVEKIT_URL, "
+                "LIVEKIT_API_KEY, and LIVEKIT_API_SECRET (mdk auth login "
+                "livekit), or check the deployment configuration.",
+                status_code=503,
+            )
+
+        # Resolve the agent (same routing as the run/stream/WS/oneshot paths).
+        canary = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        chosen_version = choose_version(canary, thread_id=None)
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=ctx.tenant_id, version=chosen_version, fallback=agents_reg
+        )
+        if bundle is None:
+            raise AgentCreationError(f"agent {name!r} not found", status_code=404)
+
+        # Provision the LiveKit room + participant token.
+        # The ``livekit-agents`` SDK is lazily imported here (``[telephony]``
+        # extra, ADR 074 D5) — a runtime without it gets a clear error.
+        try:
+            from livekit.api import (  # noqa: PLC0415
+                AccessToken,
+                VideoGrants,
+            )
+        except ImportError as exc:
+            raise AgentCreationError(
+                "the mdk[telephony] extra is not installed; "
+                "POST /api/v1/agents/{name}/call is unavailable "
+                "(install 'movate-cli[telephony]')",
+                status_code=503,
+            ) from exc
+
+        room_name = f"mdk-{name}-{secrets.token_hex(6)}"
+        options = body.get("options", {})
+        if isinstance(options, dict) and options.get("room_name"):
+            room_name = str(options["room_name"])
+
+        # Generate a participant token for the caller.
+        caller_identity = f"caller-{secrets.token_hex(4)}"
+        token = (
+            AccessToken(livekit_api_key, livekit_api_secret)
+            .with_identity(caller_identity)
+            .with_grants(
+                VideoGrants(
+                    room_join=True,
+                    room=room_name,
+                )
+            )
+        )
+        participant_token = token.to_jwt()
+
+        # Generate an agent token (the voice worker joins as the agent).
+        agent_identity = f"agent-{name}"
+        agent_token = (
+            AccessToken(livekit_api_key, livekit_api_secret)
+            .with_identity(agent_identity)
+            .with_grants(
+                VideoGrants(
+                    room_join=True,
+                    room=room_name,
+                    room_create=True,
+                )
+            )
+        )
+        agent_token_jwt = agent_token.to_jwt()
+
+        # Dispatch the voice worker as a background task. The worker joins
+        # the LiveKit room and runs ``run_voice_pipeline`` with the LiveKit
+        # transport as the audio edge. When the caller disconnects (hangs
+        # up / leaves the room), the transport's ``disconnect`` tears down
+        # the pipeline.
+        async def _run_voice_worker() -> None:
+            try:
+                from movate.voice.transports.livekit import LiveKitTransport  # noqa: PLC0415
+
+                transport_inst = LiveKitTransport()
+                audio_in = await transport_inst.connect(
+                    {
+                        "livekit_url": livekit_url,
+                        "participant_token": agent_token_jwt,
+                        "room_name": room_name,
+                    }
+                )
+                # Build the same pipeline wiring the WS path uses.
+                from movate.core.executor import Executor  # noqa: PLC0415
+                from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+                from movate.providers.pricing import load_pricing  # noqa: PLC0415
+                from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
+                from movate.tracing import build_tracer  # noqa: PLC0415
+                from movate.voice import run_voice_pipeline  # noqa: PLC0415
+
+                stt = request.app.state.voice_stt_factory()
+                tts = request.app.state.voice_tts_factory()
+                stt_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, stt)
+                tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts)
+
+                executor = Executor(
+                    provider=LiteLLMProvider(),
+                    pricing=load_pricing(),
+                    storage=store,
+                    tracer=build_tracer(),
+                    tenant_id=ctx.tenant_id,
+                    cache=request.app.state.llm_cache,
+                )
+                agent_turn = ExecutorAgentTurn(
+                    executor=executor,
+                    bundle=bundle,
+                    input_key="text",
+                    tenant_id=ctx.tenant_id,
+                )
+
+                async for event in run_voice_pipeline(
+                    audio_in=audio_in,
+                    stt=stt,
+                    tts=tts,
+                    agent=agent_turn,
+                    stt_api_key=stt_api_key,
+                    tts_api_key=tts_api_key,
+                    tts_streaming=True,
+                ):
+                    # Publish TTS audio back to the room.
+                    if event.kind == "tts.audio" and event.audio is not None:
+                        await transport_inst.publish(event.audio)
+            except Exception:
+                import logging  # noqa: PLC0415
+
+                logging.getLogger(__name__).exception("Voice worker for room %s failed", room_name)
+            finally:
+                await transport_inst.disconnect()
+
+        import asyncio as _asyncio  # noqa: PLC0415
+
+        # Store the task reference on the app state so it isn't GC'd
+        # before the call completes.
+        task = _asyncio.create_task(_run_voice_worker())
+        bg_tasks: list[_asyncio.Task[None]] = getattr(request.app.state, "_voice_worker_tasks", [])
+        bg_tasks.append(task)
+        request.app.state._voice_worker_tasks = bg_tasks
+
+        return {
+            "room_name": room_name,
+            "participant_token": participant_token,
+            "livekit_url": livekit_url,
+            "transport": "livekit",
+            "agent": name,
+        }
+
+    # ------------------------------------------------------------------
     # /api/v1/tools — Tool Registry (ADR 052 Phase 1)
     # ------------------------------------------------------------------
 

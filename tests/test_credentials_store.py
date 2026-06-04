@@ -454,6 +454,12 @@ class TestAuthStatus:
             "TEMPORAL_NAMESPACE",
             "TEMPORAL_TLS_CERT",
             "TEMPORAL_TLS_KEY",
+            # Telephony transports (ADR 074) — Twilio + LiveKit rows.
+            "TWILIO_ACCOUNT_SID",
+            "TWILIO_AUTH_TOKEN",
+            "LIVEKIT_URL",
+            "LIVEKIT_API_KEY",
+            "LIVEKIT_API_SECRET",
         ):
             monkeypatch.delenv(key, raising=False)
         # PR #112 added a Runtime Targets section to `mdk auth status`
@@ -467,12 +473,12 @@ class TestAuthStatus:
             assert env_var in result.stdout
         assert "not set" in result.stdout.lower()
         # Greppable summary line: 5 provider env vars + 3 notification
-        # env vars + 2 voice env vars + 4 temporal env vars = 14 unset
-        # total (no runtime targets configured in the isolated config
-        # path).
+        # env vars + 2 voice env vars + 3 telephony env vars + 4 temporal
+        # env vars = 17 unset total (no runtime targets configured in the
+        # isolated config path).
         assert "mdk_auth_status_summary:" in result.stdout
         assert "set=0" in result.stdout
-        assert "unset=14" in result.stdout
+        assert "unset=17" in result.stdout
 
     def test_set_keys_show_as_set(
         self, isolated_creds: Path, monkeypatch: pytest.MonkeyPatch
@@ -487,6 +493,12 @@ class TestAuthStatus:
             "TEMPORAL_NAMESPACE",
             "TEMPORAL_TLS_CERT",
             "TEMPORAL_TLS_KEY",
+            # Telephony transports (ADR 074) — Twilio + LiveKit rows.
+            "TWILIO_ACCOUNT_SID",
+            "TWILIO_AUTH_TOKEN",
+            "LIVEKIT_URL",
+            "LIVEKIT_API_KEY",
+            "LIVEKIT_API_SECRET",
         ):
             monkeypatch.delenv(key, raising=False)
         # PR #112 — isolate user config path so the Runtime Targets
@@ -513,7 +525,7 @@ class TestAuthStatus:
         autoload_credentials()
         result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
-        # One key set, thirteen unset (4 LLM + 3 notification + 2 voice
-        # + 4 temporal).
+        # One key set, sixteen unset (4 LLM + 3 notification + 2 voice
+        # + 3 telephony + 4 temporal).
         assert "set=1" in result.stdout
-        assert "unset=13" in result.stdout
+        assert "unset=16" in result.stdout
