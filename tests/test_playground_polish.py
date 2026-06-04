@@ -525,6 +525,10 @@ class TestFeedbackConfirmation:
                 posted.append({"run_id": run_id, "score": score})
                 return {"ok": True}
 
+            async def post_feedback_with_retry(self, *, run_id: str, score: int, **_: object) -> tuple:
+                posted.append({"run_id": run_id, "score": score})
+                return {"ok": True}, True
+
         session[app._K_CLIENT] = _FakeClient()
         session[app._K_CAPS] = RuntimeCapabilities()
         session[app._K_FEEDBACK_SUBMITTED] = set()
@@ -593,6 +597,9 @@ class TestFeedbackConfirmation:
         class _FailClient:
             async def post_feedback(self, **_: object) -> dict:
                 raise RuntimeError("network error")
+
+            async def post_feedback_with_retry(self, **_: object) -> tuple:
+                return None, False
 
         session[app._K_CLIENT] = _FailClient()
         session[app._K_CAPS] = RuntimeCapabilities()

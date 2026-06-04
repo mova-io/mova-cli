@@ -283,13 +283,15 @@ def replay(
       [dim]# Machine-readable result[/dim]
       $ mdk workflow replay 1f3c... --json
     """
+    # Normalize typer OptionInfo → None when called directly (e.g. tests).
+    _from_file = from_file if isinstance(from_file, Path) else None
     result = asyncio.run(
         _replay_workflow(
             run_id=run_id,
             workflows_path=Path(workflows_path),
             tenant_id=tenant_id,
             target=target,
-            from_file=from_file,
+            from_file=_from_file,
             verbose=verbose,
             suppress=as_json,
         )
