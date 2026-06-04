@@ -571,12 +571,25 @@ class LyzrV3StreamAgent:
         on_tool_call: Callable[[dict[str, Any]], None] | None = None,
         on_extras: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        import httpx  # noqa: PLC0415
+
         self._agent_id = agent_id
         self._api_key = api_key
         self._voice_hint = (voice_hint or "").strip() or None
         self.on_tool_call = on_tool_call
         self.on_extras = on_extras
         self._session_id = f"mdk-voice-{id(self):x}"
+        # Reuse a single httpx client across turns — avoids a TCP+TLS
+        # handshake (~100–300 ms) on every call. The client's connection
+        # pool keeps the HTTPS connection warm between turns.
+        self._http = httpx.AsyncClient(
+            timeout=30,
+            headers={
+                "x-api-key": self._api_key,
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream, application/x-ndjson, application/json",
+            },
+        )
 
     def reset(self) -> None:
         """Clear server-side session by rotating the session_id."""
@@ -590,8 +603,6 @@ class LyzrV3StreamAgent:
         language: str | None = None,
         session_id: str | None = None,
     ) -> AgentTurnResult:
-        import httpx  # noqa: PLC0415
-
         user_content = text
         if self._voice_hint:
             user_content = f"{text}\n\n[Voice channel — {self._voice_hint}]"
@@ -602,97 +613,90 @@ class LyzrV3StreamAgent:
             "session_id": session_id or self._session_id,
             "message": user_content,
         }
-        headers = {
-            "x-api-key": self._api_key,
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream, application/x-ndjson, application/json",
-        }
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                async with client.stream(
-                    "POST",
-                    "https://agent-prod.studio.lyzr.ai/v3/inference/stream/",
-                    json=payload,
-                    headers=headers,
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = (await resp.aread()).decode(errors="replace")
-                        return AgentTurnResult(
-                            status="error",
-                            error=AgentTurnError(message=f"{resp.status_code}: {body[:500]}"),
-                        )
+            async with self._http.stream(
+                "POST",
+                "https://agent-prod.studio.lyzr.ai/v3/inference/stream/",
+                json=payload,
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode(errors="replace")
+                    return AgentTurnResult(
+                        status="error",
+                        error=AgentTurnError(message=f"{resp.status_code}: {body[:500]}"),
+                    )
 
-                    collected: list[str] = []
-                    # Auto-detect the streaming format by inspecting chunks.
-                    # Lyzr may use SSE ("data: ..."), newline-delimited JSON,
-                    # or plain text streaming. We handle all three.
-                    async for line in resp.aiter_lines():
-                        line = line.strip()
-                        if not line:
-                            continue
+                collected: list[str] = []
+                # Auto-detect the streaming format by inspecting chunks.
+                # Lyzr may use SSE ("data: ..."), newline-delimited JSON,
+                # or plain text streaming. We handle all three.
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
 
-                        text_chunk = ""
+                    text_chunk = ""
 
-                        # SSE format: "data: ..." lines
-                        if line.startswith("data:"):
-                            data = line[5:].strip()
-                            if data == "[DONE]":
+                    # SSE format: "data: ..." lines
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data)
+                            # OpenAI-compat SSE shape
+                            if "choices" in obj:
+                                delta = obj["choices"][0].get("delta", {})
+                                text_chunk = delta.get("content", "")
+                            # Lyzr native shape
+                            elif "response" in obj:
+                                text_chunk = obj["response"]
+                            elif "content" in obj:
+                                text_chunk = obj["content"]
+                            elif "chunk" in obj:
+                                text_chunk = obj["chunk"]
+                            # Surface extras if present
+                            if self.on_extras is not None:
+                                extras: dict[str, Any] = {}
+                                for f in ("citations", "sources", "metadata"):
+                                    if f in obj and obj[f]:
+                                        extras[f] = obj[f]
+                                if extras:
+                                    try:
+                                        self.on_extras(extras)
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                        except json.JSONDecodeError:
+                            # Plain text after "data: " prefix
+                            text_chunk = data
+
+                    # Newline-delimited JSON (no "data:" prefix)
+                    elif line.startswith("{"):
+                        try:
+                            obj = json.loads(line)
+                            text_chunk = (
+                                obj.get("response", "")
+                                or obj.get("content", "")
+                                or obj.get("chunk", "")
+                                or obj.get("text", "")
+                            )
+                            # Check for done signal
+                            if obj.get("done") is True and not text_chunk:
                                 break
-                            try:
-                                obj = json.loads(data)
-                                # OpenAI-compat SSE shape
-                                if "choices" in obj:
-                                    delta = obj["choices"][0].get("delta", {})
-                                    text_chunk = delta.get("content", "")
-                                # Lyzr native shape
-                                elif "response" in obj:
-                                    text_chunk = obj["response"]
-                                elif "content" in obj:
-                                    text_chunk = obj["content"]
-                                elif "chunk" in obj:
-                                    text_chunk = obj["chunk"]
-                                # Surface extras if present
-                                if self.on_extras is not None:
-                                    extras: dict[str, Any] = {}
-                                    for f in ("citations", "sources", "metadata"):
-                                        if f in obj and obj[f]:
-                                            extras[f] = obj[f]
-                                    if extras:
-                                        try:
-                                            self.on_extras(extras)
-                                        except Exception:  # noqa: BLE001
-                                            pass
-                            except json.JSONDecodeError:
-                                # Plain text after "data: " prefix
-                                text_chunk = data
-
-                        # Newline-delimited JSON (no "data:" prefix)
-                        elif line.startswith("{"):
-                            try:
-                                obj = json.loads(line)
-                                text_chunk = (
-                                    obj.get("response", "")
-                                    or obj.get("content", "")
-                                    or obj.get("chunk", "")
-                                    or obj.get("text", "")
-                                )
-                                # Check for done signal
-                                if obj.get("done") is True and not text_chunk:
-                                    break
-                            except json.JSONDecodeError:
-                                text_chunk = line
-
-                        # Plain text streaming — each line IS a chunk
-                        else:
+                        except json.JSONDecodeError:
                             text_chunk = line
 
-                        if text_chunk:
-                            collected.append(text_chunk)
-                            if on_token is not None:
-                                on_token(text_chunk)
+                    # Plain text streaming — each line IS a chunk
+                    else:
+                        text_chunk = line
 
-                    answer = "".join(collected).strip()
+                    if text_chunk:
+                        collected.append(text_chunk)
+                        if on_token is not None:
+                            on_token(text_chunk)
+
+                answer = "".join(collected).strip()
 
         except asyncio.CancelledError:
             raise
@@ -941,12 +945,13 @@ class Session:
         self.hedge_stt: bool = False
         self.hedge_tts: bool = False
         # ADR 070: speculative agent kickoff — start the agent on a stable interim
-        # to recover the ~1.5s endpointing wait. Off by default (opt-in, changes
-        # the cost profile); only fires when the active agent is cancel-safe
-        # (OpenAIChatAgent yes, LyzrAgentTurn SDK no). Toggled live via the
+        # to recover the ~1.5s endpointing wait. ON by default — the pipeline
+        # auto-guards on agent.speculatable so non-streaming agents (LyzrAgentTurn
+        # SDK) are skipped. Streaming agents (OpenAIChatAgent, LyzrV3StreamAgent)
+        # benefit from ~500–1000 ms latency savings. Toggled live via the
         # set_speculative WS event so the demo can A/B it and the dashboard can
         # watch the real commit/cancel ratio (speculation_* events → metrics).
-        self.speculative: bool = False
+        self.speculative: bool = True
         # ADR 071 D4 / ADR 073 D3 — per-session voice tuning, editable live from
         # the UI so the audience can A/B it. Keyterms default to the curated demo
         # list (merged, de-duped, with the DeepgramSTT constructor list);
@@ -2018,7 +2023,7 @@ _twilio_config: dict[str, Any] = {
     "voice_id": "",
     "hedge_stt": False,
     "hedge_tts": False,
-    "speculative": False,
+    "speculative": True,
     "budget_usd": None,
     "lyzr_api_key": None,  # BYOK key from the browser session (if any)
     "updated_by": None,  # browser session_id that last pushed, for telemetry
