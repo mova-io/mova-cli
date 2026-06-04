@@ -1419,7 +1419,7 @@ class PostgresProvider:
     # ------------------------------------------------------------------
 
     async def save_tool_descriptor(self, descriptor: Any) -> None:
-        pool = self._get_pool()
+        pool = self._db
         scope_val = (
             descriptor.scope if isinstance(descriptor.scope, str) else descriptor.scope.value
         )
@@ -1475,7 +1475,7 @@ class PostgresProvider:
         scope: str,
         tenant_id: str,
     ) -> Any | None:
-        pool = self._get_pool()
+        pool = self._db
         if version is not None:
             row = await pool.fetchrow(
                 "SELECT * FROM tool_descriptors"
@@ -1504,7 +1504,7 @@ class PostgresProvider:
         tenant_id: str,
         tags: list[str] | None,
     ) -> list[Any]:
-        pool = self._get_pool()
+        pool = self._db
         if scope is not None:
             rows = await pool.fetch(
                 "SELECT * FROM tool_descriptors"
@@ -1532,7 +1532,7 @@ class PostgresProvider:
         scope: str,
         tenant_id: str,
     ) -> bool:
-        pool = self._get_pool()
+        pool = self._db
         status = await pool.execute(
             "DELETE FROM tool_descriptors"
             " WHERE name = $1 AND version = $2 AND scope = $3 AND tenant_id = $4",
@@ -1541,7 +1541,7 @@ class PostgresProvider:
             scope,
             tenant_id,
         )
-        return status.endswith("1")
+        return bool(status.endswith("1"))
 
     async def close(self) -> None:
         if self._pool is not None:

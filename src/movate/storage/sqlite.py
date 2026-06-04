@@ -5172,7 +5172,7 @@ class SqliteProvider:
     # ------------------------------------------------------------------
 
     async def save_tool_descriptor(self, descriptor: Any) -> None:
-        conn = await self._ensure_conn()
+        conn = self._db
         await conn.execute(
             "INSERT OR REPLACE INTO tool_descriptors"
             " (name, version, scope, tenant_id, project_id, description,"
@@ -5214,7 +5214,7 @@ class SqliteProvider:
         scope: str,
         tenant_id: str,
     ) -> Any | None:
-        conn = await self._ensure_conn()
+        conn = self._db
         if version is not None:
             cursor = await conn.execute(
                 "SELECT * FROM tool_descriptors"
@@ -5239,7 +5239,7 @@ class SqliteProvider:
         tenant_id: str,
         tags: list[str] | None,
     ) -> list[Any]:
-        conn = await self._ensure_conn()
+        conn = self._db
         if scope is not None:
             cursor = await conn.execute(
                 "SELECT * FROM tool_descriptors"
@@ -5268,14 +5268,14 @@ class SqliteProvider:
         scope: str,
         tenant_id: str,
     ) -> bool:
-        conn = await self._ensure_conn()
+        conn = self._db
         cursor = await conn.execute(
             "DELETE FROM tool_descriptors"
             " WHERE name = ? AND version = ? AND scope = ? AND tenant_id = ?",
             (name, version, scope, tenant_id),
         )
         await conn.commit()
-        return cursor.rowcount > 0
+        return bool(cursor.rowcount > 0)
 
     async def close(self) -> None:
         if self._conn is not None:
