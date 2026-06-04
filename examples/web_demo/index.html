@@ -2292,7 +2292,7 @@ $('twilio-sync').addEventListener('click', () => {
 // ─── Phone Sync panel (Simple tab) ───────────────────────────────────────
 // Shows once the Mova-iO agent dropdown has loaded (i.e. user has a key).
 // Mirrors the agent list from #lyzr-agent-select into #phone-agent-select
-// and calls PUT /api/v1/call/twilio/config to attach the chosen agent.
+// and sends push_to_twilio via WS to attach the chosen agent to the phone line.
 function _phoneSyncPopulate() {
   const src = $('lyzr-agent-select');
   const dst = $('phone-agent-select');
@@ -2329,32 +2329,33 @@ $('phone-sync-btn').addEventListener('click', async () => {
     status.textContent = 'Please select an agent first.';
     return;
   }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    status.style.display = '';
+    status.style.background = 'rgba(239,68,68,0.12)';
+    status.style.color = 'var(--err)';
+    status.textContent = 'Not connected — click Start first.';
+    return;
+  }
   $('phone-sync-btn').disabled = true;
   $('phone-sync-btn').textContent = '📞 Syncing…';
   status.style.display = 'none';
 
   try {
-    const res = await fetch('/api/v1/call/twilio/config', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent }),
-    });
-    const data = await res.json();
+    // First, tell the WS session which Lyzr agent to use, then push the
+    // full session config to the Twilio defaults — same mechanism as the
+    // Detailed-tab "Sync to phone" button (push_to_twilio WS event).
+    ws.send(JSON.stringify({ event: 'set_lyzr_agent_id', agent_id: agent }));
+    ws.send(JSON.stringify({ event: 'push_to_twilio' }));
+    const agentLabel = $('phone-agent-select').selectedOptions[0]?.textContent || agent;
     status.style.display = '';
-    if (res.ok) {
-      status.style.background = 'rgba(52,208,88,0.12)';
-      status.style.color = 'var(--ok)';
-      status.textContent = '✓ Synced! Calls to ' + ($('phone-sync-number')?.textContent || 'the number') + ' now reach ' + data.agent;
-    } else {
-      status.style.background = 'rgba(239,68,68,0.12)';
-      status.style.color = 'var(--err)';
-      status.textContent = data.detail || 'Sync failed';
-    }
+    status.style.background = 'rgba(52,208,88,0.12)';
+    status.style.color = 'var(--ok)';
+    status.textContent = '✓ Synced! Calls to ' + ($('phone-sync-number')?.textContent || 'the number') + ' now reach ' + agentLabel;
   } catch (e) {
     status.style.display = '';
     status.style.background = 'rgba(239,68,68,0.12)';
     status.style.color = 'var(--err)';
-    status.textContent = 'Network error: ' + e.message;
+    status.textContent = 'Error: ' + e.message;
   }
   $('phone-sync-btn').disabled = false;
   $('phone-sync-btn').textContent = '📞 Sync to Phone';

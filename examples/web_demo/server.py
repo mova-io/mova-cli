@@ -1567,7 +1567,13 @@ async def recording_url(session_id: str) -> dict[str, object]:
 
 
 def _twilio_creds() -> tuple[str, str, str] | None:
-    """Load Twilio (SID, auth_token, phone_number) from ~/.mdk_twilio_* files."""
+    """Load Twilio (SID, auth_token, phone_number).
+
+    Resolution order:
+    1. ``~/.mdk_twilio_{sid,token,number}`` files (laptop dev).
+    2. ``TWILIO_ACCOUNT_SID`` / ``TWILIO_AUTH_TOKEN`` / ``TWILIO_NUMBER`` env
+       vars (Azure Container Apps injects these as container secrets).
+    """
     home = Path.home()
     try:
         return (
@@ -1576,7 +1582,14 @@ def _twilio_creds() -> tuple[str, str, str] | None:
             (home / ".mdk_twilio_number").read_text().strip(),
         )
     except OSError:
-        return None
+        pass
+    # Fallback: env vars (ACA container secrets path).
+    sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    number = os.environ.get("TWILIO_NUMBER", "").strip()
+    if sid and token and number:
+        return (sid, token, number)
+    return None
 
 
 def _twilio_number() -> str:
