@@ -894,3 +894,99 @@ async def _voice_oneshot_async(
     if result.status and result.status != "success":
         detail = f": {result.error}" if result.error else ""
         err.print(f"[yellow]status: {result.status}[/yellow]{detail}")
+
+
+# ---------------------------------------------------------------------------
+# mdk voice call — outbound Twilio test call (ADR 074 D9)
+# ---------------------------------------------------------------------------
+
+
+def _require_telephony_extra() -> None:
+    """Gate behind the ``[telephony]`` optional extra."""
+    import importlib.util  # noqa: PLC0415
+
+    if importlib.util.find_spec("twilio") is None:
+        err.print(
+            "[red]✗[/red] The [bold]mdk\\[telephony][/bold] extra is not installed.\n"
+            "  Run: [bold]pip install 'movate-cli[telephony]'[/bold]\n"
+            "  (or: [bold]uv pip install 'movate-cli[telephony]'[/bold])"
+        )
+        raise typer.Exit(code=1)
+
+
+@voice_app.command("call")
+def voice_call(
+    agent: Annotated[str, typer.Argument(help="Agent name to connect the call to.")],
+    to: Annotated[
+        str,
+        typer.Option("--to", help="Phone number to call (E.164, e.g. +12175551234)."),
+    ],
+    from_number: Annotated[
+        str,
+        typer.Option(
+            "--from",
+            help="Your Twilio phone number (E.164). Defaults to TWILIO_PHONE_NUMBER env var.",
+        ),
+    ] = "",
+    target: Annotated[
+        str | None,
+        typer.Option("--target", "-t", help="Runtime URL (defaults to local dev)."),
+    ] = None,
+    transport: Annotated[
+        str,
+        typer.Option("--transport", help="Telephony transport to use."),
+    ] = "twilio",
+) -> None:
+    """Initiate an outbound phone call and connect it to an mdk voice agent.
+
+    For testing: calls ``--to`` from your Twilio number and bridges the call
+    to the agent via the Twilio Media Stream. Requires the ``[telephony]``
+    extra and ``TWILIO_ACCOUNT_SID`` / ``TWILIO_AUTH_TOKEN`` env vars.
+
+    [bold]Example:[/bold]
+
+      [dim]$ mdk voice call support-agent --to +12175551234 --from +12179195393[/dim]
+    """
+    import os  # noqa: PLC0415
+
+    _require_telephony_extra()
+
+    if transport != "twilio":
+        err.print(f"[red]✗[/red] unsupported transport: {transport!r} (only 'twilio' for now)")
+        raise typer.Exit(code=1)
+
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    if not account_sid or not auth_token:
+        err.print(
+            "[red]✗[/red] TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set.\n"
+            "  Run: [bold]mdk auth login twilio[/bold]"
+        )
+        raise typer.Exit(code=1)
+
+    twilio_number = from_number or os.environ.get("TWILIO_PHONE_NUMBER", "").strip()
+    if not twilio_number:
+        err.print(
+            "[red]✗[/red] --from or TWILIO_PHONE_NUMBER env var is required.\n"
+            "  Example: --from +12179195393"
+        )
+        raise typer.Exit(code=1)
+
+    base_url = _resolve_target_url(target)
+    # Build the TwiML that tells Twilio to open a Media Stream back to us.
+    twiml_url = f"{base_url}/api/v1/agents/{agent}/call/twilio"
+
+    from twilio.rest import Client  # noqa: PLC0415
+
+    client = Client(account_sid, auth_token)
+    err.print(
+        f"[bold]Calling[/bold] {to} from {twilio_number} "
+        f"-> agent [cyan]{agent}[/cyan] at {twiml_url}"
+    )
+    call = client.calls.create(
+        to=to,
+        from_=twilio_number,
+        url=twiml_url,
+        method="POST",
+    )
+    err.print(f"[green]✓[/green] Call initiated: SID={call.sid}")

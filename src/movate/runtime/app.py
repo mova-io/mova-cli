@@ -15690,6 +15690,174 @@ def build_app(
             return
 
     # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/call/twilio — TwiML webhook (ADR 074 D3/D4)
+    #
+    # Twilio hits this webhook when a call arrives on a configured number.
+    # Returns TwiML XML that tells Twilio to open a Media Stream back to
+    # the WS endpoint below. No bearer auth — Twilio can't send one; the
+    # webhook is callable by Twilio (and anyone who knows the URL).
+    # TODO: Twilio signature validation (X-Twilio-Signature + TWILIO_AUTH_TOKEN)
+    #
+    # New surface — flag (CLAUDE.md rule 5): a NEW additive ``/api/v1``
+    # endpoint. Changes no existing endpoint.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/call/twilio",
+        tags=["agents-v1"],
+        response_class=Response,
+    )
+    async def v1_agent_call_twilio(
+        name: str,
+        request: Request,
+    ) -> Response:
+        """TwiML webhook: Twilio calls this when a phone call arrives.
+
+        Returns TwiML XML that tells Twilio to open a bidirectional Media
+        Stream WebSocket back to the ``/call/twilio/stream`` endpoint,
+        where the call audio is bridged into the mdk voice pipeline
+        (ADR 074 D3/D4).
+        """
+        # Derive the WS URL from the incoming request's host.
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        # Use wss:// if the request came over HTTPS, ws:// otherwise.
+        scheme = "wss" if request.url.scheme == "https" else "ws"
+        stream_url = f"{scheme}://{host}/api/v1/agents/{name}/call/twilio/stream"
+
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Connect>"
+            f'<Stream url="{stream_url}" />'
+            "</Connect>"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    # ------------------------------------------------------------------
+    # WS /api/v1/agents/{name}/call/twilio/stream — Twilio Media Stream
+    #
+    # Accepts the Twilio Media Stream WebSocket opened by the TwiML
+    # <Connect><Stream> above. Bridges the call audio into the mdk voice
+    # pipeline via TwilioTransport (ADR 074 D3).
+    #
+    # Auth: Twilio opens this WS itself (from its media gateway), so no
+    # bearer token or API key. The security boundary is the TwiML webhook
+    # (which Twilio calls with a signature we can validate — deferred to
+    # the TODO above).
+    # ------------------------------------------------------------------
+    @v1.websocket("/agents/{name}/call/twilio/stream")
+    async def v1_agent_call_twilio_stream(websocket: WebSocket, name: str) -> None:
+        """Twilio Media Stream WS: bridge phone audio to the voice pipeline.
+
+        Twilio opens this WebSocket after the TwiML webhook returns a
+        ``<Connect><Stream>`` directive. The call's mu-law audio arrives as
+        ``media`` events; TTS output is sent back as ``media`` events. The
+        pipeline (STT -> unchanged Executor -> TTS) runs identically to the
+        browser WebSocket path (ADR 074 D8).
+        """
+        store: StorageProvider = websocket.app.state.storage
+
+        # ---- Resolve the agent (same routing as the WS voice path) ----
+        # For telephony, tenant resolution is simplified: use the default
+        # tenant or a configured Twilio-number -> tenant mapping. For now,
+        # resolve from a default tenant or the first available.
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        agents_reg: list[AgentBundle] = websocket.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            await websocket.accept()
+            await websocket.send_json({"event": "error", "message": f"agent {name!r} not found"})
+            await websocket.close(code=1008, reason="agent not found")
+            return
+
+        await websocket.accept()
+
+        # ---- Lazy import: voice + telephony extras (ADR 074 D5) ----
+        try:
+            from movate.core.executor import Executor  # noqa: PLC0415
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+            from movate.providers.pricing import load_pricing  # noqa: PLC0415
+            from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
+            from movate.tracing import build_tracer  # noqa: PLC0415
+            from movate.voice import run_voice_pipeline  # noqa: PLC0415
+            from movate.voice.transports.twilio import TwilioTransport  # noqa: PLC0415
+        except ImportError:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": ("mdk[voice] extra not installed; telephony bridge unavailable"),
+                }
+            )
+            await websocket.close(code=1011, reason="voice extra not installed")
+            return
+
+        # ---- Wire the transport + pipeline ----
+        transport = TwilioTransport(websocket)
+
+        # Build STT/TTS from the runtime's factories (same as the WS path).
+        stt = websocket.app.state.voice_stt_factory()
+        tts = websocket.app.state.voice_tts_factory()
+
+        # BYOK key resolution (same as WS path).
+        stt_api_key = await _resolve_voice_api_key(store, default_tenant, stt)
+        tts_api_key = await _resolve_voice_api_key(store, default_tenant, tts)
+
+        executor = Executor(
+            provider=LiteLLMProvider(),
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=default_tenant,
+            cache=websocket.app.state.llm_cache,
+        )
+
+        # Seed voice config from the agent's voice block.
+        config = _VoiceTurnConfig()
+        _seed_voice_turn_config(config, bundle)
+
+        agent = ExecutorAgentTurn(
+            executor=executor,
+            bundle=bundle,
+            tenant_id=default_tenant,
+            input_key=config.input_key,
+        )
+
+        try:
+            # Drive the pipeline: transport.receive_audio() -> STT -> agent -> TTS
+            audio_in = transport.receive_audio()
+
+            async for event in run_voice_pipeline(
+                audio_in=audio_in,
+                stt=stt,
+                tts=tts,
+                agent=agent,
+                language=config.language,
+                voice_id=config.voice_id,
+                stt_api_key=stt_api_key,
+                tts_api_key=tts_api_key,
+                keyterms=config.keyterms or None,
+                endpointing_ms=config.endpointing_ms,
+                tts_streaming=config.tts_streaming,
+            ):
+                if event.kind == "tts.audio" and event.audio is not None:
+                    await transport.send_audio(event.audio)
+                elif event.kind == "done":
+                    logger.info(
+                        "Twilio call turn done (agent=%s, run_id=%s, status=%s)",
+                        name,
+                        event.run_id,
+                        event.status,
+                    )
+        except WebSocketDisconnect:
+            logger.info("Twilio stream disconnected (agent=%s)", name)
+        except Exception:
+            logger.exception("Error in Twilio stream handler (agent=%s)", name)
+        finally:
+            await transport.disconnect()
+
+    # ------------------------------------------------------------------
     # POST /api/v1/agents/{name}/voice — One-shot / batch voice (ADR 050 D2)
     #
     # The REST parity to the streaming WS above: audio in → STT → the UNCHANGED
