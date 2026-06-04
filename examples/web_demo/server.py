@@ -692,16 +692,6 @@ class LyzrV3StreamAgent:
                         text_chunk = line
 
                     if text_chunk:
-                        # Lyzr /v3 SSE tokens often arrive without inter-word
-                        # whitespace. Insert a space before a token that starts
-                        # with an alnum if the previous token ended with one —
-                        # avoids "withthe" / "ITissue" glued-word artifacts
-                        # while preserving punctuation attachment ("Hello," not
-                        # "Hello ,").
-                        if collected and text_chunk[0].isalnum() and collected[-1][-1].isalnum():
-                            collected.append(" ")
-                            if on_token is not None:
-                                on_token(" ")
                         collected.append(text_chunk)
                         if on_token is not None:
                             on_token(text_chunk)
