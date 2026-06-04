@@ -319,34 +319,31 @@ button.active { background:var(--accent); color:white; }
     Tip: once your key is applied, the Mova-iO agent dropdown reloads with
     <em>your</em> account's agents.
   </p>
-</div>
 
-<!-- Phone Sync panel — visible in Simple view once the Mova-iO agent dropdown
-     has loaded. Lets the user pick an agent and attach it to the Twilio phone
-     number without switching to Detailed view. -->
-<div id="phone-sync-panel" class="panel"
-     style="display:none;margin:12px 16px;padding:12px 16px;
-            border-left:3px solid var(--ok);background:var(--panel);
-            border-radius:0 8px 8px 0;">
-  <h2 style="margin:0 0 8px 0;font-size:13px;display:flex;align-items:center;gap:6px;">
-    📞 Sync Agent to Phone
-  </h2>
-  <p class="muted" style="font-size:11px;margin:0 0 10px 0;font-style:normal;">
-    Select an agent and attach it to <strong id="phone-sync-number" style="color:var(--ok);font-family:'SF Mono',Menlo,monospace;"></strong>.
-    The next call to this number will be answered by the selected agent.
-  </p>
-  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-    <select id="phone-agent-select"
-            style="background:var(--surface);color:var(--text);border:1px solid var(--border);
-                   border-radius:6px;padding:6px 10px;font-size:12px;min-width:220px;max-width:320px;flex:1;">
-      <option value="">— select agent —</option>
-    </select>
-    <button id="phone-sync-btn" class="active"
-            style="font-size:12px;padding:6px 14px;white-space:nowrap;"
-            title="Attach the selected agent to the phone number">📞 Sync to Phone</button>
+  <!-- Phone Sync — integrated into the BYOK panel so the full flow lives
+       in one place: paste key → agents load → pick agent → sync to phone. -->
+  <div id="phone-sync-panel" style="display:none;margin-top:14px;padding-top:14px;
+       border-top:1px solid var(--border);">
+    <h3 style="margin:0 0 6px 0;font-size:12px;display:flex;align-items:center;gap:6px;">
+      📞 Sync Agent to Phone
+    </h3>
+    <p class="muted" style="font-size:11px;margin:0 0 8px 0;font-style:normal;">
+      Attach an agent to <strong id="phone-sync-number" style="color:var(--ok);font-family:'SF Mono',Menlo,monospace;"></strong>
+      — the next call will be answered by the selected agent.
+    </p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <select id="phone-agent-select"
+              style="background:var(--surface);color:var(--text);border:1px solid var(--border);
+                     border-radius:6px;padding:6px 10px;font-size:12px;min-width:200px;max-width:300px;flex:1;">
+        <option value="">— select agent —</option>
+      </select>
+      <button id="phone-sync-btn" class="active"
+              style="font-size:12px;padding:6px 14px;white-space:nowrap;"
+              title="Attach the selected agent to the phone number">📞 Sync to Phone</button>
+    </div>
+    <div id="phone-sync-status" style="margin-top:8px;font-size:11px;display:none;
+         padding:6px 10px;border-radius:6px;"></div>
   </div>
-  <div id="phone-sync-status" style="margin-top:8px;font-size:11px;display:none;
-       padding:6px 10px;border-radius:6px;"></div>
 </div>
 
 <!-- L2: "Currently voicing" — Mova-iO agent metadata panel. Shows when an agent
@@ -2306,11 +2303,14 @@ function _phoneSyncPopulate() {
     o.textContent = opt.textContent;
     dst.appendChild(o);
   }
-  // Show the panel if we have agents and a phone number.
+  // Show the phone-sync section if we have agents and a phone number.
+  // Phone sync lives inside the BYOK panel, so also ensure BYOK is visible.
   const num = $('twilio-dial')?.dataset?.number;
   if (dst.options.length > 1 && num) {
     $('phone-sync-panel').style.display = '';
     $('phone-sync-number').textContent = formatPhone(num);
+    // Auto-open BYOK panel so the phone sync controls are visible.
+    $('byok-panel').style.display = '';
   }
 }
 // Re-populate whenever the Mova-iO dropdown changes (after BYOK apply, refresh, etc.)
@@ -2382,12 +2382,8 @@ $('byok-apply').addEventListener('click', () => {
   currentLyzrAgentId = '';  // force re-select on the new account
   logEvent('🔄 reloading agent list with your key…', 'final');
   loadLyzrAgents(true);  // force = cache-bust
-  // Auto-collapse the modal once a real key was entered — the user is done
-  // with this panel and the dropdown / Talk button below it become the focus.
-  // We still keep it open for empty submissions so the user sees feedback.
-  if (keyEntered) {
-    $('byok-panel').style.display = 'none';
-  }
+  // Keep the panel open after applying so the user sees the phone-sync
+  // controls once the agent dropdown reloads (phone sync lives inside BYOK).
 });
 $('byok-clear').addEventListener('click', () => {
   $('byok-lyzr').value = '';
