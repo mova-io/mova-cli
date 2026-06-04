@@ -1386,6 +1386,24 @@ async def index() -> FileResponse:
 _active_sessions: int = 0
 _started_at_monotonic: float = 0.0  # set in main(); 0 means "not yet started"
 
+# Phone-call concurrency. `_active_phone_calls` is bumped on WS accept and
+# decremented in the finally of the /ws/twilio handler. The TwiML endpoint
+# checks it against `MAX_CONCURRENT_CALLS` and returns a polite <Say> rejection
+# when full — callers hear "all agents are busy" instead of degrading active
+# calls. Configurable via env so ops can tune without a redeploy.
+MAX_CONCURRENT_CALLS: int = int(os.environ.get("MAX_CONCURRENT_CALLS", "3"))
+_active_phone_calls: int = 0
+
+
+def _phone_call_entered() -> None:
+    """Bump the active-phone-call count."""
+    globals()["_active_phone_calls"] = globals()["_active_phone_calls"] + 1
+
+
+def _phone_call_exited() -> None:
+    """Decrement the active-phone-call count, floor at zero."""
+    globals()["_active_phone_calls"] = max(0, globals()["_active_phone_calls"] - 1)
+
 
 def _session_entered() -> None:
     """Bump the live-session count. Module-level helper to avoid the multiple-
@@ -1478,6 +1496,8 @@ async def health() -> dict[str, object]:
         ),
         "started_at": _started_at_wall_iso,
         "active_sessions": _active_sessions,
+        "active_phone_calls": _active_phone_calls,
+        "max_phone_calls": MAX_CONCURRENT_CALLS,
         "adapters": adapters,
         "endpoints": {
             "browser_ws": "/ws/voice",
@@ -1852,7 +1872,13 @@ def _public_base_url(request: Any) -> str | None:
 @app.get("/twiml/voice")
 @app.post("/twiml/voice")
 async def twiml_voice(request: Request) -> Any:
-    """Return a TwiML <Connect><Stream/> that points Twilio at our /ws/twilio."""
+    """Return a TwiML <Connect><Stream/> that points Twilio at our /ws/twilio.
+
+    Admission gate: if ``_active_phone_calls >= MAX_CONCURRENT_CALLS``, return
+    a polite TwiML ``<Say>`` rejection instead of handing off the stream. The
+    caller hears "all agents are busy" and hangs up — active calls are not
+    degraded. The browser event stream gets a ``call_rejected`` notification.
+    """
     from fastapi import Response  # noqa: PLC0415
     from twilio_bridge import twiml_for_stream  # noqa: PLC0415
 
@@ -1867,6 +1893,34 @@ async def twiml_voice(request: Request) -> Any:
                 "or deploy behind a public ingress.</Say></Response>"
             ),
         )
+
+    # Admission gate — reject before opening the WS so active calls keep
+    # their full CPU/bandwidth budget.
+    if _active_phone_calls >= MAX_CONCURRENT_CALLS:
+        log.warning(
+            "twilio: rejecting call — at capacity (%d/%d)",
+            _active_phone_calls,
+            MAX_CONCURRENT_CALLS,
+        )
+        # Best-effort broadcast to browsers watching the event stream.
+        asyncio.ensure_future(
+            _broadcast_twilio(
+                kind="call_rejected",
+                reason="at_capacity",
+                active=_active_phone_calls,
+                max=MAX_CONCURRENT_CALLS,
+            )
+        )
+        return Response(
+            media_type="application/xml",
+            content=(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<Response><Say voice=\"Polly.Joanna\">"
+                "All agents are currently busy. Please try again shortly."
+                "</Say></Response>"
+            ),
+        )
+
     wss = public.replace("https://", "wss://").replace("http://", "ws://") + "/ws/twilio"
     return Response(media_type="application/xml", content=twiml_for_stream(wss))
 
@@ -2032,6 +2086,20 @@ async def twilio_voice(ws: WebSocket) -> None:
         await ws.close()
         return
 
+    # Track the active call count for the admission gate + /health.
+    _phone_call_entered()
+    log.info(
+        "twilio: call accepted (%d/%d active)",
+        _active_phone_calls,
+        MAX_CONCURRENT_CALLS,
+    )
+    # Notify browsers so the event stream can show "📞 2/3 lines active".
+    await _broadcast_twilio(
+        kind="call_count",
+        active=_active_phone_calls,
+        max=MAX_CONCURRENT_CALLS,
+    )
+
     _prune_stale_twilio_sessions()
     # B5: session_holder is a 1-slot mutable container so on_call_sid can swap
     # in a resumed Session BEFORE build_kwargs is read for turn 1. The eager
@@ -2125,6 +2193,20 @@ async def twilio_voice(ws: WebSocket) -> None:
         cs = resumed_call_sid[0]
         if cs:
             _twilio_sessions[cs] = (session_holder[0], _time.monotonic())
+        # Release the call slot and notify browsers.
+        _phone_call_exited()
+        log.info(
+            "twilio: call ended (%d/%d active)",
+            _active_phone_calls,
+            MAX_CONCURRENT_CALLS,
+        )
+        asyncio.ensure_future(
+            _broadcast_twilio(
+                kind="call_count",
+                active=_active_phone_calls,
+                max=MAX_CONCURRENT_CALLS,
+            )
+        )
 
 
 # ── End Twilio bridge ─────────────────────────────────────────────────────────

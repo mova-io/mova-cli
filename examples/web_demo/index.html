@@ -1001,6 +1001,10 @@ function handleJson(s) {
       logEvent(`📞 ${t}done · ${m.badge || ''}`, 'final');
     } else if (k === 'error') {
       logEvent(`📞 ${t}error · ${m.stage || ''}: ${m.message || ''}`, 'err');
+    } else if (k === 'call_count') {
+      logEvent(`📞 ${m.active}/${m.max} phone lines active`, 'final');
+    } else if (k === 'call_rejected') {
+      logEvent(`📞 ⚠ call rejected — at capacity (${m.active}/${m.max})`, 'err');
     }
     return;
   }
