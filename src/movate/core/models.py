@@ -798,19 +798,17 @@ class SkillSpec(BaseModel):
                     f"http skill implementation.auth must be 'bearer-from-env:<VAR>'; "
                     f"got {v.auth!r}"
                 )
-        if v.kind == SkillImplementationKind.MCP:
-            if not v.entry:
-                raise ValueError(
-                    "mcp skill implementation.entry must be the subprocess "
-                    "command for the MCP server (e.g. './mcp-servers/github' "
-                    "or 'npx -y @some/mcp-package'); got empty string"
-                )
-            if not v.tool:
-                raise ValueError(
-                    "mcp skill implementation.tool is required (the name "
-                    "of the tool to invoke on the MCP server); empty tool "
-                    "would mean 'no tool selected'"
-                )
+        # MCP: entry is required; tool: is OPTIONAL — when omitted, the
+        # backend operates in multi-tool mode (all tools from tools/list
+        # are registered as namespaced callables). When specified,
+        # single-tool mode (backward-compatible).
+        if v.kind == SkillImplementationKind.MCP and not v.entry:
+            raise ValueError(
+                "mcp skill implementation.entry must be the server "
+                "command (e.g. 'npx -y @some/mcp-package') or an "
+                "HTTP/SSE URL (e.g. 'https://mcp.example.com/api'); "
+                "got empty string"
+            )
         if v.kind == SkillImplementationKind.AGENT and not v.target_agent:
             raise ValueError(
                 "agent skill implementation.target_agent is required "

@@ -644,10 +644,10 @@ async def test_aclose_terminates_running_subprocess(
 # ---------------------------------------------------------------------------
 
 
-def test_skill_spec_mcp_requires_tool(tmp_path: Path) -> None:
-    """A kind=mcp skill without a ``tool:`` field fails at load —
-    operator sees the error from ``mdk validate`` rather than a
-    deep dispatch error."""
+def test_skill_spec_mcp_omitted_tool_loads_ok(tmp_path: Path) -> None:
+    """A kind=mcp skill without a ``tool:`` field now loads successfully
+    in multi-tool mode. Previously this was an error; now tool: is
+    optional — omitting it means 'import all tools from the server'."""
     skill_dir = tmp_path / "no-tool"
     skill_dir.mkdir()
     (skill_dir / "skill.yaml").write_text(
@@ -661,12 +661,10 @@ def test_skill_spec_mcp_requires_tool(tmp_path: Path) -> None:
         "implementation:\n"
         "  kind: mcp\n"
         "  entry: ./server\n"
-        # no `tool:` — should fail
+        # no `tool:` — multi-tool mode
     )
-    from movate.core.skill_loader import SkillLoadError  # noqa: PLC0415
-
-    with pytest.raises(SkillLoadError, match=r"implementation\.tool is required"):
-        load_skill(skill_dir)
+    bundle = load_skill(skill_dir)
+    assert bundle.spec.implementation.tool is None
 
 
 def test_skill_spec_mcp_requires_entry(tmp_path: Path) -> None:
@@ -687,5 +685,164 @@ def test_skill_spec_mcp_requires_entry(tmp_path: Path) -> None:
     )
     from movate.core.skill_loader import SkillLoadError  # noqa: PLC0415
 
-    with pytest.raises(SkillLoadError, match="entry must be the subprocess command"):
+    with pytest.raises(SkillLoadError, match="entry must be the server"):
         load_skill(skill_dir)
+
+
+# ---------------------------------------------------------------------------
+# Multi-tool mode (tool: omitted)
+# ---------------------------------------------------------------------------
+
+
+def _write_mcp_skill_multi(
+    parent: Path,
+    *,
+    name: str = "github-multi",
+    entry: str = "./mcp-servers/github",
+    input_schema: str = "{__tool__: string}",
+    output_schema: str = "{}",
+) -> Path:
+    """Synth a multi-tool mcp-kind skill on disk (no tool: field)."""
+    skill_dir = parent / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "skill.yaml").write_text(
+        "api_version: movate/v1\n"
+        "kind: Skill\n"
+        f"name: {name}\n"
+        "version: 0.1.0\n"
+        "schema:\n"
+        f"  input: {input_schema}\n"
+        f"  output: {output_schema}\n"
+        "implementation:\n"
+        "  kind: mcp\n"
+        f"  entry: {entry}\n"
+        # no tool: — multi-tool mode
+    )
+    return skill_dir
+
+
+def test_skill_spec_mcp_allows_omitted_tool(tmp_path: Path) -> None:
+    """A kind=mcp skill without a ``tool:`` field loads successfully
+    for multi-tool mode."""
+    skill_dir = _write_mcp_skill_multi(tmp_path)
+    bundle = load_skill(skill_dir)
+    assert bundle.spec.implementation.tool is None
+
+
+@pytest.mark.asyncio
+async def test_multi_tool_mode_passes_dunder_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In multi-tool mode, __tool__ in input selects the tool to call."""
+    fake = _FakeProcess(
+        stdout_lines=[
+            *_handshake_lines(),
+            _tools_list_line("create_issue", "list_repos", request_id=2),
+            _tools_call_line(structured={"id": 123, "url": "https://..."}, request_id=3),
+        ]
+    )
+    _install_fake_spawn(monkeypatch, fake)
+    skill_dir = _write_mcp_skill_multi(tmp_path)
+    bundle = load_skill(skill_dir)
+    backend = MCPSkillBackend()
+    try:
+        result = await backend.execute(
+            bundle,
+            {"__tool__": "create_issue", "title": "Bug", "body": "Repro"},
+            _ctx(),
+        )
+    finally:
+        await backend.aclose()
+    assert result == {"id": 123, "url": "https://..."}
+    # Verify the tools/call request used the right tool name.
+    writes = [json.loads(w) for w in fake.stdin.written]
+    call_msg = next(m for m in writes if m.get("method") == "tools/call")
+    assert call_msg["params"]["name"] == "create_issue"
+    # __tool__ should NOT be forwarded as an argument to the server.
+    assert "__tool__" not in call_msg["params"]["arguments"]
+
+
+@pytest.mark.asyncio
+async def test_multi_tool_mode_no_tool_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In multi-tool mode, if __tool__ is missing from input → error."""
+    fake = _FakeProcess(stdout_lines=[*_handshake_lines()])
+    _install_fake_spawn(monkeypatch, fake)
+    skill_dir = _write_mcp_skill_multi(tmp_path)
+    bundle = load_skill(skill_dir)
+    backend = MCPSkillBackend()
+    try:
+        with pytest.raises(SkillError) as info:
+            await backend.execute(bundle, {"title": "Bug"}, _ctx())
+    finally:
+        await backend.aclose()
+    assert info.value.type == SkillErrorType.BACKEND_ERROR
+    assert "no tool specified" in info.value.message
+
+
+# ---------------------------------------------------------------------------
+# HTTP/SSE transport
+# ---------------------------------------------------------------------------
+
+
+def test_is_http_entry() -> None:
+    from movate.core.skill_backend.mcp import _is_http_entry  # noqa: PLC0415
+
+    assert _is_http_entry("https://mcp.example.com/api") is True
+    assert _is_http_entry("http://localhost:8080") is True
+    assert _is_http_entry("HTTP://EXAMPLE.COM") is True
+    assert _is_http_entry("./mcp-servers/github") is False
+    assert _is_http_entry("npx -y @some/pkg") is False
+
+
+def test_parse_sse_response_extracts_result() -> None:
+    from movate.core.skill_backend.mcp import _parse_sse_response  # noqa: PLC0415
+
+    body = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n\n'
+    result = _parse_sse_response(body, expected_id=1, method="test", skill_name="s")
+    assert result == {"ok": True}
+
+
+def test_parse_sse_response_error_raises() -> None:
+    from movate.core.skill_backend.mcp import _parse_sse_response  # noqa: PLC0415
+
+    body = (
+        'event: message\ndata: {"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"bad"}}\n\n'
+    )
+    with pytest.raises(SkillError) as info:
+        _parse_sse_response(body, expected_id=1, method="test", skill_name="s")
+    assert info.value.type == SkillErrorType.BACKEND_ERROR
+    assert "bad" in info.value.message
+
+
+def test_parse_sse_response_no_match_raises() -> None:
+    from movate.core.skill_backend.mcp import _parse_sse_response  # noqa: PLC0415
+
+    body = "event: ping\ndata: {}\n\n"
+    with pytest.raises(SkillError) as info:
+        _parse_sse_response(body, expected_id=1, method="test", skill_name="s")
+    assert "no matching" in info.value.message
+
+
+# ---------------------------------------------------------------------------
+# add-mcp CLI helper
+# ---------------------------------------------------------------------------
+
+
+def test_derive_skill_name_from_npm_package() -> None:
+    from movate.cli.skills_cmd import _derive_skill_name  # noqa: PLC0415
+
+    assert _derive_skill_name("npx -y @modelcontextprotocol/server-github") == "github"
+
+
+def test_derive_skill_name_from_url() -> None:
+    from movate.cli.skills_cmd import _derive_skill_name  # noqa: PLC0415
+
+    assert _derive_skill_name("https://mcp.slack.com/api") == "slack"
+
+
+def test_derive_skill_name_from_local_binary() -> None:
+    from movate.cli.skills_cmd import _derive_skill_name  # noqa: PLC0415
+
+    assert _derive_skill_name("./mcp-servers/jira-bridge") == "jira-bridge"
