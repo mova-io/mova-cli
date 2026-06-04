@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -16447,215 +16448,28 @@ def build_app(
     app.include_router(v1)
 
     # ------------------------------------------------------------------
-    # GET / — Voice demo dashboard (inline HTML, no templates)
+    # GET / — Serve the voice demo app (examples/web_demo/index.html).
+    # The file is baked into the image at /app/web_demo/index.html by the
+    # Dockerfile.  Falls back to a project-root lookup for local dev.
     # ------------------------------------------------------------------
-    _DASHBOARD_HTML = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mdk voice demo</title>
-<style>
-  :root { --bg: #0f172a; --card: #1e293b; --accent: #3b82f6;
-          --green: #22c55e; --text: #f1f5f9; --muted: #94a3b8;
-          --border: #334155; --red: #ef4444; }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-         sans-serif; background: var(--bg); color: var(--text);
-         min-height: 100vh; display: flex; flex-direction: column;
-         align-items: center; padding: 2rem 1rem; }
-  .logo { font-size: 1.5rem; font-weight: 700; margin-bottom: .25rem; }
-  .logo span { color: var(--accent); }
-  .subtitle { color: var(--muted); font-size: .85rem; margin-bottom: 2rem; }
-  .card { background: var(--card); border: 1px solid var(--border);
-          border-radius: 12px; padding: 1.5rem; width: 100%;
-          max-width: 480px; margin-bottom: 1rem; }
-  .card h2 { font-size: 1rem; margin-bottom: 1rem; display: flex;
-             align-items: center; gap: .5rem; }
-  .card h2 .dot { width: 8px; height: 8px; border-radius: 50%;
-                  background: var(--green); display: inline-block; }
-  label { display: block; color: var(--muted); font-size: .8rem;
-          margin-bottom: .35rem; }
-  select, input { width: 100%; padding: .6rem .75rem; border-radius: 8px;
-                  border: 1px solid var(--border); background: var(--bg);
-                  color: var(--text); font-size: .9rem; outline: none;
-                  margin-bottom: 1rem; }
-  select:focus, input:focus { border-color: var(--accent); }
-  .btn { display: inline-flex; align-items: center; gap: .5rem;
-         padding: .6rem 1.25rem; border-radius: 8px; border: none;
-         font-size: .9rem; font-weight: 600; cursor: pointer;
-         transition: opacity .15s; }
-  .btn:hover { opacity: .85; }
-  .btn-primary { background: var(--accent); color: #fff; }
-  .btn-green { background: var(--green); color: #fff; }
-  .btn:disabled { opacity: .4; cursor: not-allowed; }
-  .status { font-size: .8rem; margin-top: .75rem; padding: .5rem .75rem;
-            border-radius: 6px; display: none; }
-  .status.ok { display: block; background: #16a34a22; color: var(--green);
-               border: 1px solid #16a34a44; }
-  .status.err { display: block; background: #ef444422; color: var(--red);
-                border: 1px solid #ef444444; }
-  .phone-num { font-family: monospace; font-size: 1.3rem; font-weight: 700;
-               color: var(--green); margin: .5rem 0; }
-  .info { color: var(--muted); font-size: .8rem; line-height: 1.5; }
-  .info code { background: var(--bg); padding: .1rem .35rem;
-               border-radius: 4px; font-size: .75rem; }
-  .row { display: flex; gap: .75rem; align-items: end; }
-  .row > :first-child { flex: 1; }
-  .tabs { display: flex; gap: 0; margin-bottom: 0; width: 100%;
-          max-width: 480px; }
-  .tab { flex: 1; padding: .6rem; text-align: center; font-size: .85rem;
-         font-weight: 600; cursor: pointer; border: 1px solid var(--border);
-         background: var(--bg); color: var(--muted); transition: all .15s; }
-  .tab:first-child { border-radius: 8px 0 0 0; }
-  .tab:last-child { border-radius: 0 8px 0 0; }
-  .tab.active { background: var(--card); color: var(--text);
-                border-bottom-color: var(--card); }
-  .panel { display: none; }
-  .panel.active { display: block; }
-  .card.tabbed { border-radius: 0 0 12px 12px; border-top: none; }
-</style>
-</head>
-<body>
-
-<div class="logo"><span>mdk</span> voice demo</div>
-<div class="subtitle">Declarative AI agent platform &mdash; voice telephony bridge</div>
-
-<div class="tabs">
-  <div class="tab active" onclick="switchTab('simple')">Simple</div>
-  <div class="tab" onclick="switchTab('advanced')">Advanced</div>
-</div>
-
-<div class="card tabbed">
-  <!-- SIMPLE TAB -->
-  <div id="tab-simple" class="panel active">
-    <h2><span class="dot" id="dot"></span> Phone Agent</h2>
-
-    <label for="agent-select">Active agent on phone</label>
-    <div class="row">
-      <select id="agent-select"><option>Loading...</option></select>
-      <button class="btn btn-green" id="sync-btn" onclick="syncAgent()">
-        Sync to Phone
-      </button>
-    </div>
-
-    <div class="phone-num" id="phone-display"></div>
-    <p class="info">
-      Callers to this number reach the selected agent via
-      Deepgram STT &rarr; Agent &rarr; Cartesia TTS.
-    </p>
-    <div class="status" id="sync-status"></div>
-  </div>
-
-  <!-- ADVANCED TAB -->
-  <div id="tab-advanced" class="panel">
-    <h2>Runtime Info</h2>
-    <label>Version</label>
-    <div id="adv-version" class="info" style="margin-bottom:.75rem">...</div>
-    <label>Agents loaded</label>
-    <div id="adv-agents" class="info" style="margin-bottom:.75rem">...</div>
-    <label>Twilio webhook (set once in Twilio console)</label>
-    <div class="info" style="margin-bottom:.75rem">
-      <code id="adv-webhook">POST /api/v1/call/twilio</code>
-    </div>
-    <label>Config endpoint</label>
-    <div class="info">
-      <code>PUT /api/v1/call/twilio/config</code> &nbsp;
-      <code>{"agent": "&lt;name&gt;"}</code>
-    </div>
-  </div>
-</div>
-
-<script>
-const BASE = location.origin;
-const phoneNumber = '""" + os.environ.get("TWILIO_NUMBER", "") + """';
-
-function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t, i) => {
-    t.classList.toggle('active', (name==='simple' ? i===0 : i===1));
-  });
-  document.getElementById('tab-simple').classList.toggle('active', name==='simple');
-  document.getElementById('tab-advanced').classList.toggle('active', name==='advanced');
-}
-
-async function loadAgents() {
-  try {
-    const [agentsRes, configRes, capRes] = await Promise.all([
-      fetch(BASE + '/api/v1/agents'),
-      fetch(BASE + '/api/v1/call/twilio/config'),
-      fetch(BASE + '/api/v1/capabilities'),
-    ]);
-    const agents = await agentsRes.json();
-    const config = await configRes.json();
-    const caps = await capRes.json();
-
-    // Populate dropdown.
-    const sel = document.getElementById('agent-select');
-    sel.innerHTML = '';
-    const list = Array.isArray(agents) ? agents : (agents.agents || agents.items || []);
-    list.forEach(a => {
-      const name = typeof a === 'string' ? a : (a.name || a.agent_name || '');
-      if (!name) return;
-      const opt = document.createElement('option');
-      opt.value = name; opt.textContent = name;
-      if (name === config.agent) opt.selected = true;
-      sel.appendChild(opt);
-    });
-
-    // Phone number display.
-    if (phoneNumber) {
-      document.getElementById('phone-display').textContent = phoneNumber;
-    }
-
-    // Advanced tab.
-    document.getElementById('adv-version').textContent = caps.mdk_version || '?';
-    document.getElementById('adv-agents').textContent = list.map(
-      a => typeof a === 'string' ? a : a.name).join(', ');
-    document.getElementById('adv-webhook').textContent =
-      'POST ' + BASE + '/api/v1/call/twilio';
-  } catch (e) {
-    console.error('Load failed', e);
-  }
-}
-
-async function syncAgent() {
-  const btn = document.getElementById('sync-btn');
-  const status = document.getElementById('sync-status');
-  const agent = document.getElementById('agent-select').value;
-  btn.disabled = true; btn.textContent = 'Syncing...';
-  status.className = 'status'; status.style.display = 'none';
-
-  try {
-    const res = await fetch(BASE + '/api/v1/call/twilio/config', {
-      method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({agent}),
-    });
-    const data = await res.json();
-    if (res.ok) {
-      status.className = 'status ok';
-      status.textContent = 'Synced! Calls now routed to ' + data.agent;
-    } else {
-      status.className = 'status err';
-      status.textContent = data.detail || 'Sync failed';
-    }
-  } catch (e) {
-    status.className = 'status err';
-    status.textContent = 'Network error: ' + e.message;
-  }
-  btn.disabled = false; btn.textContent = 'Sync to Phone';
-}
-
-loadAgents();
-</script>
-</body>
-</html>
-"""
+    _DEMO_HTML_PATHS = [
+        "/app/web_demo/index.html",            # Docker image (COPY in Dockerfile)
+        str(pathlib.Path(__file__).resolve().parents[2] / "examples" / "web_demo" / "index.html"),
+    ]
+    _demo_html_cache: str | None = None
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-    async def _dashboard() -> HTMLResponse:
-        return HTMLResponse(_DASHBOARD_HTML)
+    async def _voice_demo() -> HTMLResponse:
+        nonlocal _demo_html_cache
+        if _demo_html_cache is None:
+            for p in _DEMO_HTML_PATHS:
+                if os.path.isfile(p):
+                    with open(p) as f:
+                        _demo_html_cache = f.read()
+                    break
+        if _demo_html_cache is None:
+            raise HTTPException(status_code=404, detail="Voice demo HTML not found")
+        return HTMLResponse(_demo_html_cache)
 
     # ------------------------------------------------------------------
     # Typed exception → HTTP code translator. AgentCreationError carries

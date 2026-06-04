@@ -76,6 +76,9 @@ COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate
 COPY agents/ /app/agents/
 ENV MOVATE_AGENTS_PATH=/app/agents
 
+# Voice demo web app — served at GET / by the runtime.
+COPY examples/web_demo/index.html /app/web_demo/index.html
+
 # Default tracer goes to stdout — Container Apps captures stdout to
 # Log Analytics. Operators flip MOVATE_TRACER=otel via env to switch
 # to OTLP.
