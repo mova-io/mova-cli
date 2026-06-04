@@ -16551,30 +16551,104 @@ def build_app(
 
     # ------------------------------------------------------------------
     # GET /tts/voices — Voice catalog for the demo UI's voice picker.
-    # Hardcoded subset; the standalone demo server fetches live from
-    # Cartesia but the runtime keeps it simple.
+    # Fetches live from Cartesia's /voices API (cached 1h), falls back
+    # to a single default voice if the API is unreachable.
     # ------------------------------------------------------------------
-    _TTS_VOICES: dict[str, list[dict[str, str]]] = {
-        "openai": [
-            {"id": "alloy", "label": "Alloy", "description": "neutral, balanced", "use_case": "general support, default"},
-            {"id": "echo", "label": "Echo", "description": "calm, measured male", "use_case": "customer service, IVR"},
-            {"id": "fable", "label": "Fable", "description": "warm British accent", "use_case": "storytelling, training"},
-            {"id": "onyx", "label": "Onyx", "description": "deep, authoritative male", "use_case": "announcements, alerts"},
-            {"id": "nova", "label": "Nova", "description": "bright, friendly female", "use_case": "help desk, assistant"},
-            {"id": "shimmer", "label": "Shimmer", "description": "soft, expressive female", "use_case": "wellness, calm settings"},
-        ],
-        "cartesia": [
-            {"id": "a0e99841-438c-4a64-b679-ae501e7d6091", "label": "Clara (F)", "description": "Middle-aged American female with a clear tone and precise enunciation", "use_case": "general use"},
-            {"id": "79a125e8-cd45-4c13-8a67-188112f4dd22", "label": "British Lady (F)", "description": "Professional, clear female British accent", "use_case": "enterprise voice"},
-            {"id": "b7d50908-b17c-442d-ad8d-810c63997ed9", "label": "California Girl (F)", "description": "Bright, upbeat young female", "use_case": "casual, help desk"},
-            {"id": "c8fff9e7-1b78-4e52-b5d7-f2b3e0b28c94", "label": "Confident Male (M)", "description": "Authoritative, steady male voice", "use_case": "announcements, IVR"},
-            {"id": "638efaaa-4d0c-442e-b701-3fae16aad012", "label": "Sarah (F)", "description": "Warm, professional female", "use_case": "customer support"},
-        ],
-    }
+    _OPENAI_VOICES = [
+        {"id": "alloy", "label": "Alloy", "description": "neutral, balanced", "use_case": "general support, default"},
+        {"id": "echo", "label": "Echo", "description": "calm, measured male", "use_case": "customer service, IVR"},
+        {"id": "fable", "label": "Fable", "description": "warm British accent", "use_case": "storytelling, training"},
+        {"id": "onyx", "label": "Onyx", "description": "deep, authoritative male", "use_case": "announcements, alerts"},
+        {"id": "nova", "label": "Nova", "description": "bright, friendly female", "use_case": "help desk, assistant"},
+        {"id": "shimmer", "label": "Shimmer", "description": "soft, expressive female", "use_case": "wellness, calm settings"},
+    ]
+    _cartesia_cache: tuple[float, list[dict[str, str]]] | None = None
+    _CARTESIA_TTL = 3600.0
+
+    def _classify_use_case(desc: str) -> str:
+        d = desc.lower()
+        for kws, label in [
+            (("support", "service", "customer", "help"), "customer service"),
+            (("professional", "business", "enterprise"), "enterprise voice"),
+            (("calm", "soothing", "meditat"), "wellness, calm settings"),
+            (("instruct", "training", "guide", "explainer"), "training, walkthrough"),
+            (("news", "anchor", "broadcast"), "news, announcements"),
+            (("bright", "upbeat", "energetic", "friendly"), "casual, help desk"),
+        ]:
+            if any(k in d for k in kws):
+                return label
+        return "general use"
+
+    def _fetch_cartesia_voices() -> list[dict[str, str]]:
+        key = os.environ.get("CARTESIA_API_KEY", "").strip()
+        if not key:
+            return []
+        try:
+            import httpx  # noqa: PLC0415
+            r = httpx.get(
+                "https://api.cartesia.ai/voices/",
+                headers={"X-API-Key": key, "Cartesia-Version": "2024-06-10"},
+                timeout=8.0,
+            )
+            r.raise_for_status()
+            voices = r.json() or []
+        except Exception:
+            return []
+        SKIP = ("fairy", "gaming", "pikachu", "robot", "elf", "demon", "ghost", "alien")
+        PREFERRED = ("support", "professional", "natural", "conversational", "assistant",
+                     "warm", "friendly", "customer", "guide", "explainer")
+        en = [v for v in voices if isinstance(v, dict) and v.get("language") == "en"
+              and v.get("is_public") and v.get("id") and v.get("name")
+              and not any(s in (v.get("description") or "").lower() for s in SKIP)
+              and not any(s in (v.get("name") or "").lower() for s in SKIP)]
+
+        def score(v: dict) -> int:
+            d = str(v.get("description") or "").lower()
+            return sum(1 for k in PREFERRED if k in d)
+
+        en.sort(key=lambda v: (-score(v), str(v.get("name") or "")))
+        by_gender: dict[str, list] = {"f": [], "m": []}
+        seen: set[str] = set()
+        for v in en:
+            nm = str(v.get("name") or "").split(" - ")[0].strip().lower()
+            if not nm or nm in seen:
+                continue
+            seen.add(nm)
+            g = "f" if str(v.get("gender") or "").lower().startswith("fem") else "m"
+            if len(by_gender[g]) < 8:
+                by_gender[g].append(v)
+        picked = by_gender["f"] + by_gender["m"]
+
+        def norm(v: dict) -> dict[str, str]:
+            name = str(v.get("name") or "").split(" - ")[0].strip()
+            gs = "F" if str(v.get("gender") or "").lower().startswith("fem") else "M"
+            desc = str(v.get("description") or "").strip().rstrip(".")
+            if len(desc) > 80:
+                desc = desc[:77] + "..."
+            return {"id": str(v["id"]), "label": f"{name} ({gs})",
+                    "description": desc or f"{gs} voice",
+                    "use_case": _classify_use_case(desc)}
+
+        return [norm(v) for v in picked]
 
     @app.get("/tts/voices", tags=["voice"], include_in_schema=False)
     async def _tts_voices() -> dict[str, Any]:
-        return {"ok": True, "voices": _TTS_VOICES, "cartesia_live": False}
+        nonlocal _cartesia_cache
+        import asyncio  # noqa: PLC0415
+        cart_voices: list[dict[str, str]] = []
+        now = _time_mod.monotonic()
+        if _cartesia_cache and now - _cartesia_cache[0] < _CARTESIA_TTL:
+            cart_voices = _cartesia_cache[1]
+        else:
+            cart_voices = await asyncio.to_thread(_fetch_cartesia_voices)
+            if cart_voices:
+                _cartesia_cache = (now, cart_voices)
+        if not cart_voices:
+            cart_voices = [{"id": "a0e99841-438c-4a64-b679-ae501e7d6091",
+                           "label": "Clara (F)", "description": "Adapter default voice",
+                           "use_case": "general use"}]
+        return {"ok": True, "voices": {"openai": _OPENAI_VOICES, "cartesia": cart_voices},
+                "cartesia_live": bool(_cartesia_cache)}
 
     # ------------------------------------------------------------------
     # GET / — Serve the voice demo app (examples/web_demo/index.html).
