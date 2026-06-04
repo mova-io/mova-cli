@@ -639,5 +639,6 @@ markers = [
     "no_preflight_stub: opts out of the eval-scorecard preflight autouse no-op",
     "acceptance: hermetic end-to-end slice guards (run in the normal suite)",
     "temporal: Temporal integration tests requiring `temporal server start-dev` (opt-in, run with pytest -m temporal)",
+    "voice_bench: voice eval/regression harness tests (ADR 049 D5)",
 ]
 addopts = "-ra --strict-markers"

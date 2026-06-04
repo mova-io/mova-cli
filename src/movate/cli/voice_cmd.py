@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     # parity gate (tests/test_cli_api_parity.py) reads to classify the voice
     # ``say``/``transcribe``/``ask`` verbs as remote-capable (ADR 050 D11).
     from movate.core.client import MovateClient
+    from movate.voice.base import SpeechToTextProvider, TextToSpeechProvider
 
 err = Console(stderr=True)
 
@@ -990,3 +991,238 @@ def voice_call(
         method="POST",
     )
     err.print(f"[green]✓[/green] Call initiated: SID={call.sid}")
+
+
+# ---------------------------------------------------------------------------
+# ``mdk voice bench`` — reproducible STT/TTS eval harness (ADR 049 D5)
+# ---------------------------------------------------------------------------
+
+
+@voice_app.command("bench")
+def voice_bench(
+    corpus_dir: Annotated[
+        str | None,
+        typer.Option(
+            "--corpus",
+            help="Path to corpus directory with manifest.json (default: tests/voice/corpus).",
+        ),
+    ] = None,
+    output: Annotated[
+        str,
+        typer.Option("--output", "-o", help="Output format: 'table' (default) or 'json'."),
+    ] = "table",
+    save_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--save-baseline",
+            help="Write results as voice-bench-baseline.json for future regression checks.",
+        ),
+    ] = False,
+    fail_on_regression: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-regression",
+            help="Compare against voice-bench-baseline.json; exit non-zero on regression.",
+        ),
+    ] = False,
+    baseline_path: Annotated[
+        str | None,
+        typer.Option(
+            "--baseline",
+            help="Path to baseline file (default: voice-bench-baseline.json in project root).",
+        ),
+    ] = None,
+    use_fakes: Annotated[
+        bool,
+        typer.Option(
+            "--fakes",
+            help="Use in-memory fake providers (for CI / harness validation).",
+        ),
+    ] = False,
+) -> None:
+    """Run the voice eval/regression harness over a golden audio corpus.
+
+    Benchmarks configured STT providers on WER + latency, and TTS providers on
+    first-byte + total latency. Compares against a saved baseline to catch
+    regressions (ADR 049 D5 — standing bake-off).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Run with fake providers (CI / harness validation)[/dim]
+      $ mdk voice bench --fakes
+
+      [dim]# Run and save a baseline[/dim]
+      $ mdk voice bench --fakes --save-baseline
+
+      [dim]# Run and fail on regression[/dim]
+      $ mdk voice bench --fakes --fail-on-regression
+
+      [dim]# JSON output for CI consumption[/dim]
+      $ mdk voice bench --fakes --output json
+    """
+    import asyncio  # noqa: PLC0415
+
+    asyncio.run(
+        _voice_bench_async(
+            corpus_dir=corpus_dir,
+            output=output,
+            save_baseline_flag=save_baseline,
+            fail_on_regression=fail_on_regression,
+            baseline_path=baseline_path,
+            use_fakes=use_fakes,
+        )
+    )
+
+
+async def _voice_bench_async(
+    *,
+    corpus_dir: str | None,
+    output: str,
+    save_baseline_flag: bool,
+    fail_on_regression: bool,
+    baseline_path: str | None,
+    use_fakes: bool,
+) -> None:
+    """Async core of ``mdk voice bench``."""
+    from pathlib import Path  # noqa: PLC0415
+
+    from movate.voice.bench import BenchReport as _BenchReport  # noqa: PLC0415
+    from movate.voice.bench import (  # noqa: PLC0415
+        bench_stt,
+        bench_tts,
+        load_audio_chunks,
+        load_corpus,
+    )
+    from movate.voice.bench import compare_to_baseline as _compare  # noqa: PLC0415
+    from movate.voice.bench import load_baseline as _load_baseline  # noqa: PLC0415
+    from movate.voice.bench import save_baseline as _save_baseline  # noqa: PLC0415
+
+    cdir = Path(corpus_dir) if corpus_dir else Path("tests/voice/corpus")
+    if not (cdir / "manifest.json").is_file():
+        err.print(f"[red]x[/red] Corpus manifest not found at {cdir / 'manifest.json'}")
+        raise typer.Exit(code=1)
+
+    corpus_items = load_corpus(cdir)
+    if not corpus_items:
+        err.print("[red]x[/red] Corpus is empty.")
+        raise typer.Exit(code=1)
+
+    stt_providers, tts_providers = _resolve_bench_providers(use_fakes)
+
+    stt_corpus = [
+        (load_audio_chunks(cdir, item.filename), item.expected_transcript) for item in corpus_items
+    ]
+    tts_phrases = [item.expected_transcript for item in corpus_items]
+
+    report = _BenchReport()
+    for stt in stt_providers:
+        report.stt_reports.append(await bench_stt(stt, stt_corpus))
+    for tts in tts_providers:
+        report.tts_reports.append(await bench_tts(tts, tts_phrases))
+
+    _emit_bench_output(report, output)
+
+    bl_path = Path(baseline_path) if baseline_path else Path("voice-bench-baseline.json")
+    if save_baseline_flag:
+        _save_baseline(report, bl_path)
+        err.print(f"\n[bold green]baseline saved:[/bold green] {bl_path}")
+
+    if fail_on_regression:
+        _check_regression(report, bl_path, _compare, _load_baseline)
+
+
+def _resolve_bench_providers(
+    use_fakes: bool,
+) -> tuple[list[SpeechToTextProvider], list[TextToSpeechProvider]]:
+    """Return (stt_providers, tts_providers) for the bench run."""
+    if use_fakes:
+        from movate.voice.doubles import FakeSTT, FakeTTS  # noqa: PLC0415
+
+        return [FakeSTT(transcript="hello")], [FakeTTS()]
+    err.print(
+        "[yellow]note:[/yellow] No real providers configured. "
+        "Use --fakes for harness validation, or configure STT/TTS providers."
+    )
+    raise typer.Exit(code=1)
+
+
+def _emit_bench_output(report: object, output: str) -> None:
+    """Render bench results to stderr as a table or JSON."""
+    import json as _json  # noqa: PLC0415
+
+    from movate.voice.bench import BenchReport  # noqa: PLC0415
+
+    assert isinstance(report, BenchReport)
+    if output == "json":
+        err.print(_json.dumps(report.to_dict(), indent=2))
+    else:
+        _render_bench_table(report)
+
+
+def _check_regression(
+    report: object,
+    bl_path: object,
+    compare_fn: object,
+    load_fn: object,
+) -> None:
+    """Compare report against baseline and exit non-zero on regression."""
+    from pathlib import Path  # noqa: PLC0415
+
+    from movate.voice.bench import BenchReport  # noqa: PLC0415
+
+    assert isinstance(report, BenchReport)
+    assert isinstance(bl_path, Path)
+    if not bl_path.is_file():
+        err.print(
+            f"[red]x[/red] Baseline file not found: {bl_path}\n  Run with --save-baseline first."
+        )
+        raise typer.Exit(code=1)
+    baseline = load_fn(bl_path)  # type: ignore[operator]
+    regressions = compare_fn(report, baseline)  # type: ignore[operator]
+    if regressions:
+        err.print(f"\n[red]REGRESSION DETECTED ({len(regressions)}):[/red]")
+        for reg in regressions:
+            err.print(f"  [red]x[/red] {reg.message}")
+        raise typer.Exit(code=1)
+    err.print("\n[bold green]No regressions detected.[/bold green]")
+
+
+def _render_bench_table(report: object) -> None:
+    """Render the bench report as a Rich table."""
+    from rich.table import Table  # noqa: PLC0415
+
+    from movate.voice.bench import BenchReport  # noqa: PLC0415
+
+    assert isinstance(report, BenchReport)
+
+    if report.stt_reports:
+        table = Table(title="STT Benchmark", show_lines=True)
+        table.add_column("Provider", style="bold")
+        table.add_column("WER", justify="right")
+        table.add_column("p50 Latency (ms)", justify="right")
+        table.add_column("p95 Latency (ms)", justify="right")
+        table.add_column("Samples", justify="right")
+        for r in report.stt_reports:
+            table.add_row(
+                r.provider,
+                f"{r.mean_wer:.1%}",
+                f"{r.p50_latency_ms:.0f}",
+                f"{r.p95_latency_ms:.0f}",
+                str(len(r.items)),
+            )
+        err.print(table)
+
+    if report.tts_reports:
+        table = Table(title="TTS Benchmark", show_lines=True)
+        table.add_column("Provider", style="bold")
+        table.add_column("First-byte (ms)", justify="right")
+        table.add_column("Total (ms)", justify="right")
+        table.add_column("Samples", justify="right")
+        for tr in report.tts_reports:
+            table.add_row(
+                tr.provider,
+                f"{tr.mean_first_byte_ms:.0f}",
+                f"{tr.mean_total_ms:.0f}",
+                str(len(tr.items)),
+            )
+        err.print(table)
