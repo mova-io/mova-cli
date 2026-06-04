@@ -15716,7 +15716,7 @@ def build_app(
         if _twilio_active_agent_name is None:
             # Default to first loaded agent.
             agents_reg: list[AgentBundle] = request.app.state.agents
-            _twilio_active_agent_name = agents_reg[0].agent.name if agents_reg else ""
+            _twilio_active_agent_name = agents_reg[0].spec.name if agents_reg else ""
         return {"agent": _twilio_active_agent_name}
 
     @v1.put("/call/twilio/config", tags=["voice-v1"])
@@ -15756,7 +15756,7 @@ def build_app(
         nonlocal _twilio_active_agent_name
         if _twilio_active_agent_name is None:
             agents_reg: list[AgentBundle] = request.app.state.agents
-            _twilio_active_agent_name = agents_reg[0].agent.name if agents_reg else ""
+            _twilio_active_agent_name = agents_reg[0].spec.name if agents_reg else ""
         if not _twilio_active_agent_name:
             return Response(
                 content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured.</Say></Response>',

@@ -31,7 +31,6 @@ voice:
   stt: deepgram
   tts: cartesia
   language: en
-  input_key: question
 
 tags:
   - voice
