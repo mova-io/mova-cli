@@ -2431,6 +2431,13 @@ async def livekit_join(request: Request) -> dict[str, object]:
     except ImportError:
         return {"ok": False, "error": "livekit SDK not installed"}
 
+    log.info(
+        "livekit: generating agent token with key=%s secret_len=%d url=%s room=%s",
+        cfg["api_key"],
+        len(cfg["api_secret"]),
+        cfg["url"],
+        room_name,
+    )
     agent_token = AccessToken(
         api_key=cfg["api_key"],
         api_secret=cfg["api_secret"],
