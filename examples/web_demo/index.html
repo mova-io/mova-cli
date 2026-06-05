@@ -890,10 +890,11 @@ async function connectLiveKit() {
     status('LiveKit error: ' + err.message, 'err');
     logEvent('LiveKit connect failed: ' + err.message, 'err');
     lkConnected = false;
-    // Fall back to WS.
-    transportMode = 'ws';
-    updateToggle('transport-toggle', 'transport', 'ws');
-    connect();
+    // Stay in LiveKit mode — don't auto-fallback to WS (that causes
+    // a reconnect loop). User can manually click WebRTC OFF to go back.
+    $('livekit-status-badge').textContent = '🔴 error';
+    $('livekit-status-badge').style.display = '';
+    $('livekit-status-badge').style.color = 'var(--err)';
   }
 }
 
