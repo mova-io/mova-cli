@@ -56,6 +56,7 @@ LIVEKIT_FRAME_DURATION_MS = 20  # Standard WebRTC frame
 SILENCE_RMS = 400.0
 MIN_SPEECH_MS = 300
 SILENCE_END_MS = 1200
+TTS_OUTPUT_RATE = 24_000  # Cartesia + OpenAI TTS both output 24 kHz
 
 
 async def handle_livekit_room(
@@ -80,15 +81,20 @@ async def handle_livekit_room(
     room = rtc.Room()
 
     # Audio source for publishing TTS back to the room.
+    # Must match the TTS output rate (24 kHz), NOT the pipeline/STT rate
+    # (16 kHz). The native FFI rejects frames whose sample rate doesn't
+    # match the source's declared rate.
     audio_source = rtc.AudioSource(
-        sample_rate=PIPELINE_RATE,
+        sample_rate=TTS_OUTPUT_RATE,
         num_channels=1,
     )
 
     turn = 0  # init before try so finally can reference it on connect failure
     try:
+        log.warning("livekit_bridge: connecting to %s room=%s", livekit_url, room_name)
         await room.connect(livekit_url, token)
-        log.info("livekit_bridge: connected to room=%s", room_name)
+        log.warning("livekit_bridge: connected to room=%s participants=%d",
+                     room_name, len(room.remote_participants))
 
         # Publish our audio track.
         local_track = rtc.LocalAudioTrack.create_audio_track(
@@ -98,22 +104,26 @@ async def handle_livekit_room(
             source=rtc.TrackSource.SOURCE_MICROPHONE
         )
         await room.local_participant.publish_track(local_track, publish_options)
+        log.warning("livekit_bridge: agent audio track published")
 
         if on_call_start:
             await on_call_start(room_name, None)
 
         # Wait for a participant to join with audio.
+        log.warning("livekit_bridge: waiting for participant audio track...")
         audio_track = await _wait_for_audio_track(room)
         if audio_track is None:
             log.warning("livekit_bridge: no participant audio within 60s")
             return
 
         participant_id = getattr(audio_track, "sid", "unknown")
-        log.info("livekit_bridge: got audio from participant=%s", participant_id)
+        sr = getattr(audio_track, "sample_rate", "?")
+        log.warning("livekit_bridge: got audio from participant=%s sr=%s", participant_id, sr)
 
         # Run turns.
         turn = 0
         audio_stream = rtc.AudioStream(audio_track)
+        log.warning("livekit_bridge: AudioStream created, entering turn loop")
 
         while True:
             turn += 1
@@ -136,11 +146,19 @@ async def handle_livekit_room(
                     # Publish TTS audio back to the room.
                     if ev.kind == "tts.audio" and hasattr(ev, "audio"):
                         try:
+                            audio_data = bytes(ev.audio.data)
+                            sr = ev.audio.sample_rate
+                            # Resample to the AudioSource rate if needed.
+                            if sr != TTS_OUTPUT_RATE:
+                                audio_data = resample_pcm16(
+                                    audio_data, sr, TTS_OUTPUT_RATE
+                                )
+                                sr = TTS_OUTPUT_RATE
                             frame = rtc.AudioFrame(
-                                data=bytes(ev.audio.data),
-                                sample_rate=ev.audio.sample_rate,
+                                data=audio_data,
+                                sample_rate=sr,
                                 num_channels=1,
-                                samples_per_channel=len(ev.audio.data) // 2,
+                                samples_per_channel=len(audio_data) // 2,
                             )
                             await audio_source.capture_frame(frame)
                         except Exception:
@@ -149,6 +167,7 @@ async def handle_livekit_room(
                                 "(sr=%s len=%d), skipping frame",
                                 ev.audio.sample_rate,
                                 len(ev.audio.data),
+                                exc_info=True,
                             )
 
                     # Forward events to the caller.
@@ -252,8 +271,17 @@ async def _audio_from_livekit(
     speech_started = False
     speech_ms = 0
     silence_ms = 0
+    frame_count = 0
+    # Buffer tiny WebRTC frames (~3ms each at 48kHz) into larger chunks
+    # for stable VAD and proper pipeline feeding (~20ms chunks).
+    pcm_buffer = bytearray()
+    CHUNK_SAMPLES = PIPELINE_RATE // 50  # 320 samples = 20ms at 16kHz
+    CHUNK_BYTES = CHUNK_SAMPLES * 2
 
     async for frame_event in audio_stream:
+        frame_count += 1
+        if frame_count == 1:
+            log.warning("livekit_bridge: first audio frame received from participant")
         frame = frame_event.frame
         pcm_data = bytes(frame.data)
         sample_rate = frame.sample_rate
@@ -273,33 +301,59 @@ async def _audio_from_livekit(
         if sample_rate != PIPELINE_RATE:
             pcm_data = resample_pcm16(pcm_data, sample_rate, PIPELINE_RATE)
 
-        # Simple RMS-based VAD for endpointing.
-        samples = struct.unpack(f"<{len(pcm_data) // 2}h", pcm_data)
-        rms = (sum(s * s for s in samples) / max(len(samples), 1)) ** 0.5
-        frame_ms = (len(samples) * 1000) // PIPELINE_RATE
+        # Buffer small frames into 20ms chunks for stable VAD.
+        pcm_buffer.extend(pcm_data)
+        if len(pcm_buffer) < CHUNK_BYTES:
+            continue  # accumulate more before processing
 
-        if rms > SILENCE_RMS:
-            silence_ms = 0
-            speech_ms += frame_ms
-            if speech_ms >= MIN_SPEECH_MS:
-                speech_started = True
-        else:
-            if speech_started:
-                silence_ms += frame_ms
-                if silence_ms >= SILENCE_END_MS:
-                    # End of speech — stop yielding.
-                    yield AudioChunk(
-                        data=pcm_data,
-                        codec="pcm16",
-                        sample_rate=PIPELINE_RATE,
-                    )
-                    return
+        # Process all complete chunks in the buffer.
+        while len(pcm_buffer) >= CHUNK_BYTES:
+            chunk_data = bytes(pcm_buffer[:CHUNK_BYTES])
+            del pcm_buffer[:CHUNK_BYTES]
 
-        yield AudioChunk(
-            data=pcm_data,
-            codec="pcm16",
-            sample_rate=PIPELINE_RATE,
-        )
+            samples = struct.unpack(f"<{CHUNK_SAMPLES}h", chunk_data)
+            rms = (sum(s * s for s in samples) / CHUNK_SAMPLES) ** 0.5
+            frame_ms = 20  # fixed: 320 samples at 16kHz = 20ms
+
+            if frame_count <= 5 or frame_count % 200 == 0:
+                log.warning(
+                    "livekit_bridge: chunk rms=%.1f speech=%s "
+                    "speech_ms=%d silence_ms=%d",
+                    rms, speech_started, speech_ms, silence_ms,
+                )
+
+            if rms > SILENCE_RMS:
+                silence_ms = 0
+                speech_ms += frame_ms
+                if speech_ms >= MIN_SPEECH_MS:
+                    if not speech_started:
+                        log.warning(
+                            "livekit_bridge: VAD speech started "
+                            "(rms=%.1f after %dms)",
+                            rms, speech_ms,
+                        )
+                    speech_started = True
+            else:
+                if speech_started:
+                    silence_ms += frame_ms
+                    if silence_ms >= SILENCE_END_MS:
+                        log.warning(
+                            "livekit_bridge: VAD silence endpoint "
+                            "(%dms quiet after speech)",
+                            silence_ms,
+                        )
+                        yield AudioChunk(
+                            data=chunk_data,
+                            codec="pcm16",
+                            sample_rate=PIPELINE_RATE,
+                        )
+                        return
+
+            yield AudioChunk(
+                data=chunk_data,
+                codec="pcm16",
+                sample_rate=PIPELINE_RATE,
+            )
 
         # Safety: if no participants remain, stop.
         if not room.remote_participants:
