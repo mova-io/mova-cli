@@ -767,17 +767,24 @@ let connectionMode = 'pipeline';
 let transportMode = 'ws';       // 'ws' (WebSocket) or 'livekit' (WebRTC)
 let lkRoom = null;               // LiveKit Room instance when connected
 let lkConnected = false;
+let lkAvailable = false;         // persists across WS reconnects
 
 // ─── LiveKit availability check ────────────────────────────────────────────
 // On load, probe /livekit/status. If configured, show the transport toggle.
+// Also called from the 'ready' handler to re-assert visibility after reconnects.
+function showLiveKitToggle() {
+  if (!lkAvailable) return;
+  $('transport-label').style.display = '';
+  $('transport-toggle').style.display = '';
+  $('lk-toggle').style.display = '';
+}
 (async function checkLiveKit() {
   try {
     const r = await fetch('/livekit/status');
     const d = await r.json();
     if (d.ok && d.configured) {
-      $('transport-label').style.display = '';
-      $('transport-toggle').style.display = '';
-      $('lk-toggle').style.display = '';
+      lkAvailable = true;
+      showLiveKitToggle();
       logEvent('LiveKit available — transport toggle enabled');
     }
   } catch { /* LiveKit not available — toggle stays hidden */ }
@@ -1016,6 +1023,8 @@ function handleJson(s) {
     // Pre-populate the agent_id input from whatever the server loaded.
     $('lyzr-id').value = m.lyzr_agent_id || '';
     showLyzrIdInput((agentTier === 'lyzr' || agentTier === 'lyzr_sdk'));
+    // Re-assert LiveKit toggle visibility — may have been lost on reconnect.
+    showLiveKitToggle();
     return;
   }
   if (ev === 'lyzr_agent_id') {
