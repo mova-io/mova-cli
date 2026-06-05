@@ -41,15 +41,17 @@ log = logging.getLogger(__name__)
 async def _publish_data(room: Any, event: dict[str, Any]) -> None:
     """Publish a JSON event over the LiveKit DataChannel (reliable)."""
     try:
-        from livekit import rtc  # noqa: PLC0415
-
         payload = json.dumps(event).encode()
         await room.local_participant.publish_data(
             payload,
-            kind=rtc.DataPacketKind.KIND_RELIABLE,
+            reliable=True,
         )
     except Exception:
-        log.debug("livekit_bridge: failed to publish data event %s", event.get("event", ""))
+        log.warning(
+            "livekit_bridge: failed to publish data event %s",
+            event.get("event", ""),
+            exc_info=True,
+        )
 
 # LiveKit audio constants
 LIVEKIT_FRAME_DURATION_MS = 20  # Standard WebRTC frame
