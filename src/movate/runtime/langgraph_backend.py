@@ -68,6 +68,9 @@ async def run_langgraph_workflow(  # noqa: PLR0912
     )
     from movate.core.workflow.ir import EdgeKind, NodeType  # noqa: PLC0415
     from movate.core.workflow.runner import WorkflowResult  # noqa: PLC0415
+    from movate.runtime.langgraph_checkpointer import (  # noqa: PLC0415
+        MdkCheckpointSaver,
+    )
 
     wf_id = workflow_run_id or str(uuid4())
     started = time.monotonic()
@@ -121,6 +124,7 @@ async def run_langgraph_workflow(  # noqa: PLR0912
                 # for voice pipeline sentence-streaming TTS).
                 _token_cb = None
                 if on_node_token is not None:
+
                     def _token_cb(token: str) -> None:  # type: ignore[misc]
                         on_node_token(node.id, token)
 
@@ -153,9 +157,7 @@ async def run_langgraph_workflow(  # noqa: PLR0912
             except Exception as exc:
                 error_node_id = node.id
                 error = exc
-                raise LangGraphBackendError(
-                    f"node {node.id!r} raised: {exc}"
-                ) from exc
+                raise LangGraphBackendError(f"node {node.id!r} raised: {exc}") from exc
             finally:
                 if node_span is not None:
                     with contextlib.suppress(Exception):
@@ -241,9 +243,9 @@ async def run_langgraph_workflow(  # noqa: PLR0912
         cond_edge_map: dict[str, dict[str, str]] = {}
         for edge in graph.edges:
             if edge.kind == EdgeKind.CONDITIONAL:
-                cond_edge_map.setdefault(edge.from_id, {})[
-                    edge.condition or edge.to_id
-                ] = edge.to_id
+                cond_edge_map.setdefault(edge.from_id, {})[edge.condition or edge.to_id] = (
+                    edge.to_id
+                )
 
         # Wire edges.
         for edge in graph.edges:
@@ -274,20 +276,26 @@ async def run_langgraph_workflow(  # noqa: PLR0912
             if sink_id not in conditional_sources:
                 builder.add_edge(sink_id, END)
 
-        # Compile with MemorySaver (v1; StorageProvider adapter is D4 follow-up).
-        compiled = builder.compile(checkpointer=MemorySaver())
+        # Use durable MdkCheckpointSaver when the storage backend supports
+        # it (SQLite / Postgres); fall back to MemorySaver for InMemory or
+        # when setup fails (e.g. missing langgraph extras).
+        checkpointer: Any
+        try:
+            checkpointer = await MdkCheckpointSaver.from_storage(storage)
+            log.debug("langgraph: using MdkCheckpointSaver (%s)", storage.name)
+        except (TypeError, Exception):
+            log.debug("langgraph: falling back to MemorySaver")
+            checkpointer = MemorySaver()
+
+        compiled = builder.compile(checkpointer=checkpointer)
 
     except LangGraphBackendError:
         raise
     except Exception as exc:
-        raise LangGraphBackendError(
-            f"failed to build LangGraph StateGraph: {exc}"
-        ) from exc
+        raise LangGraphBackendError(f"failed to build LangGraph StateGraph: {exc}") from exc
 
     # ── Execute ──────────────────────────────────────────────────────────
-    recursion_limit = int(
-        graph.metadata.get("recursion_limit", DEFAULT_RECURSION_LIMIT)
-    )
+    recursion_limit = int(graph.metadata.get("recursion_limit", DEFAULT_RECURSION_LIMIT))
 
     try:
         result_state = await compiled.ainvoke(

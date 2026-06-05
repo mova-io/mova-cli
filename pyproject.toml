@@ -277,7 +277,12 @@ telephony = [
     "livekit-agents>=0.11,<1",
 ]
 langchain = [
-    "langchain-core>=0.3,<1",
+    # LangChain core — supports both v0.3 (legacy) and v1.x (Deep Agents).
+    # The >=0.3 floor lets existing langchain-community tools work; the
+    # absence of an upper bound lets deepagents pull v1.x when both extras
+    # are installed together.
+    "langchain-core>=0.3",
+    "langsmith>=0.1.147,<1",
 ]
 langgraph = [
     # LangGraph execution backend (ADR 030 D1). Enables `mdk run --runtime
@@ -285,7 +290,14 @@ langgraph = [
     # parallel fan-out. Imported LAZILY inside `movate.runtime.langgraph_backend`
     # — a runtime without this extra never loads it. langgraph is MIT-licensed
     # (permissive; passes scripts/check_licenses.py --strict).
-    "langgraph>=0.4,<1",
+    "langgraph>=0.4",
+]
+deepagents = [
+    # LangChain Deep Agents — production agent harness with task planning,
+    # subagent spawning, memory, MCP tools, and virtual filesystem. Built
+    # on LangGraph. Requires a provider-specific langchain package.
+    "deepagents>=0.1",
+    "langchain-openai>=0.3",
 ]
 teams = [
     # The Teams bot is a FastAPI app, so it leans on the same web deps
