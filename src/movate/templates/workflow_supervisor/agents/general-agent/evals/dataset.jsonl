@@ -1,0 +1,1 @@
+{"input": {"query": "How do I update my account email address?"}, "expected": {"response": "You can update your email address by navigating to Settings > Account > Email in your dashboard. Enter your new email and click Save. You will receive a verification link at the new address that must be confirmed within 24 hours.", "resolved": true}}

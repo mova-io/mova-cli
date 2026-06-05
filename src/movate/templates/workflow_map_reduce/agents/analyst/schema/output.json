@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Analyst Node Output",
+  "type": "object",
+  "properties": {
+    "partial_answer": {
+      "type": "string",
+      "description": "Concise answer to the assigned sub-question."
+    }
+  },
+  "required": ["partial_answer"]
+}

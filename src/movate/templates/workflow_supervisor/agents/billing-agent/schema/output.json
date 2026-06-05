@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Billing Agent Output",
+  "type": "object",
+  "properties": {
+    "response": {
+      "type": "string",
+      "description": "Response addressing the user's billing concern."
+    },
+    "resolved": {
+      "type": "boolean",
+      "description": "Whether the billing issue was fully resolved."
+    }
+  },
+  "required": ["response", "resolved"]
+}

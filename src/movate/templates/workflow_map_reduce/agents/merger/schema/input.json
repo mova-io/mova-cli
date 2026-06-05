@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Merger Node Input",
+  "type": "object",
+  "properties": {
+    "question": {
+      "type": "string",
+      "description": "The user's original question."
+    },
+    "partial_answers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Partial answers from each analyst instance."
+    }
+  },
+  "required": ["question", "partial_answers"]
+}

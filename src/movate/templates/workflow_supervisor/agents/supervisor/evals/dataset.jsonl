@@ -1,0 +1,1 @@
+{"input": {"query": "I was charged twice for my subscription last month."}, "expected": {"category": "billing"}}

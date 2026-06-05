@@ -1,0 +1,30 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: |
+  General support agent. Handles general inquiries, feature requests,
+  account questions, and any queries that do not fall into billing or
+  technical categories.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.7
+    max_tokens: 512
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+tags:
+  - workflow
+  - supervisor
+  - general

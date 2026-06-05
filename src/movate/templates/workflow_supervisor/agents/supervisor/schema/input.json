@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Supervisor Node Input",
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "The user's support query to classify."
+    }
+  },
+  "required": ["query"]
+}

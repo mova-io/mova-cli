@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Merger Node Output",
+  "type": "object",
+  "properties": {
+    "final_answer": {
+      "type": "string",
+      "description": "Synthesized final answer combining all partial answers."
+    }
+  },
+  "required": ["final_answer"]
+}

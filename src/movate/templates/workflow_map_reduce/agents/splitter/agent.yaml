@@ -1,0 +1,29 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: |
+  Splitter node for the map-reduce workflow. Decomposes a complex question
+  into independent sub-questions suitable for parallel analysis.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.7
+    max_tokens: 512
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+tags:
+  - workflow
+  - map-reduce
+  - splitter

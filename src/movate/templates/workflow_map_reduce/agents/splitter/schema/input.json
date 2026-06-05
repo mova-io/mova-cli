@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Splitter Node Input",
+  "type": "object",
+  "properties": {
+    "question": {
+      "type": "string",
+      "description": "The user's original complex question to decompose."
+    }
+  },
+  "required": ["question"]
+}

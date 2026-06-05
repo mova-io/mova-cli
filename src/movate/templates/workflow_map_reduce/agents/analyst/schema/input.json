@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Analyst Node Input",
+  "type": "object",
+  "properties": {
+    "sub_question": {
+      "type": "string",
+      "description": "A single sub-question to answer."
+    }
+  },
+  "required": ["sub_question"]
+}

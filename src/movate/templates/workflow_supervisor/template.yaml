@@ -1,0 +1,11 @@
+# ADR 028 — discoverability metadata for the supervisor template.
+title: Supervisor (intent-router to specialists)
+description: LangGraph supervisor routes queries to specialist agents via intent classification — demonstrates multi-agent handoff with conditional branching.
+shape: workflow
+tags:
+  - workflow
+  - supervisor
+  - langgraph
+  - intent-router
+  - multi-agent
+recommended_for: When incoming queries span multiple domains (billing, tech support, general) and should be routed to specialized agents based on intent classification.

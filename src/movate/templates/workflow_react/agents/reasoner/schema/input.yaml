@@ -1,0 +1,35 @@
+# ============================================================================
+# Reasoner node — input schema
+# ============================================================================
+# The reasoner reads the question, any prior reasoning and research
+# results, and the current iteration count from the workflow state.
+
+version: 1
+type: object
+
+title: Reasoner Node Input
+
+fields:
+
+  question:
+    type: string
+    description: The user's original question.
+    example: What are the main benefits of microservices over monoliths?
+
+  reasoning:
+    type: string
+    description: Accumulated reasoning from prior iterations (empty on first pass).
+    example: ""
+
+  research_results:
+    type: string
+    description: Information returned by the researcher in a prior loop (empty on first pass).
+    example: ""
+
+  iteration:
+    type: integer
+    description: Current loop iteration count.
+    example: 0
+
+required:
+  - question

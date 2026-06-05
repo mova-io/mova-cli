@@ -1,0 +1,30 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: |
+  Supervisor node for the routing workflow. Classifies the user's query
+  into a category (billing, tech, or general) so the workflow's
+  intent-router can dispatch to the correct specialist agent.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.3
+    max_tokens: 256
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+tags:
+  - workflow
+  - supervisor
+  - intent-router

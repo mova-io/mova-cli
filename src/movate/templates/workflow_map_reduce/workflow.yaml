@@ -1,0 +1,67 @@
+# ============================================================================
+# MDK Workflow — Map-Reduce (parallel fan-out / fan-in)
+# ============================================================================
+# A LangGraph-native map-reduce pattern where a splitter decomposes a
+# question into sub-questions, an analyst answers each sub-question in
+# parallel, and a merger synthesizes partial answers into a final answer.
+#
+# Flow:
+#   splitter  — breaks the question into sub-questions
+#   analyst   — answers one sub-question (runs 3x in parallel via fan_out)
+#   merger    — combines partial answers into a single final answer
+
+api_version: movate/v1
+kind: Workflow
+
+name: workflow-map-reduce
+version: 0.1.0
+description: |
+  Map-reduce pattern demonstrating LangGraph parallel fan-out and fan-in
+  edges. A splitter agent decomposes a question into sub-questions, an
+  analyst agent processes each in parallel, and a merger agent synthesizes
+  the partial answers into a cohesive final answer.
+owner: ""
+
+runtime: langgraph
+
+state_schema: ./state.json
+
+entrypoint: splitter
+
+evals:
+  dataset: ./evals/dataset.jsonl
+  gate: 0.7
+
+nodes:
+  - id: splitter
+    type: agent
+    ref: ./agents/splitter
+
+  - id: analyst
+    type: agent
+    ref: ./agents/analyst
+
+  - id: merger
+    type: agent
+    ref: ./agents/merger
+
+edges:
+  # Fan-out: splitter produces sub_questions, each one dispatched to an
+  # analyst instance in parallel.
+  - from: splitter
+    to: analyst
+    kind: fan_out
+    field: sub_questions
+    max_concurrency: 3
+
+  # Fan-in: collect all analyst partial_answers, then route to merger.
+  - from: analyst
+    to: merger
+    kind: fan_in
+    field: partial_answers
+
+tags:
+  - map-reduce
+  - workflow
+  - langgraph
+  - parallel

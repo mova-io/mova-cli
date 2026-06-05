@@ -256,6 +256,24 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Bounded multi-agent simulation: a FIXED roster of two participants under a supervisor, hard-capped turns, terminating JUDGE. NOT a swarm.",  # noqa: E501
         "SUPERVISOR → (A → B → JUDGE) x2 → done",
     ),
+    "react": (
+        "workflow_react",
+        True,
+        "LangGraph ReAct loop: reasoner cycles through tool-use until answer is sufficient, bounded by recursion limit.",  # noqa: E501
+        "reasoner → (researcher → reasoner) x N → summarizer",
+    ),
+    "map-reduce": (
+        "workflow_map_reduce",
+        True,
+        "LangGraph parallel fan-out to specialist agents, fan-in merge. Demonstrates parallel execution.",  # noqa: E501
+        "splitter → [analyst x3] → merger",
+    ),
+    "supervisor": (
+        "workflow_supervisor",
+        True,
+        "LangGraph supervisor routes to specialist agents via intent-router. Multi-agent handoff.",
+        "supervisor → {billing | tech | general}",
+    ),
 }
 
 

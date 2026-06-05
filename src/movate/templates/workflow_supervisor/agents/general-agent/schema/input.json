@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "General Agent Input",
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "The user's general inquiry."
+    }
+  },
+  "required": ["query"]
+}
