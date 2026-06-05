@@ -540,6 +540,7 @@ AGENT_TIERS = {
     # same voice pipeline handles BOTH a streaming agent AND a non-streaming
     # SDK-shaped agent (via LyzrAgentTurn) without changing.
     "lyzr_sdk": "Mova-iO SDK (buffered)",
+    "deep_agent": "Deep Agent (LangChain planning + subagents)",
 }
 
 
@@ -838,6 +839,21 @@ def _build_agent(
                 log.warning("Lyzr SDK path unavailable, falling back: %s", exc)
         else:
             log.warning("Lyzr SDK selected but key/agent_id missing — falling back")
+    if tier == "deep_agent":
+        try:
+            from movate.integrations.deep_agents import DeepAgentTurn  # noqa: PLC0415
+
+            return DeepAgentTurn(
+                model="openai:gpt-4o-mini",
+                system_prompt=(
+                    "You are Deva, a helpful voice assistant at Movate. "
+                    "Reply concisely in 1-3 sentences. You have planning "
+                    "capabilities — for complex questions, break them into "
+                    "steps. You are being read aloud via text-to-speech."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Deep Agent unavailable, falling back to OpenAI Chat: %s", exc)
     return OpenAIChatAgent(
         on_tool_call=on_tool_call,
         on_extras=on_extras,
@@ -1439,6 +1455,12 @@ if _STATIC_DIR.is_dir():
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(DEMO_DIR / "index.html")
+
+
+@app.get("/livekit")
+async def livekit_page() -> FileResponse:
+    """Standalone LiveKit browser demo — WebRTC voice to the mdk agent."""
+    return FileResponse(str(Path(__file__).parent / "static" / "livekit.html"))
 
 
 # Service-wide telemetry the /health endpoint exposes (C3). Bumped from
