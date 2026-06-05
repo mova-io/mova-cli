@@ -25,7 +25,8 @@ RUN uv pip install --system --no-cache \
     ".[voice]" \
     "fastapi>=0.110,<1" "uvicorn[standard]>=0.27,<1" "websockets>=12,<14" \
     "pydub>=0.25,<1" \
-    "azure-storage-blob>=12.19,<13"
+    "azure-storage-blob>=12.19,<13" \
+    "livekit>=0.17,<1" "livekit-api>=0.7,<1"
 # ADR 067 consolidation note: the legacy mdk-voice per-provider extras
 # (`[openai,deepgram,cartesia,elevenlabs]`) collapse into the single mdk[voice]
 # extra in movate-cli's pyproject — same SDK pins, single name.
@@ -39,6 +40,7 @@ RUN uv pip install --system --no-cache \
 COPY examples/web_demo/agent.py \
      examples/web_demo/server.py \
      examples/web_demo/twilio_bridge.py \
+     examples/web_demo/livekit_bridge.py \
      examples/web_demo/index.html \
      examples/web_demo/doctor.py \
      examples/web_demo/recording.py \

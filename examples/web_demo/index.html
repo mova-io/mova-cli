@@ -2405,13 +2405,13 @@ talkBtn.addEventListener('click', (e) => {
 talkBtn.addEventListener('mousedown', (e) => { if (!vad) beginTurn(); });
 // PTT release / leave / spacebar-up: end with a 1-second tail-capture window
 // so the trailing syllable reaches STT before the mic closes.
-talkBtn.addEventListener('mouseup',   (e) => { if (!vad) { endTurn(true, 2000); e.currentTarget.blur(); } });
-talkBtn.addEventListener('mouseleave',(e) => { if (!vad) endTurn(true, 2000); });
+talkBtn.addEventListener('mouseup',   (e) => { if (!vad) { endTurn(true, 1000); e.currentTarget.blur(); } });
+talkBtn.addEventListener('mouseleave',(e) => { if (!vad) endTurn(true, 1000); });
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && !e.repeat && !vad) { e.preventDefault(); beginTurn(); }
 });
 document.addEventListener('keyup',   (e) => {
-  if (e.code === 'Space' && !vad) { e.preventDefault(); endTurn(true, 2000); }
+  if (e.code === 'Space' && !vad) { e.preventDefault(); endTurn(true, 1000); }
 });
 
 // ─── Toggle wiring ────────────────────────────────────────────────────────
