@@ -135,13 +135,21 @@ async def handle_livekit_room(
 
                     # Publish TTS audio back to the room.
                     if ev.kind == "tts.audio" and hasattr(ev, "audio"):
-                        frame = rtc.AudioFrame(
-                            data=ev.audio.data,
-                            sample_rate=ev.audio.sample_rate,
-                            num_channels=1,
-                            samples_per_channel=len(ev.audio.data) // 2,
-                        )
-                        await audio_source.capture_frame(frame)
+                        try:
+                            frame = rtc.AudioFrame(
+                                data=bytes(ev.audio.data),
+                                sample_rate=ev.audio.sample_rate,
+                                num_channels=1,
+                                samples_per_channel=len(ev.audio.data) // 2,
+                            )
+                            await audio_source.capture_frame(frame)
+                        except Exception:
+                            log.warning(
+                                "livekit_bridge: capture_frame error "
+                                "(sr=%s len=%d), skipping frame",
+                                ev.audio.sample_rate,
+                                len(ev.audio.data),
+                            )
 
                     # Forward events to the caller.
                     if on_event and hasattr(ev, "kind"):
