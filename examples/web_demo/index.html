@@ -616,6 +616,14 @@ button.active { background:var(--accent); color:white; }
       <option value="ko">🇰🇷 Korean</option>
       <option value="auto">🌐 Auto-detect</option>
     </select>
+    <!-- Transport toggle — WebSocket (default) or LiveKit WebRTC. LiveKit
+         gives 16kHz Opus (vs 8kHz WS PCM), sub-50ms P2P, built-in echo
+         cancellation. Hidden when LiveKit is not configured on the server. -->
+    <span class="muted detailed-only" id="transport-label" style="font-size:11px;margin-left:8px;display:none;">Transport</span>
+    <div class="toggle-group detailed-only" id="transport-toggle" style="display:none;">
+      <button data-transport="ws" class="active" title="WebSocket (PCM16 binary frames, default)">WebSocket</button>
+      <button data-transport="livekit" title="LiveKit WebRTC (Opus, P2P, echo cancellation)">LiveKit</button>
+    </div>
     <!-- Voice picker — kept visible in BOTH views so users can pick a voice
          that matches their use case in either mode. -->
     <span class="muted" style="font-size:11px;margin-left:8px;">Voice</span>
@@ -702,6 +710,14 @@ button.active { background:var(--accent); color:white; }
   </div>
   <div class="controls-row">
     <button id="talk" class="primary" disabled>🎙️ Talk</button>
+    <!-- Subtle LiveKit toggle next to Talk — visible in Simple + Detailed.
+         Hidden until /livekit/status confirms it's available. Clicking swaps
+         transport between WebSocket and LiveKit WebRTC. -->
+    <button id="lk-toggle" style="display:none;font-size:11px;padding:6px 12px;
+            border-radius:16px;border:1px solid var(--border);background:var(--surface);
+            color:var(--muted);cursor:pointer;transition:all .15s;margin-left:8px;"
+            title="Switch to LiveKit WebRTC (16 kHz Opus, P2P, lower latency)">📡 WebRTC</button>
+    <span id="livekit-status-badge" class="badge" style="display:none;"></span>
   </div>
   <div class="hint" id="hint">click Talk · auto-endpoints on silence · or hold space (push-to-talk mode)</div>
   <div class="error" id="err"></div>
@@ -748,14 +764,159 @@ $('gate-start').addEventListener('click', async () => {
 // same UI events (transcript.*, tts.audio, done, error) so the rendering code
 // doesn't need a parallel branch.
 let connectionMode = 'pipeline';
+let transportMode = 'ws';       // 'ws' (WebSocket) or 'livekit' (WebRTC)
+let lkRoom = null;               // LiveKit Room instance when connected
+let lkConnected = false;
+
+// ─── LiveKit availability check ────────────────────────────────────────────
+// On load, probe /livekit/status. If configured, show the transport toggle.
+(async function checkLiveKit() {
+  try {
+    const r = await fetch('/livekit/status');
+    const d = await r.json();
+    if (d.ok && d.configured) {
+      $('transport-label').style.display = '';
+      $('transport-toggle').style.display = '';
+      $('lk-toggle').style.display = '';
+      logEvent('LiveKit available — transport toggle enabled');
+    }
+  } catch { /* LiveKit not available — toggle stays hidden */ }
+})();
+
+// ─── LiveKit connect / disconnect ──────────────────────────────────────────
+async function connectLiveKit() {
+  if (lkConnected) return;
+  if (typeof LivekitClient === 'undefined') {
+    status('LiveKit SDK not loaded', 'err');
+    return;
+  }
+  try {
+    status('connecting (LiveKit)…', '');
+    $('talk').disabled = true;
+
+    // 1. Get token from server.
+    const roomName = 'playground-' + Date.now();
+    const tokResp = await fetch('/livekit/token', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({room_name: roomName, participant_name: 'browser'})
+    });
+    const tokData = await tokResp.json();
+    if (!tokData.ok) throw new Error(tokData.error || 'Token request failed');
+
+    // 2. Tell server agent to join the room (with current session config).
+    const joinResp = await fetch('/livekit/join', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        room_name: roomName,
+        agent_tier: agentTier,
+        language: $('language-select').value || '',
+        voice_id: $('voice-select').value || '',
+        lyzr_agent_id: $('lyzr-id').value || '',
+        tts_tier: ttsTier || 'cartesia',
+      })
+    });
+    const joinData = await joinResp.json();
+    if (!joinData.ok) throw new Error(joinData.error || 'Join failed');
+
+    // 3. Connect browser to the LiveKit room.
+    lkRoom = new LivekitClient.Room();
+    var RE = LivekitClient.RoomEvent;
+
+    lkRoom.on(RE.Connected, function() {
+      lkConnected = true;
+      status('connected (LiveKit WebRTC)', 'ok');
+      $('talk').disabled = true;  // No Talk button needed — VAD is automatic
+      $('hint').textContent = 'LiveKit connected — just speak, VAD handles turns automatically';
+      $('livekit-status-badge').textContent = '🟢 WebRTC';
+      $('livekit-status-badge').style.display = '';
+      $('livekit-status-badge').style.color = 'var(--ok)';
+      // Show listening state so user knows they can speak.
+      $('transcript').textContent = '…listening (LiveKit)';
+      $('answer').innerHTML = '<span class="muted">—</span>';
+      logEvent('LiveKit room connected — WebRTC audio active', 'final');
+    });
+
+    lkRoom.on(RE.Disconnected, function() {
+      lkConnected = false;
+      status('disconnected (LiveKit)', 'err');
+      $('livekit-status-badge').textContent = '🔴 reconnecting…';
+      $('livekit-status-badge').style.color = 'var(--warn)';
+      $('hint').textContent = 'LiveKit disconnected — reconnecting…';
+      logEvent('LiveKit room disconnected — will reconnect in 3s', 'err');
+      // Auto-reconnect after a brief delay.
+      if (transportMode === 'livekit') {
+        lkRoom = null;
+        setTimeout(() => { if (transportMode === 'livekit') connectLiveKit(); }, 3000);
+      }
+    });
+
+    // Receive agent's TTS audio — auto-play via DOM element.
+    lkRoom.on(RE.TrackSubscribed, function(track, pub, participant) {
+      if (track.kind === 'audio') {
+        var el = track.attach();
+        el.id = 'lk-agent-audio';
+        el.style.display = 'none';
+        document.body.appendChild(el);
+        logEvent('Receiving agent audio via WebRTC');
+      }
+    });
+    lkRoom.on(RE.TrackUnsubscribed, function(track) {
+      track.detach().forEach(function(el) { el.remove(); });
+    });
+
+    // Receive pipeline events over DataChannel → reuse existing handleJson.
+    lkRoom.on(RE.DataReceived, function(payload) {
+      try {
+        var text = new TextDecoder().decode(payload);
+        handleJson(text);
+      } catch(e) {
+        logEvent('DataChannel parse error: ' + e.message, 'err');
+      }
+    });
+
+    await lkRoom.connect(tokData.url, tokData.token);
+
+    // 4. Publish mic to the room — the bridge's VAD handles endpointing.
+    await lkRoom.localParticipant.setMicrophoneEnabled(true);
+    logEvent('Microphone published to LiveKit room');
+
+  } catch(err) {
+    status('LiveKit error: ' + err.message, 'err');
+    logEvent('LiveKit connect failed: ' + err.message, 'err');
+    lkConnected = false;
+    // Fall back to WS.
+    transportMode = 'ws';
+    updateToggle('transport-toggle', 'transport', 'ws');
+    connect();
+  }
+}
+
+async function disconnectLiveKit() {
+  if (lkRoom) {
+    try { await lkRoom.disconnect(); } catch {}
+    lkRoom = null;
+  }
+  lkConnected = false;
+  var el = document.getElementById('lk-agent-audio');
+  if (el) el.remove();
+  $('livekit-status-badge').style.display = 'none';
+}
 
 function connect() {
+  // LiveKit transport — no WebSocket needed.
+  if (transportMode === 'livekit') {
+    connectLiveKit();
+    return;
+  }
+  // Default: WebSocket transport.
   const path = connectionMode === 'realtime' ? '/ws/voice/realtime' : '/ws/voice';
   const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + path;
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { status(`connected (${connectionMode})`, 'ok'); $('talk').disabled = false; };
-  ws.onclose = () => { status('disconnected', 'err'); $('talk').disabled = true; if (audioUnlocked) setTimeout(connect, 2000); };
+  ws.onclose = () => { status('disconnected', 'err'); $('talk').disabled = true; if (audioUnlocked && transportMode === 'ws') setTimeout(connect, 2000); };
   ws.onerror = () => status('connection error', 'err');
   ws.onmessage = (e) => (typeof e.data === 'string') ? handleJson(e.data) : handleAudio(e.data);
 }
@@ -1178,6 +1339,21 @@ function handleJson(s) {
     return;
   }
   if (ev === 'done') {
+    // LiveKit bridge sends a minimal done (no latency/cost/metrics).
+    // Just reset the UI for the next turn and log it.
+    if (transportMode === 'livekit') {
+      speaking = false;
+      $('interrupt').style.display = 'none';
+      logEvent('turn complete (LiveKit)', 'final');
+      // Prep the UI for the next turn — show "listening" state.
+      setTimeout(() => {
+        if (transportMode === 'livekit' && lkConnected) {
+          $('transcript').textContent = '…listening (LiveKit)';
+          $('answer').innerHTML = '<span class="muted">—</span>';
+        }
+      }, 1500);
+      return;
+    }
     $('badge').textContent = m.badge || '';
     $('tts-badge').textContent = `served by ${m.tts_tier}`;
     $('cost-badge').textContent = m.cost_usd != null ? `$${m.cost_usd.toFixed(5)}` : '';
@@ -2125,6 +2301,8 @@ function stopMic() {
 
 // ─── Talk control (click = VAD, hold space = push-to-talk) ────────────────
 async function beginTurn() {
+  // LiveKit mode: turns are automatic (bridge VAD handles it). Skip.
+  if (transportMode === 'livekit') return;
   // A pending PTT tail-capture close from the previous press? Cancel it —
   // the user is starting a new turn (or extending the current one). The
   // mic / talking flag is still in the post-release tail window.
@@ -2174,6 +2352,7 @@ function endTurn(sendStop = true, delayMs = 0) {
 }
 function _endTurnNow(sendStop) {
   if (!talking) return;
+  if (transportMode === 'livekit') return;  // LiveKit VAD handles endpointing
   talking = false;
   $('talk').classList.remove('live');
   stopMic();
@@ -2213,6 +2392,59 @@ document.addEventListener('keyup',   (e) => {
 });
 
 // ─── Toggle wiring ────────────────────────────────────────────────────────
+// Transport toggle — switch between WebSocket and LiveKit WebRTC.
+document.querySelectorAll('#transport-toggle button').forEach(b => {
+  b.addEventListener('click', async () => {
+    const mode = b.dataset.transport;
+    if (mode === transportMode) return;
+    transportMode = mode;
+    updateToggle('transport-toggle', 'transport', mode);
+    logEvent(`transport → ${mode}`, mode === 'livekit' ? 'final' : '');
+
+    // Keep the simple-view chip in sync.
+    const chip = $('lk-toggle');
+    if (mode === 'livekit') {
+      chip.textContent = '📡 WebRTC ON';
+      chip.style.background = 'var(--accent)'; chip.style.color = '#fff'; chip.style.borderColor = 'var(--accent)';
+      try { ws.close(); } catch {}
+      await connectLiveKit();
+    } else {
+      chip.textContent = '📡 WebRTC';
+      chip.style.background = 'var(--surface)'; chip.style.color = 'var(--muted)'; chip.style.borderColor = 'var(--border)';
+      await disconnectLiveKit();
+      $('talk').disabled = false;
+      $('hint').textContent = 'click Talk · auto-endpoints on silence · or hold space (push-to-talk mode)';
+      connect();
+    }
+  });
+});
+// Simple-view LiveKit chip — single toggle button next to Talk.
+$('lk-toggle').addEventListener('click', async () => {
+  const btn = $('lk-toggle');
+  if (transportMode === 'ws') {
+    transportMode = 'livekit';
+    btn.textContent = '📡 WebRTC ON';
+    btn.style.background = 'var(--accent)';
+    btn.style.color = '#fff';
+    btn.style.borderColor = 'var(--accent)';
+    updateToggle('transport-toggle', 'transport', 'livekit');
+    logEvent('transport → livekit (WebRTC)', 'final');
+    try { ws.close(); } catch {}
+    await connectLiveKit();
+  } else {
+    transportMode = 'ws';
+    btn.textContent = '📡 WebRTC';
+    btn.style.background = 'var(--surface)';
+    btn.style.color = 'var(--muted)';
+    btn.style.borderColor = 'var(--border)';
+    updateToggle('transport-toggle', 'transport', 'ws');
+    logEvent('transport → ws (WebSocket)');
+    await disconnectLiveKit();
+    $('talk').disabled = false;
+    $('hint').textContent = 'click Talk · auto-endpoints on silence · or hold space (push-to-talk mode)';
+    connect();
+  }
+});
 document.querySelectorAll('#tts-toggle button').forEach(b => {
   b.addEventListener('click', () => ws.send(JSON.stringify({ event: 'set_tts_tier', tier: b.dataset.tier })));
 });
@@ -2220,6 +2452,14 @@ document.querySelectorAll('#agent-toggle button').forEach(b => {
   b.addEventListener('click', () => {
     if (b.disabled) return;
     const tier = b.dataset.tier;
+    // LiveKit mode: realtime toggle doesn't apply (LiveKit IS the realtime transport).
+    if (transportMode === 'livekit') {
+      if (tier === 'realtime') return;  // N/A in LiveKit mode
+      agentTier = tier;
+      updateToggle('agent-toggle', 'tier', tier);
+      logEvent(`agent → ${tier} (LiveKit — takes effect next room)`);
+      return;
+    }
     if (tier === 'realtime') {
       // B1: realtime owns transport — reconnect to /ws/voice/realtime.
       switchMode('realtime');
@@ -2697,5 +2937,7 @@ try {
   }
 })();
 </script>
+<!-- LiveKit JS SDK — loaded lazily; only used when the transport toggle is set to LiveKit. -->
+<script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.js"></script>
 </body>
 </html>

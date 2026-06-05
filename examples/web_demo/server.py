@@ -2444,6 +2444,23 @@ async def livekit_join(request: Request) -> dict[str, object]:
 
     session = Session()
 
+    # Accept optional session config from the main playground.
+    agent_tier = body.get("agent_tier", "")
+    if agent_tier and agent_tier != session.agent_tier:
+        session.set_agent_tier(agent_tier)
+    lyzr_agent_id = body.get("lyzr_agent_id", "")
+    if lyzr_agent_id:
+        session.set_lyzr_agent_id(lyzr_agent_id)
+    language = body.get("language", "")
+    if language:
+        session.set_language(language)
+    voice_id = body.get("voice_id", "")
+    if voice_id:
+        session.voice_id = voice_id
+    tts_tier = body.get("tts_tier", "")
+    if tts_tier:
+        session.set_tts_tier(tts_tier)
+
     def build_kwargs(turn: int) -> dict[str, Any]:
         return {
             "stt": session.stt,
@@ -2462,6 +2479,7 @@ async def livekit_join(request: Request) -> dict[str, object]:
             token=agent_jwt,
             room_name=room_name,
             build_pipeline_kwargs=build_kwargs,
+            publish_events=True,
         )
     )
 

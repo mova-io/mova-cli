@@ -26,6 +26,7 @@ Usage from the demo server::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -35,6 +36,20 @@ from movate.voice.pipeline import run_voice_pipeline
 from movate.voice.telephony import PIPELINE_RATE, resample_pcm16
 
 log = logging.getLogger(__name__)
+
+
+async def _publish_data(room: Any, event: dict[str, Any]) -> None:
+    """Publish a JSON event over the LiveKit DataChannel (reliable)."""
+    try:
+        from livekit import rtc  # noqa: PLC0415
+
+        payload = json.dumps(event).encode()
+        await room.local_participant.publish_data(
+            payload,
+            kind=rtc.DataPacketKind.KIND_RELIABLE,
+        )
+    except Exception:
+        log.debug("livekit_bridge: failed to publish data event %s", event.get("event", ""))
 
 # LiveKit audio constants
 LIVEKIT_FRAME_DURATION_MS = 20  # Standard WebRTC frame
@@ -53,6 +68,7 @@ async def handle_livekit_room(
     on_event: Callable[..., Any] | None = None,
     on_call_start: Callable[..., Any] | None = None,
     on_call_end: Callable[..., Any] | None = None,
+    publish_events: bool = False,
 ) -> None:
     """Join a LiveKit room as an agent and run the voice pipeline.
 
@@ -133,11 +149,37 @@ async def handle_livekit_room(
                         except Exception:  # noqa: BLE001
                             pass
 
+                    # Publish pipeline events over DataChannel so the
+                    # browser UI can display transcripts, tokens, etc.
+                    if publish_events and hasattr(ev, "kind"):
+                        evt = ev.kind
+                        if evt in (
+                            "transcript.partial",
+                            "transcript.final",
+                            "agent.token",
+                        ):
+                            await _publish_data(
+                                room, {"event": evt, "text": ev.text}
+                            )
+                        elif evt == "error":
+                            await _publish_data(room, {
+                                "event": "error",
+                                "stage": getattr(ev, "stage", ""),
+                                "code": getattr(ev, "code", ""),
+                                "message": getattr(ev, "message", ""),
+                            })
+
             except asyncio.CancelledError:
                 break
             except Exception:
                 log.exception("livekit_bridge: pipeline error on turn %d", turn)
+                if publish_events:
+                    await _publish_data(room, {"event": "error", "message": "pipeline error"})
                 break
+
+            # Signal turn completion over DataChannel.
+            if publish_events:
+                await _publish_data(room, {"event": "done"})
 
             if on_turn_done:
                 on_turn_done(events)
