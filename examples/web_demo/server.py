@@ -1559,11 +1559,17 @@ async def health() -> dict[str, object]:
         "active_phone_calls": _active_phone_calls,
         "max_phone_calls": MAX_CONCURRENT_CALLS,
         "adapters": adapters,
+        "livekit": {
+            "configured": _livekit_config() is not None,
+            "url": (_livekit_config() or {}).get("url", ""),
+        },
         "endpoints": {
             "browser_ws": "/ws/voice",
             "realtime_ws": "/ws/voice/realtime",
             "twilio_ws": "/ws/twilio",
             "twilio_twiml": "/twiml/voice",
+            "livekit_token": "/livekit/token",
+            "livekit_status": "/livekit/status",
             "parity": "/parity",
         },
         "tip": "drop missing keys at ~/.mdk_<name>_key (chmod 600) or set them via env",
@@ -1749,6 +1755,70 @@ async def languages() -> dict[str, object]:
     }
 
 
+# ── LiveKit endpoints ────────────────────────────────────────────────────
+
+@app.get("/livekit/status")
+async def livekit_status() -> dict[str, object]:
+    """Check if LiveKit is configured and reachable."""
+    cfg = _livekit_config()
+    return {
+        "ok": cfg is not None,
+        "configured": cfg is not None,
+        "url": cfg["url"] if cfg else None,
+    }
+
+
+@app.post("/livekit/token")
+async def livekit_token(request: Request) -> dict[str, object]:
+    """Generate a LiveKit access token for a browser participant.
+
+    The browser calls this to get a token, then connects directly to the
+    LiveKit room via WebRTC. The mdk agent joins the same room via the
+    LiveKitTransport and runs the voice pipeline.
+
+    Body: {"room_name": "call-123", "participant_name": "browser-user"}
+    """
+    cfg = _livekit_config()
+    if not cfg:
+        return {"ok": False, "error": "LiveKit not configured"}
+
+    try:
+        from livekit.api import AccessToken, VideoGrants  # noqa: PLC0415
+    except ImportError:
+        return {"ok": False, "error": "livekit SDK not installed"}
+
+    body = await request.json()
+    room_name = body.get("room_name", f"mdk-voice-{__import__('time').monotonic_ns()}")
+    participant_name = body.get("participant_name", "browser-user")
+
+    token = AccessToken(
+        api_key=cfg["api_key"],
+        api_secret=cfg["api_secret"],
+    )
+    token.identity = participant_name
+    token.name = participant_name
+    grant = VideoGrants(
+        room_join=True,
+        room=room_name,
+    )
+    token.video_grants = grant
+
+    jwt_token = token.to_jwt()
+
+    log.info(
+        "livekit: issued token for room=%s participant=%s",
+        room_name,
+        participant_name,
+    )
+
+    return {
+        "ok": True,
+        "token": jwt_token,
+        "url": cfg["url"],
+        "room_name": room_name,
+    }
+
+
 @app.get("/parity")
 async def parity() -> dict[str, object]:
     """Live Lyzr provider-parity report — "we cover N/M of your voice menu".
@@ -1855,6 +1925,29 @@ def _twilio_creds() -> tuple[str, str, str] | None:
     number = os.environ.get("TWILIO_NUMBER", "").strip()
     if sid and token and number:
         return (sid, token, number)
+    return None
+
+
+# ── LiveKit credentials ──────────────────────────────────────────────────
+# Loaded from env vars (LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+# or ~/.mdk_livekit_* files (same pattern as Twilio).
+
+def _livekit_config() -> dict[str, str] | None:
+    """Load LiveKit credentials. Returns {url, api_key, api_secret} or None."""
+    home = Path.home()
+    try:
+        return {
+            "url": (home / ".mdk_livekit_url").read_text().strip(),
+            "api_key": (home / ".mdk_livekit_key").read_text().strip(),
+            "api_secret": (home / ".mdk_livekit_secret").read_text().strip(),
+        }
+    except OSError:
+        pass
+    url = os.environ.get("LIVEKIT_URL", "").strip()
+    key = os.environ.get("LIVEKIT_API_KEY", "").strip()
+    secret = os.environ.get("LIVEKIT_API_SECRET", "").strip()
+    if url and key and secret:
+        return {"url": url, "api_key": key, "api_secret": secret}
     return None
 
 
