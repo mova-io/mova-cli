@@ -51,6 +51,7 @@ async def run_langgraph_workflow(  # noqa: PLR0912
     workflow_run_id: str | None = None,
     mock: bool = False,
     defaults: Any = None,
+    on_node_token: Any | None = None,
 ) -> Any:
     """Compile ``graph`` to LangGraph and execute it in-process.
 
@@ -115,6 +116,14 @@ async def run_langgraph_workflow(  # noqa: PLR0912
             try:
                 bundle = load_agent(node.ref)
                 agent_input = _project_state(state, bundle)
+                # on_node_token enables streaming: tokens from each node
+                # are forwarded to the caller as they're generated (e.g.
+                # for voice pipeline sentence-streaming TTS).
+                _token_cb = None
+                if on_node_token is not None:
+                    def _token_cb(token: str) -> None:  # type: ignore[misc]
+                        on_node_token(node.id, token)
+
                 response = await executor.execute(
                     bundle,
                     RunRequest(agent=bundle.spec.name, input=agent_input),
@@ -122,6 +131,7 @@ async def run_langgraph_workflow(  # noqa: PLR0912
                     node_id=node.id,
                     parent_span=node_span or wf_span,
                     tenant_id_override=tenant_id,
+                    on_token=_token_cb,
                 )
                 if response.status != "success":
                     error_node_id = node.id
@@ -199,7 +209,7 @@ async def run_langgraph_workflow(  # noqa: PLR0912
 
     # ── Build the StateGraph ─────────────────────────────────────────────
     try:
-        builder = StateGraph(dict)
+        builder = StateGraph(dict)  # type: ignore[type-var]
 
         for node_id, node in graph.nodes.items():
             if node.type == NodeType.AGENT:
@@ -253,7 +263,7 @@ async def run_langgraph_workflow(  # noqa: PLR0912
 
                 return route_fn
 
-            builder.add_conditional_edges(
+            builder.add_conditional_edges(  # type: ignore[arg-type]
                 source_id,
                 _make_router(decision_key, mapping),
                 mapping,
