@@ -273,6 +273,14 @@ telephony = [
 langchain = [
     "langchain-core>=0.3,<1",
 ]
+langgraph = [
+    # LangGraph execution backend (ADR 030 D1). Enables `mdk run --runtime
+    # langgraph` for graph-based workflows with conditionals, cycles, and
+    # parallel fan-out. Imported LAZILY inside `movate.runtime.langgraph_backend`
+    # — a runtime without this extra never loads it. langgraph is MIT-licensed
+    # (permissive; passes scripts/check_licenses.py --strict).
+    "langgraph>=0.4,<1",
+]
 teams = [
     # The Teams bot is a FastAPI app, so it leans on the same web deps
     # `mdk serve` uses. Listed explicitly (rather than depending on
@@ -575,6 +583,9 @@ module = [
     # Temporal compiler / worker glue (Phase 1 Track B/C), so a base install
     # is unaffected.
     "temporalio.*",
+    # LangGraph SDK — optional [langgraph] extra (ADR 030 D1). Imported
+    # LAZILY inside movate.runtime.langgraph_backend; base install unaffected.
+    "langgraph.*",
 ]
 ignore_missing_imports = true
 
