@@ -331,29 +331,13 @@ button.active { background:var(--accent); color:white; }
     <em>your</em> account's agents.
   </p>
 
-  <!-- Phone Sync — integrated into the BYOK panel so the full flow lives
-       in one place: paste key → agents load → pick agent → sync to phone. -->
-  <div id="phone-sync-panel" style="display:none;margin-top:14px;padding-top:14px;
-       border-top:1px solid var(--border);">
-    <h3 style="margin:0 0 6px 0;font-size:12px;display:flex;align-items:center;gap:6px;">
-      📞 Sync Agent to Phone
-    </h3>
-    <p class="muted" style="font-size:11px;margin:0 0 8px 0;font-style:normal;">
-      Attach an agent to <strong id="phone-sync-number" style="color:var(--ok);font-family:'SF Mono',Menlo,monospace;"></strong>
-      — the next call will be answered by the selected agent.
-    </p>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-      <select id="phone-agent-select"
-              style="background:var(--surface);color:var(--text);border:1px solid var(--border);
-                     border-radius:6px;padding:6px 10px;font-size:12px;min-width:200px;max-width:300px;flex:1;">
-        <option value="">— select agent —</option>
-      </select>
-      <button id="phone-sync-btn" class="active"
-              style="font-size:12px;padding:6px 14px;white-space:nowrap;"
-              title="Attach the selected agent to the phone number">📞 Sync to Phone</button>
-    </div>
-    <div id="phone-sync-status" style="margin-top:8px;font-size:11px;display:none;
-         padding:6px 10px;border-radius:6px;"></div>
+  <!-- Phone Sync moved to the unified 📞 Sync button next to the agent
+       dropdown (controls row). Hidden DOM kept for backward-compat JS refs. -->
+  <div id="phone-sync-panel" style="display:none !important;">
+    <strong id="phone-sync-number"></strong>
+    <select id="phone-agent-select"><option value=""></option></select>
+    <button id="phone-sync-btn"></button>
+    <div id="phone-sync-status" style="display:none;"></div>
   </div>
 </div>
 
@@ -2631,15 +2615,10 @@ function _phoneSyncPopulate() {
     o.textContent = opt.textContent;
     dst.appendChild(o);
   }
-  // Show the phone-sync section if we have agents and a phone number.
-  // Phone sync lives inside the BYOK panel, so also ensure BYOK is visible.
+  // Phone sync moved to the unified quick-sync button in the controls row.
+  // Just update the hidden phone-sync-number for backward compat.
   const num = $('twilio-dial')?.dataset?.number;
-  if (dst.options.length > 1 && num) {
-    $('phone-sync-panel').style.display = '';
-    $('phone-sync-number').textContent = formatPhone(num);
-    // Auto-open BYOK panel so the phone sync controls are visible.
-    $('byok-panel').style.display = '';
-  }
+  if (num) $('phone-sync-number').textContent = formatPhone(num);
 }
 // Re-populate whenever the Mova-iO dropdown changes (after BYOK apply, refresh, etc.)
 const _lyzrSelObs = new MutationObserver(_phoneSyncPopulate);
