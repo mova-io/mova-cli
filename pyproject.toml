@@ -269,6 +269,12 @@ telephony = [
     # SDKs only) so operators who need web-WS voice but not phone calls pay
     # nothing for the Twilio SDK.
     "twilio>=9.0,<10",
+    # LiveKit telephony transport (ADR 074 D2). WebRTC-native path: 16 kHz
+    # Opus (vs Twilio's 8 kHz mu-law), built-in SIP gateway, sub-200ms
+    # transport latency. The livekit + livekit-agents SDKs are Apache-2.0
+    # (permissive). Imported LAZILY inside movate.voice.transports.livekit.
+    "livekit>=0.14,<1",
+    "livekit-agents>=0.11,<1",
 ]
 langchain = [
     "langchain-core>=0.3,<1",
@@ -586,6 +592,10 @@ module = [
     # LangGraph SDK — optional [langgraph] extra (ADR 030 D1). Imported
     # LAZILY inside movate.runtime.langgraph_backend; base install unaffected.
     "langgraph.*",
+    # LiveKit SDK — optional [telephony] extra (ADR 074 D2). Imported
+    # LAZILY inside movate.voice.transports.livekit; base install unaffected.
+    "livekit.*",
+    "livekit_agents.*",
 ]
 ignore_missing_imports = true
 
