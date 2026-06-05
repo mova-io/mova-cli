@@ -85,6 +85,7 @@ async def handle_livekit_room(
         num_channels=1,
     )
 
+    turn = 0  # init before try so finally can reference it on connect failure
     try:
         await room.connect(livekit_url, token)
         log.info("livekit_bridge: connected to room=%s", room_name)

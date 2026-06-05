@@ -1967,9 +1967,9 @@ def _livekit_config() -> dict[str, str] | None:
         }
     except OSError:
         pass
-    url = os.environ.get("LIVEKIT_URL", "").strip()
-    key = os.environ.get("LIVEKIT_API_KEY", "").strip()
-    secret = os.environ.get("LIVEKIT_API_SECRET", "").strip()
+    url = os.environ.get("LIVEKIT_URL", "").strip().strip('"').strip("'")
+    key = os.environ.get("LIVEKIT_API_KEY", "").strip().strip('"').strip("'")
+    secret = os.environ.get("LIVEKIT_API_SECRET", "").strip().strip('"').strip("'")
     if url and key and secret:
         return {"url": url, "api_key": key, "api_secret": secret}
     return None
