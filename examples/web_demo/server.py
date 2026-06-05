@@ -1822,6 +1822,7 @@ async def livekit_token(request: Request) -> dict[str, object]:
     token.identity = participant_name
     token.name = participant_name
     grant = VideoGrants(
+        room_create=True,
         room_join=True,
         room=room_name,
     )
@@ -2436,7 +2437,7 @@ async def livekit_join(request: Request) -> dict[str, object]:
     )
     agent_token.identity = "mdk-agent"
     agent_token.name = "Deva (AI Agent)"
-    agent_token.video_grants = VideoGrants(room_join=True, room=room_name)
+    agent_token.video_grants = VideoGrants(room_create=True, room_join=True, room=room_name)
     agent_jwt = agent_token.to_jwt()
 
     # Launch the bridge in the background.
