@@ -281,6 +281,7 @@ SUPPORTED_LANGUAGES: list[dict[str, str]] = [
     {"code": "", "label": "English (default)", "flag": "🇺🇸"},
     {"code": "es", "label": "Spanish", "flag": "🇪🇸"},
     {"code": "fr", "label": "French", "flag": "🇫🇷"},
+    {"code": "fr-CA", "label": "French (Canadian)", "flag": "🇨🇦"},
     {"code": "de", "label": "German", "flag": "🇩🇪"},
     {"code": "pt", "label": "Portuguese", "flag": "🇧🇷"},
     {"code": "hi", "label": "Hindi", "flag": "🇮🇳"},
@@ -296,6 +297,7 @@ LANGUAGE_VOICES: dict[str, dict[str, str]] = {
     # openai_speech.py / cartesia.py handles unrecognized IDs gracefully.
     "es": {"cartesia": "846d6cb0-2301-48b6-9683-48f5618ea2f6", "label": "Spanish (Sophia)"},
     "fr": {"cartesia": "a8a1eb38-5f15-4c1d-8722-7ac0f329f8f3", "label": "French (Marie)"},
+    "fr-CA": {"cartesia": "a8a1eb38-5f15-4c1d-8722-7ac0f329f8f3", "label": "French-Canadian (Marie)"},
     "de": {"cartesia": "3f6e78a8-5283-42aa-b236-e00b39dbb3d3", "label": "German (Hans)"},
     "pt": {"cartesia": "700d1ee3-a641-4018-ba6e-899dcadc9e2b", "label": "Portuguese (Ana)"},
     "hi": {"cartesia": "95856005-0332-41b0-935f-352e296aa0df", "label": "Hindi (Priya)"},
@@ -2373,6 +2375,79 @@ async def twilio_voice(ws: WebSocket) -> None:
 
 
 # ── End Twilio bridge ─────────────────────────────────────────────────────────
+
+
+# ── LiveKit room-based voice ─────────────────────────────────────────────────
+
+@app.post("/livekit/join")
+async def livekit_join(request: Request) -> dict[str, object]:
+    """Start a LiveKit voice session.
+
+    The browser:
+    1. Calls POST /livekit/token to get a participant token + room name
+    2. Connects to the LiveKit room via the JS SDK (WebRTC)
+    3. Calls POST /livekit/join with the room_name to tell the server
+       to join as the agent
+
+    The server joins the same room via the LiveKit bridge, subscribes to
+    the participant's audio, runs the voice pipeline, and publishes TTS
+    audio back. The browser hears the agent via WebRTC.
+    """
+    cfg = _livekit_config()
+    if not cfg:
+        return {"ok": False, "error": "LiveKit not configured"}
+
+    body = await request.json()
+    room_name = body.get("room_name", "")
+    if not room_name:
+        return {"ok": False, "error": "room_name required"}
+
+    # Generate an agent token for this room.
+    try:
+        from livekit.api import AccessToken, VideoGrants  # noqa: PLC0415
+    except ImportError:
+        return {"ok": False, "error": "livekit SDK not installed"}
+
+    agent_token = AccessToken(
+        api_key=cfg["api_key"],
+        api_secret=cfg["api_secret"],
+    )
+    agent_token.identity = "mdk-agent"
+    agent_token.name = "Deva (AI Agent)"
+    agent_token.video_grants = VideoGrants(room_join=True, room=room_name)
+    agent_jwt = agent_token.to_jwt()
+
+    # Launch the bridge in the background.
+    from livekit_bridge import handle_livekit_room  # noqa: PLC0415
+
+    session = Session()
+
+    def build_kwargs(turn: int) -> dict[str, Any]:
+        return {
+            "stt": session.stt,
+            "agent": session.agent,
+            "tts": session.tts,
+            "tts_streaming": True,
+            "text_filter": speakify,
+            "pii_redactor": redact_pii,
+            "agent_timeout": 15.0,
+            "voice_id": session.voice_id,
+        }
+
+    asyncio.create_task(
+        handle_livekit_room(
+            livekit_url=cfg["url"],
+            token=agent_jwt,
+            room_name=room_name,
+            build_pipeline_kwargs=build_kwargs,
+        )
+    )
+
+    log.info("livekit: agent joining room=%s", room_name)
+    return {"ok": True, "room_name": room_name, "agent_identity": "mdk-agent"}
+
+
+# ── End LiveKit bridge ────────────────────────────────────────────────────────
 
 
 @app.websocket("/ws/voice")
