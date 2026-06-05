@@ -55,9 +55,9 @@ async def _publish_data(room: Any, event: dict[str, Any]) -> None:
 
 # LiveKit audio constants
 LIVEKIT_FRAME_DURATION_MS = 20  # Standard WebRTC frame
-SILENCE_RMS = 400.0
-MIN_SPEECH_MS = 300
-SILENCE_END_MS = 1200
+SILENCE_RMS = 300.0     # lowered from 400 — Opus-decoded audio has lower RMS floor
+MIN_SPEECH_MS = 400     # require 400ms of speech before endpointing activates
+SILENCE_END_MS = 1800   # 1.8s silence to endpoint (was 1.2s — too aggressive for natural pauses)
 TTS_OUTPUT_RATE = 24_000  # Cartesia + OpenAI TTS both output 24 kHz
 
 
