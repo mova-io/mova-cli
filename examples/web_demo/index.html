@@ -832,8 +832,9 @@ async function connectLiveKit() {
         agent_tier: agentTier,
         language: $('language-select').value || '',
         voice_id: $('voice-select').value || '',
-        lyzr_agent_id: $('lyzr-id').value || '',
+        lyzr_agent_id: currentLyzrAgentId || $('lyzr-agent-select').value || $('lyzr-id').value || '',
         tts_tier: ttsTier || 'cartesia',
+        user_lyzr_key: $('byok-lyzr').value || '',
       })
     });
     const joinData = await joinResp.json();

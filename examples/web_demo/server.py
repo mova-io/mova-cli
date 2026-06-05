@@ -2445,11 +2445,21 @@ async def livekit_join(request: Request) -> dict[str, object]:
     session = Session()
 
     # Accept optional session config from the main playground.
+    # BYOK: if the user pasted their own Lyzr key in the browser, apply it
+    # to this session so the LiveKit bridge authenticates with their account.
+    user_lyzr_key = body.get("user_lyzr_key", "")
+    if user_lyzr_key:
+        session.user_keys["lyzr"] = user_lyzr_key
+    # Set lyzr_agent_id BEFORE agent_tier — set_agent_tier rebuilds the
+    # agent object using self.lyzr_agent_id, so it needs to be current.
+    lyzr_agent_id = body.get("lyzr_agent_id", "")
+    if lyzr_agent_id:
+        session.lyzr_agent_id = lyzr_agent_id
     agent_tier = body.get("agent_tier", "")
     if agent_tier and agent_tier != session.agent_tier:
         session.set_agent_tier(agent_tier)
-    lyzr_agent_id = body.get("lyzr_agent_id", "")
-    if lyzr_agent_id:
+    # If agent_tier was already correct but agent_id changed, rebuild.
+    elif lyzr_agent_id:
         session.set_lyzr_agent_id(lyzr_agent_id)
     language = body.get("language", "")
     if language:
