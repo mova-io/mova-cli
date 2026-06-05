@@ -595,6 +595,24 @@ button.active { background:var(--accent); color:white; }
       <button data-tier="cartesia" class="active">Cartesia (fast)</button>
       <button data-tier="openai">OpenAI</button>
     </div>
+    <!-- Language picker — multi-language voice support. Selecting a language
+         auto-switches the STT language hint, agent prompt, and TTS voice. -->
+    <span class="muted" style="font-size:11px;margin-left:8px;">Language</span>
+    <select id="language-select"
+            title="Select language — STT, agent, and TTS voice adapt automatically"
+            style="background:var(--surface);color:var(--text);border:1px solid var(--border);
+                   border-radius:6px;padding:6px 8px;font-size:11px;min-width:140px;">
+      <option value="">🇺🇸 English (default)</option>
+      <option value="es">🇪🇸 Spanish</option>
+      <option value="fr">🇫🇷 French</option>
+      <option value="de">🇩🇪 German</option>
+      <option value="pt">🇧🇷 Portuguese</option>
+      <option value="hi">🇮🇳 Hindi</option>
+      <option value="ja">🇯🇵 Japanese</option>
+      <option value="zh">🇨🇳 Chinese</option>
+      <option value="ko">🇰🇷 Korean</option>
+      <option value="auto">🌐 Auto-detect</option>
+    </select>
     <!-- Voice picker — kept visible in BOTH views so users can pick a voice
          that matches their use case in either mode. -->
     <span class="muted" style="font-size:11px;margin-left:8px;">Voice</span>
@@ -923,6 +941,16 @@ function handleJson(s) {
     // Server echoed our voice_id change — keep the select in sync.
     if ($('voice-select').value !== (m.voice_id || '')) {
       $('voice-select').value = m.voice_id || '';
+    }
+    return;
+  }
+  if (ev === 'language') {
+    // Server confirmed language change — sync both dropdowns.
+    if ($('language-select').value !== (m.language || '')) {
+      $('language-select').value = m.language || '';
+    }
+    if (m.voice_id && $('voice-select').value !== m.voice_id) {
+      $('voice-select').value = m.voice_id;
     }
     return;
   }
@@ -2438,6 +2466,16 @@ $('interrupt').addEventListener('click', () => {
 });
 
 status('click ▶ to start');
+
+// ── Language picker ──────────────────────────────────────────────────────────
+$('language-select').addEventListener('change', () => {
+  const lang = $('language-select').value;
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ event: 'set_language', language: lang }));
+  }
+  const label = $('language-select').options[$('language-select').selectedIndex].text;
+  logEvent(`🌐 language → ${label}`, 'final');
+});
 
 // ── Voice picker (TTS voice selection) ─────────────────────────────────────
 // Voices are tier-specific: switching the TTS primary repopulates the dropdown

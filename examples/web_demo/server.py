@@ -270,6 +270,41 @@ TTS_VOICES: dict[str, list[dict[str, str]]] = {
 }
 
 
+# ── Multi-language voice mapping ─────────────────────────────────────────
+# Maps ISO 639-1 language codes to recommended TTS voices per provider.
+# Cartesia has multilingual voices (Sonic Multilingual model); OpenAI TTS
+# auto-adapts to the text language (alloy/nova/etc. work for any language).
+# When the user selects a language, we auto-select the matching Cartesia
+# voice so pronunciation is native. Deepgram STT just needs the language=
+# hint (e.g. "es", "fr") which is passed separately.
+SUPPORTED_LANGUAGES: list[dict[str, str]] = [
+    {"code": "", "label": "English (default)", "flag": "🇺🇸"},
+    {"code": "es", "label": "Spanish", "flag": "🇪🇸"},
+    {"code": "fr", "label": "French", "flag": "🇫🇷"},
+    {"code": "de", "label": "German", "flag": "🇩🇪"},
+    {"code": "pt", "label": "Portuguese", "flag": "🇧🇷"},
+    {"code": "hi", "label": "Hindi", "flag": "🇮🇳"},
+    {"code": "ja", "label": "Japanese", "flag": "🇯🇵"},
+    {"code": "zh", "label": "Chinese (Mandarin)", "flag": "🇨🇳"},
+    {"code": "ko", "label": "Korean", "flag": "🇰🇷"},
+    {"code": "auto", "label": "Auto-detect", "flag": "🌐"},
+]
+LANGUAGE_VOICES: dict[str, dict[str, str]] = {
+    # Cartesia Sonic Multilingual voices — curated for natural accent.
+    # OpenAI TTS voices are language-agnostic (auto-adapt), so no mapping needed.
+    # These Cartesia voice IDs may change — the TTS failover guard in
+    # openai_speech.py / cartesia.py handles unrecognized IDs gracefully.
+    "es": {"cartesia": "846d6cb0-2301-48b6-9683-48f5618ea2f6", "label": "Spanish (Sophia)"},
+    "fr": {"cartesia": "a8a1eb38-5f15-4c1d-8722-7ac0f329f8f3", "label": "French (Marie)"},
+    "de": {"cartesia": "3f6e78a8-5283-42aa-b236-e00b39dbb3d3", "label": "German (Hans)"},
+    "pt": {"cartesia": "700d1ee3-a641-4018-ba6e-899dcadc9e2b", "label": "Portuguese (Ana)"},
+    "hi": {"cartesia": "95856005-0332-41b0-935f-352e296aa0df", "label": "Hindi (Priya)"},
+    "ja": {"cartesia": "2b568345-1d48-4047-b25f-7baccf842eb0", "label": "Japanese (Yuki)"},
+    "zh": {"cartesia": "e90c6678-f0d3-4767-9883-5d0ecf5894a8", "label": "Chinese (Li Wei)"},
+    "ko": {"cartesia": "663afeec-d082-4ab5-827e-2e41bf73fa9c", "label": "Korean (Soo-Jin)"},
+}
+
+
 # Cartesia voice catalog cache. Voices rarely change but the catalog is 700+
 # entries so we don't want to re-fetch + filter on every page load. Per-key
 # (so a BYOK user's catalog and the server's stay isolated, even though they
@@ -980,6 +1015,9 @@ class Session:
         # voice for this tier" (alloy for OpenAI, the Cartesia adapter's
         # default UUID for Cartesia). Updated via the set_voice_id WS message.
         self.voice_id: str = ""
+        # Multi-language support — STT language hint + agent prompt language.
+        # Default "" = English (auto-detect). Set via set_language WS event.
+        self.language: str = ""
         self.tts = self._build_tts()
         self.turns = 0
         # A4: cost-bounded routing. Per-session budget; once cumulative spent
@@ -1026,6 +1064,23 @@ class Session:
         """Pick a specific TTS voice for the next turn ("" = adapter default)."""
         self.voice_id = (voice_id or "").strip()
         return self.voice_id
+
+    def set_language(self, language: str) -> dict[str, str]:
+        """Set the session language for STT + agent prompt.
+
+        Returns ``{language, voice_id}`` — when switching languages, the
+        TTS voice is auto-selected from LANGUAGE_VOICES so the accent
+        matches. Pass "" to revert to English/auto-detect.
+        """
+        self.language = (language or "").strip().lower()
+        # Auto-select a matching TTS voice when switching languages.
+        voice = LANGUAGE_VOICES.get(self.language, {}).get("cartesia", "")
+        if voice:
+            self.voice_id = voice
+        elif not self.language or self.language == "en":
+            # Revert to default English voice.
+            self.voice_id = ""
+        return {"language": self.language, "voice_id": self.voice_id}
 
     def set_hedge(self, stt: bool | None = None, tts: bool | None = None) -> dict[str, bool]:
         """B2: toggle latency hedging for STT and/or TTS; rebuild affected chains.
@@ -1682,6 +1737,16 @@ async def tts_voices() -> dict[str, object]:
     cart_voices = await _fetch_cartesia_voices_cached(cart_key) if cart_key else []
     out["cartesia"] = cart_voices or TTS_VOICES["cartesia"]
     return {"ok": True, "voices": out, "cartesia_live": bool(cart_voices)}
+
+
+@app.get("/languages")
+async def languages() -> dict[str, object]:
+    """Supported languages for multi-language voice."""
+    return {
+        "ok": True,
+        "languages": SUPPORTED_LANGUAGES,
+        "voices": LANGUAGE_VOICES,
+    }
 
 
 @app.get("/parity")
@@ -2422,6 +2487,13 @@ async def voice(ws: WebSocket) -> None:
                 applied = session.set_voice_id(str(data.get("voice_id", "")))
                 await _send_event(ws, event="voice_id", voice_id=applied)
                 continue
+            if ev_name == "set_language":
+                result = session.set_language(str(data.get("language", "")))
+                await _send_event(
+                    ws, event="language", language=result["language"],
+                    voice_id=result["voice_id"],
+                )
+                continue
             if ev_name == "set_hedge":
                 # B2: latency hedging — fire 2 STTs/TTSs in parallel, take first.
                 applied = session.set_hedge(
@@ -2582,6 +2654,7 @@ async def voice(ws: WebSocket) -> None:
                     cancel=cancel,
                     agent_timeout=15.0,
                     voice_id=session.voice_id,
+                    language=session.language or None,
                     # ADR 070: opt-in speculative kickoff + observer so the
                     # speculation_started/committed/cancelled events flow to the
                     # metrics + trail (the live cancel-ratio the dashboard shows).
