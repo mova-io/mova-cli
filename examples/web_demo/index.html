@@ -573,6 +573,18 @@ button.active { background:var(--accent); color:white; }
             min-width:240px;max-width:320px;">
       <option value="">loading…</option>
     </select>
+    <!-- Unified phone sync — right next to the agent picker. Uses whichever
+         agent is currently selected (no duplicate dropdown). Hidden until
+         Twilio number is known + agents are loaded. -->
+    <button id="quick-sync" style="display:none;font-size:11px;padding:5px 10px;
+            border-radius:6px;border:1px solid var(--border);background:var(--surface);
+            color:var(--muted);cursor:pointer;white-space:nowrap;"
+            title="Sync this agent to the phone line">📞 Sync</button>
+    <!-- Synced-agent pill — colorful indicator of which agent answers the phone.
+         Independent of the browser agent (user can switch agents freely). -->
+    <span id="synced-pill" style="display:none;font-size:11px;padding:4px 10px;
+          border-radius:12px;background:rgba(52,208,88,0.15);color:var(--ok);
+          white-space:nowrap;font-weight:500;"></span>
     <!-- Manual refresh — force a re-fetch of the agent list (e.g. after
          creating a new agent in Mova-iO Studio, or after pasting a different
          BYOK key if the auto-refresh missed). Bypasses the server-side cache. -->
@@ -1003,6 +1015,8 @@ function handleJson(s) {
         dialBtn.style.display = 'none';
       }
     }
+    // Show the quick-sync button if Twilio is configured + agents are loaded.
+    _showQuickSync();
     // BYOK badge — reflect whatever the server reports at session start.
     // We only surface Lyzr (USER_KEY_PROVIDERS narrowed to "lyzr").
     if (m.user_keys_active && m.user_keys_active.lyzr) {
@@ -2672,6 +2686,52 @@ $('phone-sync-btn').addEventListener('click', async () => {
   }
   $('phone-sync-btn').disabled = false;
   $('phone-sync-btn').textContent = '📞 Sync to Phone';
+});
+
+// ─── Unified quick-sync (controls-row button) ────────────────────────────
+// Uses the current agent from #lyzr-agent-select (no duplicate dropdown).
+// Shows the synced-agent pill after a successful sync.
+let _syncedAgentLabel = '';
+let _syncedPhoneNumber = '';
+
+function _showQuickSync() {
+  // Show the quick-sync button if we have agents + a phone number.
+  const num = $('twilio-dial')?.dataset?.number;
+  const sel = $('lyzr-agent-select');
+  if (num && sel && sel.options.length > 1) {
+    $('quick-sync').style.display = '';
+    _syncedPhoneNumber = formatPhone(num);
+  }
+}
+// Re-check whenever the agent dropdown reloads.
+const _qsObs = new MutationObserver(_showQuickSync);
+if ($('lyzr-agent-select')) _qsObs.observe($('lyzr-agent-select'), { childList: true });
+
+$('quick-sync').addEventListener('click', async () => {
+  const sel = $('lyzr-agent-select');
+  const agent = sel?.value;
+  if (!agent) {
+    logEvent('Select an agent first, then click Sync', 'err');
+    return;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    logEvent('Not connected — cannot sync to phone', 'err');
+    return;
+  }
+  const btn = $('quick-sync');
+  btn.disabled = true; btn.textContent = '📞 Syncing…';
+  try {
+    ws.send(JSON.stringify({ event: 'set_lyzr_agent_id', agent_id: agent }));
+    ws.send(JSON.stringify({ event: 'push_to_twilio' }));
+    _syncedAgentLabel = sel.selectedOptions[0]?.textContent || agent.slice(0, 12);
+    const pill = $('synced-pill');
+    pill.textContent = '🟢 ' + _syncedAgentLabel + ' → ' + _syncedPhoneNumber;
+    pill.style.display = '';
+    logEvent('📞 synced ' + _syncedAgentLabel + ' → ' + _syncedPhoneNumber, 'final');
+  } catch (e) {
+    logEvent('Sync error: ' + e.message, 'err');
+  }
+  btn.disabled = false; btn.textContent = '📞 Sync';
 });
 
 // BYOK: panel toggle + apply/clear/show controls. Keys are kept in DOM only
