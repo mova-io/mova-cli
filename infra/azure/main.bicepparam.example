@@ -131,3 +131,14 @@ param corsAllowedOrigins = ''
 // App Insights exists. Default false (purely additive). See
 // docs/azure-monitor-workbooks.md for the per-persona on-call flow.
 // param enableWorkbooks = false
+
+// OPTIONAL — self-hosted Temporal server (ADR 078) for durable workflows. When
+// true: a temporalio/auto-setup Container App is deployed on the shared CAE,
+// `temporal` + `temporal_visibility` databases are created on the shared
+// Postgres, and the api + worker get TEMPORAL_HOST=<internal-fqdn>:7233 (durable
+// HITL, ADR 062). REQUIRES enableApiWorker=true and the pg-admin-password KV
+// secret. Default false (purely additive — native is the floor; durable
+// workflows are opt-in). NOTE: the single auto-setup container is one non-HA
+// Temporal cluster (one replica). Prefer Temporal Cloud instead by leaving this
+// false and pointing TEMPORAL_HOST at a cloud namespace — both ride ADR 054 D5.
+// param enableTemporal = false

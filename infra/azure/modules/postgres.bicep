@@ -43,6 +43,9 @@ param databaseName string = 'movate'
 @description('Also create a `langfuse` database on this server (for self-hosted Langfuse). Off by default so non-Langfuse deploys stay lean.')
 param createLangfuseDatabase bool = false
 
+@description('Also create `temporal` + `temporal_visibility` databases on this server (for the self-hosted Temporal server, ADR 078). Off by default so non-Temporal deploys stay lean.')
+param createTemporalDatabases bool = false
+
 @description('Allow-list the pgvector extension (Azure blocks extensions until named in the azure.extensions server parameter). Required for the KB vector store — see docs/adr/009-pgvector-kb-storage.md.')
 param enablePgvector bool = true
 
@@ -102,6 +105,26 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2023-12-01-preview' =
   // createLangfuseDatabase=true.
   resource langfuseDb 'databases@2023-12-01-preview' = if (createLangfuseDatabase) {
     name: 'langfuse'
+    properties: {
+      charset: 'UTF8'
+      collation: 'en_US.utf8'
+    }
+  }
+
+  // Dedicated databases for the self-hosted Temporal server (ADR 078 D3): the
+  // default (history) store + the standard SQL visibility store, isolated from
+  // the movate app tables. temporalio/auto-setup runs its (idempotent) schema
+  // setup against these on boot. Created only when createTemporalDatabases=true.
+  resource temporalDb 'databases@2023-12-01-preview' = if (createTemporalDatabases) {
+    name: 'temporal'
+    properties: {
+      charset: 'UTF8'
+      collation: 'en_US.utf8'
+    }
+  }
+
+  resource temporalVisibilityDb 'databases@2023-12-01-preview' = if (createTemporalDatabases) {
+    name: 'temporal_visibility'
     properties: {
       charset: 'UTF8'
       collation: 'en_US.utf8'

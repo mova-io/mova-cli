@@ -225,6 +225,26 @@ param deployLangfuse bool = false
 param langfuseImage string = 'langfuse/langfuse:2'
 
 @description('''
+Deploy a self-hosted Temporal server (ADR 078) — a Container App running
+temporalio/auto-setup, internal gRPC on :7233, backed by `temporal` +
+`temporal_visibility` databases on the shared Postgres — and point the API +
+worker at it via TEMPORAL_HOST. Off by default; when false ZERO Temporal infra
+is emitted and the apps are byte-for-byte unchanged (durable workflows stay
+opt-in — native is the floor, ADR 065).
+
+REQUIRES enableApiWorker=true (the apps consume TEMPORAL_HOST). Two-pass like
+the rest: deploy infra + ensure the pg-admin-password Key Vault secret is set,
+then flip this true. NOTE (ADR 078 D6): the single auto-setup container is one
+non-HA Temporal cluster pinned at a single replica. Alternative to Temporal
+Cloud (point TEMPORAL_HOST at the cloud namespace instead) — both ride the same
+BYOK seam (ADR 054 D5).
+''')
+param enableTemporal bool = false
+
+@description('Temporal auto-setup image (ADR 078). PIN a tag — never :latest — so schema setup is reproducible.')
+param temporalImage string = 'temporalio/auto-setup:1.25.2'
+
+@description('''
 Provision a workspace-linked Application Insights component and route the
 runtime's OpenTelemetry traces to it through an in-cluster OpenTelemetry
 Collector. When true AND ``appInsightsConnectionString`` is non-empty:
@@ -430,6 +450,10 @@ var teamsBotUaiName = 'movate-${env}-teams-bot-mi'
 var playgroundUaiName = 'movate-${env}-playground-mi'
 var langfuseName = 'movate-${env}-langfuse'
 var langfuseUaiName = 'movate-${env}-langfuse-mi'
+// Self-hosted Temporal server (ADR 078) — RG-scoped names; the app is gated
+// on enableTemporal, the UAI is created unconditionally (cold-deploy safety).
+var temporalName = 'movate-${env}-temporal'
+var temporalUaiName = 'movate-${env}-temporal-mi'
 // RG-scoped — no global-uniqueness suffix needed (App Insights component
 // names only have to be unique within the resource group).
 var appInsightsName = 'movate-${env}-appi'
@@ -508,6 +532,7 @@ module pg 'modules/postgres.bicep' = {
     backupRetentionDays: pgBackupDays
     adminPassword: postgresAdminPassword
     createLangfuseDatabase: deployLangfuse
+    createTemporalDatabases: enableTemporal
     tags: tags
   }
 }
@@ -636,6 +661,15 @@ resource langfuseUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
   tags: tags
 }
 
+// Temporal server UAI (ADR 078). Created unconditionally (cheap, idempotent)
+// so its KV-secrets-read grant (the Postgres password) lands before the app's
+// first revision — even though the app itself is gated on enableTemporal.
+resource temporalUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: temporalUaiName
+  location: location
+  tags: tags
+}
+
 // Both Container Apps are gated on ``enableApiWorker`` so a fresh
 // deployment can run "infra-only" first, the operator populates KV
 // secrets, then the second pass deploys the apps. See param doc above.
@@ -659,6 +693,11 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: apiUai.id
     corsAllowedOrigins: corsAllowedOrigins
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    // Self-hosted Temporal frontend (ADR 078). Empty when enableTemporal=false
+    // → no TEMPORAL_* env emitted → selecting runtime:temporal fails loud
+    // (ADR 055 D6), never a silent downgrade. The API needs this to signal a
+    // durable run's handle from the resume endpoint (ADR 062 D2).
+    temporalHost: enableTemporal ? temporal!.outputs.temporalHost : ''
     // 'otlp' + the collector endpoint are gated on the SAME condition
     // (appInsightsExportEnabled) so the otlp sink always has an endpoint to
     // ship to — movate's fail-loud OtelTracer can't raise TraceSinkError.
@@ -695,6 +734,8 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: workerUai.id
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    // Self-hosted Temporal frontend (ADR 078) — empty when off (see api above).
+    temporalHost: enableTemporal ? temporal!.outputs.temporalHost : ''
     // 'otlp' + the collector endpoint gated on the SAME condition — see the
     // api module above for why pairing them keeps the fail-loud OtelTracer
     // safe, and why the endpoint is the bare https://<fqdn> (no port).
@@ -749,6 +790,31 @@ module langfuse 'modules/langfuse.bicep' = if (deployLangfuse) {
     publicUrl: 'https://${langfuseName}.${cae.outputs.defaultDomain}'
     image: langfuseImage
     userAssignedIdentityId: langfuseUai.id
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Self-hosted Temporal server (ADR 078). Gated on enableTemporal AND
+// enableApiWorker (the apps consume its TEMPORAL_HOST). Runs the public
+// temporalio/auto-setup image on the shared CAE, talks to the `temporal` +
+// `temporal_visibility` databases on the shared Postgres (created by the pg
+// module when enableTemporal=true), reads the Postgres password from Key Vault,
+// and is reachable only by internal gRPC :7233. The api + worker pick up its
+// host:port as TEMPORAL_HOST above. Zero app code change — the worker/API
+// connect via the existing BYOK seam (ADR 054 D5).
+// ---------------------------------------------------------------------------
+module temporal 'modules/containerapp-temporal.bicep' = if (enableTemporal && enableApiWorker) {
+  name: 'temporal-${env}'
+  params: {
+    name: temporalName
+    location: location
+    environmentId: cae.outputs.envId
+    keyVaultUri: kv.outputs.vaultUri
+    userAssignedIdentityId: temporalUai.id
+    postgresFqdn: pg.outputs.serverFqdn
+    postgresAdminUsername: pg.outputs.adminUsername
+    image: temporalImage
     tags: tags
   }
 }
@@ -1059,6 +1125,19 @@ resource langfuseKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(kvResource.id, langfuseUaiName, kvSecretsUserRoleId)
   properties: {
     principalId: langfuseUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
+  }
+}
+
+// Temporal server needs KV-secrets-read (the Postgres password). No AcrPull
+// grant — it runs the public temporalio/auto-setup image, not ours. Un-gated
+// (the UAI always exists) so it lands on pass 1 (ADR 078 D4).
+resource temporalKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: kvResource
+  name: guid(kvResource.id, temporalUaiName, kvSecretsUserRoleId)
+  properties: {
+    principalId: temporalUai.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
   }
