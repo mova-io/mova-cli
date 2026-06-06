@@ -78,6 +78,19 @@ startup.
      `runtime: temporal`, final state present, and it's **gone from the paused
      list** (terminal-state sync, ADR 080 D2).
 
+   **One-command smoke (codifies step 3):**
+   ```bash
+   RUNTIME_URL=https://movate-<env>-api.<domain> API_KEY=mvt_live_... \
+     WORKFLOW=<deployed runtime:temporal workflow> \
+     ./scripts/temporal-e2e-smoke.sh
+   ```
+   It submits the workflow, waits for the durable pause, signals the decision
+   (override the default with `DECISION='{"decision":"approve", ...}'` to satisfy
+   the gate's `output_contract`), and asserts the run resumes to **SUCCESS** —
+   green proves server+worker liveness, the resume door, and that the **deployed
+   worker image carries ADR 080 terminal-sync** (the image-drift check). Pair
+   with `scripts/temporal-preflight.sh` (prereqs/health) for a full before/after.
+
 ## Resolved on first deploy (validated against movate-dev, ADR 078/080 D3)
 - **ACA internal TCP ingress ↔ gRPC :7233 — WORKS.** The worker connected to
   `movate-dev-temporal.internal…:7233` over the `transport: tcp` internal ingress.
