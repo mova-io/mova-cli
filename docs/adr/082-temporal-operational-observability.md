@@ -121,6 +121,21 @@ same Collector). The workbook is added to the ADR-031 drift guard
   service; matches the four existing persona workbooks). A Grafana panel can be
   added later from the same instrument.
 
+## Update (2026-06-06) — SDK metrics follow-on delivered
+The "documented follow-on" in D4 is now wired: `mdk worker --backend temporal`
+builds a `temporalio` Runtime with an OpenTelemetry metrics exporter pointed at
+the same OTLP endpoint the app's spans/metrics use (`OTEL_EXPORTER_OTLP_ENDPOINT`),
+so the Temporal SDK's built-in worker/client metrics (`temporal_*` — task-queue
+schedule-to-start latency, worker slot availability, RPC failures, sticky cache)
+land in `AppMetrics` alongside the `mdk.*` ones. Fail-soft + opt-in:
+`_build_temporal_metrics_runtime()` returns `None` (→ default Runtime, unchanged)
+unless an OTLP endpoint AND an OTLP-bearing sink are configured, and on any build
+error. `temporal_*` names are exempt from the ADR-031 mdk-metric drift guard (it
+matches only `mdk.*`), so the workbook's new SDK panels (discovery table +
+task-slots + schedule-to-start + RPC-failures, all version-tolerant
+`startswith`/`has` queries) carry no `METRIC_NAMES` obligation. Remaining gap:
+per-workflow duration histograms (per-workflow timing lives in the Temporal Web UI).
+
 ## Compatibility (CLAUDE.md rule 5)
 Additive. One new OTel instrument (`mdk.workflow.completed`) — purely additive to
 the metric vocabulary; no existing metric changes. New worker-startup calls are

@@ -105,9 +105,72 @@
     {
       "type": 1,
       "content": {
-        "json": "## What this workbook does NOT show (yet)\n\nThis view is built on the workflow-completion counter, which is what mdk emits today for durable runs. The following Temporal **SDK / server** signals are not yet wired into the OTel pipeline and so are intentionally absent here:\n\n- **Task-queue backlog / schedule-to-start latency** — how long tasks wait before a worker picks them up (the key worker-saturation signal).\n- **Worker poll success rate / sticky-cache hit rate** — worker health beyond \"is the Container App running\".\n- **Per-workflow execution duration histogram** — for now, per-workflow timing lives in the **Temporal Web UI** (ADR 078 D6).\n\nWiring the Temporal SDK's built-in metrics into the same OTel Collector path (so they land in `AppMetrics` alongside the mdk instruments) is the natural follow-on; this workbook gains task-queue + worker-health panels when that lands."
+        "json": "## 5. Temporal SDK metrics (worker + task-queue health)\n\n**What.** The Temporal Python SDK's built-in worker/client telemetry, now exported to OTLP (ADR 082 follow-on, `mdk worker --backend temporal`) and landing in `AppMetrics` as `temporal_*` series. These cover the signals the completion counter can't: task-queue backlog (schedule-to-start latency), worker slot availability, and RPC health.\n\n**Note.** Exact series + attributes depend on the temporalio SDK version, so the queries below use `startswith` / `has` and a discovery table — they stay correct across SDK upgrades. If a panel is empty, the worker either predates this wiring or has no OTLP endpoint configured.\n\n**Requires.** The worker exports these only when an OTLP endpoint is set (`OTEL_EXPORTER_OTLP_ENDPOINT`) and the sink is OTLP/both — the same condition the `mdk.*` metrics use."
       },
-      "name": "gaps-note"
+      "name": "sdk-metrics-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name startswith \"temporal_\"\n| summarize Datapoints = count(), Last = max(TimeGenerated) by Name\n| order by Name asc",
+        "size": 0,
+        "title": "Available temporal_* SDK metrics (discovery — what's actually flowing)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "sdk-metrics-discovery"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name startswith \"temporal_worker_task_slots_available\"\n| summarize AvailableSlots = avg(Sum) by Name, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Worker task-slot availability (avg, 5m bins) — low/zero = worker saturated",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "sdk-task-slots"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name has \"schedule_to_start\"\n| summarize Latency = avg(Sum) by Name, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Schedule-to-start latency (task-queue backlog signal, 5m bins)",
+        "timeContext": {"durationMs": 21600000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "sdk-schedule-to-start"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name has \"request_failure\"\n| summarize Failures = sum(Sum) by Name, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Temporal RPC failures (client/worker → server, 15m bins)",
+        "timeContext": {"durationMs": 86400000},
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "sdk-request-failures"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Still elsewhere\n\n- **Per-workflow execution timeline / history / pending signals** — the **Temporal Web UI** (ADR 078 D6, `enableTemporalUi`). This workbook is aggregate trends; the Web UI is per-run drill-down.\n- **Per-workflow duration histogram** — derivable from the SDK metrics above once a stable activity/workflow-latency series is confirmed for your SDK version (see the discovery table)."
+      },
+      "name": "elsewhere-note"
     }
   ],
   "fallbackResourceIds": ["Azure Monitor"],

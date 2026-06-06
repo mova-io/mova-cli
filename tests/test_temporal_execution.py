@@ -62,6 +62,7 @@ from movate.core.workflow.temporal_activities import (  # noqa: E402
 )
 from movate.runtime.workflow_backend import (  # noqa: E402
     DEFAULT_TASK_QUEUE,
+    _build_temporal_metrics_runtime,
     load_compiled_workflow_class,
 )
 
@@ -579,3 +580,42 @@ async def test_temporal_human_node_durable_timeout_route(tmp_path: Path) -> None
     assert "approved_by" not in temporal_final
     assert temporal_final.get("step1") == "alpha"
     assert temporal_final.get("step2") == "beta"
+
+
+# ---------------------------------------------------------------------------
+# Temporal SDK metrics → OTel runtime builder (ADR 082 follow-on).
+# _build_temporal_metrics_runtime() must be fail-soft + opt-in: None unless an
+# OTLP endpoint AND an OTLP-bearing sink are configured; a real Runtime when both
+# are. No live server needed — Runtime construction only sets up core telemetry.
+# ---------------------------------------------------------------------------
+def test_metrics_runtime_none_without_otlp_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in (
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "MOVATE_TRACE_SINK",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    assert _build_temporal_metrics_runtime() is None
+
+
+def test_metrics_runtime_none_when_sink_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Endpoint present but the operator turned the sink off → no Temporal metrics
+    # (mirrors mdk's own metrics gate).
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setenv("MOVATE_TRACE_SINK", "none")
+    assert _build_temporal_metrics_runtime() is None
+
+
+def test_metrics_runtime_built_when_otlp_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setenv("MOVATE_TRACE_SINK", "otlp")
+    runtime = _build_temporal_metrics_runtime()
+    assert runtime is not None
+    # It's a real temporalio Runtime (used as Client.connect(runtime=...)).
+    from temporalio.runtime import Runtime  # noqa: PLC0415
+
+    assert isinstance(runtime, Runtime)
