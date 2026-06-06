@@ -879,6 +879,7 @@ class Executor:
         from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import workflow as _workflow_backend  # noqa: F401, PLC0415
 
         cfg = bundle.spec.retrieval
         auto_into = cfg.auto_into
@@ -1215,6 +1216,7 @@ class Executor:
         from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import workflow as _workflow_backend  # noqa: F401, PLC0415
 
         # LangChain backend — optional; only registers if mdk[langchain] is
         # installed. Missing extra is fine — skills with kind=langchain will
