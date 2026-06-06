@@ -161,6 +161,31 @@ async def test_project_id_stamped():
     assert all(r.project_id == "proj-1" for r in rels)
 
 
+@pytest.mark.asyncio
+async def test_resolve_existing_id_reconciles_endpoints():
+    """When the persistence layer reports a node already exists (e.g. extracted
+    earlier under a random uuid), the asserted node AND its relations reference
+    that existing id — not the deterministic content-hash id."""
+    nodes = [AssertNode(type="Incident", name="INC1"), AssertNode(type="Store", name="118")]
+    edges = [AssertEdge(src="INC1", dst="118", type="AT_STORE")]
+
+    store_hash = graph_assert._entity_hash("store-support", "devtenant", "118", "Store")
+
+    def resolver(content_hash: str) -> str | None:
+        # "118" was extracted earlier under this random uuid
+        return "extracted-uuid-118" if content_hash == store_hash else None
+
+    ents, rels = await _build(nodes, edges, resolve_existing_id=resolver)
+    by_name = {e.name: e for e in ents}
+    assert by_name["118"].entity_id == "extracted-uuid-118"
+    # content_hash is unchanged (still the deterministic dedup key)
+    assert by_name["118"].content_hash == store_hash
+    # the relation's endpoint follows the reconciled id, not the hash
+    assert rels[0].dst_entity_id == "extracted-uuid-118"
+    # an unreconciled node keeps its deterministic id
+    assert by_name["INC1"].entity_id == by_name["INC1"].content_hash
+
+
 def test_identity_contract_matches_graph_extract():
     """The dedup hashes MUST be byte-identical to graph_extract's, so an
     asserted node and an extracted node for the same (agent, tenant, name, type)

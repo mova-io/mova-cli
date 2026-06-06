@@ -40,7 +40,7 @@ self-consistent for the asserted set in isolation.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -103,6 +103,13 @@ def _norm(s: str) -> str:
     return " ".join(s.strip().lower().split())
 
 
+def normalize_name(s: str) -> str:
+    """Public alias of the internal name normalizer — for callers (e.g. the
+    assert endpoint's skip-report) that must match endpoint names the same way
+    the builder resolves them."""
+    return _norm(s)
+
+
 def _entity_hash(agent: str, tenant_id: str, name: str, type: str) -> str:
     return hashlib.sha256(f"{agent}|{tenant_id}|{_norm(name)}|{_norm(type)}".encode()).hexdigest()
 
@@ -129,6 +136,7 @@ async def build_asserted_graph(
     project_id: str | None = None,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     api_key: str | None = None,
+    resolve_existing_id: Callable[[str], str | None] | None = None,
 ) -> tuple[list[Entity], list[Relation]]:
     """Build deterministic, embedded graph records from structured facts.
 
@@ -145,6 +153,15 @@ async def build_asserted_graph(
         embedding_model: Model used to embed node text. MUST match what the KB
             chunks were embedded with so query-time cosine is comparable.
         api_key: Optional embedding key override; otherwise env resolution.
+        resolve_existing_id: Optional **cross-source reconciliation** hook
+            (``content_hash -> existing entity_id | None``). When a node already
+            exists — e.g. it was first created by *extraction* under a random
+            ``uuid4`` id — returning that id makes the asserted node AND its
+            relations reference the existing id, so the upsert merges cleanly
+            instead of leaving asserted edges dangling against the random id.
+            Default ``None`` uses the deterministic content-hash id (correct for
+            assert-first / assert-only nodes). Supplied by the persistence layer
+            (ADR 079 D2), which alone can see what's already stored.
 
     Returns:
         ``(entities, relations)`` ready to upsert. Entity ``entity_id`` and
@@ -193,10 +210,18 @@ async def build_asserted_graph(
     name_to_id: dict[str, str] = {}
     for accum, emb in zip(ordered, embeddings, strict=True):
         content_hash = _entity_hash(agent, tenant_id, accum.name, accum.type)
+        # Default to the deterministic content-hash id; if the persistence layer
+        # reports this node already exists (e.g. extracted earlier under a random
+        # uuid), reconcile onto that id so relations link to the stored row.
+        entity_id = content_hash
+        if resolve_existing_id is not None:
+            existing = resolve_existing_id(content_hash)
+            if existing:
+                entity_id = existing
         meta = {**accum.metadata, "source": "assert", "confidence": 1.0}
         entities.append(
             Entity(
-                entity_id=content_hash,  # deterministic — stable across re-asserts
+                entity_id=entity_id,  # deterministic, or reconciled to an existing id
                 tenant_id=tenant_id,
                 agent=agent,
                 project_id=project_id,
@@ -209,7 +234,7 @@ async def build_asserted_graph(
                 metadata=meta,
             )
         )
-        name_to_id.setdefault(_norm(accum.name), content_hash)
+        name_to_id.setdefault(_norm(accum.name), entity_id)
 
     relations = _build_relations(
         edges, name_to_id=name_to_id, agent=agent, tenant_id=tenant_id, project_id=project_id

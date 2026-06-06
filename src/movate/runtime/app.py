@@ -26,7 +26,6 @@ import hashlib
 import json
 import logging
 import os
-import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -301,6 +300,8 @@ from movate.runtime.schemas import (
     FeedbackSubmission,
     FeedbackView,
     GeneratedEvalCaseView,
+    GraphAssertRequest,
+    GraphAssertView,
     GraphCentralityView,
     GraphCommunitiesView,
     GraphologyView,
@@ -372,6 +373,7 @@ from movate.runtime.schemas import (
     SessionMessageView,
     SessionView,
     SkillCreatedView,
+    SkippedEdgeView,
     ThreadCreateSubmission,
     ThreadListView,
     ThreadMessageSubmission,
@@ -7822,6 +7824,111 @@ def build_app(
             min_confidence=min_confidence,
         )
         return GraphologyView.model_validate(doc.model_dump())
+
+    @v1.post(
+        "/projects/{project_id}/graph/assert",
+        response_model=GraphAssertView,
+        status_code=200,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("kb:write")],
+    )
+    async def v1_project_graph_assert(
+        project_id: str,
+        body: GraphAssertRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> GraphAssertView:
+        """Deterministically **assert** structured facts into the agent's graph
+        (ADR 079 D2) — the write counterpart to LLM extraction.
+
+        Where extraction *discovers* a probabilistic graph from prose, this
+        *writes* known nodes/edges with a guaranteed, searchable identity: a
+        node's ``content_hash`` dedups on ``(agent, tenant_id, content_hash)`` so
+        re-asserting **merges** instead of duplicating, and every asserted record
+        carries ``metadata.source = "assert"`` + ``confidence = 1.0`` (so it
+        survives the ADR 046 ``min_confidence`` floor and renders as "asserted"
+        in the UI). The first producer is the POS-demo call-ingest asserting a
+        ServiceNow incident + its store/lane/symptom edges.
+
+        Nodes are upserted **before** edges; an edge whose ``src`` / ``dst`` name
+        isn't in the asserted node set is **skipped and reported**, never fatal.
+        Cross-source reconciliation: a node previously created by *extraction*
+        (random ``entity_id``) is merged onto its existing id (looked up by
+        ``content_hash``) so asserted edges link to the stored row.
+
+        Tenant-scoped — records are stamped with the caller's tenant, so a write
+        can never land in another tenant's graph. Requires the ``kb:write``
+        scope. ``project_id`` (path) is the agent that owns the graph;
+        ``body.project_id`` is the optional ADR 046 D1 project tag.
+
+        Errors: **401** unauthed, **403** missing ``kb:write`` scope.
+        """
+        from movate.kb import graph_assert  # noqa: PLC0415 — lazy, matches kb usage
+
+        store: StorageProvider = request.app.state.storage
+        nodes = [
+            graph_assert.AssertNode(
+                type=n.type, name=n.name, description=n.description, metadata=n.metadata
+            )
+            for n in body.nodes
+        ]
+        edges = [
+            graph_assert.AssertEdge(
+                src=e.src,
+                dst=e.dst,
+                type=e.type,
+                description=e.description,
+                weight=e.weight,
+                metadata=e.metadata,
+            )
+            for e in body.edges
+        ]
+
+        # Reconciliation map: existing (content_hash -> entity_id) for this
+        # agent, so a node previously EXTRACTED under a random uuid merges onto
+        # that id (no new storage seam — reuses list_entities).
+        existing = await store.list_entities(
+            agent=project_id, tenant_id=ctx.tenant_id, limit=5000, project_id=body.project_id
+        )
+        hash_to_id = {e.content_hash: e.entity_id for e in existing}
+
+        entities, relations = await graph_assert.build_asserted_graph(
+            nodes,
+            edges,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            project_id=body.project_id,
+            resolve_existing_id=hash_to_id.get,
+        )
+        for ent in entities:
+            await store.upsert_entity(ent)
+        for rel in relations:
+            await store.upsert_relation(rel)
+
+        # Skip report: requested edges the builder dropped (unresolved endpoint
+        # or self-loop). Computed with the builder's own name normalization.
+        asserted = {graph_assert.normalize_name(n.name) for n in body.nodes}
+        skipped = [
+            SkippedEdgeView(
+                src=e.src,
+                dst=e.dst,
+                type=e.type,
+                reason=(
+                    "self-loop"
+                    if graph_assert.normalize_name(e.src) == graph_assert.normalize_name(e.dst)
+                    else "unresolved endpoint"
+                ),
+            )
+            for e in body.edges
+            if graph_assert.normalize_name(e.src) not in asserted
+            or graph_assert.normalize_name(e.dst) not in asserted
+            or graph_assert.normalize_name(e.src) == graph_assert.normalize_name(e.dst)
+        ]
+        return GraphAssertView(
+            applied_nodes=len(entities),
+            applied_edges=len(relations),
+            skipped_edges=skipped,
+        )
 
     @v1.get(
         "/graph/nodes/{node_id}",
@@ -16496,7 +16603,7 @@ def build_app(
             )
             r.raise_for_status()
             raw = r.json() or []
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
         def _summary(a: dict[str, object]) -> dict[str, object]:
@@ -16508,7 +16615,8 @@ def build_app(
                 "name": a.get("name") or "(unnamed)",
                 "description": (str(a.get("description") or ""))[:200],
                 "role": a.get("agent_role") or "",
-                "instructions_snippet": instructions[:280] + ("..." if len(instructions) > 280 else ""),
+                "instructions_snippet": instructions[:280]
+                + ("..." if len(instructions) > 280 else ""),
                 "tools": tool_names,
                 "features": a.get("features") or [],
             }
@@ -16537,16 +16645,19 @@ def build_app(
             )
             r.raise_for_status()
             a = r.json()
-            return {"ok": True, "agent": {
-                "id": a.get("_id"),
-                "name": a.get("name"),
-                "description": (str(a.get("description") or ""))[:200],
-                "role": a.get("agent_role") or "",
-                "instructions_snippet": (str(a.get("agent_instructions") or ""))[:280],
-                "tools": [t.get("name") for t in (a.get("tools") or []) if isinstance(t, dict)],
-                "features": a.get("features") or [],
-            }}
-        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": True,
+                "agent": {
+                    "id": a.get("_id"),
+                    "name": a.get("name"),
+                    "description": (str(a.get("description") or ""))[:200],
+                    "role": a.get("agent_role") or "",
+                    "instructions_snippet": (str(a.get("agent_instructions") or ""))[:280],
+                    "tools": [t.get("name") for t in (a.get("tools") or []) if isinstance(t, dict)],
+                    "features": a.get("features") or [],
+                },
+            }
+        except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
@@ -16555,12 +16666,42 @@ def build_app(
     # to a single default voice if the API is unreachable.
     # ------------------------------------------------------------------
     _OPENAI_VOICES = [
-        {"id": "alloy", "label": "Alloy", "description": "neutral, balanced", "use_case": "general support, default"},
-        {"id": "echo", "label": "Echo", "description": "calm, measured male", "use_case": "customer service, IVR"},
-        {"id": "fable", "label": "Fable", "description": "warm British accent", "use_case": "storytelling, training"},
-        {"id": "onyx", "label": "Onyx", "description": "deep, authoritative male", "use_case": "announcements, alerts"},
-        {"id": "nova", "label": "Nova", "description": "bright, friendly female", "use_case": "help desk, assistant"},
-        {"id": "shimmer", "label": "Shimmer", "description": "soft, expressive female", "use_case": "wellness, calm settings"},
+        {
+            "id": "alloy",
+            "label": "Alloy",
+            "description": "neutral, balanced",
+            "use_case": "general support, default",
+        },
+        {
+            "id": "echo",
+            "label": "Echo",
+            "description": "calm, measured male",
+            "use_case": "customer service, IVR",
+        },
+        {
+            "id": "fable",
+            "label": "Fable",
+            "description": "warm British accent",
+            "use_case": "storytelling, training",
+        },
+        {
+            "id": "onyx",
+            "label": "Onyx",
+            "description": "deep, authoritative male",
+            "use_case": "announcements, alerts",
+        },
+        {
+            "id": "nova",
+            "label": "Nova",
+            "description": "bright, friendly female",
+            "use_case": "help desk, assistant",
+        },
+        {
+            "id": "shimmer",
+            "label": "Shimmer",
+            "description": "soft, expressive female",
+            "use_case": "wellness, calm settings",
+        },
     ]
     _cartesia_cache: tuple[float, list[dict[str, str]]] | None = None
     _CARTESIA_TTL = 3600.0
@@ -16585,6 +16726,7 @@ def build_app(
             return []
         try:
             import httpx  # noqa: PLC0415
+
             r = httpx.get(
                 "https://api.cartesia.ai/voices/",
                 headers={"X-API-Key": key, "Cartesia-Version": "2024-06-10"},
@@ -16595,12 +16737,29 @@ def build_app(
         except Exception:
             return []
         SKIP = ("fairy", "gaming", "pikachu", "robot", "elf", "demon", "ghost", "alien")
-        PREFERRED = ("support", "professional", "natural", "conversational", "assistant",
-                     "warm", "friendly", "customer", "guide", "explainer")
-        en = [v for v in voices if isinstance(v, dict) and v.get("language") == "en"
-              and v.get("is_public") and v.get("id") and v.get("name")
-              and not any(s in (v.get("description") or "").lower() for s in SKIP)
-              and not any(s in (v.get("name") or "").lower() for s in SKIP)]
+        PREFERRED = (
+            "support",
+            "professional",
+            "natural",
+            "conversational",
+            "assistant",
+            "warm",
+            "friendly",
+            "customer",
+            "guide",
+            "explainer",
+        )
+        en = [
+            v
+            for v in voices
+            if isinstance(v, dict)
+            and v.get("language") == "en"
+            and v.get("is_public")
+            and v.get("id")
+            and v.get("name")
+            and not any(s in (v.get("description") or "").lower() for s in SKIP)
+            and not any(s in (v.get("name") or "").lower() for s in SKIP)
+        ]
 
         def score(v: dict) -> int:
             d = str(v.get("description") or "").lower()
@@ -16625,9 +16784,12 @@ def build_app(
             desc = str(v.get("description") or "").strip().rstrip(".")
             if len(desc) > 80:
                 desc = desc[:77] + "..."
-            return {"id": str(v["id"]), "label": f"{name} ({gs})",
-                    "description": desc or f"{gs} voice",
-                    "use_case": _classify_use_case(desc)}
+            return {
+                "id": str(v["id"]),
+                "label": f"{name} ({gs})",
+                "description": desc or f"{gs} voice",
+                "use_case": _classify_use_case(desc),
+            }
 
         return [norm(v) for v in picked]
 
@@ -16635,6 +16797,7 @@ def build_app(
     async def _tts_voices() -> dict[str, Any]:
         nonlocal _cartesia_cache
         import asyncio  # noqa: PLC0415
+
         cart_voices: list[dict[str, str]] = []
         now = _time_mod.monotonic()
         if _cartesia_cache and now - _cartesia_cache[0] < _CARTESIA_TTL:
@@ -16644,11 +16807,19 @@ def build_app(
             if cart_voices:
                 _cartesia_cache = (now, cart_voices)
         if not cart_voices:
-            cart_voices = [{"id": "a0e99841-438c-4a64-b679-ae501e7d6091",
-                           "label": "Clara (F)", "description": "Adapter default voice",
-                           "use_case": "general use"}]
-        return {"ok": True, "voices": {"openai": _OPENAI_VOICES, "cartesia": cart_voices},
-                "cartesia_live": bool(_cartesia_cache)}
+            cart_voices = [
+                {
+                    "id": "a0e99841-438c-4a64-b679-ae501e7d6091",
+                    "label": "Clara (F)",
+                    "description": "Adapter default voice",
+                    "use_case": "general use",
+                }
+            ]
+        return {
+            "ok": True,
+            "voices": {"openai": _OPENAI_VOICES, "cartesia": cart_voices},
+            "cartesia_live": bool(_cartesia_cache),
+        }
 
     # ------------------------------------------------------------------
     # GET / — Serve the voice demo app (examples/web_demo/index.html).
@@ -16660,8 +16831,17 @@ def build_app(
     _demo_html: str = ""
     _demo_candidates = [
         "/app/web_demo/index.html",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "index.html"),
-        os.path.join(os.environ.get("MOVATE_AGENTS_PATH", "/app/agents"), "..", "web_demo", "index.html"),
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "examples",
+            "web_demo",
+            "index.html",
+        ),
+        os.path.join(
+            os.environ.get("MOVATE_AGENTS_PATH", "/app/agents"), "..", "web_demo", "index.html"
+        ),
     ]
     for _p in _demo_candidates:
         _p = os.path.normpath(_p)
@@ -16676,7 +16856,9 @@ def build_app(
     # Mount /static for voice demo assets (logos, etc.).
     _static_candidates = [
         "/app/web_demo/static",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "static"),
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "static"
+        ),
     ]
     for _sp in _static_candidates:
         _sp = os.path.normpath(_sp)

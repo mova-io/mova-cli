@@ -80,11 +80,12 @@ POST /api/v1/projects/{project_id}/graph/assert      # write scope, tenant-scope
 → 200 { "applied": {"nodes": N, "edges": M}, "skipped": [...] }
 ```
 
-* **Write scope.** Gated by `require_scope(auth_dep, "write")` (ADR 013) — every
-  other graph endpoint today is `_scope("read")`; this is the first graph
-  **writer**, so it is explicitly write-scoped and **tenant-scoped** (a
-  cross-tenant `project_id` is rejected, never written — same no-leak rule as
-  the read endpoints).
+* **Write scope.** Gated by `_scope("kb:write")` (ADR 013) — the graph is part
+  of the KB, so it reuses the same `kb:write` scope as `POST …/agents/{name}/kb`
+  rather than inventing a new scope name. Every other graph endpoint today is
+  `_scope("read")`; this is the first graph **writer**. Records are stamped with
+  the caller's tenant, so a write can never land in another tenant's graph (same
+  no-leak rule as the read endpoints).
 * **Order + atomicity.** Nodes upserted before edges; an edge referencing a
   missing/!asserted node is **skipped and reported**, not fatal (partial-write
   failure mode is explicit, not silent). Per-request best-effort with a report.
