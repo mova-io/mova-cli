@@ -167,6 +167,23 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2023-12-01-preview' =
       source: 'user-override'
     }
   }
+
+  // Temporal's all-in-one server opens a persistence pool per internal service
+  // (frontend/history/matching/worker/internal-frontend) × store. Even with the
+  // small per-pool caps (SQL_MAX_CONNS=3 in containerapp-temporal.bicep) the
+  // startup burst peaks ~40 connections, which — plus the api/worker/temporal-
+  // worker stack and Azure's superuser-reserved slots — overruns the Burstable
+  // default max_connections=50 ("remaining connection slots are reserved for ...
+  // SUPERUSER"). Lift the ceiling when Temporal is deployed (B2s's 4 GB supports
+  // it comfortably). NOTE: max_connections is RESTART-REQUIRED — after a deploy
+  // that changes it, run `az postgres flexible-server restart` for it to apply.
+  resource maxConnections 'configurations@2023-12-01-preview' = if (createTemporalDatabases) {
+    name: 'max_connections'
+    properties: {
+      value: '150'
+      source: 'user-override'
+    }
+  }
 }
 
 @description('Server FQDN — used to build MDK_DB_URL.')
