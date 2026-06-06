@@ -376,6 +376,18 @@ async def _run_temporal_worker(
         raise typer.Exit(code=2) from None
 
     rt = await build_local_runtime(mock=mock)
+    # Initialize OTel metrics + log correlation + pool gauges at startup, exactly
+    # like the native worker above (_run_worker) — without this the Temporal
+    # worker emits NO metrics, so mdk.workflow.completed (ADR 082) and the
+    # asyncpg pool gauges would silently never export. All three are complete
+    # no-ops when the otel extra is absent / the OTLP sink is off; none raise.
+    from movate.cli._runtime import register_pool_observability  # noqa: PLC0415
+    from movate.tracing import init_metrics, install_log_correlation  # noqa: PLC0415
+
+    init_metrics()
+    install_log_correlation()
+    register_pool_observability(rt.storage)
+
     workflows = scan_workflows(workflows_path)
     temporal_wfs = {
         name: g for name, g in workflows.items() if getattr(g, "runtime", "native") == "temporal"

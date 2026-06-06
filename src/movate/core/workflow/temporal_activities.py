@@ -629,6 +629,24 @@ async def persist_workflow_result_activity(
     )
     await ctx.storage.save_workflow_run(record)
 
+    # Operational signal (ADR 082): durable workflows never hit the native
+    # dispatch edge that powers mdk.jobs.completed, so emit a first-class
+    # completion counter here for the Temporal workbook. Fail-soft + lazy import
+    # so a metrics hiccup never fails the terminal persist (the record above is
+    # the source of truth; the metric is best-effort telemetry). No-op when the
+    # OTLP sink is off / OTel absent.
+    try:
+        from movate.tracing import record_workflow_completed  # noqa: PLC0415
+
+        record_workflow_completed(
+            workflow=workflow_name,
+            status=record.status.value,
+            runtime="temporal",
+            tenant_id=record.tenant_id,
+        )
+    except Exception:  # pragma: no cover - telemetry must never break execution
+        pass
+
 
 __all__ = [
     "ActivityContext",

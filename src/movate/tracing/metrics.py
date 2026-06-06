@@ -83,6 +83,19 @@ METRIC_JOBS_IN_FLIGHT = "mdk.jobs.in_flight"
 METRIC_RUN_TOKENS = "mdk.run.tokens"
 METRIC_RUN_COST_USD = "mdk.run.cost_usd"
 
+# ADR 082 — durable-workflow completions. The native runner's terminal jobs are
+# already counted by ``mdk.jobs.completed{kind=WORKFLOW}`` at the dispatch edge,
+# but a Temporal-executed workflow NEVER goes through that edge: it runs in the
+# Temporal worker and emits only its activities' ``agent.execute`` spans. This
+# dedicated counter gives durable workflows a first-class completion signal —
+# emitted from the Temporal terminal activity (``persist_workflow_result_activity``).
+# Attrs: ``status`` (success/error), ``runtime`` (the backend that ran it —
+# currently always ``temporal`` here; the ``runtime`` dimension is forward-compat
+# so a native emitter can later share this instrument), ``workflow`` (the workflow
+# name — bounded, low-cardinality like ``kind``; NOT the run_id), ``tenant``.
+# Backs the Temporal operational workbook (throughput + success/failure rate).
+METRIC_WORKFLOW_COMPLETED = "mdk.workflow.completed"
+
 # ADR 034 D3 — Postgres connection-pool saturation. Observable gauges sampled
 # from the LIVE per-pod asyncpg pool at collection time (see
 # :func:`register_pool_metrics`), not recorded at a hot edge. The scale risk
@@ -117,6 +130,7 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_JOBS_IN_FLIGHT,
         METRIC_RUN_TOKENS,
         METRIC_RUN_COST_USD,
+        METRIC_WORKFLOW_COMPLETED,
         METRIC_DB_POOL_SIZE,
         METRIC_DB_POOL_IDLE,
         METRIC_DB_POOL_IN_USE,
@@ -148,6 +162,7 @@ class _State:
     jobs_in_flight: Any = None  # UpDownCounter[int]
     run_tokens: Any = None  # Counter[int]
     run_cost_usd: Any = None  # Counter[float]
+    workflow_completed: Any = None  # Counter[int]  (ADR 082)
     sse_connections_active: Any = None  # UpDownCounter[int]
 
     # ADR 034 D3 — DB pool observable gauges are registered lazily by
@@ -271,6 +286,15 @@ def init_metrics(*, reader: Any | None = None) -> None:
         METRIC_RUN_COST_USD,
         unit="usd",
         description="Total LLM cost (USD) of executed runs.",
+    )
+    _state.workflow_completed = meter.create_counter(
+        METRIC_WORKFLOW_COMPLETED,
+        unit="1",
+        description=(
+            "Durable workflows reaching a terminal status (success/error), "
+            "emitted from the Temporal terminal activity (ADR 082). Attrs: "
+            "workflow, status, runtime, tenant."
+        ),
     )
     _state.sse_connections_active = meter.create_up_down_counter(
         METRIC_SSE_CONNECTIONS_ACTIVE,
@@ -506,6 +530,39 @@ def record_run_usage(
         _state.run_cost_usd.add(float(cost_usd), {"tenant": tenant_id})
 
 
+def record_workflow_completed(
+    *,
+    workflow: str,
+    status: str,
+    runtime: str,
+    tenant_id: str,
+) -> None:
+    """Record one durable workflow reaching a terminal status (ADR 082).
+
+    Bumps ``mdk.workflow.completed`` (attrs: ``workflow``, ``status``,
+    ``runtime``, ``tenant``). ``status`` is the terminal
+    :class:`WorkflowStatus` value (``success`` / ``error``); ``runtime`` is the
+    backend that executed it (``temporal`` for the durable path that calls this).
+    ``workflow`` is the workflow *name* (bounded, low-cardinality — never the
+    run_id). No-op when metrics are off / OTel absent (the instrument is ``None``).
+
+    Emitted from the Temporal terminal activity so durable workflows — which
+    never hit the native dispatch edge that powers ``mdk.jobs.completed`` — get a
+    first-class throughput + success/failure signal for the operational workbook.
+    """
+    if _state.workflow_completed is None:
+        return
+    _state.workflow_completed.add(
+        1,
+        {
+            "workflow": workflow,
+            "status": status,
+            "runtime": runtime,
+            "tenant": tenant_id,
+        },
+    )
+
+
 def inc_in_flight(*, tenant_id: str) -> None:
     """Increment the in-flight job gauge (attrs: ``tenant``). No-op when off."""
     if _state.jobs_in_flight is None:
@@ -562,6 +619,7 @@ __all__ = [
     "METRIC_RUN_COST_USD",
     "METRIC_RUN_TOKENS",
     "METRIC_SSE_CONNECTIONS_ACTIVE",
+    "METRIC_WORKFLOW_COMPLETED",
     "PoolStatsCallback",
     "dec_in_flight",
     "dec_sse_connections",
@@ -570,5 +628,6 @@ __all__ = [
     "init_metrics",
     "record_job_completed",
     "record_run_usage",
+    "record_workflow_completed",
     "register_pool_metrics",
 ]
