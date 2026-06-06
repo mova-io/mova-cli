@@ -197,6 +197,31 @@ resource temporal 'Microsoft.App/containerApps@2024-03-01' = {
               name: 'SQL_TLS_SERVER_NAME'
               value: postgresFqdn
             }
+            // --- Connection-pool sizing (ADR 080 Tier-2 / Azure-PG fit).
+            // The all-in-one server opens a persistence pool PER internal service
+            // (frontend/history/matching/worker/internal-frontend) × store, so the
+            // default maxConns=20 bursts to 150+ connections at startup — far past
+            // the dev Burstable B1ms cap (max_connections=50), giving "remaining
+            // connection slots are reserved for ... SUPERUSER". Cap the pools small
+            // so Temporal fits alongside api/worker/temporal-worker. For real
+            // throughput, raise these AND move Postgres to a larger SKU (more
+            // max_connections) — see the runbook.
+            {
+              name: 'SQL_MAX_CONNS'
+              value: '3'
+            }
+            {
+              name: 'SQL_MAX_IDLE_CONNS'
+              value: '1'
+            }
+            {
+              name: 'SQL_VIS_MAX_CONNS'
+              value: '3'
+            }
+            {
+              name: 'SQL_VIS_MAX_IDLE_CONNS'
+              value: '1'
+            }
             {
               // Standard SQL visibility on Postgres — no Elasticsearch (D3).
               name: 'ENABLE_ES'
