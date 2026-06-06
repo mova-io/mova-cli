@@ -407,6 +407,7 @@ class TemporalCompiler:
             "        call_skill_activity,",
             "        call_gate_activity,",
             "        call_judge_activity,",
+            "        persist_workflow_result_activity,",
             "    )",
             "",
             "",
@@ -447,17 +448,25 @@ class TemporalCompiler:
             "        recorded activity results, so replay is deterministic.",
             '        """',
             "        state: dict[str, Any] = dict(initial_state)",
+            # Preserve the original input for the terminal record — the dispatch
+            # loop mutates ``state`` in place (ADR 080 D2).
+            "        _initial_state: dict[str, Any] = dict(initial_state)",
             "        run_id = workflow.info().workflow_id",
             f"        current: str | None = {spec.entrypoint!r}",
             "        # Cycle guard — mirrors the native runner; a revisited node means",
             "        # a non-deterministic loop the bounded patterns never produce.",
             "        visited: set[str] = set()",
-            "        while current is not None:",
-            "            if current in visited:",
-            "                raise ApplicationError(",
-            '                    f"workflow cycle detected at node {current!r}"',
-            "                )",
-            "            visited.add(current)",
+            # Terminal-persistence boundary (ADR 080 D2): the workflow writes its
+            # OWN terminal WorkflowRunRecord (success or handled error) so the mdk
+            # store stays accurate — the long-lived worker has no per-run
+            # completion callback. The dispatch loop is nested one level deeper.
+            "        try:",
+            "            while current is not None:",
+            "                if current in visited:",
+            "                    raise ApplicationError(",
+            '                        f"workflow cycle detected at node {current!r}"',
+            "                    )",
+            "                visited.add(current)",
         ]
 
         if has_human:
@@ -491,8 +500,10 @@ class TemporalCompiler:
             node = spec.nodes[nid]
             stmts, used = self._emit_node(nid, node, spec)
             keyword = "if" if first else "elif"
-            body_lines.append(f"            {keyword} current == {nid!r}:")
-            body_lines.extend(("                " + ln if ln else "") for ln in stmts)
+            # Branches live inside the terminal-persistence try/while, so they
+            # sit one indent level (+4) deeper than the Phase-1 layout.
+            body_lines.append(f"                {keyword} current == {nid!r}:")
+            body_lines.extend(("                    " + ln if ln else "") for ln in stmts)
             activity_names.update(used)
             first = False
 
@@ -500,15 +511,42 @@ class TemporalCompiler:
             # Defensive else — every route target / successor is a validated
             # node id, so this is unreachable in practice; it fails loud rather
             # than spinning the loop forever on an unknown id.
-            body_lines.append("            else:")
+            body_lines.append("                else:")
             body_lines.append(
-                '                raise ApplicationError(f"unknown workflow node {current!r}")'
+                '                    raise ApplicationError(f"unknown workflow node {current!r}")'
             )
         else:  # pragma: no cover — compile_workflow guarantees a valid entrypoint.
-            body_lines.append("            current = None")
+            body_lines.append("                current = None")
 
-        body_lines.append("")
-        body_lines.append("        return state")
+        # Terminal-persistence (ADR 080 D2). On success: write the SUCCESS
+        # record. On a handled failure: write ERROR then re-raise so Temporal
+        # still marks the run failed. The store write is a side effect, so it
+        # lives in an activity (ADR 054 D10). ``persist_workflow_result_activity``
+        # upserts on run_id, overwriting any prior PAUSED checkpoint.
+        body_lines += [
+            "            await workflow.execute_activity(",
+            "                persist_workflow_result_activity,",
+            (
+                f"                args=[run_id, 'success', _initial_state, state, None, "
+                f"{spec.name!r}, {spec.version!r}],"
+            ),
+            "                schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+            "                retry_policy=_RETRY_POLICY,",
+            "            )",
+            "            return state",
+            "        except Exception as _exc:",
+            "            await workflow.execute_activity(",
+            "                persist_workflow_result_activity,",
+            (
+                f"                args=[run_id, 'error', _initial_state, state, str(_exc), "
+                f"{spec.name!r}, {spec.version!r}],"
+            ),
+            "                schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+            "                retry_policy=_RETRY_POLICY,",
+            "            )",
+            "            raise",
+        ]
+        activity_names.add("persist_workflow_result_activity")
 
         source = "\n".join(header + body_lines) + "\n"
 

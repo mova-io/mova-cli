@@ -454,6 +454,9 @@ var langfuseUaiName = 'movate-${env}-langfuse-mi'
 // on enableTemporal, the UAI is created unconditionally (cold-deploy safety).
 var temporalName = 'movate-${env}-temporal'
 var temporalUaiName = 'movate-${env}-temporal-mi'
+// Temporal worker (ADR 080 D1) — the process that executes runtime:temporal
+// workflows. Reuses the native worker UAI (same image + secrets).
+var temporalWorkerName = 'movate-${env}-temporal-worker'
 // RG-scoped — no global-uniqueness suffix needed (App Insights component
 // names only have to be unique within the resource group).
 var appInsightsName = 'movate-${env}-appi'
@@ -815,6 +818,35 @@ module temporal 'modules/containerapp-temporal.bicep' = if (enableTemporal && en
     postgresFqdn: pg.outputs.serverFqdn
     postgresAdminUsername: pg.outputs.adminUsername
     image: temporalImage
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal worker (ADR 080 D1). Executes runtime:temporal workflows by polling
+// the Temporal task queue — without it, durable workflows compile + register but
+// never run. Gated on the SAME condition as the server; reuses the native worker
+// UAI (same image + AcrPull + KV-read). Connects to the server's internal FQDN
+// via TEMPORAL_HOST (the same value threaded into the api/worker above).
+// ---------------------------------------------------------------------------
+module temporalWorker 'modules/containerapp-temporal-worker.bicep' = if (enableTemporal && enableApiWorker) {
+  name: 'temporal-worker-${env}'
+  params: {
+    name: temporalWorkerName
+    location: location
+    environmentId: cae.outputs.envId
+    acrLoginServer: acr.outputs.loginServer
+    acrResourceId: acr.outputs.registryId
+    image: image
+    keyVaultUri: kv.outputs.vaultUri
+    postgresFqdn: pg.outputs.serverFqdn
+    postgresDatabase: pg.outputs.databaseName
+    postgresAdminUsername: pg.outputs.adminUsername
+    temporalHost: temporal!.outputs.temporalHost
+    userAssignedIdentityId: workerUai.id
+    langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    traceSink: appInsightsExportEnabled ? 'otlp' : ''
+    otelExporterEndpoint: appInsightsExportEnabled ? 'https://${otelCollector!.outputs.fqdn}' : ''
     tags: tags
   }
 }

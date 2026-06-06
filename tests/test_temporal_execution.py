@@ -58,6 +58,7 @@ from movate.core.workflow.temporal_activities import (  # noqa: E402
     call_judge_activity,
     call_skill_activity,
     configure_activities,
+    persist_workflow_result_activity,
 )
 from movate.runtime.workflow_backend import (  # noqa: E402
     DEFAULT_TASK_QUEUE,
@@ -367,6 +368,7 @@ async def test_temporal_smoke_matches_native(tmp_path: Path) -> None:
                 call_skill_activity,
                 call_gate_activity,
                 call_judge_activity,
+                persist_workflow_result_activity,
             ],
             workflow_runner=UnsandboxedWorkflowRunner(),
         ),
@@ -446,7 +448,7 @@ def _scaffold_with_human(
 
 
 def _human_worker(env: Any, workflow_cls: Any) -> Any:
-    """A Worker registering all five activities (incl. the pause-record one)."""
+    """A Worker registering every activity the compiled workflow may call."""
     return Worker(
         env.client,
         task_queue=DEFAULT_TASK_QUEUE,
@@ -457,6 +459,7 @@ def _human_worker(env: Any, workflow_cls: Any) -> Any:
             call_gate_activity,
             call_judge_activity,
             call_human_activity,
+            persist_workflow_result_activity,
         ],
         workflow_runner=UnsandboxedWorkflowRunner(),
     )
@@ -523,12 +526,16 @@ async def test_temporal_human_node_pause_resume_matches_native(tmp_path: Path) -
         await handle.signal("human_response", args=["approval", decision])
         temporal_final = await handle.result()
 
-    # The durable pause record was persisted (an operator could list it) and is
-    # tagged temporal so the signal endpoint routes the resume (ADR 062 D2).
-    pause_record = await temporal_storage.get_workflow_run("conformance-human-1", tenant_id="local")
-    assert pause_record is not None
-    assert pause_record.runtime == "temporal"
-    assert pause_record.human_task is not None and pause_record.human_task["approvers"] == []
+    # ADR 080 D2 — terminal-state sync: after the durable run resumes + completes,
+    # the store holds the TERMINAL record (SUCCESS, runtime temporal, final state),
+    # having overwritten the PAUSED checkpoint — so mdk runs show + the
+    # ?status=paused approvals list reflect reality.
+    final_record = await temporal_storage.get_workflow_run("conformance-human-1", tenant_id="local")
+    assert final_record is not None
+    assert final_record.runtime == "temporal"
+    assert final_record.status is WorkflowStatus.SUCCESS
+    assert final_record.final_state is not None
+    assert final_record.final_state.get("approved_by") == "alice"
 
     temporal_final.pop("tenant_id", None)
     assert temporal_final == native_result.final_state

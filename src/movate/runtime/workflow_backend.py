@@ -268,9 +268,11 @@ async def run_temporal_workflow(
     from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
         call_agent_activity,
         call_gate_activity,
+        call_human_activity,
         call_judge_activity,
         call_skill_activity,
         configure_activities,
+        persist_workflow_result_activity,
     )
 
     wf_id = workflow_run_id or str(uuid4())
@@ -317,6 +319,8 @@ async def run_temporal_workflow(
             call_skill_activity,
             call_gate_activity,
             call_judge_activity,
+            call_human_activity,
+            persist_workflow_result_activity,
         ],
         wf_id=wf_id,
         run_state=run_state,
@@ -428,17 +432,19 @@ async def run_temporal_worker(
     from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
         call_agent_activity,
         call_gate_activity,
+        call_human_activity,
         call_judge_activity,
         call_skill_activity,
         configure_activities,
+        persist_workflow_result_activity,
     )
 
     _require_temporal_extra()
     conn = _resolve_temporal_connection()
 
     # Compile every temporal-declared workflow to a registrable class. A
-    # workflow that fails to compile (e.g. a HUMAN node — Phase 2) is surfaced
-    # loudly rather than silently dropped.
+    # workflow that fails to compile (an unsupported node type — sub-workflow /
+    # function, ADR 054) is surfaced loudly rather than silently dropped.
     compiler = TemporalCompiler()
     workflow_classes: list[Any] = []
     registered: list[str] = []
@@ -479,6 +485,8 @@ async def run_temporal_worker(
             call_skill_activity,
             call_gate_activity,
             call_judge_activity,
+            call_human_activity,
+            persist_workflow_result_activity,
         ],
         # Run compiled workflows unsandboxed — the source is generated at
         # runtime (not a file the sandbox can re-import); determinism is

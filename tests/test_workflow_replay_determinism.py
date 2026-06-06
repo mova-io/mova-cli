@@ -50,6 +50,7 @@ from movate.core.workflow.temporal_activities import (  # noqa: E402
     call_judge_activity,
     call_skill_activity,
     configure_activities,
+    persist_workflow_result_activity,
 )
 from movate.providers.base import (  # noqa: E402
     BaseLLMProvider,
@@ -246,6 +247,7 @@ async def _run_and_capture_history(
                 call_skill_activity,
                 call_gate_activity,
                 call_judge_activity,
+                persist_workflow_result_activity,
             ],
             workflow_runner=UnsandboxedWorkflowRunner(),
         ),
