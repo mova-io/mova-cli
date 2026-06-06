@@ -30,9 +30,6 @@ param environmentId string
 @description('ACR login server.')
 param acrLoginServer string
 
-@description('ACR resource id.')
-param acrResourceId string
-
 @description('Image tag, e.g. movate:0.5.0 (same image as the api/worker).')
 param image string
 

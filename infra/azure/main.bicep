@@ -836,7 +836,6 @@ module temporalWorker 'modules/containerapp-temporal-worker.bicep' = if (enableT
     location: location
     environmentId: cae.outputs.envId
     acrLoginServer: acr.outputs.loginServer
-    acrResourceId: acr.outputs.registryId
     image: image
     keyVaultUri: kv.outputs.vaultUri
     postgresFqdn: pg.outputs.serverFqdn
