@@ -5085,13 +5085,32 @@ def build_app(
     # without touching the route. Each factory takes no args and returns a fresh
     # adapter per connection.
     def _default_voice_stt() -> Any:
+        # Provider selection via env wires the reserved ADR 048 D3 / ADR 049 seam
+        # to config. Default stays OpenAI Whisper (byte-for-byte today's behavior
+        # when MDK_VOICE_STT is unset). ``deepgram`` → Deepgram with OpenAI
+        # failover (uses DEEPGRAM_API_KEY; falls back to Whisper if it's absent).
         from movate.voice import OpenAIWhisperSTT  # noqa: PLC0415
 
+        if os.environ.get("MDK_VOICE_STT", "").strip().lower() == "deepgram":
+            from movate.voice import DeepgramSTT, FailoverSTT  # noqa: PLC0415
+
+            return FailoverSTT([DeepgramSTT(), OpenAIWhisperSTT()])
         return OpenAIWhisperSTT()
 
     def _default_voice_tts() -> Any:
+        # Default OpenAI TTS; ``cartesia`` / ``elevenlabs`` select that provider
+        # with OpenAI failover (uses CARTESIA_API_KEY / ELEVENLABS_API_KEY).
         from movate.voice import OpenAITTS  # noqa: PLC0415
 
+        sel = os.environ.get("MDK_VOICE_TTS", "").strip().lower()
+        if sel == "cartesia":
+            from movate.voice import CartesiaTTS, FailoverTTS  # noqa: PLC0415
+
+            return FailoverTTS([CartesiaTTS(), OpenAITTS()])
+        if sel == "elevenlabs":
+            from movate.voice import ElevenLabsTTS, FailoverTTS  # noqa: PLC0415
+
+            return FailoverTTS([ElevenLabsTTS(), OpenAITTS()])
         return OpenAITTS()
 
     app.state.voice_stt_factory = _default_voice_stt
@@ -12779,13 +12798,21 @@ def build_app(
            (``paused_node_id`` carried forward as the resume target, but
            ``status`` set to ``RUNNING`` so a re-signal hits the 409 in step
            2) — the worker reads this single source of truth.
-        5. Enqueues a continuation ``JobKind.WORKFLOW`` job carrying
-           ``resume_workflow_run_id``; the worker resumes the runner from the
-           gate's successor. Returns **202** ``{job_id, status}``.
+        5. Resumes the run on its owning backend (ADR 062 D2):
+           * **native** (default) — enqueues a continuation
+             ``JobKind.WORKFLOW`` job carrying ``resume_workflow_run_id``; the
+             worker resumes the runner from the gate's successor.
+           * **temporal** (``record.runtime == 'temporal'``) — signals the
+             durable run's Temporal handle (``human_response``); its
+             ``wait_condition`` resolves and the workflow continues in the
+             Temporal worker. No job is enqueued.
+           Returns **202** ``{job_id, status}`` either way (for the durable
+           path ``job_id`` is the run id and ``status`` is ``running``).
 
-        Control vs execution plane: the workflow is NOT run inline here — it
-        is enqueued, and the worker executes it. This is the contract a Teams
-        Adaptive Card button (ADR 003) would POST to in a later PR.
+        Control vs execution plane: the workflow is NOT run inline here — the
+        native run is enqueued and the durable run resumes itself; in both
+        cases the worker executes it. This is the contract a Teams Adaptive
+        Card button (ADR 003) would POST to in a later PR.
 
         Errors:
 
@@ -12847,6 +12874,49 @@ def build_app(
             }
         )
         await store.save_workflow_run(resumed_record)
+
+        # Resume — fork on the backend that owns this run (ADR 062 D2). One API,
+        # both backends, caller agnostic:
+        #   * temporal → signal the durable run's handle; its wait_condition
+        #     resolves and it continues in the Temporal worker. No job is
+        #     enqueued (the workflow resumes itself).
+        #   * native (default; runtime None/'native') → enqueue a
+        #     JobKind.WORKFLOW continuation the worker drives via runner.resume.
+        if record.runtime == "temporal":
+            from movate.runtime.workflow_backend import (  # noqa: PLC0415
+                WorkflowBackendError,
+                get_temporal_client,
+            )
+
+            try:
+                client = await get_temporal_client()
+                handle = client.get_workflow_handle(workflow_run_id)
+                await handle.signal(
+                    "human_response", args=[record.paused_node_id, dict(body.decision)]
+                )
+            except WorkflowBackendError as exc:
+                # The run is tagged temporal but this runtime has no Temporal
+                # connection configured (TEMPORAL_HOST unset) — a server-side
+                # misconfiguration, not a client error. Fail loud as 500.
+                raise http_error(
+                    ErrorCode.INTERNAL,
+                    status_code=500,
+                    message=(
+                        "this run is durable (runtime=temporal) but the Temporal "
+                        f"backend is not configured on this server: {exc}"
+                    ),
+                ) from exc
+            except Exception as exc:
+                # Missing / already-completed handle, transport error — the
+                # durable run can't be signaled. Fail loud as 409 rather than 500.
+                raise conflict(
+                    f"workflow_run {workflow_run_id!r} could not be signaled on the "
+                    "Temporal backend (the durable run may have already completed "
+                    f"or be unavailable): {exc}"
+                ) from exc
+            # No job to poll — the durable run resumes itself. Return the run id
+            # as the handle, RUNNING since the workflow is actively continuing.
+            return RunAccepted(job_id=workflow_run_id, status=JobStatus.RUNNING)
 
         job = JobRecord(
             job_id=str(uuid4()),

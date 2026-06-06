@@ -113,9 +113,30 @@ Workflows with no HUMAN node compile + run exactly as today. The native runner
 is untouched. The signal endpoint already exists (its shape is extended
 additively with the optional `node`/`fields`). New `workflow.yaml` HUMAN fields
 are optional with safe defaults. No storage-schema change beyond the pause
-record, which reuses the existing `workflow_run` row's state/status (a new
-`awaiting_human` status value — additive enum). No version bump in a PR
-(ADR 059).
+record, which reuses the existing `workflow_run` row's state/status. No version
+bump in a PR (ADR 059).
+
+## As built (2026-06-05)
+
+Three deviations from the decision text above, recorded honestly (CLAUDE.md §11):
+
+- **Pause status is the shipped `paused`, not a new `awaiting_human` enum
+  value.** Native HITL (ADR 017 D5) already lists paused approvals via
+  `GET …/workflow-runs?status=paused`; the Temporal HUMAN node reuses it, so no
+  `WorkflowStatus` enum change (and no `?status=` API surface change). Read
+  `awaiting_human` as `paused` throughout D3/D7.
+- **Backend-routed resume via a `runtime` field on `WorkflowRunRecord`** (new,
+  additive, nullable → old rows read native). The single signal endpoint reads
+  it to route the resume: `temporal` → signal the durable handle; native →
+  enqueue the continuation job. This is how "one resume API, both backends"
+  (D2) is realized without coupling the endpoint to the workflow registry.
+- **Gate-style `routes` on the HUMAN node are deferred.** The native runner
+  advances a resumed HUMAN node to its *sequential successor* (it does not
+  branch on the decision); to keep cross-backend parity (D5) the Temporal node
+  matches that. `approvers`, `timeout`, and `on_timeout` (D3/D4) shipped; the
+  durable timeout takes `on_timeout` (a Temporal-only capability — native has no
+  durable timer, so there is no parity to violate). Routed HUMAN branching would
+  need a matching native change and is left to a follow-up.
 
 ## Consequences
 

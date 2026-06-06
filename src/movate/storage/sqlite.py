@@ -620,6 +620,11 @@ _MIGRATIONS = [
     "ALTER TABLE workflow_runs ADD COLUMN paused_node_id TEXT",
     "ALTER TABLE workflow_runs ADD COLUMN paused_state TEXT",
     "ALTER TABLE workflow_runs ADD COLUMN human_task TEXT",
+    # ADR 062 D2: which backend owns this run. NULL on pre-migration rows and
+    # native runs → None → the resume-on-signal endpoint defaults to the native
+    # re-walk; only 'temporal' routes the resume to a Temporal signal. Additive
+    # + nullable, same backward-compatible story as the paused_* columns above.
+    "ALTER TABLE workflow_runs ADD COLUMN runtime TEXT",
     # ADR 017 D5 (PR 2): resume-on-signal. The signal endpoint enqueues a
     # JobKind.WORKFLOW continuation job carrying the workflow_run_id to resume
     # from; the worker reads this and calls WorkflowRunner.resume. Nullable —
@@ -3127,8 +3132,8 @@ class SqliteProvider:
             INSERT INTO workflow_runs (
                 workflow_run_id, tenant_id, workflow, workflow_version,
                 status, initial_state, final_state, error_node_id, error,
-                created_at, paused_node_id, paused_state, human_task
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, paused_node_id, paused_state, human_task, runtime
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(workflow_run_id) DO UPDATE SET
                 tenant_id        = excluded.tenant_id,
                 workflow         = excluded.workflow,
@@ -3141,7 +3146,8 @@ class SqliteProvider:
                 created_at       = excluded.created_at,
                 paused_node_id   = excluded.paused_node_id,
                 paused_state     = excluded.paused_state,
-                human_task       = excluded.human_task
+                human_task       = excluded.human_task,
+                runtime          = excluded.runtime
             """,
             (
                 w.workflow_run_id,
@@ -3157,6 +3163,7 @@ class SqliteProvider:
                 w.paused_node_id,
                 json.dumps(w.paused_state) if w.paused_state is not None else None,
                 json.dumps(w.human_task) if w.human_task is not None else None,
+                w.runtime,
             ),
         )
         await self._db.commit()
@@ -5649,6 +5656,8 @@ def _row_to_workflow_run(row: aiosqlite.Row) -> WorkflowRunRecord:
         paused_node_id=row["paused_node_id"],
         paused_state=json.loads(row["paused_state"]) if row["paused_state"] else None,
         human_task=json.loads(row["human_task"]) if row["human_task"] else None,
+        # ADR 062 D2: backend owner. NULL on pre-migration / native rows → None.
+        runtime=row["runtime"],
     )
 
 
