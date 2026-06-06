@@ -165,15 +165,37 @@ resource temporal 'Microsoft.App/containerApps@2024-03-01' = {
               name: 'SKIP_SCHEMA_SETUP'
               value: 'false'
             }
+            // --- TLS to Azure Postgres (which mandates SSL: require_secure_transport=on).
+            // auto-setup uses TWO env prefixes for TLS, and BOTH must be set:
+            //   * POSTGRES_TLS_* — read by the SCHEMA SETUP tool (temporal-sql-tool).
+            //   * SQL_TLS_*      — read by the SERVER's config_template.yaml for its
+            //                      runtime persistence connection.
+            // We previously set only POSTGRES_TLS_*, so schema setup worked over SSL
+            // but the server connected WITHOUT TLS → Postgres rejected it ("no usable
+            // database connection"). Both stores' runtime connections need SQL_TLS_*.
+            // Host verification is OFF (TLS-encrypted but no CA verification — same
+            // posture as the apps' sslmode=require); this lets require_secure_transport
+            // stay ON without bundling Azure's CA cert.
             {
-              // Azure Postgres mandates SSL; the server cert is Azure's, so
-              // skip host verification (the network boundary is the control).
               name: 'POSTGRES_TLS_ENABLED'
               value: 'true'
             }
             {
               name: 'POSTGRES_TLS_DISABLE_HOST_VERIFICATION'
               value: 'true'
+            }
+            {
+              name: 'SQL_TLS_ENABLED'
+              value: 'true'
+            }
+            {
+              name: 'SQL_TLS_ENABLE_HOST_VERIFICATION'
+              value: 'false'
+            }
+            {
+              // SNI / server name for the TLS handshake to Azure PG.
+              name: 'SQL_TLS_SERVER_NAME'
+              value: postgresFqdn
             }
             {
               // Standard SQL visibility on Postgres — no Elasticsearch (D3).

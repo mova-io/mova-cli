@@ -78,16 +78,23 @@ startup.
      `runtime: temporal`, final state present, and it's **gone from the paused
      list** (terminal-state sync, ADR 080 D2).
 
-## Known spike items (validate on first deploy — ADR 078/080 D3)
-- **ACA internal TCP ingress ↔ gRPC :7233.** If the worker can't reach the
-  server, confirm the server app's ingress is `transport: tcp`, `exposedPort:
-  7233`, `external: false`, and that `TEMPORAL_HOST` resolves to the internal
-  FQDN. Fallback: switch the server ingress to `transport: http2` and set
-  `TEMPORAL_HOST=<fqdn>:443` (no code change; both ride ADR 054 D5).
-- **auto-setup Postgres TLS.** Azure Postgres requires SSL. If schema setup
-  fails on TLS, check the `POSTGRES_TLS_ENABLED` / `POSTGRES_TLS_DISABLE_HOST_VERIFICATION`
-  env names against the pinned `temporalio/auto-setup` tag and adjust in
-  `containerapp-temporal.bicep`.
+## Resolved on first deploy (validated against movate-dev, ADR 078/080 D3)
+- **ACA internal TCP ingress ↔ gRPC :7233 — WORKS.** The worker connected to
+  `movate-dev-temporal.internal…:7233` over the `transport: tcp` internal ingress.
+- **Azure Postgres extension allow-list.** The visibility schema needs
+  `btree_gin` + `pg_trgm`; Azure blocks `CREATE EXTENSION` until allow-listed in
+  `azure.extensions`. Fixed in `postgres.bicep` (`createTemporalDatabases` adds
+  `BTREE_GIN,PG_TRGM` alongside `VECTOR`).
+- **auto-setup TLS uses TWO env prefixes (the subtle one).** Azure PG mandates
+  SSL (`require_secure_transport=on`). The schema **setup tool** reads
+  `POSTGRES_TLS_*`; the **server's** runtime config reads `SQL_TLS_*`. Setting
+  only `POSTGRES_TLS_*` makes schema setup succeed over SSL but the server
+  connect *without* TLS → Postgres rejects it ("no usable database connection").
+  Fixed in `containerapp-temporal.bicep`: also set `SQL_TLS_ENABLED=true`,
+  `SQL_TLS_ENABLE_HOST_VERIFICATION=false`, `SQL_TLS_SERVER_NAME=<pg-fqdn>`.
+  (Quick unblock if you hit this before the fix lands: temporarily
+  `az postgres flexible-server parameter set … --name require_secure_transport
+  --value off`, then re-enable once the `SQL_TLS_*` env is deployed.)
 
 ## Limits (v1)
 - The server is a **single non-HA replica** (ADR 078 D6): a restart briefly
