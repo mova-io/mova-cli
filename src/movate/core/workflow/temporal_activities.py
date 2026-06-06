@@ -584,6 +584,26 @@ async def call_human_activity(
     )
     await ctx.storage.save_workflow_run(record)
 
+    # Escalate to the approval channel (ADR 083) — parity with the native
+    # runner's HUMAN-pause branch. Fire-and-forget + never raises (side effects
+    # in activities, ADR 054 D10; the pause is already persisted). No-op until
+    # MOVATE_NOTIFIER is configured.
+    from movate.core.notifier import HumanPause, notify_human_pause_safe  # noqa: PLC0415
+
+    await notify_human_pause_safe(
+        HumanPause(
+            run_id=run_id,
+            workflow_name=workflow_name,
+            workflow_version=workflow_version,
+            node_id=node_id,
+            prompt=prompt,
+            output_contract=list(output_contract),
+            approvers=list(approvers),
+            tenant_id=record.tenant_id,
+            runtime="temporal",
+        )
+    )
+
 
 @_activity.defn  # type: ignore[untyped-decorator]
 async def persist_workflow_result_activity(
