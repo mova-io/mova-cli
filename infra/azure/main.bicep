@@ -251,6 +251,24 @@ param enableTemporal bool = false
 param temporalImage string = 'temporalio/auto-setup:1.25.2'
 
 @description('''
+Deploy the Temporal Web UI (ADR 078 D6) — browse workflows, histories, task
+queues, and pending signals instead of grepping container logs. Gated off by
+default. Requires enableTemporal=true (it connects to the self-hosted frontend).
+
+⚠ The UI is UNAUTHENTICATED and exposes all workflow data. Default ingress is
+INTERNAL (reach it via the CAE / a port-forward). Flip ``temporalUiExternal``
+true ONLY for a dev/POC where public exposure of workflow data is acceptable —
+prefer IP restrictions / SSO otherwise.
+''')
+param enableTemporalUi bool = false
+
+@description('Temporal Web UI image (ADR 078 D6). PIN a tag — never :latest.')
+param temporalUiImage string = 'temporalio/ui:2.34.0'
+
+@description('Expose the Temporal Web UI publicly (external ingress). Default false = internal-only. See enableTemporalUi warning.')
+param temporalUiExternal bool = false
+
+@description('''
 Provision a workspace-linked Application Insights component and route the
 runtime's OpenTelemetry traces to it through an in-cluster OpenTelemetry
 Collector. When true AND ``appInsightsConnectionString`` is non-empty:
@@ -463,6 +481,9 @@ var temporalUaiName = 'movate-${env}-temporal-mi'
 // Temporal worker (ADR 080 D1) — the process that executes runtime:temporal
 // workflows. Reuses the native worker UAI (same image + secrets).
 var temporalWorkerName = 'movate-${env}-temporal-worker'
+// Temporal Web UI (ADR 078 D6) — RG-scoped; gated on enableTemporalUi. Public
+// image, no UAI needed.
+var temporalUiName = 'movate-${env}-temporal-ui'
 // RG-scoped — no global-uniqueness suffix needed (App Insights component
 // names only have to be unique within the resource group).
 var appInsightsName = 'movate-${env}-appi'
@@ -857,6 +878,28 @@ module temporalWorker 'modules/containerapp-temporal-worker.bicep' = if (enableT
 }
 
 // ---------------------------------------------------------------------------
+// Temporal Web UI (ADR 078 D6). Browse workflows / histories / pending signals
+// in a browser instead of grepping logs. Gated on enableTemporalUi AND the same
+// enableTemporal && enableApiWorker that bring up the server it connects to.
+// Public temporalio/ui image (no UAI / registries). Connects to the frontend's
+// internal gRPC FQDN (temporalHost = <fqdn>:7233). Internal ingress by default;
+// temporalUiExternal flips it public (unauthenticated — dev/POC only).
+// ---------------------------------------------------------------------------
+module temporalUi 'modules/containerapp-temporal-ui.bicep' = if (enableTemporalUi && enableTemporal && enableApiWorker) {
+  name: 'temporal-ui-${env}'
+  params: {
+    name: temporalUiName
+    location: location
+    environmentId: cae.outputs.envId
+    temporalAddress: temporal!.outputs.temporalHost
+    image: temporalUiImage
+    external: temporalUiExternal
+    publicUrl: temporalUiExternal ? 'https://${temporalUiName}.${cae.outputs.defaultDomain}' : ''
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OpenTelemetry Collector (ADR 020) — the in-cluster bridge that exports the
 // runtime's generic OTLP traces to Application Insights via the collector's
 // `azuremonitor` exporter. Replaces the (unsupported-on-live-ACA) managed-OTel
@@ -1207,6 +1250,9 @@ output playgroundUrl string = (enablePlayground && enableApiWorker) ? playground
 
 @description('Self-hosted Langfuse URL. Empty when deployLangfuse=false. Open it to create a project + mint keys, then store them in KV as langfuse-public-key / langfuse-secret-key.')
 output langfuseUrl string = deployLangfuse ? langfuse!.outputs.publicUrl : ''
+
+@description('Temporal Web UI URL. Empty when enableTemporalUi=false OR the UI is internal-only (temporalUiExternal=false → reach it via the CAE / a port-forward).')
+output temporalUiUrl string = (enableTemporalUi && enableTemporal && enableApiWorker) ? temporalUi!.outputs.url : ''
 
 @description('App Insights component name. Empty when enableAppInsights=false. The connection string is intentionally NOT output (it carries an ingestion key).')
 output appInsightsName string = enableAppInsights ? appInsights!.outputs.name : ''
