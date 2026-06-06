@@ -21,6 +21,11 @@
 set -euo pipefail
 
 # --- config (override via env) ----------------------------------------------
+# Existing-server redeploy → pass an EMPTY admin password so the pg module omits
+# the property and Azure RETAINS the current password (avoids the reset footgun).
+# To create a NEW server or rotate the password, run the deployment directly with
+# postgresAdminPassword set, not this script.
+PG_ADMIN_PASSWORD="${PG_ADMIN_PASSWORD:-}"
 RG="${RG:-movate-dev-rg}"
 ACR="${ACR:-movatedevacrmvt}"
 BICEP="${BICEP:-infra/azure/main.bicep}"
@@ -46,7 +51,7 @@ fi
 
 echo "▸ Deploying ${BICEP} to ${RG} (enableTemporal=true, image=${IMAGE}) ..."
 STATE=$(az deployment group create -g "$RG" -f "$BICEP" -p "$PARAMS" \
-  --parameters enableTemporal=true image="$IMAGE" \
+  --parameters enableTemporal=true image="$IMAGE" postgresAdminPassword="$PG_ADMIN_PASSWORD" \
   --query "properties.provisioningState" -o tsv)
 echo "  deployment: ${STATE}"
 [ "$STATE" = "Succeeded" ] || { echo "✗ deployment did not succeed" >&2; exit 1; }

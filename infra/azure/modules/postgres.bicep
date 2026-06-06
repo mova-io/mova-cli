@@ -33,9 +33,19 @@ param backupRetentionDays int = 7
 @description('Database admin username.')
 param adminUsername string = 'movateadmin'
 
-@description('Admin password — pulled from Key Vault by main.bicep, never in source.')
+@description('''
+Admin password. Pulled from Key Vault by main.bicep, never in source.
+
+LEAVE EMPTY on redeploys of an EXISTING server: an empty value omits the
+`administratorLoginPassword` property entirely, and Azure RETAINS the current
+password on update. Set it only to (a) create a new server or (b) intentionally
+rotate the password. This prevents the footgun where every redeploy reset the
+admin password to a param literal that had drifted from the `pg-admin-password`
+Key Vault secret the apps authenticate with — silently breaking PG auth for the
+whole stack (api/worker/temporal).
+''')
 @secure()
-param adminPassword string
+param adminPassword string = ''
 
 @description('Default database name to create.')
 param databaseName string = 'movate'
@@ -60,37 +70,44 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2023-12-01-preview' =
     name: skuName
     tier: skuTier
   }
-  properties: {
-    version: postgresVersion
-    administratorLogin: adminUsername
-    administratorLoginPassword: adminPassword
-    storage: {
-      storageSizeGB: storageSizeGB
-      // Auto-grow ON: never page an operator at 3am because the disk
-      // filled up. Costs slightly more than a fixed disk that's right-sized,
-      // but page-prevention is worth it.
-      autoGrow: 'Enabled'
+  // ``administratorLoginPassword`` is included ONLY when adminPassword is set
+  // (union merges it in). On an existing-server update, omitting it makes Azure
+  // RETAIN the current password — so redeploys no longer reset it (the footgun).
+  properties: union(
+    {
+      version: postgresVersion
+      administratorLogin: adminUsername
+      storage: {
+        storageSizeGB: storageSizeGB
+        // Auto-grow ON: never page an operator at 3am because the disk
+        // filled up. Costs slightly more than a fixed disk that's right-sized,
+        // but page-prevention is worth it.
+        autoGrow: 'Enabled'
+      }
+      backup: {
+        backupRetentionDays: backupRetentionDays
+        geoRedundantBackup: 'Disabled' // v1.0 single-region; revisit at v1.1
+      }
+      network: {
+        // Public access; firewall rules below restrict to Azure Services.
+        publicNetworkAccess: 'Enabled'
+      }
+      highAvailability: {
+        // Burstable doesn't support HA; GP does. Operators flip this when
+        // they upgrade SKU.
+        mode: 'Disabled'
+      }
+      authConfig: {
+        // Password auth for now. Microsoft Entra ID auth is a v1.1 win
+        // (eliminates the admin password entirely).
+        passwordAuth: 'Enabled'
+        activeDirectoryAuth: 'Disabled'
+      }
+    },
+    empty(adminPassword) ? {} : {
+      administratorLoginPassword: adminPassword
     }
-    backup: {
-      backupRetentionDays: backupRetentionDays
-      geoRedundantBackup: 'Disabled' // v1.0 single-region; revisit at v1.1
-    }
-    network: {
-      // Public access; firewall rules below restrict to Azure Services.
-      publicNetworkAccess: 'Enabled'
-    }
-    highAvailability: {
-      // Burstable doesn't support HA; GP does. Operators flip this when
-      // they upgrade SKU.
-      mode: 'Disabled'
-    }
-    authConfig: {
-      // Password auth for now. Microsoft Entra ID auth is a v1.1 win
-      // (eliminates the admin password entirely).
-      passwordAuth: 'Enabled'
-      activeDirectoryAuth: 'Disabled'
-    }
-  }
+  )
 
   resource db 'databases@2023-12-01-preview' = {
     name: databaseName

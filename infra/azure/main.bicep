@@ -39,9 +39,15 @@ param location string = resourceGroup().location
 @description('Container image (e.g. movate:0.5.0). Pushed to ACR before this deployment runs.')
 param image string
 
-@description('Postgres admin password. Should be a Key Vault reference in the bicepparam file.')
+@description('''
+Postgres admin password (Key Vault reference in the bicepparam file). REQUIRED on
+the first deploy of a new server (and to rotate); LEAVE EMPTY on redeploys of an
+existing server so the current password is retained (postgres.bicep omits the
+property when empty). Passing a value on every redeploy is the footgun that reset
+the password out from under the apps — deploy-temporal.sh passes empty by default.
+''')
 @secure()
-param postgresAdminPassword string
+param postgresAdminPassword string = ''
 
 @description('Tags applied to every resource.')
 param tags object = {
