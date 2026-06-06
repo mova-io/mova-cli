@@ -148,10 +148,22 @@ resource server 'Microsoft.DBforPostgreSQL/flexibleServers@2023-12-01-preview' =
   // at boot (PostgresProvider._ensure_pgvector). `azure.extensions` is a
   // dynamic parameter, so this takes effect without a server restart.
   // See docs/adr/009-pgvector-kb-storage.md.
-  resource extensionsAllowlist 'configurations@2023-12-01-preview' = if (enablePgvector) {
+  resource extensionsAllowlist 'configurations@2023-12-01-preview' = if (enablePgvector || createTemporalDatabases) {
     name: 'azure.extensions'
     properties: {
-      value: 'VECTOR'
+      // pgvector (KB, ADR 009) PLUS the extensions Temporal's visibility store
+      // needs — btree_gin + pg_trgm back its GIN search-attribute indexes
+      // (ADR 078). Azure Postgres blocks CREATE EXTENSION until named here;
+      // azure.extensions is a dynamic parameter, so this applies without a
+      // server restart. The Temporal auto-setup container retries schema setup
+      // on its next start once these are allow-listed.
+      value: join(
+        concat(
+          enablePgvector ? ['VECTOR'] : [],
+          createTemporalDatabases ? ['BTREE_GIN', 'PG_TRGM'] : []
+        ),
+        ','
+      )
       source: 'user-override'
     }
   }

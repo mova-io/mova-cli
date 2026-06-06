@@ -28,15 +28,21 @@ PARAMS="${PARAMS:-infra/azure/main.dev.bicepparam}"
 TEMPORAL_APP="${TEMPORAL_APP:-movate-dev-temporal}"
 # Unique, traceable image tag from git → forces fresh revisions every deploy
 # (so apps re-read Key Vault secrets) and ties the running image to a commit.
+# Override IMAGE to deploy a specific existing tag; set SKIP_BUILD=1 for an
+# infra-only redeploy (e.g. a bicep change) that doesn't need a fresh image.
 TAG="${TAG:-0.7.0-temporal-$(git rev-parse --short HEAD 2>/dev/null || echo manual)}"
-IMAGE="movate:${TAG}"
+IMAGE="${IMAGE:-movate:${TAG}}"
 
 command -v az >/dev/null || { echo "✗ az CLI not found" >&2; exit 1; }
 az account show >/dev/null 2>&1 || { echo "✗ not logged in — run 'az login'" >&2; exit 1; }
 [ -f "$BICEP" ] || { echo "✗ $BICEP not found — run from the repo root" >&2; exit 1; }
 
-echo "▸ Building ${IMAGE} in ${ACR} (this uploads the current checkout) ..."
-az acr build -r "$ACR" -t "$IMAGE" -f Dockerfile .
+if [ -n "${SKIP_BUILD:-}" ]; then
+  echo "▸ SKIP_BUILD set — deploying existing image ${IMAGE} (no rebuild)"
+else
+  echo "▸ Building ${IMAGE} in ${ACR} (this uploads the current checkout) ..."
+  az acr build -r "$ACR" -t "$IMAGE" -f Dockerfile .
+fi
 
 echo "▸ Deploying ${BICEP} to ${RG} (enableTemporal=true, image=${IMAGE}) ..."
 STATE=$(az deployment group create -g "$RG" -f "$BICEP" -p "$PARAMS" \
