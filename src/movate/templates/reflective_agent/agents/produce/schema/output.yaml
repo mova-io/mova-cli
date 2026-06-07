@@ -1,0 +1,20 @@
+# ============================================================================
+# Produce node — output schema
+# ============================================================================
+# The produce node emits an `answer` string that is merged back into the
+# workflow state for the downstream JUDGE node to grade.
+
+version: 1
+type: object
+
+title: Produce Node Output
+
+fields:
+
+  answer:
+    type: string
+    description: The 2-4 sentence answer, graded by the judge and revised on a revise verdict.
+    example: Short feedback loops let teams catch problems early and correct course cheaply.
+
+required:
+  - answer
