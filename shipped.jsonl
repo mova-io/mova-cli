@@ -13,3 +13,6 @@
 {"version": "2026.5.30.6", "pr": 619, "id": "demo-runbook-doctor", "title": "Bulletproof demo flow — one-command seed + demo doctor + runbook"}
 {"version": "2026.5.30.6", "pr": 620, "id": "mission-control-dashboard", "title": "Mission-control single-pane operator dashboard"}
 {"version": "2026.5.30.6", "pr": 621, "id": "graph-viz-live-growth", "title": "Knowledge-graph viz — paced live growth + confidence dimming + centrality cues"}
+{"version": "2026.5.30.7", "pr": 623, "id": "replay-cli", "title": "Workflow replay CLI — deterministic re-execution from event history"}
+{"version": "2026.5.30.7", "pr": 625, "id": "temporal-conformance-suite", "title": "Temporal conformance suite — parity across native/LangGraph/Temporal backends"}
+{"version": "2026.6.7.1", "pr": 710, "id": "durable-hitl", "title": "Durable HITL on Temporal (HUMAN node — durable pause/resume)"}

@@ -10,6 +10,9 @@ Generated from `roadmap.yaml` (intent) + `shipped.jsonl` (CalVer-keyed ship ledg
 
 | id | title | PR | shipped_version |
 | --- | --- | --- | --- |
+| `durable-hitl` | Durable HITL on Temporal (HUMAN node — durable pause/resume) | #710 | 2026.6.7.1 |
+| `temporal-conformance-suite` | Temporal conformance suite — parity across native/LangGraph/Temporal backends | #625 | 2026.5.30.7 |
+| `replay-cli` | Workflow replay CLI — deterministic re-execution from event history | #623 | 2026.5.30.7 |
 | `graph-viz-live-growth` | Knowledge-graph viz — paced live growth + confidence dimming + centrality cues | #621 | 2026.5.30.6 |
 | `mission-control-dashboard` | Mission-control single-pane operator dashboard | #620 | 2026.5.30.6 |
 | `demo-runbook-doctor` | Bulletproof demo flow — one-command seed + demo doctor + runbook | #619 | 2026.5.30.6 |
@@ -36,7 +39,6 @@ Generated from `roadmap.yaml` (intent) + `shipped.jsonl` (CalVer-keyed ship ledg
 
 - `alert-routing` — Observability alert routing — thresholded insights to operator channels
 - `dead-letter-mgmt` — Dead-letter management — inspect, retry, and purge failed jobs
-- `durable-hitl` — Durable HITL on Temporal (HUMAN node — durable pause/resume) (ADR 054)
 - `graphrag-storage-protocol` — GraphRAG behind the StorageProvider Protocol (SQLite + Postgres, Neo4j optional) (ADR 046)
 - `ltm-agent-yaml-config` — Long-term memory — agent.yaml memory: block composing with retrieval: (long_term kinds/scope/pii_policy) (ADR 086)
 - `ltm-audit-injection` — Long-term memory — auditable injection: recall event via the tracer seam + queryable recall row (ADR 086)
@@ -47,9 +49,7 @@ Generated from `roadmap.yaml` (intent) + `shipped.jsonl` (CalVer-keyed ship ledg
 - `ltm-storage-protocol` — Long-term memory — memory_items on the StorageProvider Protocol (SQLite + Postgres/pgvector), tenant/user/agent scoped (ADR 086)
 - `nl-query` — Natural-language query over observability + graph (ADR 047) (ADR 047)
 - `production-hardening` — Production hardening — retries, timeouts, backpressure, partial-failure recovery
-- `replay-cli` — Workflow replay CLI — deterministic re-execution from event history (ADR 054)
 - `temporal-composition` — Temporal workflow composition — child workflows + signals across agents (ADR 054)
-- `temporal-conformance-suite` — Temporal conformance suite — parity across native/LangGraph/Temporal backends (ADR 055)
 
 ## Blocked-by
 

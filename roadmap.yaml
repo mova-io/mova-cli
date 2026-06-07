@@ -140,19 +140,25 @@ items:
 
   - id: durable-hitl
     title: "Durable HITL on Temporal (HUMAN node — durable pause/resume)"
-    status: planned
-    adr: "054"
+    status: shipped
+    pr: 710
+    shipped_version: 2026.6.7.1
+    adr: "062"
     depends_on: [temporal-exec-backend]
 
   - id: temporal-conformance-suite
     title: "Temporal conformance suite — parity across native/LangGraph/Temporal backends"
-    status: planned
+    status: shipped
+    pr: 625
+    shipped_version: 2026.5.30.7
     adr: "055"
     depends_on: [temporal-exec-backend]
 
   - id: replay-cli
     title: "Workflow replay CLI — deterministic re-execution from event history"
-    status: planned
+    status: shipped
+    pr: 623
+    shipped_version: 2026.5.30.7
     adr: "054"
     depends_on: [temporal-exec-backend]
 
