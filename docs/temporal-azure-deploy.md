@@ -109,6 +109,100 @@ startup.
   `az postgres flexible-server parameter set … --name require_secure_transport
   --value off`, then re-enable once the `SQL_TLS_*` env is deployed.)
 
+## Temporal Web UI (optional) — and why external exposure needs auth
+
+The deploy can also stand up the **Temporal Web UI** (ADR 078 D6,
+`movate-<env>-temporal-ui`) — browse workflows, histories, task queues, and
+pending HUMAN-node signals in a browser instead of grepping container logs. It's
+gated on `enableTemporalUi` (default off) and requires `enableTemporal=true`.
+
+> ⚠ **The `temporalio/ui` image has NO built-in authentication.** Anyone who can
+> reach it sees **every workflow history** — inputs, results, and the
+> **durable-HITL payloads** (ADR 062/083). Treat the UI's reachability as
+> equivalent to read access to all workflow data.
+
+**Default = INTERNAL, which is safe.** With `temporalUiExternal=false` (the
+default) the UI has **internal** Container Apps ingress — reachable only from
+inside the Container Apps Environment (browse via a port-forward / jumpbox), not
+from the public internet. No auth is needed in this mode.
+
+**External exposure REQUIRES auth.** Setting `temporalUiExternal=true` publishes
+a public FQDN. To make that safe, the bicep fronts the UI with **Azure Container
+Apps built-in authentication ("Easy Auth") + Entra ID** — the same pattern as the
+graph/playground apps (ADR 053 D4). This is controlled by `temporalUiAuth`:
+
+| `temporalUiExternal` | `temporalUiAuth` | Result |
+| --- | --- | --- |
+| `false` (default) | (ignored) | Internal ingress — not publicly reachable, no auth needed. |
+| `true` | `true` (default) | Public FQDN, **gated behind Entra login** (Easy Auth). Requires `temporalUiEntraClientId`. |
+| `true` | `false` | Public FQDN, **UNAUTHENTICATED** — anyone with the URL reads all workflow histories. Throwaway dev/POC only. |
+
+Because `temporalUiAuth` defaults to **true**, flipping the UI external does not
+silently expose it — you must explicitly opt out (`temporalUiAuth=false`) to get
+the old unauthenticated behavior.
+
+### Configure Easy Auth (the `temporalUiExternal=true` path)
+
+Mirrors the [graph dashboard runbook](graph-app-deploy.md) Easy-Auth ceremony.
+The Entra app registration and the Key Vault secret are **operator-run**; Bicep
+provisions the **app**, never tenant identity.
+
+```bash
+ENV=dev
+RG_NAME="movate-${ENV}-rg"
+VAULT_NAME="movate-${ENV}-kv"             # append your nameSuffix if you set one
+UI_NAME="movate-${ENV}-temporal-ui"
+```
+
+**1. Create the Entra app registration** (the redirect URI needs the UI's FQDN,
+which you only learn after the first deploy — use a placeholder, fix it in step 4):
+```bash
+az ad app create --display-name "movate-temporal-ui-${ENV}" \
+  --web-redirect-uris "https://PLACEHOLDER/.auth/login/aad/callback"
+# note the printed appId → that's temporalUiEntraClientId
+```
+
+**2. Mint a client secret and store it in Key Vault** (ACA reads it via the
+temporal-ui managed identity; the bicep grants that identity "Key Vault Secrets
+User" on pass 1):
+```bash
+az ad app credential reset --id <appId> --append --query password -o tsv
+az keyvault secret set --vault-name "$VAULT_NAME" \
+  --name temporal-ui-entra-client-secret --value "<the-secret>"
+```
+
+**3. Set the parameters** in `main.<env>.bicepparam`:
+```bicep
+param enableTemporalUi     = true
+param temporalUiExternal   = true
+// param temporalUiAuth    = true            // default — Easy Auth ON
+param temporalUiEntraClientId = '<appId from step 1>'
+// param temporalUiEntraTenantId = ''        // empty → the deployment's own tenant
+```
+
+> If you set `temporalUiExternal=true` and leave `temporalUiAuth=true` (the
+> default) but forget `temporalUiEntraClientId`, the deployment **fails at the
+> `authConfig` resource** (Easy Auth needs a client id) rather than shipping a
+> broken or open gate — fix the client id and re-deploy.
+
+**4. Deploy, then finish the redirect URI:**
+```bash
+az deployment group create -g "$RG_NAME" \
+  -f infra/azure/main.bicep -p infra/azure/main.${ENV}.bicepparam \
+  --query "properties.outputs.temporalUiUrl.value" -o tsv
+# → the SSO-gated UI URL. Now point the redirect URI at the real FQDN:
+az ad app update --id <appId> \
+  --web-redirect-uris "https://${UI_NAME}.<env-default-domain>/.auth/login/aad/callback"
+```
+Re-deploy (or roll a new revision) so Easy Auth accepts logins. Browse the URL →
+Entra login → the Temporal UI loads. Anonymous requests are redirected to login
+**before** they reach the container.
+
+> **CI guard.** `infra/azure/main.bicep` (and every module) is compiled +
+> linted on each PR by the `bicep` job in `.github/workflows/ci.yml`
+> (`bicep build` + `bicep lint`), so a malformed authConfig or unused param is
+> caught before anyone runs `az deployment group create`.
+
 ## Limits (v1)
 - The server is a **single non-HA replica** (ADR 078 D6): a restart briefly
   pauses progress (durable state is safe in Postgres; in-flight workflows resume).

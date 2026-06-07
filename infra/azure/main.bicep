@@ -309,18 +309,56 @@ Deploy the Temporal Web UI (ADR 078 D6) — browse workflows, histories, task
 queues, and pending signals instead of grepping container logs. Gated off by
 default. Requires enableTemporal=true (it connects to the self-hosted frontend).
 
-⚠ The UI is UNAUTHENTICATED and exposes all workflow data. Default ingress is
-INTERNAL (reach it via the CAE / a port-forward). Flip ``temporalUiExternal``
-true ONLY for a dev/POC where public exposure of workflow data is acceptable —
-prefer IP restrictions / SSO otherwise.
+⚠ The temporalio/ui image has NO built-in authentication and exposes all
+workflow data (incl. durable-HITL payloads). Default ingress is INTERNAL (reach
+it via the CAE / a port-forward — no public exposure). Flip ``temporalUiExternal``
+true to publish a real FQDN; when you do, ``temporalUiAuth`` (default true)
+fronts it with Entra Easy Auth so it is never a public, unauthenticated leak.
 ''')
 param enableTemporalUi bool = false
 
 @description('Temporal Web UI image (ADR 078 D6). PIN a tag — never :latest.')
 param temporalUiImage string = 'temporalio/ui:2.34.0'
 
-@description('Expose the Temporal Web UI publicly (external ingress). Default false = internal-only. See enableTemporalUi warning.')
+@description('Expose the Temporal Web UI publicly (external ingress). Default false = internal-only. When true, ``temporalUiAuth`` gates it behind Entra Easy Auth (see that param).')
 param temporalUiExternal bool = false
+
+@description('''
+Front the EXTERNAL Temporal Web UI with Entra ID Easy Auth (ADR 078 follow-on;
+mirrors the graph/playground apps, ADR 053 D4). Default true: an external UI is
+ALWAYS authenticated unless you explicitly opt out. Only consulted when
+``temporalUiExternal`` is true — internal ingress needs no auth (it is already
+unreachable from the public internet).
+
+When auth is on (external && this), ``temporalUiEntraClientId`` is REQUIRED: the
+operator pre-creates an Entra app registration and uploads its client secret to
+Key Vault as ``temporal-ui-entra-client-secret`` (ACA validates the secret ref at
+create time). See docs/temporal-azure-deploy.md.
+
+Set this false ONLY for a throwaway dev/POC where public, UNAUTHENTICATED access
+to every workflow history is acceptable — that exposes durable-HITL payloads to
+anyone with the URL.
+''')
+param temporalUiAuth bool = true
+
+@description('''
+Entra ID (Azure AD) application **client id** for the Temporal UI's Easy Auth.
+The app registration is **operator-pre-created** OUTSIDE Bicep via:
+    az ad app create --display-name "movate-temporal-ui-${env}" \
+        --web-redirect-uris "https://<ui-fqdn>/.auth/login/aad/callback"
+Copy the printed appId here. Required when ``temporalUiExternal`` is true AND
+``temporalUiAuth`` is true (the default); ignored otherwise. The redirect URI
+needs the app's FQDN, so deploy once to learn it, then add the redirect URI and
+mint the secret — see docs/temporal-azure-deploy.md for the full ordering.
+''')
+param temporalUiEntraClientId string = ''
+
+@description('''
+Tenant id whose Entra directory issues the Temporal UI's Easy Auth tokens. Empty
+(default) → the deployment's own tenant (``subscription().tenantId``), the common
+case. Set only for a cross-tenant app registration.
+''')
+param temporalUiEntraTenantId string = ''
 
 @description('''
 Provision a workspace-linked Application Insights component and route the
@@ -545,8 +583,15 @@ var temporalUaiName = 'movate-${env}-temporal-mi'
 // workflows. Reuses the native worker UAI (same image + secrets).
 var temporalWorkerName = 'movate-${env}-temporal-worker'
 // Temporal Web UI (ADR 078 D6) — RG-scoped; gated on enableTemporalUi. Public
-// image, no UAI needed.
+// image; the UAI is only used by the Easy-Auth path (external + temporalUiAuth)
+// to read the Entra client secret from KV. Created unconditionally (cold-deploy
+// safety) so its KV-secrets-read grant lands before the app's first revision.
 var temporalUiName = 'movate-${env}-temporal-ui'
+var temporalUiUaiName = 'movate-${env}-temporal-ui-mi'
+// Easy Auth fronts the UI only when it is BOTH external AND auth-enabled
+// (internal ingress is already unreachable from the public internet, so it needs
+// no auth). main.bicep enables auth by default for any external UI.
+var temporalUiAuthEffective = enableTemporalUi && enableTemporal && enableApiWorker && temporalUiExternal && temporalUiAuth
 // RG-scoped — no global-uniqueness suffix needed (App Insights component
 // names only have to be unique within the resource group).
 var appInsightsName = 'movate-${env}-appi'
@@ -772,6 +817,16 @@ resource temporalUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
   tags: tags
 }
 
+// Temporal Web UI UAI (ADR 078 follow-on). Created unconditionally (cheap,
+// idempotent) so its KV-secrets-read grant (the Entra Easy-Auth client secret)
+// lands before the app's first revision — even though the app itself is gated on
+// enableTemporalUi and the identity is only attached on the external+auth path.
+resource temporalUiUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: temporalUiUaiName
+  location: location
+  tags: tags
+}
+
 // Both Container Apps are gated on ``enableApiWorker`` so a fresh
 // deployment can run "infra-only" first, the operator populates KV
 // secrets, then the second pass deploys the apps. See param doc above.
@@ -953,9 +1008,12 @@ module temporalWorker 'modules/containerapp-temporal-worker.bicep' = if (enableT
 // Temporal Web UI (ADR 078 D6). Browse workflows / histories / pending signals
 // in a browser instead of grepping logs. Gated on enableTemporalUi AND the same
 // enableTemporal && enableApiWorker that bring up the server it connects to.
-// Public temporalio/ui image (no UAI / registries). Connects to the frontend's
-// internal gRPC FQDN (temporalHost = <fqdn>:7233). Internal ingress by default;
-// temporalUiExternal flips it public (unauthenticated — dev/POC only).
+// Public temporalio/ui image. Connects to the frontend's internal gRPC FQDN
+// (temporalHost = <fqdn>:7233). Internal ingress by default; temporalUiExternal
+// flips it public — and when public, temporalUiAuth (default true) fronts it
+// with Entra Easy Auth (authConfig child in the module) so it is never an
+// unauthenticated leak of workflow histories. The UAI + KV client-secret ref are
+// only attached on that external+auth path (temporalUiAuthEffective).
 // ---------------------------------------------------------------------------
 module temporalUi 'modules/containerapp-temporal-ui.bicep' = if (enableTemporalUi && enableTemporal && enableApiWorker) {
   name: 'temporal-ui-${env}'
@@ -967,6 +1025,11 @@ module temporalUi 'modules/containerapp-temporal-ui.bicep' = if (enableTemporalU
     image: temporalUiImage
     external: temporalUiExternal
     publicUrl: temporalUiExternal ? 'https://${temporalUiName}.${cae.outputs.defaultDomain}' : ''
+    authEnabled: temporalUiAuthEffective
+    entraClientId: temporalUiEntraClientId
+    entraTenantId: empty(temporalUiEntraTenantId) ? subscription().tenantId : temporalUiEntraTenantId
+    userAssignedIdentityId: temporalUiUai.id
+    keyVaultUri: kv.outputs.vaultUri
     tags: tags
   }
 }
@@ -1352,6 +1415,20 @@ resource temporalKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(kvResource.id, temporalUaiName, kvSecretsUserRoleId)
   properties: {
     principalId: temporalUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
+  }
+}
+
+// Temporal UI needs KV-secrets-read only on the Easy-Auth path (the Entra client
+// secret `temporal-ui-entra-client-secret`). No AcrPull grant — it runs the
+// public temporalio/ui image. Un-gated (the UAI always exists) so it lands on
+// pass 1, before the app's first revision tries to read the secret.
+resource temporalUiKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: kvResource
+  name: guid(kvResource.id, temporalUiUaiName, kvSecretsUserRoleId)
+  properties: {
+    principalId: temporalUiUai.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
   }
