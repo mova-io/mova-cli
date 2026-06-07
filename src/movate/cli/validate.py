@@ -1210,6 +1210,37 @@ def _validate_workflow(path: Path) -> None:
     chain = " → ".join(graph.topological_order())
     console.print(f"  topology:    {chain}")
 
+    # Temporal determinism feedback (ADR 054 D5). For a ``runtime: temporal``
+    # workflow, surface the compiler's determinism lint right here in the
+    # front-door check so authors learn about non-deterministic primitives
+    # (time/random/datetime, unbounded loops) and HUMAN-node phasing at
+    # validate time rather than at compile/run time. This is a *summary*
+    # pointer — the full, machine-readable findings (codes, --strict, --json)
+    # live in the dedicated ``mdk workflow lint --runtime temporal``. The lint
+    # is pure static analysis and never imports temporalio, so it works
+    # without the ``[temporal]`` extra installed.
+    if getattr(graph, "runtime", "native") == "temporal":
+        from movate.core.workflow.compilers.temporal import (  # noqa: PLC0415
+            lint_temporal,
+        )
+
+        issues = lint_temporal(graph)
+        if issues:
+            n_warn = sum(1 for i in issues if i.severity == "warning")
+            n_err = sum(1 for i in issues if i.severity == "error")
+            counts = []
+            if n_err:
+                counts.append(f"{n_err} error(s)")
+            if n_warn:
+                counts.append(f"{n_warn} warning(s)")
+            console.print(f"[yellow]![/yellow] temporal determinism lint: {', '.join(counts)}")
+            for issue in issues:
+                loc = f" [dim]@{issue.node_id}[/dim]" if issue.node_id else ""
+                console.print(f"    [dim]{issue.code}[/dim]{loc}: {issue.message}")
+            console.print(f"[dim]    detail: mdk workflow lint --runtime temporal {path}[/dim]")
+        else:
+            console.print("[dim]  temporal lint: ✓ clean[/dim]")
+
     if spec.evals is None:
         console.print(
             "[yellow]![/yellow] no [bold]evals:[/bold] stanza in workflow.yaml — "
