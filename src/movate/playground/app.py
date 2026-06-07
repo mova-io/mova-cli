@@ -101,6 +101,7 @@ from movate.playground.conversation import (
     feedback_route,
     select_backend,
 )
+from movate.playground.explain_steps import ExplainStep, build_explain_steps
 from movate.playground.harvest_feedback import harvest_feedback_turn
 from movate.playground.state import ensure_chainlit_sqlite_schema, resolve_data_layer_config
 from movate.playground.targets import (
@@ -1034,6 +1035,12 @@ async def on_message(message: cl.Message) -> None:
     convo.add_assistant(result.output_text, run_id=result.run_id)
     cl.user_session.set("last_run_id", result.run_id)
 
+    # Glass box (additive): render the turn's agent internals as collapsed
+    # Steps above the answer, reusing the explain surface. Emitted BEFORE the
+    # final message update so the Steps sit above the answer bubble; degrades
+    # silently when the chain is unavailable.
+    await _render_glassbox(client, result.run_id)
+
     thinking.content = text
     thinking.actions = _feedback_actions(result.run_id)
     await thinking.update()
@@ -1114,6 +1121,57 @@ async def _run_streaming(
         msg.content = f"⚠️ _(truncated)_ {msg.content}" if msg.content else "⚠️ _(truncated)_"
     msg.actions = _feedback_actions(run_id)
     await msg.update()
+    await _render_glassbox(client, run_id)
+
+
+# ---------------------------------------------------------------------------
+# Glass box — render a turn's agent internals as collapsible cl.Steps.
+#
+# Reuses the read-only explain surface (GET /api/v1/runs/{id}/explain, the
+# shared movate.core.explain seam behind `mdk explain --json`) — no new tracer.
+# After a turn completes we fetch its decision chain and render one nested,
+# DEFAULT-COLLAPSED cl.Step per tool/skill call, retrieval, and routing
+# decision, so the chat stays clean but a tester can expand to debug. Any
+# failure (older run / endpoint absent / stateless / malformed payload)
+# degrades silently to today's behaviour — it never errors the chat.
+# ---------------------------------------------------------------------------
+
+
+async def _render_glassbox(client: PlaygroundClient, run_id: str | None) -> None:
+    """Fetch + render the decision chain for ``run_id`` as collapsed Steps.
+
+    Strictly additive observation: on a missing run id, an unavailable explain
+    endpoint (``None`` from the client), an empty chain, or *any* exception, we
+    return quietly and the turn keeps today's message + trace link. The chat is
+    never broken by the glass box.
+    """
+    if not run_id:
+        return
+    try:
+        payload = await client.get_explain(run_id)
+        steps = build_explain_steps(payload)
+        for step in steps:
+            await _emit_step(step)
+    except Exception as exc:  # pragma: no cover - defensive; never break chat
+        logger.debug("glass-box render skipped for run %s: %s", run_id, exc)
+
+
+async def _emit_step(step: ExplainStep) -> None:
+    """Emit one :class:`ExplainStep` (and its children) as a ``cl.Step``.
+
+    Chainlit Steps render collapsed by default and expand on click — exactly
+    the "clean chat, expand to debug" behaviour we want (``default_open``
+    stays ``False``). Children are created inside the parent's ``async with``
+    so Chainlit nests them automatically (no manual ``parent_id`` wiring).
+    """
+    async with cl.Step(name=step.name, type=_STEP_TYPE.get(step.kind, "tool")) as cl_step:
+        cl_step.output = step.body
+        for child in step.children:
+            await _emit_step(child)
+
+
+# Map our semantic step kind → Chainlit's Step ``type`` (drives the icon).
+_STEP_TYPE = {"tool": "tool", "retrieval": "retrieval", "decision": "run"}
 
 
 # ---------------------------------------------------------------------------

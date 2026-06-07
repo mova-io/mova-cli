@@ -448,6 +448,39 @@ class PlaygroundClient:
         result: dict[str, Any] = resp.json()
         return result
 
+    async def get_explain(self, run_id: str) -> dict[str, Any] | None:
+        """Fetch a run's decision chain (the "glass box" for a turn).
+
+        Reads ``GET /api/v1/runs/{run_id}/explain?steps=true`` — the read-only
+        mirror of ``mdk explain <run_id> --json`` (the shared
+        :func:`movate.core.explain.explain_run` seam). ``steps=true`` embeds
+        the full per-step ``skill_calls`` breakdown so the playground can
+        render each tool/skill call + retrieved context inline.
+
+        Returns the raw decision-chain dict on success, or ``None`` when the
+        chain is unavailable — a runtime that predates the endpoint (404), a
+        run with no persisted record, or any HTTP/connection error. The caller
+        degrades a ``None`` to today's plain message + trace link, so a missing
+        glass box never errors the chat (playground rule: degrade, don't fail).
+        Every non-200 / transport failure maps to ``None`` — the explain
+        surface is strictly additive observability and must never break the
+        response render path.
+        """
+        try:
+            resp = await self._client.get(
+                f"/api/v1/runs/{run_id}/explain",
+                params={"steps": "true"},
+            )
+        except httpx.HTTPError:
+            return None
+        if resp.status_code != httpx.codes.OK:
+            return None
+        try:
+            result: dict[str, Any] = resp.json()
+        except ValueError:
+            return None
+        return result
+
     async def wait_for_run(self, job_id: str) -> dict[str, Any]:
         """Poll ``/jobs/{id}`` until terminal, then return the run
         record via ``/runs/{result_run_id}``. Raises ``TimeoutError``
