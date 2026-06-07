@@ -87,6 +87,9 @@ param agentsStorageName string = ''
 @description('Langfuse host URL (self-hosted). Empty string = the Langfuse SDK default (Cloud). Set by main.bicep to the self-hosted Langfuse app URL when deployLangfuse=true.')
 param langfuseHost string = ''
 
+@description('Temporal frontend host:port (ADR 078, e.g. movate-dev-temporal.internal.<domain>:7233). Empty string = no Temporal wiring (durable workflows unavailable; runtime:temporal fails loud). Set by main.bicep when enableTemporal=true.')
+param temporalHost string = ''
+
 @description('Trace sink for the runtime (MDK_TRACE_SINK). Empty = unset (legacy auto-detect / silent). "otlp" ships spans to the OTLP endpoint below.')
 param traceSink string = ''
 
@@ -237,6 +240,20 @@ resource worker 'Microsoft.App/containerApps@2024-03-01' = {
               // empty so the SDK keeps its Cloud default).
               name: 'LANGFUSE_HOST'
               value: langfuseHost
+            }
+          ], empty(temporalHost) ? [] : [
+            // Self-hosted Temporal frontend (ADR 078). Read by
+            // _resolve_temporal_connection (ADR 054 D5) so a Temporal worker /
+            // backend can reach the durable engine. Omitted when empty →
+            // runtime:temporal fails loud (ADR 055 D6). No TLS inside the CAE
+            // boundary (D5).
+            {
+              name: 'TEMPORAL_HOST'
+              value: temporalHost
+            }
+            {
+              name: 'TEMPORAL_NAMESPACE'
+              value: 'default'
             }
           ], empty(traceSink) ? [] : [
             // Trace sink selector — emitted only when main.bicep sets

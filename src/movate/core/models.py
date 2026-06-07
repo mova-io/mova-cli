@@ -2608,6 +2608,15 @@ class WorkflowRunRecord(BaseModel):
     the operator (Teams card / API) and validates the returned decision
     against ``output_contract`` before merging into ``paused_state``."""
 
+    # --- durable-execution backend (ADR 062 D2) --------------------------
+    runtime: str | None = None
+    """Which workflow backend owns this run — ``'temporal'`` for a durable
+    Temporal run, ``None``/``'native'`` for the in-process runner. Additive +
+    nullable: existing rows read ``None`` ⇒ native, so the resume-on-signal
+    endpoint defaults to the native re-walk and only routes to a Temporal
+    ``signal`` when this is ``'temporal'``. Set at the durable pause
+    (``call_human_activity``) on the Temporal path."""
+
 
 class EvalRecord(BaseModel):
     """Persisted summary of one eval run (one dataset, one agent version, N cases)."""

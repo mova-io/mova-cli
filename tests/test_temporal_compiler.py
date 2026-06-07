@@ -20,7 +20,6 @@ import pytest
 
 from movate.core.workflow.compiler import compile_workflow
 from movate.core.workflow.compilers.temporal import (
-    LINT_HUMAN_NODE_PHASE2,
     LINT_NONDETERMINISTIC_SKILL,
     LINT_NONDETERMINISTIC_TIME,
     LINT_UNBOUNDED_LOOP,
@@ -192,13 +191,15 @@ def test_compile_monitor_pattern() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6: HUMAN node — Phase 1 stub (NotImplementedError with Phase 2 pointer).
+# 6: HUMAN node — durable HITL (ADR 062): wait_condition + signal.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-def test_compile_human_node_stubbed() -> None:
-    """HUMAN node raises ``NotImplementedError`` with a clear Phase 2 pointer."""
+def test_compile_human_node_durable_hitl() -> None:
+    """HUMAN node compiles to a durable pause: pause-record activity + a
+    ``wait_condition`` on a ``human_response`` signal, merging the
+    ``output_contract`` and advancing to the sequential successor (ADR 062)."""
     human = WorkflowNode(
         id="approval",
         type=NodeType.HUMAN,
@@ -206,14 +207,55 @@ def test_compile_human_node_stubbed() -> None:
         metadata={"prompt": "Approve?", "output_contract": ["decision"]},
     )
     graph = _make_graph(
-        [_make_node("start"), human],
-        [WorkflowEdge(from_id="start", to_id="approval")],
+        [_make_node("start"), human, _make_node("done")],
+        [
+            WorkflowEdge(from_id="start", to_id="approval"),
+            WorkflowEdge(from_id="approval", to_id="done"),
+        ],
     )
-    with pytest.raises(NotImplementedError) as ei:
-        TemporalCompiler().compile(graph)
-    assert "Phase 2" in str(ei.value)
-    assert "ADR 054" in str(ei.value)
-    assert "approval" in str(ei.value)
+    compiled = TemporalCompiler().compile(graph)
+    src = compiled.module_source
+    # The durable-HITL primitives are emitted...
+    assert "call_human_activity" in src
+    assert "@workflow.signal" in src
+    assert "def human_response(self" in src
+    assert "self._human" in src
+    assert "wait_condition(lambda: 'approval' in self._human)" in src
+    # ...the response merges output_contract and advances to the successor.
+    assert "for k in ['decision']" in src
+    assert "current = 'done'" in src
+    # ...and the pause-record activity is registered for the worker.
+    assert "call_human_activity" in compiled.activity_names
+    # The compiled module is valid Python (parses + exec-imports cleanly).
+    compile(src, "<emitted-human>", "exec")
+
+
+@pytest.mark.unit
+def test_compile_human_node_timeout_route() -> None:
+    """A HUMAN node with ``timeout`` + ``on_timeout`` emits the durable
+    deadline + the timeout route (ADR 062 D4)."""
+    human = WorkflowNode(
+        id="approval",
+        type=NodeType.HUMAN,
+        ref="",
+        metadata={
+            "prompt": "Approve?",
+            "output_contract": ["decision"],
+            "timeout": 3600,
+            "on_timeout": "done",
+        },
+    )
+    graph = _make_graph(
+        [_make_node("start"), human, _make_node("done")],
+        [
+            WorkflowEdge(from_id="start", to_id="approval"),
+            WorkflowEdge(from_id="approval", to_id="done"),
+        ],
+    )
+    src = TemporalCompiler().compile(graph).module_source
+    assert "timeout=timedelta(seconds=3600.0)" in src
+    assert "except asyncio.TimeoutError:" in src
+    compile(src, "<emitted-human-timeout>", "exec")
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +276,8 @@ def test_lint_warns_on_time_time_call() -> None:
 
 
 @pytest.mark.unit
-def test_lint_warns_on_human_node() -> None:
-    """HUMAN node → warning carrying the Phase 2 pointer."""
+def test_lint_clean_on_human_node() -> None:
+    """HUMAN node is first-class (ADR 062) — the linter no longer flags it."""
     human = WorkflowNode(
         id="hold",
         type=NodeType.HUMAN,
@@ -244,10 +286,8 @@ def test_lint_warns_on_human_node() -> None:
     )
     graph = _make_graph([_make_node("a"), human], [WorkflowEdge(from_id="a", to_id="hold")])
     issues = TemporalCompiler().lint(graph)
-    hum = [i for i in issues if i.code == LINT_HUMAN_NODE_PHASE2]
-    assert hum, f"expected a HUMAN warning, got {issues}"
-    assert hum[0].severity == "warning"
-    assert "Phase 2" in hum[0].message
+    human_codes = [i.code for i in issues if "HUMAN" in i.code]
+    assert not human_codes, f"expected no HUMAN lint, got {issues}"
 
 
 @pytest.mark.unit

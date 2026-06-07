@@ -87,10 +87,15 @@ CONTEXT_DIR="$(mktemp -d -t mdk-voice-ctx-XXXXXX)"
 trap 'rm -rf "$CONTEXT_DIR"' EXIT
 git -C "$REPO_ROOT" archive --format=tar HEAD | tar -x -C "$CONTEXT_DIR"
 ok "build context: $(du -sh "$CONTEXT_DIR" | cut -f1) clean checkout (tracked files only)"
+# ADR 066 — the version is git-derived, but the archived context has no .git, so
+# compute the CalVer from the real checkout and pass it as a build-arg (the hatch
+# metadata hook reads MOVATE_BUILD_VERSION).
+BUILD_VERSION="$(python3 "$REPO_ROOT/scripts/calver_version.py" 2>/dev/null || echo "")"
 az acr build \
     --registry "$ACR" \
     --image "$IMAGE" \
     --file "$DOCKERFILE_REL" \
+    --build-arg "MOVATE_BUILD_VERSION=$BUILD_VERSION" \
     "$CONTEXT_DIR" \
     -o table
 ok "image built: $ACR.azurecr.io/$IMAGE"
