@@ -38,6 +38,13 @@ Generated from `roadmap.yaml` (intent) + `shipped.jsonl` (CalVer-keyed ship ledg
 - `dead-letter-mgmt` — Dead-letter management — inspect, retry, and purge failed jobs
 - `durable-hitl` — Durable HITL on Temporal (HUMAN node — durable pause/resume) (ADR 054)
 - `graphrag-storage-protocol` — GraphRAG behind the StorageProvider Protocol (SQLite + Postgres, Neo4j optional) (ADR 046)
+- `ltm-agent-yaml-config` — Long-term memory — agent.yaml memory: block composing with retrieval: (long_term kinds/scope/pii_policy) (ADR 086)
+- `ltm-audit-injection` — Long-term memory — auditable injection: recall event via the tracer seam + queryable recall row (ADR 086)
+- `ltm-deletion-export` — Long-term memory — GDPR-grade per-user/per-tenant purge + bulk export (ADR 086)
+- `ltm-evals` — Long-term memory — mdk eval memory (recall@k, stale rate, wrong-user leakage, token overhead) + CI gate (ADR 086)
+- `ltm-extraction` — Long-term memory — picky, opt-in fact extraction (preference/fact/decision/instruction) with PII-reject-by-default (ADR 086)
+- `ltm-hybrid-recall` — Long-term memory — hybrid recall (vector + keyword + recency) reusing the KB pipeline, injected via the auto-retrieval seam (ADR 086)
+- `ltm-storage-protocol` — Long-term memory — memory_items on the StorageProvider Protocol (SQLite + Postgres/pgvector), tenant/user/agent scoped (ADR 086)
 - `nl-query` — Natural-language query over observability + graph (ADR 047) (ADR 047)
 - `production-hardening` — Production hardening — retries, timeouts, backpressure, partial-failure recovery
 - `replay-cli` — Workflow replay CLI — deterministic re-execution from event history (ADR 054)
@@ -48,4 +55,10 @@ Generated from `roadmap.yaml` (intent) + `shipped.jsonl` (CalVer-keyed ship ledg
 
 Items with unshipped dependencies (from `depends_on`).
 
-_Nothing blocked._
+- `ltm-agent-yaml-config` blocked by `ltm-storage-protocol`
+- `ltm-audit-injection` blocked by `ltm-hybrid-recall`
+- `ltm-deletion-export` blocked by `ltm-storage-protocol`
+- `ltm-evals` blocked by `ltm-hybrid-recall`
+- `ltm-extraction` blocked by `ltm-storage-protocol`
+- `ltm-hybrid-recall` blocked by `ltm-extraction`, `ltm-storage-protocol`
+- `ltm-storage-protocol` blocked by `graphrag-storage-protocol`

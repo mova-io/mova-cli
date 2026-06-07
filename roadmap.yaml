@@ -187,3 +187,49 @@ items:
     title: "Production hardening — retries, timeouts, backpressure, partial-failure recovery"
     status: planned
     depends_on: [temporal-exec-backend]
+
+  # --- Long-term agent memory (ADR 086) — governed semantic memory layer.
+  # The 2026-06-07 audit found run/conversation/procedural memory already
+  # shipped; this phase adds the missing long-term layer on the existing
+  # StorageProvider + pgvector seams (shares substrate with GraphRAG).
+  - id: ltm-storage-protocol
+    title: "Long-term memory — memory_items on the StorageProvider Protocol (SQLite + Postgres/pgvector), tenant/user/agent scoped"
+    status: planned
+    adr: "086"
+    depends_on: [graphrag-storage-protocol]
+
+  - id: ltm-agent-yaml-config
+    title: "Long-term memory — agent.yaml memory: block composing with retrieval: (long_term kinds/scope/pii_policy)"
+    status: planned
+    adr: "086"
+    depends_on: [ltm-storage-protocol]
+
+  - id: ltm-extraction
+    title: "Long-term memory — picky, opt-in fact extraction (preference/fact/decision/instruction) with PII-reject-by-default"
+    status: planned
+    adr: "086"
+    depends_on: [ltm-storage-protocol]
+
+  - id: ltm-hybrid-recall
+    title: "Long-term memory — hybrid recall (vector + keyword + recency) reusing the KB pipeline, injected via the auto-retrieval seam"
+    status: planned
+    adr: "086"
+    depends_on: [ltm-storage-protocol, ltm-extraction]
+
+  - id: ltm-audit-injection
+    title: "Long-term memory — auditable injection: recall event via the tracer seam + queryable recall row"
+    status: planned
+    adr: "086"
+    depends_on: [ltm-hybrid-recall]
+
+  - id: ltm-deletion-export
+    title: "Long-term memory — GDPR-grade per-user/per-tenant purge + bulk export"
+    status: planned
+    adr: "086"
+    depends_on: [ltm-storage-protocol]
+
+  - id: ltm-evals
+    title: "Long-term memory — mdk eval memory (recall@k, stale rate, wrong-user leakage, token overhead) + CI gate"
+    status: planned
+    adr: "086"
+    depends_on: [ltm-hybrid-recall]
