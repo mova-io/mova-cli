@@ -1,0 +1,47 @@
+api_version: movate/v1
+kind: Agent
+
+name: voice-receptionist
+version: 0.1.0
+description: A friendly voice receptionist for phone callers. Conversational, natural speech output.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.7
+    max_tokens: 256
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+# Voice agents speak free-form, but text I/O is still the contract
+# (ADR 048 D1): STT feeds transcribed speech in as `text`, and the
+# response `text` is synthesized back via TTS. Declaring it explicitly
+# keeps the agent valid under `movate validate --strict`.
+schema:
+  input:
+    question: string
+  output:
+    answer: string
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 15000
+  total_ms: 30000
+
+budget:
+  max_cost_usd_per_run: 0.10
+
+voice:
+  stt: deepgram
+  tts: cartesia
+  language: en
+
+tags:
+  - voice
+  - receptionist
+  - demo

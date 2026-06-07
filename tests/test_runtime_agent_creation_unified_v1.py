@@ -36,6 +36,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
+from movate.core.models import Project
 from movate.runtime import build_app
 from movate.testing import InMemoryStorage
 
@@ -61,13 +62,26 @@ def client(storage: InMemoryStorage, agents_path: Path) -> TestClient:
 
 @pytest.fixture
 async def auth_header(storage: InMemoryStorage) -> dict[str, str]:
+    tenant_id = uuid4().hex
     minted = mint_api_key(
-        tenant_id=uuid4().hex,
+        tenant_id=tenant_id,
         env=ApiKeyEnv.LIVE,
         label="unified-create-tests",
         scopes=list(ALL_SCOPES),
     )
     await storage.save_api_key(minted.record)
+    # Seed the project the happy-path tests attach into. The endpoint now
+    # validates the project exists — a typo'd ``project_id`` 404s instead of
+    # silently attaching the agent to a phantom project — so ``proj-1`` must be
+    # a real, tenant-owned project for the sync create paths to return 200.
+    await storage.create_project(
+        Project(
+            project_id="proj-1",
+            tenant_id=tenant_id,
+            name="proj-1",
+            owner_principal_id="api_key:test",
+        )
+    )
     return {"Authorization": f"Bearer {minted.full_key}"}
 
 
@@ -521,3 +535,44 @@ def test_no_agents_path_returns_503(storage: InMemoryStorage, auth_header: dict[
         headers=auth_header,
     )
     assert r.status_code == 503
+
+
+def test_create_under_missing_project_returns_404(
+    client: TestClient, auth_header: dict[str, str]
+) -> None:
+    """A non-existent ``project_id`` 404s instead of silently attaching the
+    agent to a phantom project.
+
+    Regression guard: the junction insert is ``INSERT OR IGNORE`` on every
+    backend (no FK enforcement of ``project_id``), so before the existence
+    check a typo'd id returned 200 / ``attached=true`` against a project that
+    was never created. The endpoint now validates the project exists first.
+    """
+    r = client.post(
+        "/api/v1/projects/prj_does_not_exist/agents",
+        json=_spec_body(),
+        headers=auth_header,
+    )
+    assert r.status_code == 404, r.text
+    assert r.json()["detail"]["error"]["code"] == "not_found"
+
+
+def test_create_under_other_tenants_project_returns_404(
+    client: TestClient,
+    storage: InMemoryStorage,
+    auth_header: dict[str, str],
+    auth_header_b: dict[str, str],
+) -> None:
+    """Tenant B cannot attach an agent into tenant A's project.
+
+    The existence check is tenant-scoped (``get_project(tenant_id, ...)``), so
+    a project that exists for another tenant is invisible — the create 404s
+    rather than cross the tenant boundary (rule 6)."""
+    # ``proj-1`` was seeded for tenant A (auth_header). Tenant B (auth_header_b)
+    # must not be able to attach into it.
+    r = client.post(
+        "/api/v1/projects/proj-1/agents",
+        json=_spec_body(name="b-bot"),
+        headers=auth_header_b,
+    )
+    assert r.status_code == 404, r.text

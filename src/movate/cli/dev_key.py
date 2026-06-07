@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 from movate.core.auth import (
     SCOPE_ADMIN,
+    SCOPE_KB_WRITE,
     SCOPE_READ,
     SCOPE_RUN,
     mint_api_key,
@@ -51,9 +52,11 @@ if TYPE_CHECKING:
 DEV_TENANT_ID = "devtenant"
 
 # Broad-but-not-fleet scopes: enough to list agents (read), run them (run),
-# and manage them (admin) from the playground, without the cross-tenant
-# reach of ``fleet-admin``. Least privilege for the local loop.
-DEV_SCOPES = [SCOPE_READ, SCOPE_RUN, SCOPE_ADMIN]
+# manage them (admin), and write to the KB / knowledge graph (kb:write — e.g.
+# the ADR 079 graph-assert endpoint the playground demo calls) from the
+# playground, without the cross-tenant reach of ``fleet-admin``. Least
+# privilege for the local loop.
+DEV_SCOPES = [SCOPE_READ, SCOPE_RUN, SCOPE_ADMIN, SCOPE_KB_WRITE]
 
 # Local-dev key env: ``test`` (not ``live``) so a dev key is hard-separated
 # from any real ``live`` key at parse time — a dev key can't authenticate

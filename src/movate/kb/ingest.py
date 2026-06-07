@@ -128,14 +128,19 @@ async def ingest_path(
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     api_key: str | None = None,
     clean_source: bool = False,
-    build_graph: bool = False,
+    build_graph: bool = True,
     extraction_model: str = DEFAULT_EXTRACTION_MODEL,
     complete_fn: CompleteFn | None = None,
     on_file_start: Callable[[str, int, int], None] | None = None,
     project_id: str | None = None,
-    emit_growth_events: bool = False,
+    emit_growth_events: bool = True,
 ) -> tuple[list[IngestSummary], list[tuple[str, str]]]:
     """Ingest a file or directory tree. Returns one summary per file.
+
+    As of 2026.6 the knowledge graph is built by default on every
+    ingest (``build_graph=True``).  Pass ``build_graph=False`` (CLI:
+    ``--skip-graph``) to opt out.  Growth events are emitted by
+    default too so the sigma viewer live-tails the graph as it grows.
 
     Empty directory / unsupported file = empty list (not an error).
 
@@ -198,11 +203,11 @@ async def _ingest_one_file(
     embedding_model: str,
     api_key: str | None,
     clean_source: bool = False,
-    build_graph: bool = False,
+    build_graph: bool = True,
     extraction_model: str = DEFAULT_EXTRACTION_MODEL,
     complete_fn: CompleteFn | None = None,
     project_id: str | None = None,
-    emit_growth_events: bool = False,
+    emit_growth_events: bool = True,
 ) -> IngestSummary | None:
     """Read + parse + ingest a single file.
 
@@ -282,12 +287,12 @@ async def ingest_text(
     api_key: str | None = None,
     ocr: bool = False,
     page_texts: tuple[str, ...] | None = None,
-    build_graph: bool = False,
+    build_graph: bool = True,
     extraction_model: str = DEFAULT_EXTRACTION_MODEL,
     complete_fn: CompleteFn | None = None,
     project_id: str | None = None,
     on_graph_mutation: GraphMutationFn | None = None,
-    emit_growth_events: bool = False,
+    emit_growth_events: bool = True,
 ) -> IngestSummary | None:
     """Chunk + embed + persist ``text`` as KB content for ``agent``.
 
@@ -298,6 +303,11 @@ async def ingest_text(
       (``POST /api/v1/agents/{name}/kb``) — accepts multipart file
       uploads and never writes them to a project ``kb/`` directory.
     * Future programmatic ingest from notebooks / scripts.
+
+    As of 2026.6 the knowledge graph is built by default on every
+    ingest (``build_graph=True``).  Pass ``build_graph=False`` (CLI:
+    ``--skip-graph``) to opt out.  Growth events are likewise emitted
+    by default (``emit_growth_events=True``).
 
     ``source`` is a free-form label that ends up on each
     :class:`KbChunk` for traceability (e.g. the uploaded filename or
@@ -311,15 +321,14 @@ async def ingest_text(
     :class:`~movate.core.models.KbChunk`. This lets the search table
     display the source page number alongside each result.
 
-    ``emit_growth_events`` (ADR 046 D6, additive, default off): when
+    ``emit_growth_events`` (ADR 046 D6, additive, default on): when
     ``build_graph`` is on, record a ``graph.node.added`` /
     ``graph.edge.added`` outbox event per upserted node/edge so the sigma
-    viewer's live-growth stream animates the graph as it grows. ``mdk kb
-    ingest --build-graph`` sets this; the runtime serves the resulting
-    events over ``GET /api/v1/projects/{id}/graph/stream?live=true``. An
-    explicit ``on_graph_mutation`` callback overrides the default
-    publisher. Both are failure-isolated — a flaky outbox never breaks
-    ingest.
+    viewer's live-growth stream animates the graph as it grows. The runtime
+    serves the resulting events over
+    ``GET /api/v1/projects/{id}/graph/stream?live=true``. An explicit
+    ``on_graph_mutation`` callback overrides the default publisher. Both are
+    failure-isolated — a flaky outbox never breaks ingest.
 
     Empty / whitespace-only input → ``None`` (idempotent no-op,
     matches :func:`_ingest_one_file`).

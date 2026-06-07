@@ -14,6 +14,7 @@ Workflow orchestration lives in ``movate.core.workflow``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 
 from jsonschema import ValidationError as JsonSchemaError
 
+from movate.core.alert_emit import budget_alert, emit_alert
 from movate.core.cache import (
     CachedResponse,
     CacheProvider,
@@ -1214,6 +1216,12 @@ class Executor:
         from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
 
+        # LangChain backend — optional; only registers if mdk[langchain] is
+        # installed. Missing extra is fine — skills with kind=langchain will
+        # get a clear "no backend registered" error at dispatch time.
+        with contextlib.suppress(ImportError):
+            from movate.core.skill_backend import langchain as _lc_backend  # noqa: F401, PLC0415
+
         # Build a name → SkillBundle map for quick lookup inside the loop.
         skill_index: dict[str, Any] = {s.spec.name: s for s in bundle.skills}
 
@@ -1274,6 +1282,7 @@ class Executor:
                 input=accumulated_tokens.input + completion.tokens.input,
                 output=accumulated_tokens.output + completion.tokens.output,
                 cached_input=accumulated_tokens.cached_input + completion.tokens.cached_input,
+                cache_write=accumulated_tokens.cache_write + completion.tokens.cache_write,
             )
             if completion.raw:
                 accumulated_raw.update(completion.raw)
@@ -1789,6 +1798,29 @@ class Executor:
             return
         current = await self._storage.sum_tenant_cost_current_month(tenant_id)
         if current >= budget.monthly_usd_limit:
+            # ADR 057 D1 (step 2) — the tenant crossed its budget threshold:
+            # raise a typed ``budget_threshold`` alert onto the outbox so the
+            # router can page on it BEFORE we abort the run. Fire-and-forget,
+            # best-effort (D5): emitting the alert must never replace the
+            # TenantBudgetExceededError the run actually needs (so emit, then
+            # raise). Recorded-but-undelivered when no routes are configured
+            # (D7). The dedup_key is per-tenant, so a tenant pinned at its cap
+            # pages once per throttle window, not on every blocked run.
+            emit_alert(
+                self._storage,
+                budget_alert(
+                    tenant_id=tenant_id,
+                    summary=(
+                        f"tenant {tenant_id!r} crossed its monthly budget — "
+                        f"spent ${current:.2f} of ${budget.monthly_usd_limit:.2f}; "
+                        f"runs are paused"
+                    ),
+                    data={
+                        "spent_usd": current,
+                        "limit_usd": budget.monthly_usd_limit,
+                    },
+                ),
+            )
             raise TenantBudgetExceededError(
                 f"tenant {tenant_id!r} has spent ${current:.2f} of "
                 f"${budget.monthly_usd_limit:.2f} this month; runs are paused. "

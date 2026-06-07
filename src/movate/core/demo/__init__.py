@@ -33,6 +33,7 @@ from movate.core.demo.scenario import (
 )
 from movate.core.demo.seeder import (
     DEMO_MARKER_KEY,
+    DEMO_TELEMETRY_TENANT_ID,
     DEMO_TENANT_PREFIX,
     DemoBundle,
     SeedConfig,
@@ -45,6 +46,7 @@ __all__ = [
     "DEMO_GRAPH_AGENT",
     "DEMO_MARKER_KEY",
     "DEMO_PROJECT_ID",
+    "DEMO_TELEMETRY_TENANT_ID",
     "DEMO_TENANT_ID",
     "DEMO_TENANT_PREFIX",
     "DemoBundle",

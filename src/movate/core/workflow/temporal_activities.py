@@ -377,23 +377,63 @@ async def call_skill_activity(
     return dict(output)
 
 
+def _resolve_classifier_ref(classifier_agent: str, workflow_dir: str) -> str:
+    """Resolve a possibly-relative classifier ref against the workflow dir.
+
+    Mirrors the native runner's intent-router resolution
+    (:meth:`movate.core.workflow.runner.WorkflowRunner._run_intent_router`): an
+    absolute ref is used as-is; a relative ref (e.g. ``./agents/goal-judge`` —
+    the form the IR leaves ``classifier_agent`` in, unlike the absolutized AGENT
+    ``node.ref``) is resolved against the compiled workflow's source dir, which
+    the Track-B compiler bakes into the activity args (``_emit_gate_node``).
+
+    Without this the worker would call :func:`load_agent` on a CWD-relative ref
+    and raise ``AgentLoadError`` — the exact Phase-1 divergence the conformance
+    suite caught (ADR 055 D7). ``workflow_dir`` empty (a hand-built direct call)
+    falls back to passing the ref through unchanged.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    if not classifier_agent or not workflow_dir:
+        return classifier_agent
+    ref_path = Path(classifier_agent)
+    if ref_path.is_absolute():
+        return classifier_agent
+    return str((Path(workflow_dir) / classifier_agent).resolve())
+
+
 @_activity.defn  # type: ignore[untyped-decorator]
 async def call_gate_activity(
     node_id: str,
     classifier_agent: str,
     state: dict[str, Any],
     run_id: str,
+    workflow_dir: str = "",
+    input_field: str = "",
+    route_labels: list[str] | None = None,
 ) -> dict[str, Any]:
     """GATE / INTENT_ROUTER node → run the classifier agent; return its decision.
 
-    Compiler contract (``_emit_gate_node``): the workflow stores this return
-    value as ``state['<method>_decision']`` and branches on it. Per the
-    compiler the activity receives only ``(node_id, classifier_agent, state,
-    run_id)`` — the ``routes`` / ``input_field`` / ``fallback`` stay in
-    workflow scope — so this activity's job is narrow: run the classifier
-    agent and hand back its decision dict (which carries ``"label"``; see
-    ``pattern_simulation``'s ``turn-judge`` output schema). The workflow then
-    maps that label to the next node.
+    Compiler contract (``_emit_gate_node``): the workflow branches on this
+    return value's ``"label"`` (``current = routes[label] or fallback``) — the
+    ``routes`` / ``fallback`` stay in workflow scope. So this activity's job is
+    narrow: run the classifier agent and hand back its decision dict (which
+    carries ``"label"``; see ``pattern_simulation``'s ``turn-judge`` output
+    schema). The workflow then maps that label to the next node and does NOT
+    merge the decision into state (native parity).
+
+    The compiler passes ``(node_id, classifier_agent, state, run_id,
+    workflow_dir, input_field, route_labels)``:
+
+    * ``workflow_dir`` is the compiled workflow's source dir, used to resolve a
+      relative ``classifier_agent`` ref the same way the native runner does
+      (see :func:`_resolve_classifier_ref`).
+    * ``input_field`` + ``route_labels`` build the classifier input
+      ``{"text": str(state[input_field]), "labels": route_labels}`` — the EXACT
+      shape the native runner sends (``runner._run_intent_router``), which the
+      classifier agents' input schemas require (``text`` + ``labels``). They
+      default so a direct caller passing an already-absolute ref needs only the
+      original four args.
 
     Mirrors the native runner's intent-router path (``runner._run_intent_router``)
     but without the routing table (which the workflow owns): the classifier
@@ -404,8 +444,13 @@ async def call_gate_activity(
     from movate.core.models import RunRequest  # noqa: PLC0415
 
     ctx = _get_context()
-    bundle = load_agent(classifier_agent, defaults=ctx.defaults)
-    clf_input = _project_state(state, bundle)
+    clf_ref = _resolve_classifier_ref(classifier_agent, workflow_dir)
+    bundle = load_agent(clf_ref, defaults=ctx.defaults)
+    # Build the classifier input the SAME way the native runner does
+    # (runner._run_intent_router): {text: <state[input_field]>, labels: <route
+    # keys>}. The classifier agents' input schemas require both keys, so the
+    # _project_state projection used for agent nodes is the wrong builder here.
+    clf_input = {"text": str(state.get(input_field, "")), "labels": list(route_labels or [])}
     executor = _executor_for(ctx, state)
 
     response = await executor.execute(
@@ -500,11 +545,147 @@ async def call_judge_activity(
     )
 
 
+@_activity.defn  # type: ignore[untyped-decorator]
+async def call_human_activity(
+    node_id: str,
+    state: dict[str, Any],
+    run_id: str,
+    prompt: str,
+    output_contract: list[str],
+    approvers: list[str],
+    workflow_name: str,
+    workflow_version: str,
+) -> None:
+    """HUMAN node → persist a durable awaiting-human pause record (ADR 062).
+
+    Compiler contract (``_emit_human_node``): the workflow calls this activity,
+    then parks on ``workflow.wait_condition`` until a ``human_response`` signal
+    arrives. This activity records the pause in the mdk store so an operator can
+    list it (``GET /workflow-runs?status=paused``) and a transport can render
+    the approval; the HTTP signal endpoint (``POST /workflow-runs/{id}/signal``)
+    reads this record, validates the decision against ``output_contract``, then
+    signals the Temporal handle — which resolves the ``wait_condition``.
+
+    Mirrors the native runner's pause write (``runner.py`` HUMAN branch): same
+    PAUSED status, ``paused_node_id``, ``paused_state`` and ``human_task`` shape
+    — plus ``runtime='temporal'`` so the signal endpoint routes the resume to
+    the Temporal handle instead of enqueuing a native re-walk (ADR 062 D2). The
+    activity returns nothing; its effect is the persisted checkpoint.
+    """
+    from movate.core.models import WorkflowRunRecord, WorkflowStatus  # noqa: PLC0415
+
+    ctx = _get_context()
+    human_task = {
+        "prompt": prompt,
+        "output_contract": list(output_contract),
+        "approvers": list(approvers),
+    }
+    record = WorkflowRunRecord(
+        workflow_run_id=run_id,
+        tenant_id=_resolve_tenant_id(ctx, state),
+        workflow=workflow_name,
+        workflow_version=workflow_version,
+        status=WorkflowStatus.PAUSED,
+        initial_state=dict(state),
+        final_state=dict(state),
+        paused_node_id=node_id,
+        paused_state=dict(state),
+        human_task=human_task,
+        runtime="temporal",
+    )
+    await ctx.storage.save_workflow_run(record)
+
+    # Escalate to the approval channel (ADR 083) — parity with the native
+    # runner's HUMAN-pause branch. Fire-and-forget + never raises (side effects
+    # in activities, ADR 054 D10; the pause is already persisted). No-op until
+    # MOVATE_NOTIFIER is configured.
+    from movate.core.notifier import HumanPause, notify_human_pause_safe  # noqa: PLC0415
+
+    await notify_human_pause_safe(
+        HumanPause(
+            run_id=run_id,
+            workflow_name=workflow_name,
+            workflow_version=workflow_version,
+            node_id=node_id,
+            prompt=prompt,
+            output_contract=list(output_contract),
+            approvers=list(approvers),
+            tenant_id=record.tenant_id,
+            runtime="temporal",
+        )
+    )
+
+
+@_activity.defn  # type: ignore[untyped-decorator]
+async def persist_workflow_result_activity(
+    run_id: str,
+    status: str,
+    initial_state: dict[str, Any],
+    final_state: dict[str, Any],
+    error: str | None,
+    workflow_name: str,
+    workflow_version: str,
+) -> None:
+    """Write the TERMINAL ``WorkflowRunRecord`` for a Temporal run (ADR 080 D2).
+
+    The compiler emits a call to this around the workflow body: on success (and,
+    via a handled exception, on error) the workflow persists its terminal state
+    to the mdk store so ``mdk runs show`` is accurate and a resumed HITL run is
+    flipped out of ``PAUSED`` (clearing the ``?status=paused`` approvals list).
+    The native runner writes this record at end-of-run; the long-lived Temporal
+    worker has no per-workflow completion callback, so the workflow persists its
+    own terminal state from within an activity (side effects in activities,
+    ADR 054 D10). Upserts on ``workflow_run_id`` — overwriting any prior PAUSED
+    checkpoint under the same id (``run_id`` == the Temporal workflow id, D6).
+    """
+    from movate.core.models import (  # noqa: PLC0415
+        ErrorInfo,
+        WorkflowRunRecord,
+        WorkflowStatus,
+    )
+
+    ctx = _get_context()
+    record = WorkflowRunRecord(
+        workflow_run_id=run_id,
+        tenant_id=_resolve_tenant_id(ctx, final_state),
+        workflow=workflow_name,
+        workflow_version=workflow_version,
+        status=WorkflowStatus(status),
+        initial_state=dict(initial_state),
+        final_state=dict(final_state),
+        error=(
+            ErrorInfo(type="temporal_workflow_error", message=error) if error is not None else None
+        ),
+        runtime="temporal",
+    )
+    await ctx.storage.save_workflow_run(record)
+
+    # Operational signal (ADR 082): durable workflows never hit the native
+    # dispatch edge that powers mdk.jobs.completed, so emit a first-class
+    # completion counter here for the Temporal workbook. Fail-soft + lazy import
+    # so a metrics hiccup never fails the terminal persist (the record above is
+    # the source of truth; the metric is best-effort telemetry). No-op when the
+    # OTLP sink is off / OTel absent.
+    try:
+        from movate.tracing import record_workflow_completed  # noqa: PLC0415
+
+        record_workflow_completed(
+            workflow=workflow_name,
+            status=record.status.value,
+            runtime="temporal",
+            tenant_id=record.tenant_id,
+        )
+    except Exception:  # pragma: no cover - telemetry must never break execution
+        pass
+
+
 __all__ = [
     "ActivityContext",
     "call_agent_activity",
     "call_gate_activity",
+    "call_human_activity",
     "call_judge_activity",
     "call_skill_activity",
     "configure_activities",
+    "persist_workflow_result_activity",
 ]

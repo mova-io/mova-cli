@@ -27,7 +27,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
@@ -40,6 +40,7 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     Header,
     HTTPException,
     Query,
@@ -50,7 +51,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import movate
 from movate.core.auth import (
@@ -176,6 +177,10 @@ from movate.runtime.hardening import (
     resolve_max_request_bytes,
     set_response_economics,
 )
+from movate.runtime.hypermedia import (
+    agent_links,
+    kb_links,
+)
 from movate.runtime.long_poll import (
     HEADER_POLL_TIMEOUT,
     HEADER_WAIT_CLAMPED,
@@ -271,6 +276,7 @@ from movate.runtime.schemas import (
     CatalogSyncResponse,
     CentralityScoreView,
     CommunityView,
+    DeadLetterPurgeView,
     DescribeAgentRequest,
     DescribeAgentResponse,
     DescribeAgentTokenUsageView,
@@ -294,6 +300,8 @@ from movate.runtime.schemas import (
     FeedbackSubmission,
     FeedbackView,
     GeneratedEvalCaseView,
+    GraphAssertRequest,
+    GraphAssertView,
     GraphCentralityView,
     GraphCommunitiesView,
     GraphologyView,
@@ -356,6 +364,7 @@ from movate.runtime.schemas import (
     RunEstimateView,
     RunExplainLlmCallView,
     RunExplainView,
+    RunReplayView,
     RunSubmission,
     RunTraceView,
     RunView,
@@ -364,6 +373,7 @@ from movate.runtime.schemas import (
     SessionMessageView,
     SessionView,
     SkillCreatedView,
+    SkippedEdgeView,
     ThreadCreateSubmission,
     ThreadListView,
     ThreadMessageSubmission,
@@ -375,6 +385,7 @@ from movate.runtime.schemas import (
     TroubleshootRequest,
     UnifiedAgentCreatedView,
     UsageView,
+    VoiceTurnView,
     WizardAgentSubmission,
     WorkflowCreatedView,
     WorkflowCreateRequest,
@@ -604,12 +615,79 @@ class _VoiceTurnConfig:
     Defaults reproduce the zero-change promise (the common single-text-field
     agent, tenant-default voice). ``mock`` mirrors the SSE run-stream route's
     ``body.mock`` so a turn can run offline without a live LLM key.
+
+    ``session_id`` (ADR 050 D1/D8 — voice session threading): when set on the
+    initial ``config`` frame, the voice handler threads prior session turns as
+    context and appends completed voice turns — the same ``_assemble_session_input``
+    + ``_append_session_turn`` pattern the text run endpoint uses. This means
+    a client can start a text conversation, switch to voice, and the agent has
+    full context from both modalities.
     """
 
     input_key: str = "text"
     language: str | None = None
     voice_id: str = ""
     mock: bool = False
+    session_id: str | None = None
+    # Sentence-level TTS overlap (ADR 048 D7 / pipeline ``tts_streaming``): speak
+    # sentence one while the agent is still generating sentence two — the biggest
+    # time-to-first-audio win. Defaults ON so production mdk voice agents get the
+    # same latency the demo already ships; a client can set ``tts_streaming:
+    # false`` in its config frame to fall back to the strictly-sequential turn.
+    # The WS event protocol is unchanged either way (consumers key off ``kind``).
+    tts_streaming: bool = True
+    # Speculative agent kickoff (ADR 070): start the agent on a stable interim,
+    # before STT endpoints, to recover the ~1.5s endpointing wait. Defaults OFF
+    # (opt-in) because it changes the cost profile (cancelled speculative runs);
+    # a client enables it per-turn via ``speculative: true`` in the config frame.
+    # Only takes effect when the agent is cancel-safe (``speculatable``).
+    speculative: bool = False
+    # Per-agent STT keyterm boosting (ADR 071 D4): domain vocab passed to
+    # ``stt.transcribe(keyterms=...)``. Empty → no boosting. Seeded from the
+    # agent's voice block; boosting-capable providers (Deepgram) honor it.
+    keyterms: list[str] = field(default_factory=list)
+    # Per-agent endpointing override (ADR 073 D3): the silence-hold (ms) before
+    # the turn is declared final — the dominant fixed latency. ``None`` keeps the
+    # adapter default (1500 ms). Seeded from the agent's voice block; a client may
+    # override per-turn via ``endpointing_ms`` in its config frame. Endpointing-
+    # capable providers (Deepgram) honor it; others ignore it.
+    endpointing_ms: int | None = None
+    # ADR 073 Phase 3 — adaptively move the endpointing hold within the session
+    # from observed turn cadence (speculation commit-ratio). Off by default; when
+    # on, the session controller seeds from ``endpointing_ms`` (or 1500).
+    endpointing_adaptive: bool = False
+
+
+def _seed_voice_turn_config(config: _VoiceTurnConfig, bundle: Any) -> None:
+    """Seed the per-turn config from the agent's ``voice`` block (ADR 071 D1-D3).
+
+    The ``agent.yaml`` voice block (:class:`movate.core.models.VoiceConfig`) used
+    to be parsed but **ignored** by the runtime — this closes that gap. The block
+    is the *default* for the session; a client ``config`` frame still overrides
+    per-turn (handled in :func:`_collect_voice_turn`). Absent block / unset
+    fields leave the runtime defaults untouched, byte-for-byte today's behavior.
+    """
+    voice = getattr(getattr(bundle, "spec", None), "voice", None)
+    if voice is None:
+        return
+    if getattr(voice, "voice_id", ""):
+        config.voice_id = voice.voice_id
+    if getattr(voice, "language", None) is not None:
+        config.language = voice.language
+    # ADR 071 D2: tri-state — None means "keep the runtime default".
+    if getattr(voice, "tts_streaming", None) is not None:
+        config.tts_streaming = bool(voice.tts_streaming)
+    # ADR 071 D3: speculative is a plain bool (default False).
+    config.speculative = bool(getattr(voice, "speculative", False))
+    # ADR 071 D4: per-agent STT keyterm boosting (empty list = no boosting).
+    keyterms = getattr(voice, "keyterms", None)
+    if keyterms:
+        config.keyterms = list(keyterms)
+    # ADR 073 D3: per-agent endpointing override (None = keep adapter default).
+    if getattr(voice, "endpointing_ms", None) is not None:
+        config.endpointing_ms = int(voice.endpointing_ms)
+    # ADR 073 Phase 3: adaptive endpointing opt-in (default False).
+    config.endpointing_adaptive = bool(getattr(voice, "endpointing_adaptive", False))
 
 
 async def _collect_voice_turn(
@@ -644,6 +722,22 @@ async def _collect_voice_turn(
             config.language = ctrl.get("language") or config.language
             config.voice_id = str(ctrl.get("voice_id") or config.voice_id)
             config.mock = bool(ctrl.get("mock", config.mock))
+            # ADR 050 D1/D8 — session_id threading through voice WS. Set
+            # once on the initial config frame; subsequent config frames in
+            # the same connection can update it (e.g. to start a new session
+            # mid-connection). ``None`` (the default / absent) is the
+            # stateless path, byte-for-byte unchanged.
+            if "session_id" in ctrl:
+                config.session_id = ctrl["session_id"] or None
+            config.tts_streaming = bool(ctrl.get("tts_streaming", config.tts_streaming))
+            config.speculative = bool(ctrl.get("speculative", config.speculative))
+            # ADR 073 D3: a client may pin the silence-hold per-turn. An explicit
+            # ``null`` resets to the adapter default; absent leaves it untouched.
+            if "endpointing_ms" in ctrl:
+                raw = ctrl.get("endpointing_ms")
+                config.endpointing_ms = int(raw) if raw is not None else None
+            if "endpointing_adaptive" in ctrl:
+                config.endpointing_adaptive = bool(ctrl.get("endpointing_adaptive"))
         elif ctrl_type == "end":
             return audio_frames, False
         elif ctrl_type == "close":
@@ -679,7 +773,7 @@ async def _send_voice_event(websocket: WebSocket, event: Any) -> None:
         await websocket.send_json(_voice_ctrl(event.kind, text=event.text))
 
 
-async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
+async def _send_voice_latency(websocket: WebSocket, events: list[Any], metrics: Any = None) -> None:
     """Emit one ``latency`` control frame for a finished pipeline turn.
 
     Derives per-stage latencies from the ``at_ms`` offsets stamped on the
@@ -688,6 +782,12 @@ async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
     UI renders as the "responded in {X}ms" badge. Additive (a client that
     doesn't know the frame ignores it); silent when there's nothing to report
     (e.g. an STT-stage error produced no milestones).
+
+    When ``metrics`` (a :class:`~movate.voice.observer.MetricsObserver`) is
+    given and a speculation fired this turn, a ``speculation`` block
+    (started / committed / cancelled / commit_ratio / avg_head_start_ms) rides
+    along — the ADR 070/073 A/B signal the demo perf panel + runbook aggregate
+    to decide the ``speculative`` default-flip. Omitted when nothing speculated.
     """
     from movate.voice.pipeline import (  # noqa: PLC0415 - lazy, voice-only path
         compute_turn_latency,
@@ -698,16 +798,18 @@ async def _send_voice_latency(websocket: WebSocket, events: list[Any]) -> None:
     badge = format_latency_badge(latency)
     if not badge:
         return
-    await websocket.send_json(
-        _voice_ctrl(
-            "latency",
-            badge=badge,
-            responded_in_ms=latency.responded_in_ms,
-            stt_final_ms=latency.stt_final_ms,
-            agent_first_token_ms=latency.agent_first_token_ms,
-            tts_first_audio_ms=latency.tts_first_audio_ms,
-        )
+    fields: dict[str, Any] = dict(
+        badge=badge,
+        responded_in_ms=latency.responded_in_ms,
+        stt_final_ms=latency.stt_final_ms,
+        agent_first_token_ms=latency.agent_first_token_ms,
+        tts_first_audio_ms=latency.tts_first_audio_ms,
     )
+    if metrics is not None:
+        spec = metrics.speculation_snapshot()
+        if spec["started"]:
+            fields["speculation"] = spec
+    await websocket.send_json(_voice_ctrl("latency", **fields))
 
 
 async def _watch_voice_barge_in(
@@ -748,6 +850,29 @@ async def _watch_voice_barge_in(
                 buffered.append(ctrl)
 
 
+@dataclass
+class _VoicePipelineTurnResult:
+    """What :func:`_stream_voice_pipeline_turn` returns after streaming one turn.
+
+    Captures the outcome (stop / continue, events for latency + cost, and the
+    ``done`` frame data) so the caller (the WS handler loop) can persist a
+    RunRecord and thread session state WITHOUT re-parsing the event stream.
+    """
+
+    stop: bool
+    """True when the session should end (the watcher saw a ``close``)."""
+    events: list[Any]
+    """All VoiceEvents emitted during the turn (for latency + cost derivation)."""
+    run_id: str
+    """The Executor's run_id from the ``done`` event (empty on error)."""
+    status: str
+    """The turn's terminal status from ``done`` (empty on error)."""
+    transcript: str
+    """The final STT transcript (the user's words)."""
+    answer_text: str
+    """The agent's answer text (concatenated agent.token deltas)."""
+
+
 async def _stream_voice_pipeline_turn(
     websocket: WebSocket,
     *,
@@ -760,7 +885,10 @@ async def _stream_voice_pipeline_turn(
     config: Any,
     stt_api_key: str | None,
     tts_api_key: str | None,
-) -> bool:
+    extra_input: dict[str, Any] | None = None,
+    guard: Any = None,
+    adaptive: Any = None,
+) -> _VoicePipelineTurnResult:
     """Stream one pipeline voice turn with barge-in + a latency badge.
 
     Wraps :func:`movate.voice.run_voice_pipeline` with two pieces of demo
@@ -774,43 +902,516 @@ async def _stream_voice_pipeline_turn(
       frame carrying the turn's per-stage timings is emitted (the demo's
       "responded in {X}ms" UI + the voice-latency observability win).
 
-    Returns ``True`` when the session should end (the watcher saw a ``close``
-    during the turn), else ``False`` to run the next turn.
+    Returns a :class:`_VoicePipelineTurnResult` with the stop signal plus the
+    data needed to persist a RunRecord and thread session state.
     """
+    from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
     from movate.voice import run_voice_pipeline  # noqa: PLC0415
+    from movate.voice.observer import MetricsObserver  # noqa: PLC0415
 
     cancel = asyncio.Event()
     buffered: list[dict[str, Any]] = []
     watcher = asyncio.create_task(_watch_voice_barge_in(websocket, cancel, buffered))
     latency_events: list[Any] = []
+    run_id = ""
+    status = ""
+    transcript = ""
+    answer_parts: list[str] = []
+    # Per-turn observer: tallies this turn's speculation outcomes (started /
+    # committed / cancelled + head-start) so the latency badge can carry the
+    # ADR 070/073 A/B signal alongside the per-stage timings. Off-path for any
+    # non-speculative turn (counts stay zero).
+    metrics = MetricsObserver()
+    # ADR 067 D4: the mdk Executor enters the framework-neutral pipeline as an
+    # ``AgentTurn`` adapter — the only place the runtime threads bundle /
+    # tenant / input_key into the voice path. The pipeline sees the seam, not
+    # the executor.
+    agent = ExecutorAgentTurn(
+        executor=executor,
+        bundle=bundle,
+        tenant_id=tenant_id,
+        input_key=config.input_key,
+    )
+    # ADR 073 cost-guard: speculation only fires if the agent requested it AND the
+    # session-scoped guard hasn't tripped (a low commit-ratio profile auto-
+    # disables it mid-session so cancelled runs stop costing — ADR 070's risk).
+    effective_speculative = config.speculative and (guard is None or guard.should_speculate())
+    # ADR 073 Phase 3: when adaptive endpointing is on, the controller's current
+    # hold (moved from observed cadence) wins over the static value for this turn.
+    effective_endpointing = config.endpointing_ms
+    if adaptive is not None and config.endpointing_adaptive:
+        effective_endpointing = adaptive.current_ms
     try:
         async for event in run_voice_pipeline(
             audio_in=audio_in,
             stt=stt,
             tts=tts,
-            executor=executor,
-            bundle=bundle,
-            tenant_id=tenant_id,
-            input_key=config.input_key,
+            agent=agent,
             language=config.language,
             voice_id=config.voice_id,
             stt_api_key=stt_api_key,
             tts_api_key=tts_api_key,
+            keyterms=config.keyterms or None,
+            endpointing_ms=effective_endpointing,
+            tts_streaming=config.tts_streaming,
+            speculative=effective_speculative,
+            observer=metrics,
             cancel=cancel,
+            extra_input=extra_input,
         ):
             latency_events.append(event)
-            if event.kind == "done":
+            if event.kind == "transcript.final":
+                transcript = event.text
+            elif event.kind == "agent.token" and event.text:
+                answer_parts.append(event.text)
+            elif event.kind == "done":
+                run_id = event.run_id
+                status = event.status
                 # Emit the latency badge just BEFORE done so it lands inside the
                 # turn (a client draining to ``done`` still sees it).
-                await _send_voice_latency(websocket, latency_events)
+                await _send_voice_latency(websocket, latency_events, metrics)
             await _send_voice_event(websocket, event)
+        # Feed this turn's speculation outcome to the guard; if it trips now,
+        # tell the client so the UI can reflect that speculation went dormant.
+        if (
+            guard is not None
+            and effective_speculative
+            and guard.record(metrics.speculation_snapshot())
+        ):
+            await websocket.send_json(
+                _voice_ctrl(
+                    "speculation_disabled",
+                    reason="low_commit_ratio",
+                    commit_ratio=round(guard.commit_ratio, 3),
+                )
+            )
+        # ADR 073 Phase 3: feed the turn's cadence to the adaptive controller; if
+        # it moved the hold, tell the client so the UI can show the new value.
+        if adaptive is not None and config.endpointing_adaptive:
+            moved = adaptive.record(metrics.speculation_snapshot())
+            if moved is not None:
+                await websocket.send_json(_voice_ctrl("endpointing_adapted", endpointing_ms=moved))
     finally:
         watcher.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await watcher
 
     # A ``close`` the watcher read mid-turn ends the session after this turn.
-    return any(b.get("type") == "close" for b in buffered)
+    stop = any(b.get("type") == "close" for b in buffered)
+    return _VoicePipelineTurnResult(
+        stop=stop,
+        events=latency_events,
+        run_id=run_id,
+        status=status,
+        transcript=transcript,
+        answer_text="".join(answer_parts),
+    )
+
+
+async def _finalize_voice_turn(
+    *,
+    websocket: WebSocket,
+    store: StorageProvider,
+    result: _VoicePipelineTurnResult,
+    tenant_id: str,
+    config: _VoiceTurnConfig,
+    session: Session | None,
+) -> None:
+    """Post-turn processing: patch voice metrics, emit cost, append session.
+
+    Called after each pipeline voice turn completes (ADR 050 D1/D7/D8). Extracted
+    from the main handler loop to keep the branch count manageable.
+    """
+    if not result.run_id:
+        return
+
+    from movate.voice.cost import compute_voice_turn_cost  # noqa: PLC0415
+    from movate.voice.pipeline import compute_turn_latency  # noqa: PLC0415
+
+    latency = compute_turn_latency(result.events)
+    audio_dur_s = (latency.stt_final_ms or 0.0) / 1000.0
+
+    # Bridge the per-turn voice latency to OTel — once per turn, at this edge,
+    # alongside cost recording (voice observability). No-op when metrics are off.
+    from movate.tracing import record_voice_turn  # noqa: PLC0415
+
+    record_voice_turn(
+        tenant_id=tenant_id,
+        responded_ms=latency.responded_in_ms,
+        stt_final_ms=latency.stt_final_ms,
+        tts_first_audio_ms=latency.tts_first_audio_ms,
+        interrupted=str(getattr(result, "status", "")).lower() == "interrupted",
+    )
+
+    run_record = await store.get_run(result.run_id, tenant_id=tenant_id)
+    if run_record is None:
+        return
+
+    voice_cost = compute_voice_turn_cost(
+        audio_duration_s=audio_dur_s,
+        answer_chars=len(result.answer_text),
+        llm_cost_usd=run_record.metrics.cost_usd,
+    )
+    patched = run_record.model_copy(
+        update={
+            "modality": "voice",
+            "stt_latency_ms": latency.stt_final_ms,
+            "tts_latency_ms": latency.tts_ms,
+            "audio_duration_s": audio_dur_s,
+            "stt_cost_usd": voice_cost.stt_cost_usd,
+            "tts_cost_usd": voice_cost.tts_cost_usd,
+        }
+    )
+    await store.save_run(patched)
+
+    # ADR 050 D7: voice cost in the usage frame.
+    await websocket.send_json(
+        _voice_ctrl(
+            "usage",
+            run_id=result.run_id,
+            llm_cost_usd=voice_cost.llm_cost_usd,
+            stt_cost_usd=voice_cost.stt_cost_usd,
+            tts_cost_usd=voice_cost.tts_cost_usd,
+            total_cost_usd=voice_cost.total_cost_usd,
+            session_id=config.session_id,
+        )
+    )
+
+    # ADR 050 D1/D8: append to session (same pattern as text runs).
+    if session is not None and run_record.status == JobStatus.SUCCESS:
+        await _append_session_turn(
+            store,
+            session=session,
+            user_input={config.input_key: result.transcript},
+            run_id=run_record.run_id,
+            output=run_record.output,
+            cost_usd=(
+                run_record.metrics.cost_usd + voice_cost.stt_cost_usd + voice_cost.tts_cost_usd
+            ),
+            tokens_in=run_record.metrics.tokens.input,
+            tokens_out=run_record.metrics.tokens.output,
+        )
+
+
+@dataclass
+class _OneShotVoiceResult:
+    """The collapsed result of one one-shot voice turn (the REST POST path).
+
+    ADR 050 D2 — the same ``run_voice_pipeline`` turn as the WS, but drained to
+    a single request/response instead of streamed. Built by
+    :func:`_run_voice_pipeline_oneshot` from the SAME event stream the WS
+    serializes, so there is exactly ONE voice execution path (no fork — ADR 050
+    D1 / Consequences). The route reads ``transcript`` / ``answer_text`` / the
+    synthesized ``audio`` for the JSON envelope + headers, and ``latency`` for
+    the per-stage timing headers (ADR 050 D7).
+    """
+
+    transcript: str = ""
+    answer_text: str = ""
+    run_id: str = ""
+    status: str = ""
+    audio: bytearray = field(default_factory=bytearray)
+    audio_codec: str | None = None
+    audio_sample_rate: int | None = None
+    error_message: str = ""
+    error_stage: str = ""
+    events: list[Any] = field(default_factory=list)
+
+
+async def _run_voice_pipeline_oneshot(
+    *,
+    audio_in: AsyncIterator[Any],
+    stt: Any,
+    tts: Any,
+    executor: Any,
+    bundle: Any,
+    tenant_id: str,
+    input_key: str = "text",
+    language: str | None = None,
+    voice_id: str = "",
+    keyterms: list[str] | None = None,
+    endpointing_ms: int | None = None,
+    stt_api_key: str | None = None,
+    tts_api_key: str | None = None,
+) -> _OneShotVoiceResult:
+    """Drive ONE voice turn to completion and collect its outcome (ADR 050 D2).
+
+    The REST one-shot parity to the streaming WS: it runs the **same**
+    :func:`movate.voice.run_voice_pipeline` (STT → the UNCHANGED Executor →
+    TTS) the WS route drives, but instead of serializing each event onto a
+    socket it accumulates them — concatenating the ``tts.audio`` frames into one
+    answer-audio buffer and capturing the transcript / answer / run id / status
+    / any stage error. This is deliberately NOT a second execution path (ADR 050
+    Consequences): it is the same pipeline, drained to a request/response.
+
+    No ``cancel`` event is passed — a one-shot REST turn has no live barge-in
+    (there is no concurrent mic stream); the turn runs to its natural end.
+    """
+    from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
+    from movate.voice import run_voice_pipeline  # noqa: PLC0415
+
+    # ADR 067 D4: the Executor enters the framework-neutral pipeline as an
+    # ``AgentTurn`` — the same seam the streaming WS turn uses, so the one-shot
+    # path stays a single execution path (ADR 050 D1), now behind the seam.
+    agent = ExecutorAgentTurn(
+        executor=executor,
+        bundle=bundle,
+        tenant_id=tenant_id,
+        input_key=input_key,
+    )
+    result = _OneShotVoiceResult()
+    async for event in run_voice_pipeline(
+        audio_in=audio_in,
+        stt=stt,
+        tts=tts,
+        agent=agent,
+        language=language,
+        voice_id=voice_id,
+        keyterms=keyterms or None,
+        endpointing_ms=endpointing_ms,
+        stt_api_key=stt_api_key,
+        tts_api_key=tts_api_key,
+    ):
+        result.events.append(event)
+        if event.kind == "transcript.final":
+            result.transcript = event.text
+        elif event.kind == "tts.audio" and event.audio is not None:
+            result.audio.extend(event.audio.data)
+            # The codec/sample-rate is uniform across a turn's frames; record
+            # the first non-empty frame's so the envelope can describe the bytes.
+            if result.audio_codec is None:
+                result.audio_codec = event.audio.codec
+                result.audio_sample_rate = event.audio.sample_rate
+        elif event.kind == "error":
+            # First error wins — the pipeline degrades and stops at STT/agent
+            # errors (TTS errors still leave the text answer intact, D8).
+            if not result.error_message:
+                result.error_message = event.message
+                result.error_stage = event.stage
+        elif event.kind == "done":
+            result.run_id = event.run_id
+            result.status = event.status
+
+    # The answer text is the concatenation of the streamed agent tokens (the
+    # same text TTS spoke). Derive it from the event stream so the envelope's
+    # ``response_text`` matches what was synthesized.
+    result.answer_text = "".join(ev.text for ev in result.events if ev.kind == "agent.token")
+    # A turn that errored before ``done`` (STT/agent stage) has no terminal
+    # event — surface the failure as the status so the envelope is truthful.
+    if not result.status and result.error_message:
+        result.status = "error"
+    return result
+
+
+class _PrefilledSTT:
+    """An STT adapter that yields a caller-supplied transcript verbatim.
+
+    The ``mdk voice say <agent> <text>`` path (ADR 050 D11) speaks an answer to
+    *text* the caller typed — there is no audio to recognize. Rather than fork a
+    second, STT-less execution path (which ADR 050 D1 forbids), this stands in as
+    the STT stage of the SAME ``run_voice_pipeline``: it drains any inbound audio
+    and immediately endpoints with the provided text as the final transcript, so
+    the turn is STT(=given text) → the UNCHANGED agent → TTS exactly like every
+    other turn — just entered with the words already known.
+    """
+
+    name = "prefilled_stt"
+    version = "0.0.1"
+
+    def __init__(self, transcript: str) -> None:
+        self._transcript = transcript
+
+    async def transcribe(
+        self,
+        audio: Any,
+        *,
+        language: str | None = None,
+        api_key: str | None = None,
+        keyterms: Any = None,  # ADR 071 D4: accepted; no recognition happens here
+        endpointing_ms: int | None = None,  # ADR 073 D3: accepted; no silence-wait here
+    ) -> AsyncIterator[Any]:
+        from movate.voice.base import TranscriptChunk  # noqa: PLC0415
+
+        async for _ in audio:
+            pass
+        yield TranscriptChunk(text=self._transcript, is_final=True, confidence=1.0)
+
+
+# Inbound-audio fetch ceiling for the ``audio_url`` path (ADR 050 D10). A turn's
+# audio is bounded — 25 MiB is comfortably above a long phone call's recording
+# while capping a hostile / mistyped URL from streaming an unbounded body into a
+# replica. Mirrors the default request-body guard (hardening D6).
+_VOICE_AUDIO_URL_MAX_BYTES = 25 * 1024 * 1024
+
+
+async def _fetch_voice_audio_url(url: str) -> bytes:
+    """Fetch inbound audio from a URL for the one-shot voice POST (ADR 050 D10).
+
+    The "large / already-hosted audio" path — a telephony recording in blob
+    storage, etc. Bounded by :data:`_VOICE_AUDIO_URL_MAX_BYTES` so a mistyped or
+    hostile URL can't stream an unbounded body into the replica. Only ``http``/
+    ``https`` are accepted (no ``file://`` / SSRF-to-localhost-scheme tricks at
+    the scheme level; deeper SSRF policy is an operator network concern, flagged
+    in the PR). Any fetch failure becomes a clean 400 rather than a 500.
+    """
+    import httpx  # noqa: PLC0415
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise AgentCreationError("audio_url must be an http(s) URL (ADR 050 D10)", status_code=400)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.content
+    except Exception as exc:
+        raise AgentCreationError(f"could not fetch audio_url: {exc}", status_code=400) from exc
+    if len(data) > _VOICE_AUDIO_URL_MAX_BYTES:
+        raise AgentCreationError(
+            f"fetched audio exceeds the {_VOICE_AUDIO_URL_MAX_BYTES}-byte limit",
+            status_code=400,
+        )
+    return data
+
+
+def _build_voice_adapter(app: Any, kind: str, override: str | None) -> Any:
+    """Build an STT/TTS adapter for one turn, honoring a per-request override.
+
+    ``kind`` is ``"stt"`` or ``"tts"``. Absent an override, returns the runtime
+    default from the app-state factory (the SAME factory the WS path uses — so
+    the REST and WS surfaces resolve providers identically, ADR 050 D2/D6). An
+    override names a provider family (``deepgram`` / ``cartesia`` / ``openai`` /
+    ``elevenlabs`` / ``azure``); an unknown name falls back to the default
+    rather than erroring, so a typo degrades to the configured provider instead
+    of failing the turn (the per-request override is a hint routed through the
+    edge, mirroring the WS init-frame override).
+
+    NOTE (honest scope, §11): full ADR-049 router validation of the override
+    against the tenant policy/manifests is the router's job (ADR 050 D6) and is
+    NOT re-implemented here — this resolves the override to a built adapter and
+    defers richer policy to the router seam the WS path shares.
+    """
+    factory = getattr(app.state, f"voice_{kind}_factory", None)
+    default_adapter = factory() if factory is not None else None
+    if not override:
+        return default_adapter
+    built = _build_named_voice_adapter(kind, override)
+    return built if built is not None else default_adapter
+
+
+def _build_named_voice_adapter(kind: str, name: str) -> Any:
+    """Construct a named voice adapter (provider-family) or ``None`` if unknown.
+
+    Lazy-imports the concrete adapter so a runtime without the relevant SDK
+    only pays for what the override asks for. ``None`` (unknown name / import
+    failure) lets the caller fall back to the configured default.
+    """
+    family = (name or "").strip().lower()
+    try:
+        if kind == "stt":
+            if family == "deepgram":
+                from movate.voice import DeepgramSTT  # noqa: PLC0415
+
+                return DeepgramSTT()
+            if family in ("openai", "whisper", "openai_whisper"):
+                from movate.voice import OpenAIWhisperSTT  # noqa: PLC0415
+
+                return OpenAIWhisperSTT()
+            if family in ("azure", "azure_speech"):
+                from movate.voice import AzureSpeechSTT  # noqa: PLC0415
+
+                return AzureSpeechSTT()
+        elif kind == "tts":
+            if family == "cartesia":
+                from movate.voice import CartesiaTTS  # noqa: PLC0415
+
+                return CartesiaTTS()
+            if family == "elevenlabs":
+                from movate.voice import ElevenLabsTTS  # noqa: PLC0415
+
+                return ElevenLabsTTS()
+            if family in ("openai", "openai_tts"):
+                from movate.voice import OpenAITTS  # noqa: PLC0415
+
+                return OpenAITTS()
+            if family in ("azure", "azure_neural"):
+                from movate.voice import AzureNeuralTTS  # noqa: PLC0415
+
+                return AzureNeuralTTS()
+    except Exception:
+        # Unknown family or an adapter whose construction needs config we don't
+        # have → fall back to the runtime default (never fail the turn on a hint).
+        return None
+    return None
+
+
+def _header_safe(value: str) -> str:
+    """Make a string safe to put in an HTTP header value.
+
+    Transcripts/answers can contain newlines or non-latin-1 characters that an
+    HTTP header value cannot carry; collapse newlines and drop un-encodable
+    characters so the stream-mode response can echo them as headers without a
+    serialization error. (The full text is always available in the JSON body
+    mode; the header echo is a convenience for the binary-body path.)
+    """
+    flat = " ".join(value.splitlines())
+    return flat.encode("latin-1", "ignore").decode("latin-1")
+
+
+async def _voice_economics_from_run(
+    store: StorageProvider, *, run_id: str, tenant_id: str
+) -> ResponseEconomics | None:
+    """Read a finished voice turn's run-record metrics into ResponseEconomics.
+
+    Best-effort (ADR 045 R2): returns ``None`` when the run record isn't
+    retrievable (e.g. the turn errored and persisted a FailureRecord, or a
+    storage hiccup) so the middleware omits the cost/token headers rather than
+    emitting a misleading zero. Never raises.
+    """
+    if not run_id:
+        return None
+    try:
+        record = await store.get_run(run_id, tenant_id=tenant_id)
+    except Exception:
+        return None
+    if record is None:
+        return None
+    metrics = getattr(record, "metrics", None)
+    if metrics is None:
+        # Some run records carry flat cost/token fields instead of a metrics
+        # object — read those when present.
+        cost = getattr(record, "cost_usd", None)
+        return ResponseEconomics(cost_usd=cost) if cost is not None else None
+    tokens = getattr(metrics, "tokens", None)
+    return ResponseEconomics(
+        cost_usd=getattr(metrics, "cost_usd", None),
+        tokens_in=getattr(tokens, "input", None) if tokens is not None else None,
+        tokens_out=getattr(tokens, "output", None) if tokens is not None else None,
+    )
+
+
+def _set_voice_latency_headers(response: Response, events: list[Any]) -> None:
+    """Stamp the voice turn's per-stage latency onto additive response headers.
+
+    Derives the per-stage timings from the ``at_ms`` offsets stamped on the
+    event stream (the SAME ``compute_turn_latency`` the WS ``latency`` frame
+    uses, ADR 050 D7) and emits them as ``X-MDK-Voice-Latency-*`` headers (the
+    REST analogue of the WS latency frame). Additive + best-effort: a milestone
+    never reached (an STT-stage error) simply omits that header. Never raises.
+    """
+    try:
+        from movate.voice.pipeline import compute_turn_latency  # noqa: PLC0415
+
+        latency = compute_turn_latency(events)
+    except Exception:
+        return
+    if latency.responded_in_ms is not None:
+        response.headers["X-MDK-Voice-Latency-Responded-Ms"] = str(round(latency.responded_in_ms))
+    if latency.stt_final_ms is not None:
+        response.headers["X-MDK-Voice-Latency-Stt-Ms"] = str(round(latency.stt_final_ms))
+    if latency.agent_first_token_ms is not None:
+        response.headers["X-MDK-Voice-Latency-Agent-Ms"] = str(round(latency.agent_first_token_ms))
+    if latency.tts_first_audio_ms is not None:
+        response.headers["X-MDK-Voice-Latency-Tts-Ms"] = str(round(latency.tts_first_audio_ms))
 
 
 async def _send_realtime_chunk(websocket: WebSocket, chunk: Any) -> None:
@@ -939,7 +1540,12 @@ async def _run_voice_realtime(websocket: WebSocket, bundle: Any, *, tenant_id: s
 
     provider = factory()
     instructions = _realtime_instructions(bundle)
+    # ADR 071 D1: seed from the agent's voice block so per-agent voice_id /
+    # language apply on the realtime path too (the streaming/speculative/keyterms
+    # fields are pipeline-only and ignored here). Client config frames still
+    # override per-turn.
     config = _VoiceTurnConfig()
+    _seed_voice_turn_config(config, bundle)
 
     # BYOK (ADR 048 D6 / ADR 018): the tenant's own realtime-provider key,
     # resolved at the edge. ``None`` → the adapter's env default (back-compat).
@@ -1488,6 +2094,12 @@ _GRAPH_GROWTH_KINDS: tuple[str, str] = (
     EventKind.GRAPH_EDGE_ADDED.value,
 )
 
+# Upper bound (seconds) on the per-frame ``?pace=`` delay for the snapshot
+# replay. The demo "watch it assemble" effect uses small fractions of a
+# second; this ceiling stops a stray/abusive ``?pace=`` from pinning a
+# streaming connection open frame-by-frame for an unreasonable time.
+_GRAPH_REPLAY_PACE_MAX_S = 2.0
+
 
 def _graph_growth_frame_for_event(ev: EventView, *, project_id: str | None) -> str | None:
     """Translate one outbox event into a growth SSE frame, or ``None`` to skip.
@@ -1506,6 +2118,43 @@ def _graph_growth_frame_for_event(ev: EventView, *, project_id: str | None) -> s
     return _sse_frame(sse_event, data)
 
 
+async def _replay_snapshot_frames(
+    doc: GraphologyDoc,
+    *,
+    seen_nodes: set[str],
+    seen_edges: set[str],
+    replay_pace_s: float,
+    is_disconnected: Callable[[], Awaitable[bool]] | None,
+) -> AsyncIterator[str]:
+    """Yield one ``node.added`` frame per node then one ``edge.added`` per edge.
+
+    Each frame is a single-element graphology document so the client merges it
+    with the same zero-transform ``graph.import(...)``. ``seen_nodes`` /
+    ``seen_edges`` are populated as we go (the caller dedupes the live-tail
+    against them). When ``replay_pace_s > 0`` we sleep that long *between*
+    frames so the viewer paints the graph node-by-node (the demo "watch it
+    grow" effect) and check the disconnect predicate before each frame so a
+    paced replay unwinds promptly when the EventSource closes. At ``0.0`` it
+    emits as fast as the client drains — the original snapshot contract."""
+    paced = replay_pace_s > 0.0
+    for node in doc.nodes:
+        if paced and is_disconnected is not None and await is_disconnected():
+            return
+        seen_nodes.add(node.key)
+        frame_doc = GraphologyDoc(nodes=[node], edges=[])
+        yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
+        if paced:
+            await asyncio.sleep(replay_pace_s)
+    for edge in doc.edges:
+        if paced and is_disconnected is not None and await is_disconnected():
+            return
+        seen_edges.add(edge.key)
+        frame_doc = GraphologyDoc(nodes=[], edges=[edge])
+        yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
+        if paced:
+            await asyncio.sleep(replay_pace_s)
+
+
 async def _sse_graph_growth_stream(
     *,
     store: StorageProvider,
@@ -1514,7 +2163,9 @@ async def _sse_graph_growth_stream(
     mode: GraphMode,
     cap: int,
     project_id: str | None = None,
+    min_confidence: float = 0.0,
     live: bool = False,
+    replay_pace_s: float = 0.0,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     poll_interval_s: float = _EVENTS_SSE_POLL_INTERVAL_S,
     heartbeat_interval_s: float = _EVENTS_SSE_HEARTBEAT_INTERVAL_S,
@@ -1527,7 +2178,18 @@ async def _sse_graph_growth_stream(
     node, then one ``edge.added`` frame per edge, each carrying a
     single-element graphology document so the client merges every frame
     with the same zero-transform ``graph.import(...)``. ``project_id``
-    (additive) scopes the replayed window to one project's subgraph.
+    (additive) scopes the replayed window to one project's subgraph;
+    ``min_confidence`` (additive) applies the same confidence floor the GET
+    endpoint does so a filtered stream and a filtered snapshot agree.
+
+    ``replay_pace_s`` (additive, default ``0.0`` = no delay) sleeps that many
+    seconds **between** snapshot frames so the viewer animates the graph
+    *assembling node-by-node* — the demo's "watch it grow" moment even when
+    the graph was built atomically (e.g. a one-shot ``mdk kb ingest
+    --build-graph`` that finished before the viewer opened). At ``0.0`` the
+    replay is emitted as fast as the client drains it, byte-for-byte the
+    original contract. Disconnect is honored between frames so a paced
+    replay unwinds promptly when the EventSource closes.
 
     Phase 2 — **live-tail** (only when ``live=True``): anchor a UTC-now
     cursor and poll the ADR 035 events outbox (the same machinery
@@ -1559,15 +2221,18 @@ async def _sse_graph_growth_stream(
         mode=mode,
         limit=cap,
         project_id=project_id,
+        min_confidence=min_confidence,
     )
-    for node in doc.nodes:
-        seen_nodes.add(node.key)
-        frame_doc = GraphologyDoc(nodes=[node], edges=[])
-        yield _sse_frame("node.added", frame_doc.model_dump(mode="json"))
-    for edge in doc.edges:
-        seen_edges.add(edge.key)
-        frame_doc = GraphologyDoc(nodes=[], edges=[edge])
-        yield _sse_frame("edge.added", frame_doc.model_dump(mode="json"))
+    async for snapshot_frame in _replay_snapshot_frames(
+        doc,
+        seen_nodes=seen_nodes,
+        seen_edges=seen_edges,
+        replay_pace_s=replay_pace_s,
+        is_disconnected=is_disconnected,
+    ):
+        yield snapshot_frame
+    # A paced replay that aborted on disconnect leaves seen_* short of the doc;
+    # the loop simply stopped yielding, which is the correct unwind.
 
     if not live:
         yield _sse_frame("done", {"nodes": len(doc.nodes), "edges": len(doc.edges)})
@@ -2258,7 +2923,7 @@ async def _unified_create_persist_and_attach(
         agent_name=result.bundle.spec.name,
         tenant_id=ctx.tenant_id,
     )
-    return UnifiedAgentCreatedView(
+    view = UnifiedAgentCreatedView(
         source=source,  # type: ignore[arg-type]
         project_id=project_id,
         agent_name=result.bundle.spec.name,
@@ -2269,7 +2934,14 @@ async def _unified_create_persist_and_attach(
         published_version=published.version if published is not None else None,
         changed=published.published if published is not None else True,
         attached=attachment.attached,
+        # Uniform created-resource envelope (ADR 061).
+        id=result.bundle.spec.name,
+        created_at=datetime.now(UTC),
+        etag=published.content_hash if published is not None else None,
     )
+    # Aliased ``_links`` set by field name post-construction (pydantic-mypy).
+    view.links = agent_links(result.bundle.spec.name)
+    return view
 
 
 async def _unified_create_spec(
@@ -3297,8 +3969,28 @@ def _read_idempotency_key(request: Request) -> str | None:
     return key
 
 
+def _idempotency_request_hash(payload: dict[str, Any]) -> str:
+    """Stable SHA-256 fingerprint of a submit payload (item 37 conflict guard).
+
+    Canonicalizes with ``json.dumps(..., sort_keys=True)`` so key order /
+    whitespace don't perturb the digest — two semantically-identical retries
+    fingerprint the same, while a genuinely different payload fingerprints
+    differently. ``default=str`` keeps non-JSON-native values (rare in a submit
+    body) from raising. The caller passes only the request-identifying fields
+    (agent/target/kind/input) — NOT volatile metadata like request_id — so a
+    retry that differs only in a fresh request id is still recognised as the
+    same submission.
+    """
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 async def _idempotent_submit_guard(
-    request: Request, store: StorageProvider, ctx: AuthContext
+    request: Request,
+    store: StorageProvider,
+    ctx: AuthContext,
+    *,
+    request_hash: str | None = None,
 ) -> str | None:
     """Return the ``job_id`` a prior submission with this key enqueued, or ``None``.
 
@@ -3308,11 +4000,31 @@ async def _idempotent_submit_guard(
     header (or an unusable one) → ``None`` → the endpoint creates a job as
     today. After creating, the endpoint calls
     :meth:`StorageProvider.record_run_submission` (race-safe) to bind the key.
+
+    **Payload-conflict guard.** When ``request_hash`` is supplied and the prior
+    row stored a (non-None) fingerprint that DIFFERS, the key was reused for a
+    different payload — we raise a **409** rather than silently returning the
+    wrong run. A prior row with a ``None`` fingerprint (legacy / pre-guard
+    record) is treated as "unknown" and returns the prior job unchanged
+    (back-compat). Passing ``request_hash=None`` disables the comparison
+    entirely (the pre-guard behavior).
     """
     key = _read_idempotency_key(request)
     if key is None:
         return None
-    return await store.get_run_submission(ctx.tenant_id, key)
+    prior = await store.get_run_submission_record(ctx.tenant_id, key)
+    if prior is None:
+        return None
+    if (
+        request_hash is not None
+        and prior.request_hash is not None
+        and prior.request_hash != request_hash
+    ):
+        raise conflict(
+            f"Idempotency-Key {key!r} was already used for a different request payload "
+            f"(prior job {prior.job_id}); reuse a key only for an identical retry"
+        )
+    return prior.job_id
 
 
 def _apply_history_char_budget(
@@ -3670,6 +4382,9 @@ async def _ingest_upload(
             tenant_id=ctx.tenant_id,
             embedding_model=embedding_model(),
             ocr=parse_result.ocr_used,
+            build_graph=True,
+            emit_growth_events=True,
+            project_id=getattr(ctx, "project_id", None),
         )
         if summary is None:
             per_file.append(KbIngestFileResult(source=basename, status="empty"))
@@ -4080,7 +4795,7 @@ def _load_sample_cases(bundle: AgentBundle, *, limit: int = 3) -> list[dict[str,
     return rows
 
 
-def build_app(
+def build_app(  # noqa: PLR0912
     storage: StorageProvider,
     *,
     agents: list[AgentBundle] | None = None,
@@ -4384,13 +5099,32 @@ def build_app(
     # without touching the route. Each factory takes no args and returns a fresh
     # adapter per connection.
     def _default_voice_stt() -> Any:
+        # Provider selection via env wires the reserved ADR 048 D3 / ADR 049 seam
+        # to config. Default stays OpenAI Whisper (byte-for-byte today's behavior
+        # when MDK_VOICE_STT is unset). ``deepgram`` → Deepgram with OpenAI
+        # failover (uses DEEPGRAM_API_KEY; falls back to Whisper if it's absent).
         from movate.voice import OpenAIWhisperSTT  # noqa: PLC0415
 
+        if os.environ.get("MDK_VOICE_STT", "").strip().lower() == "deepgram":
+            from movate.voice import DeepgramSTT, FailoverSTT  # noqa: PLC0415
+
+            return FailoverSTT([DeepgramSTT(), OpenAIWhisperSTT()])
         return OpenAIWhisperSTT()
 
     def _default_voice_tts() -> Any:
+        # Default OpenAI TTS; ``cartesia`` / ``elevenlabs`` select that provider
+        # with OpenAI failover (uses CARTESIA_API_KEY / ELEVENLABS_API_KEY).
         from movate.voice import OpenAITTS  # noqa: PLC0415
 
+        sel = os.environ.get("MDK_VOICE_TTS", "").strip().lower()
+        if sel == "cartesia":
+            from movate.voice import CartesiaTTS, FailoverTTS  # noqa: PLC0415
+
+            return FailoverTTS([CartesiaTTS(), OpenAITTS()])
+        if sel == "elevenlabs":
+            from movate.voice import ElevenLabsTTS, FailoverTTS  # noqa: PLC0415
+
+            return FailoverTTS([ElevenLabsTTS(), OpenAITTS()])
         return OpenAITTS()
 
     app.state.voice_stt_factory = _default_voice_stt
@@ -4642,8 +5376,14 @@ def build_app(
 
         # item 37 — submission idempotency. Pre-create check: a prior submit
         # with this key for this tenant returns the SAME job; do NOT enqueue
-        # again. No header → prior is None → today's path.
-        prior_job_id = await _idempotent_submit_guard(request, store, ctx)
+        # again. No header → prior is None → today's path. The fingerprint
+        # (kind/target/input — the request-identifying fields) lets the guard
+        # 409 a key reused for a DIFFERENT payload instead of silently
+        # returning the wrong job.
+        req_hash = _idempotency_request_hash(
+            {"kind": body.kind, "target": body.target, "input": body.input}
+        )
+        prior_job_id = await _idempotent_submit_guard(request, store, ctx, request_hash=req_hash)
         if prior_job_id is not None:
             return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
 
@@ -4667,7 +5407,7 @@ def build_app(
         # simultaneous race we may have enqueued one extra job).
         key = _read_idempotency_key(request)
         if key is not None:
-            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id)
+            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id, req_hash)
             if not recorded:
                 winning_job_id = await store.get_run_submission(ctx.tenant_id, key)
                 if winning_job_id is not None and winning_job_id != job.job_id:
@@ -5361,7 +6101,7 @@ def build_app(
                 agent_name=result.bundle.spec.name,
                 tenant_id=ctx.tenant_id,
             )
-            return UnifiedAgentCreatedView(
+            agent_view = UnifiedAgentCreatedView(
                 source="bundle",
                 project_id=project_id,
                 agent_name=result.bundle.spec.name,
@@ -5372,7 +6112,13 @@ def build_app(
                 published_version=published.version if published is not None else None,
                 changed=published.published if published is not None else True,
                 attached=attachment.attached,
+                # Uniform created-resource envelope (ADR 061).
+                id=result.bundle.spec.name,
+                created_at=datetime.now(UTC),
+                etag=published.content_hash if published is not None else None,
             )
+            agent_view.links = agent_links(result.bundle.spec.name)
+            return agent_view
 
         # ---- JSON path → parse discriminator ----
         try:
@@ -5692,6 +6438,11 @@ def build_app(
             description=spec.description or "",
             skill_dir=result.skill_dir.name,
             files_persisted=result.files_persisted,
+            # Uniform created-resource envelope (ADR 061). ``_links`` stays
+            # empty until the skill GET/attach routes ship (ADR 060) — no dead
+            # links.
+            id=spec.name,
+            created_at=datetime.now(UTC),
         )
 
     @v1.get(
@@ -6685,15 +7436,19 @@ def build_app(
         # in the chosen handler. Keeps the multipart path byte-for-byte
         # the same as before.
         content_type = (request.headers.get("content-type") or "").lower()
-        if content_type.startswith("multipart/"):
-            return await _ingest_upload(name, request, ctx)
         if content_type.startswith("application/json"):
-            return await _ingest_json(name, request, ctx)
-        # Other content types: most front-end clients will hit one of
-        # the two above. Treat unknown as multipart for the existing
-        # error shape — the multipart parser will fail with a clean
-        # 400 ("no files in the multipart form") on a bogus body.
-        return await _ingest_upload(name, request, ctx)
+            view = await _ingest_json(name, request, ctx)
+        else:
+            # Other content types: most front-end clients will hit JSON or
+            # multipart. Treat unknown as multipart for the existing error
+            # shape — the multipart parser fails with a clean 400 ("no files
+            # in the multipart form") on a bogus body.
+            view = await _ingest_upload(name, request, ctx)
+        # Hypermedia next-calls (ADR 061) — set once at the route boundary so
+        # every ingest kind (upload/text/url/generated) carries ``_links``
+        # (self / search / stats) without touching each builder.
+        view.links = kb_links(name)
+        return view
 
     @v1.get(
         "/agents/{name}/kb",
@@ -7052,6 +7807,7 @@ def build_app(
         depth: int | None = None,
         limit: int | None = None,
         project: str | None = None,
+        min_confidence: float = 0.0,
     ) -> GraphologyView:
         """A windowed subgraph for ``project_id`` as **graphology JSON**.
 
@@ -7059,8 +7815,9 @@ def build_app(
         response is a graphology import document (``{attributes, nodes,
         edges}``) a sigma.js client feeds to ``graph.import(...)`` with
         zero transform: each node carries ``label`` / ``type`` /
-        degree-derived ``size`` / ``color`` (+ ``community`` when stored);
-        layout ``x`` / ``y`` are omitted (the client runs ForceAtlas2).
+        degree-derived ``size`` / ``color`` (+ ``community`` /
+        ``confidence`` when stored); layout ``x`` / ``y`` are omitted (the
+        client runs ForceAtlas2).
 
         Query params:
 
@@ -7075,6 +7832,11 @@ def build_app(
           nodes/edges tagged with this ``project_id`` are returned (a
           project's subgraph across the agent's KBs). Omit (default) for
           the full per-agent graph — backward-compatible.
+        * ``min_confidence`` — **ADR 046 D2** confidence floor in ``[0, 1]``.
+          Drops nodes whose stored extraction confidence is below it (and
+          their now-dangling edges). Default ``0.0`` shows every node — an
+          opt-in, backward-compatible filter. A node with no recorded
+          confidence is treated as full-confidence (never dropped).
 
         Tenant-scoped: a cross-tenant ``project_id`` / ``root`` yields an
         empty document (no leak). Read scope.
@@ -7090,8 +7852,114 @@ def build_app(
             depth=depth,
             limit=limit,
             project_id=project,
+            min_confidence=min_confidence,
         )
         return GraphologyView.model_validate(doc.model_dump())
+
+    @v1.post(
+        "/projects/{project_id}/graph/assert",
+        response_model=GraphAssertView,
+        status_code=200,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("kb:write")],
+    )
+    async def v1_project_graph_assert(
+        project_id: str,
+        body: GraphAssertRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> GraphAssertView:
+        """Deterministically **assert** structured facts into the agent's graph
+        (ADR 079 D2) — the write counterpart to LLM extraction.
+
+        Where extraction *discovers* a probabilistic graph from prose, this
+        *writes* known nodes/edges with a guaranteed, searchable identity: a
+        node's ``content_hash`` dedups on ``(agent, tenant_id, content_hash)`` so
+        re-asserting **merges** instead of duplicating, and every asserted record
+        carries ``metadata.source = "assert"`` + ``confidence = 1.0`` (so it
+        survives the ADR 046 ``min_confidence`` floor and renders as "asserted"
+        in the UI). The first producer is the POS-demo call-ingest asserting a
+        ServiceNow incident + its store/lane/symptom edges.
+
+        Nodes are upserted **before** edges; an edge whose ``src`` / ``dst`` name
+        isn't in the asserted node set is **skipped and reported**, never fatal.
+        Cross-source reconciliation: a node previously created by *extraction*
+        (random ``entity_id``) is merged onto its existing id (looked up by
+        ``content_hash``) so asserted edges link to the stored row.
+
+        Tenant-scoped — records are stamped with the caller's tenant, so a write
+        can never land in another tenant's graph. Requires the ``kb:write``
+        scope. ``project_id`` (path) is the agent that owns the graph;
+        ``body.project_id`` is the optional ADR 046 D1 project tag.
+
+        Errors: **401** unauthed, **403** missing ``kb:write`` scope.
+        """
+        from movate.kb import graph_assert  # noqa: PLC0415 — lazy, matches kb usage
+
+        store: StorageProvider = request.app.state.storage
+        nodes = [
+            graph_assert.AssertNode(
+                type=n.type, name=n.name, description=n.description, metadata=n.metadata
+            )
+            for n in body.nodes
+        ]
+        edges = [
+            graph_assert.AssertEdge(
+                src=e.src,
+                dst=e.dst,
+                type=e.type,
+                description=e.description,
+                weight=e.weight,
+                metadata=e.metadata,
+            )
+            for e in body.edges
+        ]
+
+        # Reconciliation map: existing (content_hash -> entity_id) for this
+        # agent, so a node previously EXTRACTED under a random uuid merges onto
+        # that id (no new storage seam — reuses list_entities).
+        existing = await store.list_entities(
+            agent=project_id, tenant_id=ctx.tenant_id, limit=5000, project_id=body.project_id
+        )
+        hash_to_id = {e.content_hash: e.entity_id for e in existing}
+
+        entities, relations = await graph_assert.build_asserted_graph(
+            nodes,
+            edges,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            project_id=body.project_id,
+            resolve_existing_id=hash_to_id.get,
+        )
+        for ent in entities:
+            await store.upsert_entity(ent)
+        for rel in relations:
+            await store.upsert_relation(rel)
+
+        # Skip report: requested edges the builder dropped (unresolved endpoint
+        # or self-loop). Computed with the builder's own name normalization.
+        asserted = {graph_assert.normalize_name(n.name) for n in body.nodes}
+        skipped = [
+            SkippedEdgeView(
+                src=e.src,
+                dst=e.dst,
+                type=e.type,
+                reason=(
+                    "self-loop"
+                    if graph_assert.normalize_name(e.src) == graph_assert.normalize_name(e.dst)
+                    else "unresolved endpoint"
+                ),
+            )
+            for e in body.edges
+            if graph_assert.normalize_name(e.src) not in asserted
+            or graph_assert.normalize_name(e.dst) not in asserted
+            or graph_assert.normalize_name(e.src) == graph_assert.normalize_name(e.dst)
+        ]
+        return GraphAssertView(
+            applied_nodes=len(entities),
+            applied_edges=len(relations),
+            skipped_edges=skipped,
+        )
 
     @v1.get(
         "/graph/nodes/{node_id}",
@@ -7410,6 +8278,8 @@ def build_app(
         limit: int | None = None,
         project: str | None = None,
         live: bool = False,
+        min_confidence: float = 0.0,
+        pace: float = 0.0,
     ) -> StreamingResponse:
         """Growth stream for ``project_id``'s graph over **SSE**.
 
@@ -7448,16 +8318,30 @@ def build_app(
         Bounded by ``limit`` (node/edge cap). ``?project=`` (ADR 046 D1,
         additive) scopes both the replayed window AND the live-tail to one
         project's subgraph (a cross-project event never reaches the
-        stream). Tenant-scoped. Read scope.
+        stream). ``?min_confidence=`` (ADR 046 D2, additive) applies a
+        confidence floor to the replayed window (and, in live mode, leaves
+        low-confidence live frames to the viewer's dimming) — default
+        ``0.0`` shows everything. ``?pace=`` (additive, default ``0.0``)
+        sleeps that many seconds between snapshot frames so the viewer
+        animates the graph **assembling node-by-node** — the demo "watch it
+        grow" effect even for a graph that was built atomically. A paced
+        replay honors client disconnect between frames. Tenant-scoped. Read
+        scope.
         """
         store: StorageProvider = request.app.state.storage
         tenant_id = ctx.tenant_id
         cap = graph_query.clamp_cap(limit)
         graph_mode = _graph_mode(mode)
+        # Bound the per-frame pacing so a stray ?pace= can't pin a connection
+        # open for an absurd time; the demo uses fractions of a second.
+        replay_pace_s = min(max(pace, 0.0), _GRAPH_REPLAY_PACE_MAX_S)
 
         async def _is_disconnected() -> bool:
             return await request.is_disconnected()
 
+        # A paced replay also needs the disconnect predicate so it can unwind
+        # between frames even in snapshot (non-live) mode.
+        needs_disconnect = live or replay_pace_s > 0.0
         generator = _sse_graph_growth_stream(
             store=store,
             agent=project_id,
@@ -7465,8 +8349,10 @@ def build_app(
             mode=graph_mode,
             cap=cap,
             project_id=project,
+            min_confidence=min_confidence,
             live=live,
-            is_disconnected=_is_disconnected if live else None,
+            replay_pace_s=replay_pace_s,
+            is_disconnected=_is_disconnected if needs_disconnect else None,
         )
         return StreamingResponse(
             generator,
@@ -7936,7 +8822,13 @@ def build_app(
         # ?wait=true branch above returns before here and is out of scope).
         # Pre-create check: a prior submit with this key for this tenant
         # returns the SAME job; do NOT enqueue again. No header → today's path.
-        prior_job_id = await _idempotent_submit_guard(request, store, ctx)
+        # The fingerprint (agent name / input / thread — the request-identifying
+        # fields) lets the guard 409 a key reused for a DIFFERENT payload
+        # instead of silently returning the wrong job.
+        req_hash = _idempotency_request_hash(
+            {"agent": name, "input": body.input, "thread_id": body.thread_id}
+        )
+        prior_job_id = await _idempotent_submit_guard(request, store, ctx, request_hash=req_hash)
         if prior_job_id is not None:
             response.status_code = 202
             return RunAccepted(job_id=prior_job_id, status=JobStatus.QUEUED, deduplicated=True)
@@ -7972,7 +8864,7 @@ def build_app(
         # enqueued one extra job).
         key = _read_idempotency_key(request)
         if key is not None:
-            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id)
+            recorded = await store.record_run_submission(ctx.tenant_id, key, job.job_id, req_hash)
             if not recorded:
                 winning_job_id = await store.get_run_submission(ctx.tenant_id, key)
                 if winning_job_id is not None and winning_job_id != job.job_id:
@@ -8385,6 +9277,121 @@ def build_app(
         return JobListView(jobs=views, count=len(views))
 
     # ------------------------------------------------------------------
+    # Dead-letter management (additive /api/v1 surface). Operate the jobs
+    # that exhausted their retry budget and landed in DEAD_LETTER. The
+    # GET is registered BEFORE ``/jobs/{job_id}`` so the static path
+    # ``/jobs/dead-letter`` is matched here, not captured as a job_id.
+    # ------------------------------------------------------------------
+    @v1.get(
+        "/jobs/dead-letter",
+        response_model=JobListView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_dead_letter_jobs(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        agent: str | None = Query(
+            default=None,
+            description="Narrow to one agent/workflow name (the job ``target``).",
+        ),
+        limit: int = 20,
+    ) -> JobListView:
+        """List this tenant's retry-exhausted (``DEAD_LETTER``) jobs.
+
+        The operator triage surface for jobs the retry policy gave up on
+        (distinct from a one-off ``ERROR``). Newest-first, tenant-scoped
+        (a tenant never sees another's dead-letters). ``agent`` narrows to
+        a single component. Limit hard-capped at 100.
+
+        Read-only (``read`` scope). Recover a row with
+        ``POST /api/v1/jobs/{job_id}/requeue``; prune with
+        ``POST /api/v1/jobs/dead-letter/purge``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        """
+        capped_limit = max(1, min(limit, 100))
+        store: StorageProvider = request.app.state.storage
+        records = await store.list_dead_letter_jobs(ctx.tenant_id, limit=capped_limit, agent=agent)
+        views = [JobView.from_record(r) for r in records]
+        return JobListView(jobs=views, count=len(views))
+
+    @v1.post(
+        "/jobs/{job_id}/requeue",
+        response_model=JobView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_requeue_dead_letter_job(
+        job_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> JobView:
+        """Recover a ``DEAD_LETTER`` job back onto the queue.
+
+        Body-less. Resets the job to a fresh ``QUEUED`` state
+        (``attempt_count=0``, ``next_retry_at`` / ``claimed_at`` /
+        ``completed_at`` / ``error`` cleared) so the worker claims it
+        again on the next poll. Returns the requeued :class:`JobView`.
+
+        Gated on the ``run`` scope (it re-enqueues work — a stronger
+        capability than the ``read`` used to list). Tenant-scoped at the
+        storage layer; status-guarded on ``DEAD_LETTER``.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``run`` scope
+        * **404** — no ``DEAD_LETTER`` job with this id for this tenant
+          (missing, cross-tenant, or the job is not dead-lettered — you
+          can only requeue a retry-exhausted job)
+        """
+        store: StorageProvider = request.app.state.storage
+        ok = await store.requeue_dead_letter_job(job_id, tenant_id=ctx.tenant_id)
+        if not ok:
+            raise not_found("dead-letter job", job_id)
+        record = await store.get_job(job_id, tenant_id=ctx.tenant_id)
+        if record is None:  # pragma: no cover — requeue just succeeded
+            raise not_found("job", job_id)
+        return JobView.from_record(record)
+
+    @v1.post(
+        "/jobs/dead-letter/purge",
+        response_model=DeadLetterPurgeView,
+        tags=["jobs-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_purge_dead_letter_jobs(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        before: datetime | None = Query(
+            default=None,
+            description=(
+                "Only purge dead-letters whose ``completed_at`` is strictly "
+                "older than this ISO-8601 instant. Omit to purge all."
+            ),
+        ),
+    ) -> DeadLetterPurgeView:
+        """Permanently delete this tenant's ``DEAD_LETTER`` jobs.
+
+        Destructive housekeeping. Gated on the ``admin`` scope (the
+        strongest — it irrecoverably deletes rows) and tenant-scoped:
+        deletes ONLY this tenant's dead-letter rows, never a live job and
+        never another tenant's. ``before`` keeps recent dead-letters for
+        inspection while clearing stale ones. Returns the count purged.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **403** — token lacks the ``admin`` scope
+        """
+        store: StorageProvider = request.app.state.storage
+        purged = await store.purge_dead_letter_jobs(ctx.tenant_id, before=before)
+        return DeadLetterPurgeView(purged=purged)
+
+    # ------------------------------------------------------------------
     # /api/v1 aliases for the unversioned job-poll + run-fetch routes.
     #
     # A caller that submits via ``POST /api/v1/agents/{name}/runs`` gets
@@ -8541,6 +9548,97 @@ def build_app(
         ``read`` scope, ``RunView`` response (including ``output``), and
         tenant-scoping (404 on cross-tenant access, never 403)."""
         return await get_run(run_id, request, ctx)
+
+    @v1.post(
+        "/runs/{run_id}/replay",
+        response_model=RunReplayView,
+        tags=["runs-v1"],
+        dependencies=[_scope("run")],
+    )
+    async def v1_replay_run(
+        run_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        against: str = "published",
+        mock: bool = False,
+    ) -> RunReplayView:
+        """Re-run a historical run's recorded input against a chosen agent
+        version, side-by-side (ADR 045 D13 — run replay / time-travel).
+
+        ``against`` selects the version: ``"published"`` (default → latest) or
+        ``"version:X"`` (a pinned published version; 404 if that version doesn't
+        exist for this agent/tenant). The original run is **immutable** — this
+        only reads it; the replay is a brand-new run (persisted + metered like
+        any other). Returns the original and replayed :class:`RunView`s plus a
+        ``changed`` flag. ``mock=true`` drives the agent with ``MockProvider``
+        for offline / test use (mirrors the run-stream + voice routes).
+
+        Errors: **404** original run (or the requested ``version:X``) not found
+        for this tenant; **403** token lacks ``run`` scope.
+        """
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.core.models import RunRequest  # noqa: PLC0415
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        original = await store.get_run(run_id, tenant_id=ctx.tenant_id)
+        if original is None:
+            raise not_found("run", run_id)
+
+        # Resolve the target version: "published" → latest; "version:X" → exact.
+        version = against.split("version:", 1)[1] if against.startswith("version:") else None
+        bundle = await resolve_agent_bundle(
+            store,
+            original.agent,
+            tenant_id=ctx.tenant_id,
+            version=version,
+            fallback=request.app.state.agents,
+        )
+        if bundle is None:
+            # Clearer than a bare id: name the version target + the fix.
+            label = (
+                f"{original.agent} version {version!r}"
+                if version is not None
+                else f"{original.agent} (published)"
+            )
+            raise not_found(
+                "agent",
+                f"{label} - not found for this tenant; "
+                "publish it or pick an existing --against version",
+            )
+
+        provider: BaseLLMProvider = MockProvider() if mock else LiteLLMProvider()
+        executor = Executor(
+            provider=provider,
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=ctx.tenant_id,
+            cache=request.app.state.llm_cache,
+        )
+        # Re-execute the ORIGINAL recorded input (verbatim) at the target
+        # version — a single-case re-run, not a parallel exec path (ADR 045 D13).
+        response = await executor.execute(
+            bundle, RunRequest(agent=original.agent, input=original.input)
+        )
+        replayed = await store.get_run(response.run_id, tenant_id=ctx.tenant_id)
+        if replayed is None:  # pragma: no cover - the executor just persisted it
+            raise not_found("run", response.run_id)
+
+        return RunReplayView(
+            original=RunView.from_record(original),
+            replayed=RunView.from_record(replayed),
+            against=against,
+            changed=(original.output != replayed.output),
+            # Economics delta (replayed minus original): negative = the chosen version
+            # is cheaper / faster on this case (ADR 045 D13 — "is the edit better?").
+            cost_delta_usd=replayed.metrics.cost_usd - original.metrics.cost_usd,
+            latency_delta_ms=float(replayed.metrics.latency_ms - original.metrics.latency_ms),
+        )
 
     @v1.get(
         "/runs/{run_id}/trace",
@@ -11819,13 +12917,21 @@ def build_app(
            (``paused_node_id`` carried forward as the resume target, but
            ``status`` set to ``RUNNING`` so a re-signal hits the 409 in step
            2) — the worker reads this single source of truth.
-        5. Enqueues a continuation ``JobKind.WORKFLOW`` job carrying
-           ``resume_workflow_run_id``; the worker resumes the runner from the
-           gate's successor. Returns **202** ``{job_id, status}``.
+        5. Resumes the run on its owning backend (ADR 062 D2):
+           * **native** (default) — enqueues a continuation
+             ``JobKind.WORKFLOW`` job carrying ``resume_workflow_run_id``; the
+             worker resumes the runner from the gate's successor.
+           * **temporal** (``record.runtime == 'temporal'``) — signals the
+             durable run's Temporal handle (``human_response``); its
+             ``wait_condition`` resolves and the workflow continues in the
+             Temporal worker. No job is enqueued.
+           Returns **202** ``{job_id, status}`` either way (for the durable
+           path ``job_id`` is the run id and ``status`` is ``running``).
 
-        Control vs execution plane: the workflow is NOT run inline here — it
-        is enqueued, and the worker executes it. This is the contract a Teams
-        Adaptive Card button (ADR 003) would POST to in a later PR.
+        Control vs execution plane: the workflow is NOT run inline here — the
+        native run is enqueued and the durable run resumes itself; in both
+        cases the worker executes it. This is the contract a Teams Adaptive
+        Card button (ADR 003) would POST to in a later PR.
 
         Errors:
 
@@ -11887,6 +12993,49 @@ def build_app(
             }
         )
         await store.save_workflow_run(resumed_record)
+
+        # Resume — fork on the backend that owns this run (ADR 062 D2). One API,
+        # both backends, caller agnostic:
+        #   * temporal → signal the durable run's handle; its wait_condition
+        #     resolves and it continues in the Temporal worker. No job is
+        #     enqueued (the workflow resumes itself).
+        #   * native (default; runtime None/'native') → enqueue a
+        #     JobKind.WORKFLOW continuation the worker drives via runner.resume.
+        if record.runtime == "temporal":
+            from movate.runtime.workflow_backend import (  # noqa: PLC0415
+                WorkflowBackendError,
+                get_temporal_client,
+            )
+
+            try:
+                client = await get_temporal_client()
+                handle = client.get_workflow_handle(workflow_run_id)
+                await handle.signal(
+                    "human_response", args=[record.paused_node_id, dict(body.decision)]
+                )
+            except WorkflowBackendError as exc:
+                # The run is tagged temporal but this runtime has no Temporal
+                # connection configured (TEMPORAL_HOST unset) — a server-side
+                # misconfiguration, not a client error. Fail loud as 500.
+                raise http_error(
+                    ErrorCode.INTERNAL,
+                    status_code=500,
+                    message=(
+                        "this run is durable (runtime=temporal) but the Temporal "
+                        f"backend is not configured on this server: {exc}"
+                    ),
+                ) from exc
+            except Exception as exc:
+                # Missing / already-completed handle, transport error — the
+                # durable run can't be signaled. Fail loud as 409 rather than 500.
+                raise conflict(
+                    f"workflow_run {workflow_run_id!r} could not be signaled on the "
+                    "Temporal backend (the durable run may have already completed "
+                    f"or be unavailable): {exc}"
+                ) from exc
+            # No job to poll — the durable run resumes itself. Return the run id
+            # as the handle, RUNNING since the workflow is actively continuing.
+            return RunAccepted(job_id=workflow_run_id, status=JobStatus.RUNNING)
 
         job = JobRecord(
             job_id=str(uuid4()),
@@ -14625,14 +15774,45 @@ def build_app(
         stt_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, stt)
         tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts)
 
+        # ADR 073 Phase 5 — warm the STT client/connector once at session start
+        # (while the caller is still being greeted) so the FIRST turn skips
+        # client cold-start. Best-effort: a no-op for adapters that don't support
+        # warming, and never fatal to the session.
+        from movate.voice import warm_stt  # noqa: PLC0415
+
+        with contextlib.suppress(Exception):
+            await warm_stt(stt, stt_api_key)
+
         # Config persists across turns in a session; a per-turn ``config`` frame
-        # can override it before that turn's ``end``.
+        # can override it before that turn's ``end``. Seed from the agent's
+        # ``voice`` block first (ADR 071 D1-D3) so per-agent voice_id / language /
+        # tts_streaming / speculative apply without a client frame.
         config = _VoiceTurnConfig()
+        _seed_voice_turn_config(config, bundle)
+        # ADR 073 cost-guard — one per WS session: auto-disables speculation if its
+        # commit-ratio proves too low over the session (no-op unless speculating).
+        from movate.voice.adaptive import AdaptiveEndpointing  # noqa: PLC0415
+        from movate.voice.observer import SpeculationGuard  # noqa: PLC0415
+
+        speculation_guard = SpeculationGuard()
+        # ADR 073 Phase 3 — one adaptive-endpointing controller per session,
+        # seeded from the agent's static hold (or 1500). Only consulted when
+        # ``config.endpointing_adaptive`` is on (no-op otherwise).
+        adaptive_endpointing = AdaptiveEndpointing(base_ms=config.endpointing_ms or 1500)
         try:
             while True:
                 audio_frames, closed = await _collect_voice_turn(websocket, config)
                 if closed:
                     return
+
+                # ── ADR 050 D1/D8: resolve session for voice (same pattern as
+                # the text run path). ``None`` = stateless, byte-for-byte. ──
+                session: Session | None = None
+                if config.session_id is not None:
+                    session = await store.get_session(config.session_id, tenant_id=ctx.tenant_id)
+                    # If the session doesn't exist / cross-tenant, silently
+                    # fall back to stateless rather than dropping the voice
+                    # connection (failure-mode rule; WS can't 404).
 
                 # ── Drive STT → unchanged Executor → TTS, stream the events ──
                 # `mock` drives the agent stage with MockProvider — the same
@@ -14651,7 +15831,25 @@ def build_app(
                     for raw_bytes in frames:
                         yield _AudioChunk(data=raw_bytes)
 
-                stop = await _stream_voice_pipeline_turn(
+                # ADR 050 D1/D8: when a session is active, assemble prior
+                # turns as conversation_history (same pattern as the text
+                # ``POST /runs`` path). The history dict is passed to the
+                # pipeline as ``extra_input`` and merged into the RunRequest
+                # input alongside the transcript.
+                voice_extra_input: dict[str, Any] | None = None
+                if session is not None:
+                    # Build a stub input dict that _assemble_session_input
+                    # augments with conversation_history. We pass an empty
+                    # user_input because the actual transcript (input_key)
+                    # is set by the pipeline after STT.
+                    voice_extra_input = await _assemble_session_input(
+                        store,
+                        session_id=session.session_id,
+                        tenant_id=ctx.tenant_id,
+                        user_input={},
+                    )
+
+                result = await _stream_voice_pipeline_turn(
                     websocket,
                     audio_in=_audio_in(),
                     stt=stt,
@@ -14662,15 +15860,1105 @@ def build_app(
                     config=config,
                     stt_api_key=stt_api_key,
                     tts_api_key=tts_api_key,
+                    extra_input=voice_extra_input,
+                    guard=speculation_guard,
+                    adaptive=adaptive_endpointing,
                 )
-                if stop:
+
+                # ADR 050 D1/D7/D8 — patch voice metrics + emit cost + session.
+                await _finalize_voice_turn(
+                    websocket=websocket,
+                    store=store,
+                    result=result,
+                    tenant_id=ctx.tenant_id,
+                    config=config,
+                    session=session,
+                )
+
+                if result.stop:
                     return
         except WebSocketDisconnect:
             # Client hung up — nothing to clean up beyond the executor task,
             # which run_voice_pipeline reaps in its own finally. Normal exit.
             return
 
+    # ------------------------------------------------------------------
+    # Twilio phone routing — configurable active agent
+    #
+    # One fixed webhook URL for Twilio: POST /api/v1/call/twilio
+    # The runtime keeps an in-memory "active voice agent" name (defaults
+    # to MDK_TWILIO_AGENT env or the first loaded agent).  A config
+    # endpoint lets callers switch it without touching Twilio console.
+    #
+    # GET  /api/v1/call/twilio/config  — read current active agent
+    # PUT  /api/v1/call/twilio/config  — set active agent {"agent":"name"}
+    # POST /api/v1/call/twilio         — Twilio webhook (routes to active)
+    # ------------------------------------------------------------------
+
+    # Initialise on first request (app.state is set after startup).
+    _twilio_active_agent_name: str | None = os.environ.get("MDK_TWILIO_AGENT")
+
+    @v1.get("/call/twilio/config", tags=["voice-v1"])
+    async def v1_call_twilio_config_get(request: Request) -> dict[str, Any]:
+        """Return the currently active voice agent for Twilio calls."""
+        nonlocal _twilio_active_agent_name
+        if _twilio_active_agent_name is None:
+            # Default to first loaded agent.
+            agents_reg: list[AgentBundle] = request.app.state.agents
+            _twilio_active_agent_name = agents_reg[0].spec.name if agents_reg else ""
+        return {"agent": _twilio_active_agent_name}
+
+    @v1.put("/call/twilio/config", tags=["voice-v1"])
+    async def v1_call_twilio_config_put(
+        request: Request,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Set the active voice agent for Twilio calls.
+
+        Body: ``{"agent": "voice-receptionist"}``
+        """
+        nonlocal _twilio_active_agent_name
+        agent_name = body.get("agent", "").strip()
+        if not agent_name:
+            raise HTTPException(status_code=400, detail="'agent' field required")
+
+        # Verify the agent exists.
+        store: StorageProvider = request.app.state.storage
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        bundle = await resolve_agent_bundle(
+            store, agent_name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            raise HTTPException(status_code=404, detail=f"Agent {agent_name!r} not found")
+
+        _twilio_active_agent_name = agent_name
+        return {"agent": _twilio_active_agent_name, "status": "active"}
+
+    @v1.post("/call/twilio", tags=["voice-v1"], response_class=Response)
+    async def v1_call_twilio_generic(request: Request) -> Response:
+        """Generic Twilio webhook — routes to the currently active agent.
+
+        Set once in Twilio console, then switch agents via
+        PUT /api/v1/call/twilio/config.
+        """
+        nonlocal _twilio_active_agent_name
+        if _twilio_active_agent_name is None:
+            agents_reg: list[AgentBundle] = request.app.state.agents
+            _twilio_active_agent_name = agents_reg[0].spec.name if agents_reg else ""
+        if not _twilio_active_agent_name:
+            return Response(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured.</Say></Response>',  # noqa: E501
+                media_type="application/xml",
+            )
+        # Redirect to the per-agent TwiML endpoint.
+        name = _twilio_active_agent_name
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        scheme = "wss" if proto == "https" else "ws"
+        stream_url = f"{scheme}://{host}/api/v1/agents/{name}/call/twilio/stream"
+
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Connect>"
+            f'<Stream url="{stream_url}" />'
+            "</Connect>"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/call/twilio — TwiML webhook (ADR 074 D3/D4)
+    #
+    # Twilio hits this webhook when a call arrives on a configured number.
+    # Returns TwiML XML that tells Twilio to open a Media Stream back to
+    # the WS endpoint below. No bearer auth — Twilio can't send one; the
+    # webhook is callable by Twilio (and anyone who knows the URL).
+    # TODO: Twilio signature validation (X-Twilio-Signature + TWILIO_AUTH_TOKEN)
+    #
+    # New surface — flag (CLAUDE.md rule 5): a NEW additive ``/api/v1``
+    # endpoint. Changes no existing endpoint.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/call/twilio",
+        tags=["agents-v1"],
+        response_class=Response,
+    )
+    async def v1_agent_call_twilio(
+        name: str,
+        request: Request,
+    ) -> Response:
+        """TwiML webhook: Twilio calls this when a phone call arrives.
+
+        Returns TwiML XML that tells Twilio to open a bidirectional Media
+        Stream WebSocket back to the ``/call/twilio/stream`` endpoint,
+        where the call audio is bridged into the mdk voice pipeline
+        (ADR 074 D3/D4).
+        """
+        # Derive the WS URL from the incoming request's host.
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        # Use wss:// if the request came over HTTPS, ws:// otherwise.
+        # Behind a reverse proxy (Azure Container Apps, nginx, etc.) the
+        # proxy terminates TLS and forwards plain HTTP internally, so
+        # request.url.scheme is "http" even though the client connected
+        # over HTTPS.  X-Forwarded-Proto carries the original scheme.
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        scheme = "wss" if proto == "https" else "ws"
+        stream_url = f"{scheme}://{host}/api/v1/agents/{name}/call/twilio/stream"
+
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Connect>"
+            f'<Stream url="{stream_url}" />'
+            "</Connect>"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/call/twilio/sync — Sync phone number
+    #
+    # Updates the Twilio phone number's Voice webhook to point at this
+    # agent's /call/twilio endpoint.  Requires TWILIO_ACCOUNT_SID,
+    # TWILIO_AUTH_TOKEN, and TWILIO_NUMBER env vars.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/call/twilio/sync",
+        tags=["agents-v1"],
+    )
+    async def v1_agent_call_twilio_sync(
+        name: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Sync a Twilio phone number to route calls to this agent.
+
+        Updates the Twilio Incoming Phone Number's VoiceUrl to
+        ``https://<host>/api/v1/agents/{name}/call/twilio`` so incoming
+        calls are handled by the named agent's voice pipeline.
+        """
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+        auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+        phone_number = os.environ.get("TWILIO_NUMBER", "").strip()
+
+        if not account_sid or not auth_token or not phone_number:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_NUMBER "
+                    "must all be set as environment variables."
+                ),
+            )
+
+        # Verify the agent exists.
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        store: StorageProvider = request.app.state.storage
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            raise HTTPException(status_code=404, detail=f"Agent {name!r} not found")
+
+        # Build the webhook URL for this agent.
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        webhook_url = f"{proto}://{host}/api/v1/agents/{name}/call/twilio"
+
+        # Use the Twilio REST API to find the phone number SID and update it.
+        try:
+            from twilio.rest import Client as TwilioClient  # noqa: PLC0415
+        except ImportError:
+            raise HTTPException(  # noqa: B904
+                status_code=501,
+                detail="twilio SDK not installed; add mdk[telephony]",
+            )
+
+        try:
+            client = TwilioClient(account_sid, auth_token)
+            # Look up the phone number SID.
+            numbers = client.incoming_phone_numbers.list(phone_number=phone_number)
+            if not numbers:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No Twilio number matching {phone_number}",
+                )
+            pn = numbers[0]
+            # Update the voice webhook URL.
+            pn.update(voice_url=webhook_url, voice_method="POST")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(  # noqa: B904
+                status_code=502,
+                detail=f"Twilio API error: {exc}",
+            )
+
+        return {
+            "status": "synced",
+            "agent": name,
+            "phone_number": phone_number,
+            "webhook_url": webhook_url,
+            "phone_number_sid": pn.sid,
+        }
+
+    # ------------------------------------------------------------------
+    # WS /api/v1/agents/{name}/call/twilio/stream — Twilio Media Stream
+    #
+    # Accepts the Twilio Media Stream WebSocket opened by the TwiML
+    # <Connect><Stream> above. Bridges the call audio into the mdk voice
+    # pipeline via TwilioTransport (ADR 074 D3).
+    #
+    # Auth: Twilio opens this WS itself (from its media gateway), so no
+    # bearer token or API key. The security boundary is the TwiML webhook
+    # (which Twilio calls with a signature we can validate — deferred to
+    # the TODO above).
+    # ------------------------------------------------------------------
+    @v1.websocket("/agents/{name}/call/twilio/stream")
+    async def v1_agent_call_twilio_stream(websocket: WebSocket, name: str) -> None:
+        """Twilio Media Stream WS: bridge phone audio to the voice pipeline.
+
+        Twilio opens this WebSocket after the TwiML webhook returns a
+        ``<Connect><Stream>`` directive. The call's mu-law audio arrives as
+        ``media`` events; TTS output is sent back as ``media`` events. The
+        pipeline (STT -> unchanged Executor -> TTS) runs identically to the
+        browser WebSocket path (ADR 074 D8).
+        """
+        store: StorageProvider = websocket.app.state.storage
+
+        # ---- Resolve the agent (same routing as the WS voice path) ----
+        # For telephony, tenant resolution is simplified: use the default
+        # tenant or a configured Twilio-number -> tenant mapping. For now,
+        # resolve from a default tenant or the first available.
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        agents_reg: list[AgentBundle] = websocket.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            await websocket.accept()
+            await websocket.send_json({"event": "error", "message": f"agent {name!r} not found"})
+            await websocket.close(code=1008, reason="agent not found")
+            return
+
+        await websocket.accept()
+
+        # ---- Lazy import: voice + telephony extras (ADR 074 D5) ----
+        try:
+            from movate.core.executor import Executor  # noqa: PLC0415
+            from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+            from movate.providers.pricing import load_pricing  # noqa: PLC0415
+            from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
+            from movate.tracing import build_tracer  # noqa: PLC0415
+            from movate.voice import run_voice_pipeline  # noqa: PLC0415
+            from movate.voice.transports.twilio import TwilioTransport  # noqa: PLC0415
+        except ImportError:
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "message": ("mdk[voice] extra not installed; telephony bridge unavailable"),
+                }
+            )
+            await websocket.close(code=1011, reason="voice extra not installed")
+            return
+
+        # ---- Wire the transport + pipeline ----
+        transport = TwilioTransport(websocket)
+
+        # Build STT/TTS from the runtime's factories (same as the WS path).
+        stt = websocket.app.state.voice_stt_factory()
+        tts = websocket.app.state.voice_tts_factory()
+
+        # BYOK key resolution (same as WS path).
+        stt_api_key = await _resolve_voice_api_key(store, default_tenant, stt)
+        tts_api_key = await _resolve_voice_api_key(store, default_tenant, tts)
+
+        executor = Executor(
+            provider=LiteLLMProvider(),
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=default_tenant,
+            cache=websocket.app.state.llm_cache,
+        )
+
+        # Seed voice config from the agent's voice block.
+        config = _VoiceTurnConfig()
+        _seed_voice_turn_config(config, bundle)
+
+        # Voice-context cue: nudge the agent to respond conversationally
+        # (short sentences, no markdown) so TTS sounds natural. Same hint
+        # used by the standalone demo server (server.py _LYZR_VOICE_HINT).
+        _VOICE_HINT = (  # noqa: N806
+            "please respond conversationally in 1-3 short sentences suitable "
+            "for text-to-speech playback. Do not use markdown, headers, bullet "
+            "lists, numbered steps, or section labels. Summarize key info "
+            "inline. If a long procedure is needed, offer to send detailed "
+            "steps separately."
+        )
+        agent = ExecutorAgentTurn(
+            executor=executor,
+            bundle=bundle,
+            tenant_id=default_tenant,
+            input_key=config.input_key,
+            voice_hint=_VOICE_HINT,
+        )
+
+        try:
+            # Drive the pipeline: transport.receive_audio() -> STT -> agent -> TTS
+            audio_in = transport.receive_audio()
+
+            async for event in run_voice_pipeline(
+                audio_in=audio_in,
+                stt=stt,
+                tts=tts,
+                agent=agent,
+                language=config.language,
+                voice_id=config.voice_id,
+                stt_api_key=stt_api_key,
+                tts_api_key=tts_api_key,
+                keyterms=config.keyterms or None,
+                endpointing_ms=config.endpointing_ms,
+                tts_streaming=config.tts_streaming,
+            ):
+                if event.kind == "tts.audio" and event.audio is not None:
+                    await transport.send_audio(event.audio)
+                elif event.kind == "done":
+                    logger.info(
+                        "Twilio call turn done (agent=%s, run_id=%s, status=%s)",
+                        name,
+                        event.run_id,
+                        event.status,
+                    )
+        except WebSocketDisconnect:
+            logger.info("Twilio stream disconnected (agent=%s)", name)
+        except Exception:
+            logger.exception("Error in Twilio stream handler (agent=%s)", name)
+        finally:
+            await transport.disconnect()
+
+    # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/voice — One-shot / batch voice (ADR 050 D2)
+    #
+    # The REST parity to the streaming WS above: audio in → STT → the UNCHANGED
+    # Executor → TTS → ``{transcript, response_text, audio_*}`` out in a single
+    # request/response. The surface a telephony bridge, a "transcribe this file
+    # and answer it", or an automated test reaches for when a socket is overkill
+    # (ADR 050 D2 / Alternatives (c)). It runs the SAME ``run_voice_pipeline``
+    # the WS drives (no second execution path — ADR 050 D1 / Consequences) and
+    # reuses the SAME edge BYOK key resolution (``_resolve_voice_api_key``).
+    #
+    # Audio I/O (ADR 050 D10): inbound audio is a multipart file part (never
+    # base64-in-JSON); outbound audio is a binary streamed body by default, with
+    # ``?audio=inline`` returning base64 in the JSON envelope for small
+    # test/telephony turns. The transcript + response text + cost/latency ride
+    # the JSON body + headers; the audio bytes never bloat the JSON.
+    #
+    # New surface — flag (CLAUDE.md rule 5): a NEW additive ``/api/v1`` endpoint
+    # (scope ``run``, same as the WS). Changes no existing endpoint.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/voice",
+        response_model=VoiceTurnView,
+        tags=["agents-v1"],
+        dependencies=[_scope("run")],
+        responses={
+            200: {
+                "description": (
+                    "One-shot voice turn result. JSON (the default, or "
+                    "``?audio=inline``) carries the transcript + response text + "
+                    "an audio reference; ``?audio=stream`` (the default for a "
+                    "telephony bridge) returns the synthesized audio as the "
+                    "binary body with the transcript/response in headers."
+                ),
+            },
+        },
+    )
+    async def v1_agent_voice_oneshot(
+        name: str,
+        request: Request,
+        response: Response,
+        ctx: AuthContext = Depends(auth_dep),
+        audio: UploadFile | None = File(
+            default=None,
+            description=(
+                "The inbound audio as a multipart file part (ADR 050 D10 — "
+                "never base64-in-JSON). Either this or ``audio_url`` is required."
+            ),
+        ),
+        audio_url: str | None = Form(
+            default=None,
+            description=(
+                "A URL the runtime fetches the inbound audio from (ADR 050 D10 — "
+                "the large / already-hosted path, e.g. a telephony recording). "
+                "Alternative to the ``audio`` multipart part."
+            ),
+        ),
+        text: str | None = Form(
+            default=None,
+            description=(
+                "Text to speak instead of audio in (the ``mdk voice say`` path, "
+                "ADR 050 D11). When set, STT is bypassed — the text IS the "
+                "transcript and the SAME pipeline runs agent → TTS. Mutually "
+                "exclusive with ``audio`` / ``audio_url``."
+            ),
+        ),
+        stt: str | None = Form(
+            default=None, description="STT provider override for this turn (ADR 050 D6)."
+        ),
+        tts: str | None = Form(
+            default=None, description="TTS provider override for this turn (ADR 050 D6)."
+        ),
+        voice_id: str | None = Form(
+            default=None, description="TTS voice id override for this turn (ADR 050 D6)."
+        ),
+        language: str | None = Form(
+            default=None, description="STT language hint for this turn (ADR 050 D6)."
+        ),
+        input_key: str = Form(
+            default="text",
+            description="The agent-input field the transcript is bound to (default ``text``).",
+        ),
+        codec: str = Form(
+            default="pcm16", description="Codec of the inbound audio bytes (pcm16 / opus / mulaw)."
+        ),
+        mock: bool = Form(
+            default=False,
+            description="Run the agent stage offline with MockProvider (test hook; mirrors WS).",
+        ),
+        audio_out: str = Query(
+            default="inline",
+            alias="audio",
+            description=(
+                "How the synthesized answer audio travels (ADR 050 D10): "
+                "``inline`` (default) = base64 in the JSON envelope (small "
+                "test/telephony turns); ``stream`` = the raw audio bytes as the "
+                "binary response body, transcript/response in headers; ``none`` "
+                "= no audio (transcribe-only)."
+            ),
+        ),
+    ) -> Any:
+        """Run one voice turn over REST: audio → STT → the unchanged agent → TTS.
+
+        The one-shot / batch parity to the streaming WS (ADR 050 D2). A voice
+        turn **is** a run (ADR 050 D1): it runs the SAME ``run_voice_pipeline``
+        the WS drives — STT, then the **unchanged** text Executor (this route
+        never edits ``core/executor.py``; it calls the executor exactly like
+        the SSE run-stream + WS voice routes), then TTS — and the resulting run
+        shows up in ``mdk runs list`` / ``/api/v1/usage`` / traces like any run.
+
+        Audio I/O (ADR 050 D10): inbound audio is the ``audio`` multipart file
+        part **or** an ``audio_url`` the runtime fetches; outbound audio rides a
+        binary body (``?audio=stream``) or base64 in the JSON envelope
+        (``?audio=inline``), **never** base64-in-JSON by default for the
+        codegen-clean shape.
+
+        Per-request ``stt`` / ``tts`` / ``voice_id`` / ``language`` overrides
+        (ADR 050 D6) tune this one turn. The tenant's own BYOK STT/TTS keys are
+        resolved at this edge (ADR 048 D6) — reusing the WS path's resolver, not
+        a second mechanism.
+
+        Lazily imports the ``mdk[voice]`` extra — a runtime without it returns a
+        clear 503 rather than a cryptic ImportError (the REST degrade).
+
+        Errors:
+
+        * **400** — neither ``audio`` nor ``audio_url`` supplied, or an empty
+          audio part.
+        * **404** — agent not in the registry for this tenant.
+        * **503** — the ``mdk[voice]`` extra is not installed on this runtime.
+        """
+        store: StorageProvider = request.app.state.storage
+
+        # ── Voice extra gate (lazy import; clear 503 if absent) ──
+        # The route module imports nothing voice-heavy at module scope; the
+        # speech adapters + pipeline only import here, so a non-voice runtime
+        # pays nothing until a voice request actually arrives.
+        try:
+            from movate.voice import run_voice_pipeline as _  # noqa: F401, PLC0415
+            from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
+        except ImportError as exc:
+            raise AgentCreationError(
+                "this runtime was built without the mdk[voice] extra; "
+                "POST /api/v1/agents/{name}/voice is unavailable "
+                "(install 'movate-cli[voice]')",
+                status_code=503,
+            ) from exc
+
+        # ── Resolve the inbound input: text-to-speak OR audio (part / URL) ──
+        # The ``mdk voice say`` path supplies ``text`` (no audio); STT is then
+        # bypassed via _PrefilledSTT below. Otherwise audio arrives as a
+        # multipart part or a fetched URL (ADR 050 D10).
+        audio_data = b""
+        if text is None:
+            if audio is not None:
+                audio_data = await audio.read()
+            elif audio_url:
+                audio_data = await _fetch_voice_audio_url(audio_url)
+            else:
+                raise AgentCreationError(
+                    "no input: supply 'text' to speak, an 'audio' multipart file "
+                    "part, or an 'audio_url' to fetch (ADR 050 D2 / D10)",
+                    status_code=400,
+                )
+            if not audio_data:
+                raise AgentCreationError("the inbound audio is empty", status_code=400)
+
+        # ── Resolve the agent (same routing as the run/stream/WS paths) ──
+        canary = await store.get_canary_config(name, tenant_id=ctx.tenant_id)
+        chosen_version = choose_version(canary, thread_id=None)
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=ctx.tenant_id, version=chosen_version, fallback=agents_reg
+        )
+        if bundle is None:
+            raise AgentCreationError(f"agent {name!r} not found", status_code=404)
+
+        # ── Wire the speech adapters + the UNCHANGED Executor ──
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.providers.base import BaseLLMProvider  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        # Per-request STT/TTS provider overrides (ADR 050 D6) select a built
+        # adapter from the app-state factories; absent, the runtime default
+        # (the same the WS uses). Building from the factory keeps the route
+        # provider-agnostic (ADR 048 D3). For the ``text``-in path, STT is
+        # bypassed with a prefilled adapter so the SAME pipeline runs (the text
+        # IS the transcript) — no separate STT-less execution path (ADR 050 D1).
+        stt_adapter: Any = (
+            _PrefilledSTT(text)
+            if text is not None
+            else _build_voice_adapter(request.app, "stt", stt)
+        )
+        tts_adapter = _build_voice_adapter(request.app, "tts", tts)
+
+        # BYOK (ADR 048 D6 / ADR 018) — resolve the tenant's OWN keys at this
+        # edge, exactly as the WS path does. No tenant key → None → the
+        # adapter's env default (byte-for-byte today's behavior).
+        stt_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, stt_adapter)
+        tts_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, tts_adapter)
+
+        provider: BaseLLMProvider = MockProvider() if mock else LiteLLMProvider()
+        executor = Executor(
+            provider=provider,
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=ctx.tenant_id,
+            cache=request.app.state.llm_cache,
+        )
+
+        async def _audio_in() -> AsyncIterator[Any]:
+            # One chunk: the whole uploaded utterance. STT endpoints it.
+            yield _AudioChunk(data=audio_data, codec=cast(Any, codec))
+
+        # ADR 071 D1 — apply the agent's voice block as DEFAULTS (an explicit
+        # request param still wins). Mirrors the WS/realtime seeding so a
+        # per-agent voice_id / language / keyterms applies on the REST path too;
+        # absent block leaves the request values untouched (today's behavior).
+        _vblock = getattr(getattr(bundle, "spec", None), "voice", None)
+        eff_voice_id = (voice_id or "") or getattr(_vblock, "voice_id", "")
+        eff_language = language if language is not None else getattr(_vblock, "language", None)
+        eff_keyterms = list(getattr(_vblock, "keyterms", []) or [])
+        # ADR 073 D3 — the agent's tuned silence-hold applies on REST too.
+        eff_endpointing = getattr(_vblock, "endpointing_ms", None)
+
+        turn = await _run_voice_pipeline_oneshot(
+            audio_in=_audio_in(),
+            stt=stt_adapter,
+            tts=tts_adapter,
+            executor=executor,
+            bundle=bundle,
+            tenant_id=ctx.tenant_id,
+            input_key=input_key,
+            language=eff_language,
+            voice_id=eff_voice_id,
+            keyterms=eff_keyterms,
+            endpointing_ms=eff_endpointing,
+            stt_api_key=stt_api_key,
+            tts_api_key=tts_api_key,
+        )
+
+        # ── Cost (ADR 036 / ADR 050 D7) + per-stage latency headers ──
+        # The run's economics ride the SAME X-MDK-Cost-USD / -Tokens-* headers
+        # every other run uses (via the economics middleware); the voice-specific
+        # per-stage latency rides additive X-MDK-Voice-Latency-* headers derived
+        # from the event stream. Best-effort: a missing record omits the headers.
+        econ = await _voice_economics_from_run(store, run_id=turn.run_id, tenant_id=ctx.tenant_id)
+        if econ is not None:
+            set_response_economics(request, econ)
+        _set_voice_latency_headers(response, turn.events)
+
+        # ── Shape the response per the audio-transport choice (ADR 050 D10) ──
+        out_mode = (audio_out or "inline").strip().lower()
+        has_audio = bool(turn.audio)
+        if out_mode == "stream" and has_audio:
+            # Binary body: the synthesized audio bytes, transcript/response in
+            # headers (the telephony-bridge path — a socket-free spoken answer).
+            media_type = (
+                "audio/basic" if turn.audio_codec == "mulaw" else "application/octet-stream"
+            )
+            stream_resp = Response(content=bytes(turn.audio), media_type=media_type)
+            stream_resp.headers["X-MDK-Voice-Transcript"] = _header_safe(turn.transcript)
+            stream_resp.headers["X-MDK-Voice-Response"] = _header_safe(turn.answer_text)
+            if turn.run_id:
+                stream_resp.headers["X-MDK-Voice-Run-Id"] = turn.run_id
+            if turn.status:
+                stream_resp.headers["X-MDK-Voice-Status"] = turn.status
+            if turn.audio_codec:
+                stream_resp.headers["X-MDK-Voice-Codec"] = turn.audio_codec
+            # Re-stamp the cost/latency headers onto the replacement response
+            # (a fresh Response doesn't inherit the injected one's headers).
+            _set_voice_latency_headers(stream_resp, turn.events)
+            return stream_resp
+
+        view = VoiceTurnView(
+            transcript=turn.transcript,
+            response_text=turn.answer_text,
+            audio_bytes_b64=(
+                base64.b64encode(bytes(turn.audio)).decode("ascii")
+                if (out_mode == "inline" and has_audio)
+                else None
+            ),
+            audio_url=None,
+            audio_codec=turn.audio_codec if has_audio else None,
+            audio_sample_rate=turn.audio_sample_rate if has_audio else None,
+            run_id=turn.run_id,
+            status=turn.status,
+            error=turn.error_message or None,
+        )
+        return view
+
+    # ------------------------------------------------------------------
+    # /api/v1/tools — Tool Registry (ADR 052 Phase 1)
+    # ------------------------------------------------------------------
+
+    @v1.get(
+        "/tools",
+        tags=["tools"],
+        dependencies=[_scope("read")],
+    )
+    async def list_tools(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        scope: str | None = None,
+        tag: str | None = None,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        """List tool descriptors (filterable by scope, tags, name pattern)."""
+        store: StorageProvider = request.app.state.storage
+        tags_filter = [tag] if tag else None
+        descriptors = await store.list_tool_descriptors(
+            scope=scope,
+            tenant_id=ctx.tenant_id,
+            tags=tags_filter,
+        )
+        if q:
+            q_lower = q.lower()
+            descriptors = [
+                d
+                for d in descriptors
+                if q_lower in d.name.lower() or q_lower in d.description.lower()
+            ]
+        return {
+            "tools": [d.model_dump(mode="json") for d in descriptors],
+            "count": len(descriptors),
+        }
+
+    @v1.get(
+        "/tools/{name}",
+        tags=["tools"],
+        dependencies=[_scope("read")],
+    )
+    async def get_tool(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        version: str | None = None,
+    ) -> dict[str, Any]:
+        """Get tool detail (with optional version resolution)."""
+        store: StorageProvider = request.app.state.storage
+        # Walk scope precedence: project -> tenant -> movate.
+        descriptor = None
+        for scope_val in ("project", "tenant", "movate"):
+            descriptor = await store.get_tool_descriptor(
+                name=name,
+                version=version,
+                scope=scope_val,
+                tenant_id=ctx.tenant_id,
+            )
+            if descriptor is not None:
+                break
+        if descriptor is None:
+            raise not_found("tool", name)
+        return {"tool": descriptor.model_dump(mode="json")}
+
+    @v1.post(
+        "/tools",
+        tags=["tools"],
+        dependencies=[_scope("admin")],
+        status_code=201,
+    )
+    async def publish_tool(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """Publish a tool descriptor (tenant-scoped)."""
+        from movate.core.tool_registry.models import ToolDescriptor  # noqa: PLC0415
+
+        body = await request.json()
+        try:
+            descriptor = ToolDescriptor.model_validate(body)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        descriptor = descriptor.model_copy(update={"tenant_id": ctx.tenant_id})
+        descriptor = descriptor.stamp_now()
+        store: StorageProvider = request.app.state.storage
+        await store.save_tool_descriptor(descriptor)
+        return {"tool": descriptor.model_dump(mode="json")}
+
+    @v1.delete(
+        "/tools/{name}/{version}",
+        tags=["tools"],
+        dependencies=[_scope("admin")],
+    )
+    async def delete_tool(
+        name: str,
+        version: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        scope: str = "tenant",
+    ) -> dict[str, Any]:
+        """Remove a tool descriptor."""
+        store: StorageProvider = request.app.state.storage
+        deleted = await store.delete_tool_descriptor(
+            name=name,
+            version=version,
+            scope=scope,
+            tenant_id=ctx.tenant_id,
+        )
+        if not deleted:
+            raise not_found("tool", f"{name}@{version}")
+        return {"deleted": True}
+
     app.include_router(v1)
+
+    # ------------------------------------------------------------------
+    # GET /lyzr/agents — List agents from the user's Lyzr account.
+    # Drives the Mova-iO agent picker dropdown in the voice demo UI.
+    # Honors BYOK via X-Lyzr-Api-Key header; falls back to LYZR_API_KEY env.
+    # ------------------------------------------------------------------
+    import time as _time_mod  # noqa: PLC0415
+
+    _lyzr_agents_cache: dict[str, tuple[float, dict[str, object]]] = {}
+    _LYZR_AGENTS_TTL_S = 60.0  # noqa: N806
+
+    def _resolve_lyzr_key(request: Request) -> str:
+        header_key = (request.headers.get("x-lyzr-api-key") or "").strip()
+        return header_key or os.environ.get("LYZR_API_KEY", "").strip()
+
+    @app.get("/lyzr/agents", tags=["voice"], include_in_schema=False)
+    async def _lyzr_agents(request: Request) -> dict[str, object]:
+        """List agents from the caller's Lyzr account for the agent picker."""
+        key = _resolve_lyzr_key(request)
+        if not key:
+            return {
+                "ok": False,
+                "error": "LYZR_API_KEY not set",
+                "tip": "Paste a Mova-iO API key in the key panel, or set LYZR_API_KEY env",
+            }
+        now = _time_mod.monotonic()
+        cached = _lyzr_agents_cache.get(key)
+        if cached and now - cached[0] < _LYZR_AGENTS_TTL_S:
+            return cached[1]
+        try:
+            import httpx  # noqa: PLC0415
+
+            r = httpx.get(
+                "https://agent-prod.studio.lyzr.ai/v3/agents/",
+                headers={"x-api-key": key},
+                timeout=5.0,
+            )
+            r.raise_for_status()
+            raw = r.json() or []
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        def _summary(a: dict[str, object]) -> dict[str, object]:
+            tools = a.get("tools") or []
+            tool_names = [t.get("name") for t in tools if isinstance(t, dict)]  # type: ignore[attr-defined]
+            instructions = str(a.get("agent_instructions") or "")
+            return {
+                "id": a.get("_id"),
+                "name": a.get("name") or "(unnamed)",
+                "description": (str(a.get("description") or ""))[:200],
+                "role": a.get("agent_role") or "",
+                "instructions_snippet": instructions[:280]
+                + ("..." if len(instructions) > 280 else ""),  # noqa: PLR2004
+                "tools": tool_names,
+                "features": a.get("features") or [],
+            }
+
+        agents = sorted(
+            (_summary(a) for a in raw if isinstance(a, dict) and a.get("_id")),
+            key=lambda x: str(x.get("name") or "").lower(),
+        )
+        payload: dict[str, object] = {"ok": True, "agents": agents, "count": len(agents)}
+        _lyzr_agents_cache[key] = (now, payload)
+        return payload
+
+    @app.get("/lyzr/agents/{agent_id}", tags=["voice"], include_in_schema=False)
+    async def _lyzr_agent_detail(agent_id: str, request: Request) -> dict[str, object]:
+        """Validate + fetch metadata for a single Lyzr agent (L5 badge)."""
+        key = _resolve_lyzr_key(request)
+        if not key:
+            return {"ok": False, "error": "no key"}
+        try:
+            import httpx  # noqa: PLC0415
+
+            r = httpx.get(
+                f"https://agent-prod.studio.lyzr.ai/v3/agents/{agent_id}",
+                headers={"x-api-key": key},
+                timeout=5.0,
+            )
+            r.raise_for_status()
+            a = r.json()
+            return {
+                "ok": True,
+                "agent": {
+                    "id": a.get("_id"),
+                    "name": a.get("name"),
+                    "description": (str(a.get("description") or ""))[:200],
+                    "role": a.get("agent_role") or "",
+                    "instructions_snippet": (str(a.get("agent_instructions") or ""))[:280],
+                    "tools": [t.get("name") for t in (a.get("tools") or []) if isinstance(t, dict)],
+                    "features": a.get("features") or [],
+                },
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # GET /tts/voices — Voice catalog for the demo UI's voice picker.
+    # Fetches live from Cartesia's /voices API (cached 1h), falls back
+    # to a single default voice if the API is unreachable.
+    # ------------------------------------------------------------------
+    _OPENAI_VOICES = [  # noqa: N806
+        {
+            "id": "alloy",
+            "label": "Alloy",
+            "description": "neutral, balanced",
+            "use_case": "general support, default",
+        },
+        {
+            "id": "echo",
+            "label": "Echo",
+            "description": "calm, measured male",
+            "use_case": "customer service, IVR",
+        },
+        {
+            "id": "fable",
+            "label": "Fable",
+            "description": "warm British accent",
+            "use_case": "storytelling, training",
+        },
+        {
+            "id": "onyx",
+            "label": "Onyx",
+            "description": "deep, authoritative male",
+            "use_case": "announcements, alerts",
+        },
+        {
+            "id": "nova",
+            "label": "Nova",
+            "description": "bright, friendly female",
+            "use_case": "help desk, assistant",
+        },
+        {
+            "id": "shimmer",
+            "label": "Shimmer",
+            "description": "soft, expressive female",
+            "use_case": "wellness, calm settings",
+        },
+    ]
+    _cartesia_cache: tuple[float, list[dict[str, str]]] | None = None
+    _CARTESIA_TTL = 3600.0  # noqa: N806
+
+    def _classify_use_case(desc: str) -> str:
+        d = desc.lower()
+        for kws, label in [
+            (("support", "service", "customer", "help"), "customer service"),
+            (("professional", "business", "enterprise"), "enterprise voice"),
+            (("calm", "soothing", "meditat"), "wellness, calm settings"),
+            (("instruct", "training", "guide", "explainer"), "training, walkthrough"),
+            (("news", "anchor", "broadcast"), "news, announcements"),
+            (("bright", "upbeat", "energetic", "friendly"), "casual, help desk"),
+        ]:
+            if any(k in d for k in kws):
+                return label
+        return "general use"
+
+    def _fetch_cartesia_voices() -> list[dict[str, str]]:
+        key = os.environ.get("CARTESIA_API_KEY", "").strip()
+        if not key:
+            return []
+        try:
+            import httpx  # noqa: PLC0415
+
+            r = httpx.get(
+                "https://api.cartesia.ai/voices/",
+                headers={"X-API-Key": key, "Cartesia-Version": "2024-06-10"},
+                timeout=8.0,
+            )
+            r.raise_for_status()
+            voices = r.json() or []
+        except Exception:
+            return []
+        SKIP = ("fairy", "gaming", "pikachu", "robot", "elf", "demon", "ghost", "alien")  # noqa: N806
+        PREFERRED = (  # noqa: N806
+            "support",
+            "professional",
+            "natural",
+            "conversational",
+            "assistant",
+            "warm",
+            "friendly",
+            "customer",
+            "guide",
+            "explainer",
+        )
+        en = [
+            v
+            for v in voices
+            if isinstance(v, dict)
+            and v.get("language") == "en"
+            and v.get("is_public")
+            and v.get("id")
+            and v.get("name")
+            and not any(s in (v.get("description") or "").lower() for s in SKIP)
+            and not any(s in (v.get("name") or "").lower() for s in SKIP)
+        ]
+
+        def score(v: dict) -> int:  # type: ignore[type-arg]
+            d = str(v.get("description") or "").lower()
+            return sum(1 for k in PREFERRED if k in d)
+
+        en.sort(key=lambda v: (-score(v), str(v.get("name") or "")))
+        by_gender: dict[str, list] = {"f": [], "m": []}  # type: ignore[type-arg]
+        seen: set[str] = set()
+        for v in en:
+            nm = str(v.get("name") or "").split(" - ")[0].strip().lower()
+            if not nm or nm in seen:
+                continue
+            seen.add(nm)
+            g = "f" if str(v.get("gender") or "").lower().startswith("fem") else "m"
+            if len(by_gender[g]) < 8:  # noqa: PLR2004
+                by_gender[g].append(v)
+        picked = by_gender["f"] + by_gender["m"]
+
+        def norm(v: dict) -> dict[str, str]:  # type: ignore[type-arg]
+            name = str(v.get("name") or "").split(" - ")[0].strip()
+            gs = "F" if str(v.get("gender") or "").lower().startswith("fem") else "M"
+            desc = str(v.get("description") or "").strip().rstrip(".")
+            if len(desc) > 80:  # noqa: PLR2004
+                desc = desc[:77] + "..."
+            return {
+                "id": str(v["id"]),
+                "label": f"{name} ({gs})",
+                "description": desc or f"{gs} voice",
+                "use_case": _classify_use_case(desc),
+            }
+
+        return [norm(v) for v in picked]
+
+    @app.get("/tts/voices", tags=["voice"], include_in_schema=False)
+    async def _tts_voices() -> dict[str, Any]:
+        nonlocal _cartesia_cache
+        import asyncio  # noqa: PLC0415
+
+        cart_voices: list[dict[str, str]] = []
+        now = _time_mod.monotonic()
+        if _cartesia_cache and now - _cartesia_cache[0] < _CARTESIA_TTL:
+            cart_voices = _cartesia_cache[1]
+        else:
+            cart_voices = await asyncio.to_thread(_fetch_cartesia_voices)
+            if cart_voices:
+                _cartesia_cache = (now, cart_voices)
+        if not cart_voices:
+            cart_voices = [
+                {
+                    "id": "a0e99841-438c-4a64-b679-ae501e7d6091",
+                    "label": "Clara (F)",
+                    "description": "Adapter default voice",
+                    "use_case": "general use",
+                }
+            ]
+        return {
+            "ok": True,
+            "voices": {"openai": _OPENAI_VOICES, "cartesia": cart_voices},
+            "cartesia_live": bool(_cartesia_cache),
+        }
+
+    # ------------------------------------------------------------------
+    # GET / — Serve the voice demo app (examples/web_demo/index.html).
+    # The file is baked into the image at /app/web_demo/index.html by the
+    # Dockerfile.  Falls back to a project-root lookup for local dev.
+    # ------------------------------------------------------------------
+    # Eagerly load the voice demo HTML at startup so the GET / route
+    # never hits a file-not-found at request time.
+    _demo_html: str = ""
+    _demo_candidates = [
+        "/app/web_demo/index.html",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "examples",
+            "web_demo",
+            "index.html",
+        ),
+        os.path.join(
+            os.environ.get("MOVATE_AGENTS_PATH", "/app/agents"), "..", "web_demo", "index.html"
+        ),
+    ]
+    for _p in _demo_candidates:
+        _p = os.path.normpath(_p)
+        if os.path.isfile(_p):
+            with open(_p) as _f:
+                _demo_html = _f.read()
+            logger.info("Voice demo HTML loaded from %s (%d bytes)", _p, len(_demo_html))
+            break
+    else:
+        logger.warning("Voice demo HTML not found; checked: %s", _demo_candidates)
+
+    # Mount /static for voice demo assets (logos, etc.).
+    _static_candidates = [
+        "/app/web_demo/static",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "static"
+        ),
+    ]
+    for _sp in _static_candidates:
+        _sp = os.path.normpath(_sp)
+        if os.path.isdir(_sp):
+            from starlette.staticfiles import StaticFiles  # noqa: PLC0415
+
+            app.mount("/static", StaticFiles(directory=_sp), name="demo-static")
+            logger.info("Mounted /static from %s", _sp)
+            break
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def _voice_demo() -> HTMLResponse:
+        if not _demo_html:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice demo HTML not found. Checked: {_demo_candidates}",
+            )
+        return HTMLResponse(_demo_html)
 
     # ------------------------------------------------------------------
     # Typed exception → HTTP code translator. AgentCreationError carries

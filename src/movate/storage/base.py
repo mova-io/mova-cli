@@ -26,7 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from movate.core.tool_registry.models import ToolDescriptor
 
 from movate.core.dr_backup import ImportResult
 from movate.core.eval_generator import EvalGenerationJob
@@ -90,6 +93,27 @@ class EvalCommitResult:
     dataset_path: str
     cases_added: int
     judge_yaml_updated: bool
+
+
+@dataclass(frozen=True)
+class RunSubmissionRecord:
+    """A persisted run-submission dedup row (item 37).
+
+    Returned by :meth:`StorageProvider.get_run_submission_record`. Carries the
+    ``job_id`` the first submission enqueued plus the ``request_hash`` — a
+    canonical fingerprint of that submission's payload — so the submit endpoint
+    can tell apart *"the same retry"* (return the prior job) from *"the same key
+    reused for a DIFFERENT payload"* (a 409 conflict; never silently return the
+    wrong run).
+
+    ``request_hash`` is ``None`` for rows recorded before the fingerprint
+    column existed (legacy / mixed-version fleets). A ``None`` fingerprint means
+    *"unknown"* — the endpoint skips the conflict check and returns the prior
+    job, preserving byte-for-byte the pre-guard behavior.
+    """
+
+    job_id: str
+    request_hash: str | None
 
 
 class StorageProvider(Protocol):
@@ -468,8 +492,26 @@ class StorageProvider(Protocol):
         first time we've seen this key for this tenant.
         """
 
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        """Return the full dedup row (``job_id`` + ``request_hash``) or ``None``.
+
+        Keyed by ``(tenant_id, idempotency_key)``. ``None`` means first-seen for
+        this tenant. The ``request_hash`` (item 37 payload-conflict guard) lets
+        the submit endpoint distinguish a genuine retry from a key reused for a
+        different payload (→ 409). ``request_hash`` is ``None`` on legacy rows
+        recorded before the fingerprint column existed → "unknown" → no
+        conflict raised (back-compat). Complements :meth:`get_run_submission`,
+        which stays job-id-only for callers that don't need the fingerprint.
+        """
+
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         """Record that ``idempotency_key`` for ``tenant_id`` enqueued ``job_id``.
 
@@ -478,6 +520,12 @@ class StorageProvider(Protocol):
         winner rather than recording two jobs. Returns ``True`` if this call
         inserted the row, ``False`` if a row already existed (the existing
         ``job_id`` is preserved — never overwritten).
+
+        ``request_hash`` (item 37 payload-conflict guard) is an optional
+        canonical fingerprint of the submitted payload, stored so a later submit
+        reusing the same key with a DIFFERENT payload can be rejected with a
+        409. ``None`` (the default) stores no fingerprint — back-compatible with
+        callers / fleets that predate the guard.
         """
 
     # ------------------------------------------------------------------
@@ -799,6 +847,77 @@ class StorageProvider(Protocol):
         cooperative (the worker honors the flag at a checkpoint), so a
         ``RUNNING`` job's in-flight LLM call is allowed to complete; its
         result is then discarded in favor of ``CANCELLED``.
+        """
+
+    # ------------------------------------------------------------------
+    # Dead-letter operations — operate jobs that exhausted their retry
+    # budget and landed in ``DEAD_LETTER`` (see ``movate.core.job_retry``).
+    # All tenant-scoped: an operator inspects, recovers, or prunes only
+    # its own tenant's poisoned jobs. Additive — the normal job lifecycle
+    # (claim / update / requeue / reclaim) is untouched.
+    # ------------------------------------------------------------------
+
+    async def list_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        limit: int = 20,
+        agent: str | None = None,
+    ) -> list[JobRecord]:
+        """List this tenant's ``DEAD_LETTER`` jobs, newest-first.
+
+        A focused convenience over ``list_jobs(status=DEAD_LETTER)``: it is
+        the operator triage surface for retry-exhausted jobs. ``agent``
+        (the ``target`` column) narrows to a single agent/workflow name so
+        an operator can scope a recovery to the failing component. Always
+        tenant-scoped (``tenant_id`` is required, not optional) — there is
+        no cross-tenant dead-letter view.
+        """
+
+    async def requeue_dead_letter_job(self, job_id: str, *, tenant_id: str) -> bool:
+        """Recover ONE ``DEAD_LETTER`` job back onto the queue, tenant-scoped.
+
+        Resets the row to a fresh ``QUEUED`` state so the worker picks it
+        up again on the next claim:
+
+        * ``status`` → ``QUEUED``
+        * ``attempt_count`` → ``0`` (a fresh retry budget)
+        * ``next_retry_at`` → ``NULL`` (claimable immediately)
+        * ``claimed_at`` / ``completed_at`` → ``NULL``
+        * ``error`` → ``NULL`` (the prior failure is cleared)
+
+        The transition is guarded on ``status = 'dead_letter'`` in WHERE,
+        so a job that is not dead-lettered (queued / running / a different
+        terminal status) is NOT touched. Returns ``True`` iff a row was
+        actually requeued; ``False`` if no row matched (missing,
+        cross-tenant, or not in ``DEAD_LETTER``) — the caller maps a
+        ``False`` to a clean "nothing to requeue" error rather than
+        silently corrupting a live job.
+
+        Tenant-scoped in WHERE (``job_id`` AND ``tenant_id``) so a
+        cross-tenant id can never resurrect another tenant's job.
+        """
+
+    async def purge_dead_letter_jobs(
+        self,
+        tenant_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> int:
+        """Permanently delete this tenant's ``DEAD_LETTER`` jobs.
+
+        Destructive housekeeping for an operator that has triaged the
+        dead-letter queue and wants the un-recoverable rows gone.
+        Tenant-scoped: deletes ONLY rows where ``status = 'dead_letter'``
+        AND ``tenant_id`` matches — never another tenant's, and never a
+        live (queued/running) or non-dead-letter terminal job.
+
+        ``before`` (when set) restricts the purge to rows whose
+        ``completed_at`` is strictly older than the cutoff, so an operator
+        can keep recent dead-letters for inspection while clearing stale
+        ones. ``None`` purges every dead-letter row for the tenant.
+
+        Returns the number of rows deleted.
         """
 
     # ------------------------------------------------------------------
@@ -2315,5 +2434,64 @@ class StorageProvider(Protocol):
         different tenant — same 404-not-403 contract as the other
         single-record getters, so a caller can't probe for the existence
         of another tenant's diagnoses."""
+
+    # ------------------------------------------------------------------
+    # Tool registry (ADR 052) -- shared, versioned, governed tool
+    # descriptors. Additive new table ``tool_descriptors``, keyed by
+    # ``(name, version, scope, tenant_id)``. Phase 1: CRUD + list/filter;
+    # the sync protocol for ``movate``-tier tools defers to a follow-up.
+    # ------------------------------------------------------------------
+
+    async def save_tool_descriptor(
+        self,
+        descriptor: ToolDescriptor,
+    ) -> None:
+        """Upsert one tool descriptor keyed by ``(name, version, scope, tenant_id)``.
+
+        Re-publishing the same ``(name, version)`` in the same scope + tenant
+        overwrites the prior row (last write wins). Used by the publish
+        endpoint and ``mdk tools publish``.
+        """
+
+    async def get_tool_descriptor(
+        self,
+        name: str,
+        version: str | None,
+        scope: str,
+        tenant_id: str,
+    ) -> ToolDescriptor | None:
+        """Fetch one tool descriptor.
+
+        ``version=None`` returns the **latest** version (newest ``updated_at``)
+        for ``(name, scope, tenant_id)``; an explicit ``version`` returns that
+        exact version. Returns ``None`` if no match -- same no-leak contract as
+        the other single-record getters.
+        """
+
+    async def list_tool_descriptors(
+        self,
+        scope: str | None,
+        tenant_id: str,
+        tags: list[str] | None,
+    ) -> list[ToolDescriptor]:
+        """List tool descriptors, optionally filtered by scope and/or tags.
+
+        ``scope=None`` lists across all scopes visible to the tenant
+        (project + tenant + movate). ``tags`` filters to descriptors
+        containing ALL specified tags. Ordered by name ASC, version DESC.
+        """
+
+    async def delete_tool_descriptor(
+        self,
+        name: str,
+        version: str,
+        scope: str,
+        tenant_id: str,
+    ) -> bool:
+        """Delete one tool descriptor by ``(name, version, scope, tenant_id)``.
+
+        Returns ``True`` if a row was deleted, ``False`` if none matched.
+        Tenant-scoped: a wrong-tenant delete is a no-op.
+        """
 
     async def close(self) -> None: ...

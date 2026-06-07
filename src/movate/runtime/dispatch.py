@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from movate.core.alert_emit import drift_alert, emit_alert
 from movate.core.events import EventKind
 from movate.core.executor import Executor
 from movate.core.loader import AgentBundle
@@ -412,6 +413,34 @@ class WorkerDispatch:
                         "pass_rate_delta": result.pass_rate_delta,
                         "tolerance": tolerance,
                     },
+                )
+                # ADR 057 D1 (step 2) — also raise a typed alert onto the same
+                # outbox so the alert router can *page* on this regression (the
+                # ``drift.detected`` event above is the lifecycle record; this
+                # is the routable alert). Fire-and-forget, best-effort (D5):
+                # this never raises into the eval/worker path, and with no
+                # routes configured it's a recorded-but-undelivered no-op (D7).
+                emit_alert(
+                    self._storage,
+                    drift_alert(
+                        tenant_id=job.tenant_id,
+                        agent=record.agent,
+                        summary=(
+                            f"eval drift — {record.agent} regressed "
+                            f"(mean_score {result.mean_score_delta:+.4f}, "
+                            f"pass_rate {result.pass_rate_delta:+.4f}) vs baseline "
+                            f"{result.baseline.eval_id}"
+                        ),
+                        data={
+                            "eval_id": record.eval_id,
+                            "baseline_eval_id": result.baseline.eval_id,
+                            "agent_version": record.agent_version,
+                            "mean_score_delta": result.mean_score_delta,
+                            "pass_rate_delta": result.pass_rate_delta,
+                            "tolerance": tolerance,
+                            "regressed_metrics": list(result.regressed_metrics),
+                        },
+                    ),
                 )
             await alert_on_drift(
                 result,
@@ -915,11 +944,10 @@ class WorkerDispatch:
                 return _error("internal", str(exc), retryable=True)
             return self._workflow_result_to_outcome(result)
 
-        # temporal — compile (Track B) + execute on Temporal via Track C
-        # activities, reusing this worker's Executor collaborators (ADR 054 D3).
-        # langgraph never reaches here (require_backend_available failed loud).
+        # temporal / langgraph — route through the backend seam (ADR 055 D2),
+        # reusing this worker's Executor collaborators (ADR 054 D3).
         try:
-            result = await self._run_workflow_on_backend(job, graph)
+            result = await self._run_workflow_on_backend(job, graph, effective)
         except WorkflowBackendError as exc:
             return _error("runtime_unavailable", str(exc), retryable=False)
         except Exception as exc:
@@ -927,18 +955,17 @@ class WorkerDispatch:
             return _error("internal", str(exc), retryable=True)
         return self._workflow_result_to_outcome(result)
 
-    async def _run_workflow_on_backend(self, job: JobRecord, graph: Any) -> Any:
+    async def _run_workflow_on_backend(
+        self, job: JobRecord, graph: Any, effective: str = "temporal"
+    ) -> Any:
         """Execute a non-native workflow via the backend seam (ADR 055 D2).
 
-        The Temporal activities run the SAME execution model the native runner
-        does (ADR 054 D3): one Executor, built here from the same provider
-        policy the eval/bench paths use (MockProvider under a ``mock`` job,
-        LiteLLM otherwise) plus this worker's storage + tracer. The job's tenant
-        is stamped so every node's RunRecord is scoped correctly (mirrors the
-        native path)."""
-        from movate.providers.pricing import load_pricing  # noqa: PLC0415
-        from movate.runtime.workflow_backend import run_temporal_workflow  # noqa: PLC0415
-
+        Routes to Temporal or LangGraph based on ``effective``. Both paths use
+        the SAME execution model (ADR 054 D3): one Executor, built here from the
+        same provider policy the eval/bench paths use (MockProvider under a
+        ``mock`` job, LiteLLM otherwise) plus this worker's storage + tracer.
+        The job's tenant is stamped so every node's RunRecord is scoped correctly.
+        """
         use_mock = self._use_mock_for_eval or bool(job.input.get("mock"))
         if use_mock:
             from movate.providers.mock import MockProvider  # noqa: PLC0415
@@ -948,6 +975,23 @@ class WorkerDispatch:
             from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
 
             provider = LiteLLMProvider()
+
+        if effective == "langgraph":
+            from movate.runtime.langgraph_backend import run_langgraph_workflow  # noqa: PLC0415
+
+            return await run_langgraph_workflow(
+                graph,
+                job.input,
+                executor=self._executor,
+                tracer=self._executor.tracer,
+                storage=self._storage,
+                tenant_id=job.tenant_id,
+                mock=use_mock,
+            )
+
+        # Default: temporal
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.runtime.workflow_backend import run_temporal_workflow  # noqa: PLC0415
 
         return await run_temporal_workflow(
             graph,

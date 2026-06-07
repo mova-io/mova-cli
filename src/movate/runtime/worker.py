@@ -29,6 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from movate.core.alert_emit import dead_letter_alert, emit_alert
 from movate.core.events import EventKind
 from movate.core.job_retry import (
     DEFAULT_POLICY,
@@ -391,6 +392,32 @@ class Worker:
         Fire-and-forget via :func:`emit_event` — NEVER raises into the
         worker loop, NEVER waits on the storage write.
         """
+        # ADR 057 D1 (step 2) — a job that exhausted its retry budget and
+        # landed in DEAD_LETTER is an operator-actionable condition: raise a
+        # typed ``dead_letter_spike`` alert onto the outbox so the router can
+        # page on it. Emitted for EVERY job kind (the dead-letter is the
+        # signal, not the job wrapper), so this sits ABOVE the AGENT/WORKFLOW
+        # gate on the lifecycle event below. Fire-and-forget, best-effort (D5:
+        # never raises into the worker loop); recorded-but-undelivered when no
+        # routes are configured (D7).
+        if final_status == JobStatus.DEAD_LETTER:
+            emit_alert(
+                self._storage,
+                dead_letter_alert(
+                    tenant_id=job.tenant_id,
+                    subject=job.target,
+                    summary=(
+                        f"job for {job.kind.value}/{job.target} exhausted its retry "
+                        f"budget and was dead-lettered (job {job.job_id})"
+                    ),
+                    data={
+                        "job_id": job.job_id,
+                        "agent": job.target,
+                        "kind": job.kind.value,
+                        "duration_ms": duration_ms,
+                    },
+                ),
+            )
         if job.kind not in (JobKind.AGENT, JobKind.WORKFLOW):
             return
         run_kind = (

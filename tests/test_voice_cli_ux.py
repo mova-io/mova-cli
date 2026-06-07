@@ -21,6 +21,7 @@ from uuid import uuid4
 import pytest
 from click.testing import Result
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from movate.core.auth import ApiKeyEnv, mint_api_key
@@ -343,6 +344,21 @@ class TestVoiceConfigOnAgentSpec:
         assert vc.tts is None
         assert vc.voice_id == ""
         assert vc.language is None
+        # ADR 071 — new tuning fields default to "use runtime default" / off.
+        assert vc.tts_streaming is None
+        assert vc.speculative is False
+
+    def test_voice_config_tuning_fields_parse(self) -> None:
+        """ADR 071 D2/D3 — tts_streaming + speculative are additive and parse."""
+        spec = AgentSpec(**self._minimal_spec(voice={"tts_streaming": False, "speculative": True}))
+        assert spec.voice is not None
+        assert spec.voice.tts_streaming is False
+        assert spec.voice.speculative is True
+
+    def test_voice_config_rejects_unknown_field(self) -> None:
+        """extra='forbid' still catches typos in the voice block."""
+        with pytest.raises(ValidationError):
+            AgentSpec(**self._minimal_spec(voice={"speculatve": True}))  # typo
 
     def test_voice_config_partial_override(self) -> None:
         """An author can override just the TTS provider."""

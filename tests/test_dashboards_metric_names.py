@@ -43,10 +43,15 @@ import yaml
 from movate.tracing.metrics import METRIC_NAMES
 
 # Repo-root-relative dashboards directory (tests/ is one level under the root).
-_DASHBOARDS_DIR = Path(__file__).resolve().parent.parent / "dashboards"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DASHBOARDS_DIR = _REPO_ROOT / "dashboards"
 _GRAFANA = _DASHBOARDS_DIR / "grafana" / "mdk-golden-signals.json"
 _PROM_RULES = _DASHBOARDS_DIR / "prometheus" / "mdk-rules.yaml"
 _AZURE_WORKBOOK = _DASHBOARDS_DIR / "azure" / "mdk-golden-signals.workbook.json"
+# ADR 082 — the deployed Temporal operational workbook (loaded by
+# infra/azure/modules/monitor-workbooks.bicep via loadTextContent). Brought under
+# the same anti-drift guard so its mdk.* references can't go stale.
+_TEMPORAL_WORKBOOK = _REPO_ROOT / "infra" / "azure-monitor" / "workbooks" / "temporal.workbook.json"
 
 # Prometheus unit / aggregation suffixes the OTLP -> Prometheus convention
 # appends. Stripped (one layer per pass) before matching a Prometheus token
@@ -140,10 +145,15 @@ _POOL_METRICS = {
     "mdk.db.pool.max",
 }
 
+# ADR 082 — the Temporal operational workbook is built solely on the durable-
+# workflow completion counter (per-workflow timing lives in the Temporal Web UI).
+_TEMPORAL_METRICS = {"mdk.workflow.completed"}
+
 _CASES = [
     pytest.param(_GRAFANA, "json", _ALL_FIVE | _POOL_METRICS, id="grafana"),
     pytest.param(_PROM_RULES, "yaml", _ALL_FIVE, id="prometheus-rules"),
     pytest.param(_AZURE_WORKBOOK, "json", _ALL_FIVE, id="azure-workbook"),
+    pytest.param(_TEMPORAL_WORKBOOK, "json", _TEMPORAL_METRICS, id="temporal-workbook"),
 ]
 
 
@@ -219,6 +229,13 @@ def test_every_emitted_metric_appears_on_some_dashboard() -> None:
         # the rest of the data-plane gauges are waiting on. Add a panel
         # alongside the DB-pool gauges when item #27 lands.
         "mdk.sse.connections_active": "ADR 035 D3, dashboard panel deferred to item #27",
+        # Voice turn latency (ADR 024/036/073) — newly bridged from the voice
+        # subsystem to OTel. A dedicated voice dashboard/workbook is the
+        # follow-up; the metrics ship first so data accrues before the panels.
+        "mdk.voice.responded_ms": "voice latency; voice dashboard is a follow-up",
+        "mdk.voice.stt_final_ms": "voice latency; voice dashboard is a follow-up",
+        "mdk.voice.tts_first_audio_ms": "voice latency; voice dashboard is a follow-up",
+        "mdk.voice.turns": "voice turn/barge-in counter; voice dashboard is a follow-up",
     }
 
     covered: set[str] = set()

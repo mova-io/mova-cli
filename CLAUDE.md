@@ -54,9 +54,18 @@ pytest -m "not smoke"
 python scripts/check_licenses.py --strict   # shipped-dep license gate
 ```
 
-Versioning is automatic (CalVer `YYYY.M.D.N`, bumped by `.githooks/pre-commit`)
-— don't hand-edit version files. Never skip hooks or use `--no-verify` unless
-explicitly asked.
+Versioning is CalVer (`YYYY.M.D.N`), **derived from git at build time — never
+committed** (ADR 066). There is NO version line in `pyproject.toml` /
+`src/movate/__init__.py` / `uv.lock`, so **PRs carry no version diff and never
+conflict on a version line.** Do **not** add one or run a bump script. The
+version is computed by the hatch metadata hook (`hatch_build.py` +
+`scripts/calver_version.py`) from `HEAD`'s date + the per-day commit counter;
+`movate.__version__` reads it back from the installed package metadata. Docker
+builds get it via the `MOVATE_BUILD_VERSION` build-arg (the deploy CLI computes +
+passes it, since the image context excludes `.git`). `scripts/bump_version.py` is
+now just a printer. (This supersedes ADR 059's at-merge bump, which couldn't push
+to protected `main`, and the old per-PR bump that caused the version-line merge
+tax.) Never skip hooks or use `--no-verify` unless asked.
 
 ## Canonical docs (source of truth — read, don't reinvent)
 

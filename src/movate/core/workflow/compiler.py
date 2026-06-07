@@ -122,14 +122,25 @@ def compile_workflow(
                     f"human node {ns.id!r}: 'output_contract' must be a list of "
                     f"non-empty state-key strings"
                 )
+            human_metadata: dict[str, Any] = {
+                "prompt": prompt,
+                "output_contract": list(ns.output_contract),
+            }
+            # Durable-HITL extras (ADR 062 D3/D4) — only stamped when set, so a
+            # plain HUMAN gate's metadata is byte-for-byte the ADR 017 shape and
+            # the native runner (which reads only prompt/output_contract) is
+            # unaffected. The Temporal compiler reads these for the durable
+            # timeout route; native ignores them (it cannot durably wait).
+            if ns.approvers:
+                human_metadata["approvers"] = list(ns.approvers)
+            if ns.timeout is not None:
+                human_metadata["timeout"] = ns.timeout
+                human_metadata["on_timeout"] = ns.on_timeout
             nodes[ns.id] = WorkflowNode(
                 id=ns.id,
                 type=NodeType.HUMAN,
                 ref="",  # unused for human gates
-                metadata={
-                    "prompt": prompt,
-                    "output_contract": list(ns.output_contract),
-                },
+                metadata=human_metadata,
             )
         elif isinstance(ns, JudgeNodeSpec):
             # JUDGE node (ADR 056 D1). When a ``judge_agent`` ref is supplied

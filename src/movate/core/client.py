@@ -32,6 +32,7 @@ from movate.runtime.schemas import (
     BatchListView,
     BatchStatusView,
     CapabilitiesView,
+    DeadLetterPurgeView,
     GroundedAnswerView,
     HealthView,
     JobCancelView,
@@ -48,8 +49,10 @@ from movate.runtime.schemas import (
     ProjectMemberView,
     ProjectView,
     RunAccepted,
+    RunReplayView,
     RunSubmission,
     RunView,
+    VoiceTurnView,
     WorkflowCreateRequest,
     WorkflowDetailView,
     WorkflowListResponse,
@@ -211,6 +214,49 @@ class MovateClient:
         self._raise_for_status(r)
         return JobListView.model_validate(r.json())
 
+    async def list_dead_letter_jobs(
+        self,
+        *,
+        agent: str | None = None,
+        limit: int = 20,
+    ) -> JobListView:
+        """``GET /api/v1/jobs/dead-letter`` — this tenant's retry-exhausted
+        jobs, newest-first.
+
+        ``agent`` narrows to one agent/workflow ``target``; ``limit`` is
+        hard-capped at 100 server-side."""
+        params: dict[str, str | int] = {"limit": limit}
+        if agent is not None:
+            params["agent"] = agent
+        r = await self._client.get("/api/v1/jobs/dead-letter", params=params)
+        self._raise_for_status(r)
+        return JobListView.model_validate(r.json())
+
+    async def requeue_dead_letter_job(self, job_id: str) -> JobView:
+        """``POST /api/v1/jobs/{id}/requeue`` — recover a DEAD_LETTER job.
+
+        Body-less; requires the ``run`` scope. Resets the job to a fresh
+        ``QUEUED`` state (attempt budget cleared) so the worker reclaims
+        it. Returns the requeued :class:`JobView`. 404 if the job is not a
+        dead-letter for this tenant."""
+        r = await self._client.post(f"/api/v1/jobs/{job_id}/requeue")
+        self._raise_for_status(r)
+        return JobView.model_validate(r.json())
+
+    async def purge_dead_letter_jobs(self, *, before: str | None = None) -> DeadLetterPurgeView:
+        """``POST /api/v1/jobs/dead-letter/purge`` — delete this tenant's
+        DEAD_LETTER jobs.
+
+        Destructive; requires the ``admin`` scope. ``before`` (an ISO-8601
+        instant) restricts the purge to dead-letters completed strictly
+        before it; omit to purge all. Returns the count purged."""
+        params: dict[str, str] = {}
+        if before is not None:
+            params["before"] = before
+        r = await self._client.post("/api/v1/jobs/dead-letter/purge", params=params)
+        self._raise_for_status(r)
+        return DeadLetterPurgeView.model_validate(r.json())
+
     async def get_run(self, run_id: str) -> RunView:
         """``GET /runs/{id}`` — full run record including ``output``.
 
@@ -222,6 +268,22 @@ class MovateClient:
         r = await self._client.get(f"/runs/{run_id}")
         self._raise_for_status(r)
         return RunView.model_validate(r.json())
+
+    async def replay_run(
+        self, run_id: str, *, against: str = "published", mock: bool = False
+    ) -> RunReplayView:
+        """``POST /api/v1/runs/{id}/replay`` — re-run a historical run's recorded
+        input against a chosen agent version (ADR 045 D13).
+
+        ``against`` is ``"published"`` (latest) or ``"version:X"``. Returns the
+        original + replayed runs side-by-side with a ``changed`` flag. The
+        original run is immutable; the replay is a new persisted run."""
+        r = await self._client.post(
+            f"/api/v1/runs/{run_id}/replay",
+            params={"against": against, "mock": mock},
+        )
+        self._raise_for_status(r)
+        return RunReplayView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Observability Intelligence (ADR 047)
@@ -776,6 +838,67 @@ class MovateClient:
         )
         self._raise_for_status(r)
         return WebhookAttemptListView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Voice — one-shot / batch REST turn (ADR 050 D2)
+    # ------------------------------------------------------------------
+
+    async def voice_oneshot(
+        self,
+        *,
+        agent: str,
+        audio: bytes | None = None,
+        text: str | None = None,
+        filename: str = "audio.wav",
+        content_type: str = "application/octet-stream",
+        stt: str | None = None,
+        tts: str | None = None,
+        voice_id: str | None = None,
+        language: str | None = None,
+        input_key: str = "text",
+        codec: str = "pcm16",
+        mock: bool = False,
+        audio_out: str = "inline",
+    ) -> VoiceTurnView:
+        """``POST /api/v1/agents/{name}/voice`` — one-shot voice turn (ADR 050 D2).
+
+        The REST parity to the streaming WS. Supply EITHER ``audio`` (sent as a
+        multipart file part, ADR 050 D10 — never base64-in-JSON; the
+        ``ask``/``transcribe`` paths) OR ``text`` to speak (the ``say`` path,
+        ADR 050 D11 — STT is bypassed server-side). Returns the
+        ``{transcript, response_text, audio_*}`` envelope. ``audio_out`` selects
+        how the synthesized answer travels (``inline`` base64 in the envelope,
+        ``stream`` for the binary body, ``none`` to transcribe only).
+
+        Per-request ``stt`` / ``tts`` / ``voice_id`` / ``language`` override the
+        agent's voice defaults for this one turn (ADR 050 D6). ``mock`` runs the
+        agent stage offline (test parity with the WS ``mock`` config). Requires
+        the ``run`` scope.
+        """
+        data: dict[str, str] = {
+            "input_key": input_key,
+            "codec": codec,
+            "mock": "true" if mock else "false",
+        }
+        if text is not None:
+            data["text"] = text
+        if stt is not None:
+            data["stt"] = stt
+        if tts is not None:
+            data["tts"] = tts
+        if voice_id is not None:
+            data["voice_id"] = voice_id
+        if language is not None:
+            data["language"] = language
+        files = {"audio": (filename, audio, content_type)} if audio is not None else None
+        r = await self._client.post(
+            f"/api/v1/agents/{agent}/voice",
+            params={"audio": audio_out},
+            files=files,
+            data=data,
+        )
+        self._raise_for_status(r)
+        return VoiceTurnView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Internal

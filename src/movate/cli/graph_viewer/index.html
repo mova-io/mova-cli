@@ -46,6 +46,12 @@
         <label class="toggle" title="Tint nodes by detected community (connected components)">
           <input type="checkbox" id="community-toggle" /> communities
         </label>
+        <label class="toggle" title="Fade nodes whose extraction confidence is below the threshold (the graph is honest about uncertainty). 0 shows everything at full strength.">
+          min conf:
+          <input type="range" id="min-confidence" min="0" max="1" step="0.05" value="0" />
+          <span id="min-confidence-val" class="range-val">0.00</span>
+        </label>
+        <button id="replay-btn" class="toggle replay-btn" title="Clear and re-assemble the graph node-by-node from the server (the demo 'watch it grow' moment)">▶ replay growth</button>
         <label class="toggle live" title="Stream node/edge additions as documents are ingested">
           <input type="checkbox" id="live-toggle" /> <span class="live-dot"></span> live growth
         </label>

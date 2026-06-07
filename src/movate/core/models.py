@@ -473,6 +473,20 @@ class SkillImplementationKind(StrEnum):
     up in the runtime registry and called synchronously. Enables
     cross-agent orchestration without the v1.1 LangGraph machinery."""
 
+    EXEC = "exec"
+    """Run any executable as a tool via subprocess + JSON stdin/stdout.
+    The raw-script escape hatch per ADR 052 D2 -- how a Node CLI, a Java
+    jar, a Go binary, or a bare Python script becomes a tool without an
+    MCP server or an HTTP service. Sandboxed: configurable timeout,
+    resource limits."""
+
+    LANGCHAIN = "langchain"
+    """Wrap a LangChain ``BaseTool`` as an MDK skill. The ``entry`` field
+    is a dotted import path to a LangChain tool class or factory function
+    (e.g. ``langchain_community.tools.wikipedia:WikipediaQueryRun``).
+    The tool is instantiated once on first call and reused. Requires the
+    ``mdk[langchain]`` extra (imported lazily)."""
+
 
 class SkillImplementation(BaseModel):
     """Backend declaration for a skill.
@@ -791,19 +805,17 @@ class SkillSpec(BaseModel):
                     f"http skill implementation.auth must be 'bearer-from-env:<VAR>'; "
                     f"got {v.auth!r}"
                 )
-        if v.kind == SkillImplementationKind.MCP:
-            if not v.entry:
-                raise ValueError(
-                    "mcp skill implementation.entry must be the subprocess "
-                    "command for the MCP server (e.g. './mcp-servers/github' "
-                    "or 'npx -y @some/mcp-package'); got empty string"
-                )
-            if not v.tool:
-                raise ValueError(
-                    "mcp skill implementation.tool is required (the name "
-                    "of the tool to invoke on the MCP server); empty tool "
-                    "would mean 'no tool selected'"
-                )
+        # MCP: entry is required; tool: is OPTIONAL — when omitted, the
+        # backend operates in multi-tool mode (all tools from tools/list
+        # are registered as namespaced callables). When specified,
+        # single-tool mode (backward-compatible).
+        if v.kind == SkillImplementationKind.MCP and not v.entry:
+            raise ValueError(
+                "mcp skill implementation.entry must be the server "
+                "command (e.g. 'npx -y @some/mcp-package') or an "
+                "HTTP/SSE URL (e.g. 'https://mcp.example.com/api'); "
+                "got empty string"
+            )
         if v.kind == SkillImplementationKind.AGENT and not v.target_agent:
             raise ValueError(
                 "agent skill implementation.target_agent is required "
@@ -1324,6 +1336,66 @@ class VoiceConfig(BaseModel):
             "``None`` → auto-detect / provider default."
         ),
     )
+    # ---- ADR 071 — per-agent latency/cost tuning (ADDITIVE, OPTIONAL) ----
+    tts_streaming: bool | None = Field(
+        default=None,
+        description=(
+            "Sentence-level TTS overlap for this agent (ADR 048 D7) — speak "
+            "sentence one while the agent is still generating sentence two, the "
+            "biggest time-to-first-audio win.  ``None`` (default / absent block) "
+            "uses the runtime default; ``true``/``false`` pins it for this agent. "
+            "The WS event protocol is unchanged either way (consumers key off the "
+            "event ``kind``)."
+        ),
+    )
+    speculative: bool = Field(
+        default=False,
+        description=(
+            "Speculative agent kickoff for this agent (ADR 070) — start the agent "
+            "on a stable interim transcript, before STT endpoints, to recover the "
+            "~1.5s endpointing wait; commit if the final matches, else cancel and "
+            "re-run.  Off by default (it changes the cost profile via cancelled "
+            "runs).  Only fires when the agent stage is cancel-safe — the mdk "
+            "Executor is, so an mdk agent honors this flag."
+        ),
+    )
+    keyterms: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Domain vocabulary to **boost** at recognition time for this agent "
+            "(ADR 071 D4) — names, acronyms, jargon a general STT model mis-hears "
+            "(e.g. ``['VPN', 'Okta', 'Mova-iO']``).  Passed per-turn to the STT "
+            "provider; boosting-capable providers (Deepgram) honor it, others "
+            "ignore it.  Empty (the default) sends no boosting."
+        ),
+    )
+    endpointing_ms: int | None = Field(
+        default=None,
+        ge=0,
+        le=10_000,
+        description=(
+            "Silence-hold (ms) this agent waits before declaring the speaker's "
+            "turn finished (ADR 073 D3) — the dominant fixed latency of a "
+            "pipeline turn.  Raise it for deliberate speakers (fewer mid-pause "
+            "barge-ins), lower it for snappy command-style agents.  Passed "
+            "per-turn to the STT provider; endpointing-capable providers "
+            "(Deepgram) honor it, others ignore it.  ``None`` (the default) "
+            "keeps the runtime/adapter default (1500 ms) — byte-for-byte "
+            "unchanged."
+        ),
+    )
+    endpointing_adaptive: bool = Field(
+        default=False,
+        description=(
+            "Adaptively tune the silence-hold within a session from observed "
+            "turn cadence (ADR 073 Phase 3) — shorten it when speakers finish "
+            "cleanly (high speculation commit-ratio), lengthen it when they run "
+            "past their interims.  Seeded from ``endpointing_ms`` (or 1500) and "
+            "bounded.  Off by default; requires the streaming/speculatable path "
+            "to have a cadence signal.  When off, ``endpointing_ms`` is used "
+            "verbatim — byte-for-byte unchanged."
+        ),
+    )
 
 
 class AgentSpec(BaseModel):
@@ -1502,12 +1574,34 @@ class AgentSpec(BaseModel):
             result.append(SkillRef._from_raw(item))
         return result
 
+    # ---- ADR 052: shared tool registry references ----
+    # Optional ``tools: [name@version]`` block for the tool registry.
+    # Each entry is a ``name@version`` string (or bare name for any
+    # version) that the ToolResolver late-binds to a ToolDescriptor at
+    # agent-load time. Resolved descriptors are converted to SkillBundles
+    # the executor can dispatch alongside the per-agent skills.
+    # SCHEMA FLAG (additive, backward-compatible): empty list is the
+    # default; existing agent.yaml files that omit this block load
+    # unchanged.
+
+    tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tool registry references this agent depends on (ADR 052). "
+            "Each entry is a ``name@version`` string (e.g. "
+            "``'jira.create-issue@^1.2.0'``) or a bare name (any version). "
+            "Resolved at agent-load time via the ToolResolver against the "
+            "tenant's tool registry. Empty list (the default) means no "
+            "registry tools; the agent uses only its per-agent skills."
+        ),
+    )
+
     # ---- v0.6 shared contexts (ADR 002) ----
     # Names referencing `contexts/<name>.md` files in the project's
     # contexts/ folder. Each named context's body is prepended to the
     # rendered prompt at execution time, in declaration order, with a
     # `\n\n---\n\n` separator. Solves the "stop copy-pasting the style
-    # guide into every prompt.md" pain. Pure markdown — no templating,
+    # guide into every prompt.md" pain. Pure markdown -- no templating,
     # no Python, no Jinja side effects. See docs/adr/002-skills-and-contexts.md.
 
     contexts: list[str] = Field(
@@ -1777,6 +1871,18 @@ class TokenUsage(BaseModel):
     input: int = 0
     output: int = 0
     cached_input: int = 0
+    """Prompt tokens served FROM the cache (Anthropic
+    ``cache_read_input_tokens`` / OpenAI ``cached_tokens``). Billed at the
+    discounted cache-read rate (~0.1x input). Already counted within
+    ``input`` for OpenAI-style providers, but reported separately by
+    Anthropic — see ``cost_for`` for how the two conventions reconcile."""
+    cache_write: int = 0
+    """Prompt tokens WRITTEN to the cache this request (Anthropic
+    ``cache_creation_input_tokens``). Billed at the cache-write premium
+    (~1.25x input for the default 5-minute TTL). Disjoint from ``input``
+    on Anthropic — the SDK reports uncached input, cache reads, and cache
+    writes as three separate counts. Defaults to ``0`` so non-caching and
+    non-Anthropic paths serialize byte-for-byte as before (additive)."""
 
 
 class Metrics(BaseModel):
@@ -2082,6 +2188,58 @@ class RunRecord(BaseModel):
             "as a single node — additive, backward-compatible. Persisted as a JSON "
             "blob so `mdk explain` can reconstruct the per-step breakdown offline, "
             "without a Langfuse / OTel backend."
+        ),
+    )
+
+    # ---- ADR 050 D1 / D7 / D8 — voice-as-run parity (ADDITIVE, OPTIONAL) ----
+    # All fields below default to ``None`` so text runs serialize identically to
+    # before; voice turns set them after the pipeline completes. ``modality``
+    # distinguishes voice vs text in ``mdk runs list``; the ``stt_*`` / ``tts_*``
+    # / ``audio_*`` fields carry voice-specific economics for the usage API.
+    modality: str | None = Field(
+        default=None,
+        description=(
+            "Run modality: ``'voice'`` for voice turns, ``None`` (the default) for "
+            "text. Additive: every existing RunRecord is ``None`` and renders as "
+            "text. Voice turns set this when the WS handler persists them."
+        ),
+    )
+    stt_latency_ms: float | None = Field(
+        default=None,
+        description=(
+            "STT stage latency in milliseconds (voice turns only). Time from "
+            "audio-in start to the final transcript. ``None`` for text runs."
+        ),
+    )
+    tts_latency_ms: float | None = Field(
+        default=None,
+        description=(
+            "TTS stage latency in milliseconds (voice turns only). Time from "
+            "agent answer to first audio frame. ``None`` for text runs."
+        ),
+    )
+    audio_duration_s: float | None = Field(
+        default=None,
+        description=(
+            "Duration of the inbound audio in seconds (voice turns only). "
+            "Derived from the STT transcript length or audio frame count. "
+            "``None`` for text runs."
+        ),
+    )
+    stt_cost_usd: float | None = Field(
+        default=None,
+        description=(
+            "STT cost in USD for this voice turn (ADR 050 D7). Computed as "
+            "``audio_duration_s * provider_rate_per_second``. ``None`` for "
+            "text runs. Flows into the usage API alongside ``metrics.cost_usd``."
+        ),
+    )
+    tts_cost_usd: float | None = Field(
+        default=None,
+        description=(
+            "TTS cost in USD for this voice turn (ADR 050 D7). Computed as "
+            "``answer_chars * provider_rate_per_char``. ``None`` for text "
+            "runs. Flows into the usage API alongside ``metrics.cost_usd``."
         ),
     )
 
@@ -2449,6 +2607,15 @@ class WorkflowRunRecord(BaseModel):
     [<state keys the human's response contributes>]}``. PR 2 renders this to
     the operator (Teams card / API) and validates the returned decision
     against ``output_contract`` before merging into ``paused_state``."""
+
+    # --- durable-execution backend (ADR 062 D2) --------------------------
+    runtime: str | None = None
+    """Which workflow backend owns this run — ``'temporal'`` for a durable
+    Temporal run, ``None``/``'native'`` for the in-process runner. Additive +
+    nullable: existing rows read ``None`` ⇒ native, so the resume-on-signal
+    endpoint defaults to the native re-walk and only routes to a Temporal
+    ``signal`` when this is ``'temporal'``. Set at the durable pause
+    (``call_human_activity``) on the Temporal path."""
 
 
 class EvalRecord(BaseModel):
@@ -2891,6 +3058,16 @@ class JobKind(StrEnum):
     agent registry, prompts, contexts, or eval datasets — read-only is
     enforced by construction (the Auditor only reads + calls the
     BaseLLMProvider; never invokes the storage save_agent / save_kb paths)."""
+    FINETUNE = "finetune"
+    """Async fine-tune job (ADR 063). ``JobRecord.input`` carries the
+    fine-tune config (``base_model``, ``min_score``, ``provider``,
+    ``promote_if_better``). The worker builds a training dataset from the
+    agent's harvested/golden eval cases (:func:`movate.core.finetune.
+    build_finetune_dataset`), dispatches a hosted fine-tune via the
+    :class:`movate.core.finetune.FineTuneProvider` seam (BYOK keys), registers
+    the resulting model in the catalog with provenance, and runs eval-vs-base
+    — never auto-promoting unless ``promote_if_better`` is set. The job's
+    output payload carries ``{model_id, eval_id}``."""
 
 
 class JobRecord(BaseModel):

@@ -11,7 +11,7 @@ is synthesized (the latency story, ADR 048 D7) — what OpenAI's buffered speech
 API can't do.
 
 The ``elevenlabs`` SDK import is **lazy + guarded** exactly like
-:mod:`movate.voice.cartesia` / :mod:`movate.providers.openai_native`: nothing
+:mod:`movate.voice.cartesia`: nothing
 here imports ``elevenlabs`` at module scope, so a runtime/CLI installed without
 ``mdk[voice]`` is wholly unaffected (ADR 048 D9). The SDK client is constructed
 on first use from the BYOK key; tests inject a fake via the ``client=`` kwarg.
@@ -78,7 +78,7 @@ def _require_elevenlabs() -> Any:
     except ImportError as exc:  # pragma: no cover - exercised via the import-guard test
         raise ImportError(
             "the 'elevenlabs' package is required for the ElevenLabs voice adapter. "
-            "Install with: uv add 'movate-cli[voice]'"
+            "Install with: pip install 'mdk-voice[elevenlabs]'"
         ) from exc
     return _elevenlabs
 
@@ -141,9 +141,23 @@ class ElevenLabsTTS:
         if not utterance.strip():
             return  # nothing to say → no audio frames
 
+        # Guard: ElevenLabs voice IDs are alphanumeric ~20-char strings (no
+        # dashes). If the failover chain passes a Cartesia UUID (has dashes),
+        # fall back to our default rather than 400-ing (ADR 049 portability).
+        import re  # noqa: PLC0415
+
+        _is_uuid = bool(
+            voice_id
+            and re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                voice_id.lower(),
+            )
+        )
+        resolved_voice = self._default_voice if _is_uuid else (voice_id or self._default_voice)
+
         client = self._resolve_client(api_key)
         stream = client.text_to_speech.stream(
-            voice_id=voice_id or self._default_voice,
+            voice_id=resolved_voice,
             text=utterance,
             model_id=self._model,
             output_format=_ELEVENLABS_OUTPUT_FORMAT,

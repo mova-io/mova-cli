@@ -18,12 +18,20 @@ documented variable and wins when both are set.
 Postgres dependency is in the ``[runtime]`` extra; importing the
 provider only happens when the env points at it, so users on the
 sqlite path never need ``asyncpg``.
+
+**Graph backend delegation** (``MOVATE_GRAPH_BACKEND=neo4j``): when set,
+:func:`build_graph_storage` returns a :class:`Neo4jStorageProvider` that
+handles the graph-related methods of the Protocol. The relational backend
+(runs, jobs, api_keys, etc.) stays on Postgres/SQLite. Callers that need
+graph operations should use :func:`build_graph_storage` (falls back to the
+primary backend when no separate graph backend is configured).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 from urllib.parse import urlparse
 
 from movate.storage.base import StorageProvider
@@ -32,6 +40,7 @@ from movate.storage.sqlite import SqliteProvider
 __all__ = [
     "SqliteProvider",
     "StorageProvider",
+    "build_graph_storage",
     "build_storage",
     "mark_cli_mode",
     "selected_backend",
@@ -192,3 +201,41 @@ def build_storage() -> StorageProvider:
         )
         _DURABILITY_WARNING_EMITTED = True
     return SqliteProvider(db_path=db_path)
+
+
+def build_graph_storage() -> Any:
+    """Build a Neo4j graph-only provider when ``MOVATE_GRAPH_BACKEND=neo4j``.
+
+    Returns ``None`` when no separate graph backend is configured — callers
+    should fall back to the primary storage provider for graph operations.
+    Returns a ``Neo4jStorageProvider`` (graph-only delegate, NOT a full
+    ``StorageProvider``) when configured.
+
+    Connection details come from ``NEO4J_URI`` + ``NEO4J_USER`` +
+    ``NEO4J_PASSWORD`` env vars (autoloaded from ``~/.movate/credentials``
+    via ``mdk auth login neo4j``). Missing env vars → ``None`` (no graph
+    backend configured).
+
+    The ``neo4j`` package is lazy-imported from the ``[neo4j]`` optional
+    extra; a missing install raises ``ImportError`` with a clear message.
+    """
+    backend = os.environ.get("MOVATE_GRAPH_BACKEND", "").strip().lower()
+    if backend != "neo4j":
+        return None
+
+    uri = os.environ.get("NEO4J_URI", "").strip()
+    user = os.environ.get("NEO4J_USER", "neo4j").strip()
+    password = os.environ.get("NEO4J_PASSWORD", "").strip()
+
+    if not uri:
+        logger.warning(
+            "MOVATE_GRAPH_BACKEND=neo4j but NEO4J_URI is not set; "
+            "graph operations will fall back to the relational backend."
+        )
+        return None
+
+    # Lazy import — keeps the neo4j package optional.
+    from movate.storage.neo4j import Neo4jStorageProvider  # noqa: PLC0415
+
+    logger.info("graph storage: Neo4jStorageProvider at %s", uri)
+    return Neo4jStorageProvider(uri=uri, user=user, password=password)

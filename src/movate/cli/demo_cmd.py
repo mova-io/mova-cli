@@ -557,8 +557,11 @@ def seed(
         False,
         "--with-voice",
         help=(
-            "Also seed voice-turn records (Deepgram STT + Cartesia TTS) for "
-            "each successful run. Realistic latency/cost figures, same seeded RNG."
+            "Also GENERATE voice-turn records (Deepgram STT + Cartesia TTS) for "
+            "each successful run — realistic latency/cost figures, same seeded "
+            "RNG. NOTE: these are generated + counted but NOT persisted yet "
+            "(no voice_turns table on the StorageProvider Protocol); the flag "
+            "exercises the generation path until the voice-storage ADR lands."
         ),
     ),
     full: bool = typer.Option(
@@ -580,9 +583,11 @@ def seed(
     injected anomalies (a cost spike + a latency regression after a deploy) so
     the anomaly + narrative dashboard panels have a story to tell.
 
-    Pass [bold]--with-voice[/bold] to also seed voice-turn rows (Deepgram STT
-    + Cartesia TTS) alongside each successful run — lights up any voice-latency
-    panels in the demo dashboards.
+    Pass [bold]--with-voice[/bold] to also GENERATE voice-turn records (Deepgram
+    STT + Cartesia TTS) alongside each successful run. These are generated +
+    counted but [bold]not persisted yet[/bold] (no voice_turns table on the
+    StorageProvider Protocol) — the flag exercises the generation path until the
+    voice-storage ADR lands.
 
     [bold]Safety.[/bold] Every seeded row is tagged: its tenant_id starts with
     [cyan]demo-[/cyan] and its input carries a [cyan]__mdk_demo__[/cyan] marker.
@@ -692,7 +697,12 @@ def seed(
     table.add_row("evals", f"{s['evals']:,}")
     table.add_row("failures", f"{s['failures']:,}")
     if with_voice:
-        table.add_row("voice turns", f"{s['voice_turns']:,}")
+        # Voice turns are generated but NOT persisted yet — there is no
+        # voice_turns table on the StorageProvider Protocol (see the
+        # TODO(voice-storage) note in _persist). Label the count clearly as
+        # generated-not-stored so the summary never implies queryable data that
+        # the dashboards / `mdk demo doctor` would then fail to find.
+        table.add_row("voice turns (generated, not stored)", f"{s['voice_turns']:,}")
     table.add_row("agents x tenants", f"{s['agents']} x {s['tenants']}")
     table.add_row("days of history", str(days))
     table.add_row("success rate", f"{s['success_rate_pct']}%")
@@ -721,7 +731,9 @@ def seed(
             "Playground + graph viewer populated — "
             f"{scenario.stats['agents']} sample agents (incl. voice + workflow) and a "
             f"{scenario.stats['graph_nodes']}-node knowledge graph under "
-            f"[cyan]{_SCENARIO_TENANT}[/cyan] / agent [cyan]{_SCENARIO_AGENT}[/cyan]."
+            f"[cyan]{_SCENARIO_TENANT}[/cyan] / agent [cyan]{_SCENARIO_AGENT}[/cyan] "
+            "(the [bold]mdk serve --dev[/bold] tenant — the live browser viewer "
+            "sees it directly)."
         )
         if scenario is not None
         else (
@@ -821,14 +833,24 @@ def clear(
 async def _purge_demo(storage: object) -> int:
     """Delete every demo-tagged row across the storage backend.
 
-    Demo data is identified solely by the ``demo-`` tenant prefix. The
-    StorageProvider Protocol has no "delete run/eval by id" method (runs are
+    Demo data lives under two disjoint tenant scopes, both purged here:
+
+    * the **telemetry** rows (runs / failures / evals) and the analyzer's
+      **insight** rows — tagged with the ``demo-`` tenant *prefix*
+      (``tenant_id LIKE 'demo-%'``); and
+    * the **scenario** rows (sample agents + workflow registry + the knowledge
+      graph) — tagged with the single scenario tenant
+      :data:`~movate.core.demo.DEMO_TENANT_ID` (the serve --dev tenant, a
+      *dash-free exact* id, NOT a ``demo-`` prefix). These are matched by an
+      exact ``tenant_id = ?`` predicate.
+
+    The StorageProvider Protocol has no "delete by id" method (runs are
     immutable history by design), so the purge DELETEs directly against the
-    backend's tables, scoped to ``tenant_id LIKE 'demo-%'`` — the one place
-    this command has to know the backend's table shape. The WHERE clause is the
-    hard guarantee that only synthetic rows are touched. We reuse the already-
-    ``init()``-ed connection/pool (do NOT open a second handle — a separate
-    sqlite connection would deadlock on the writer lock).
+    backend's tables — the one place this command has to know the backend's
+    table shape. The WHERE clauses are the hard guarantee that only synthetic
+    rows are touched. We reuse the already-``init()``-ed connection/pool (do
+    NOT open a second handle — a separate sqlite connection would deadlock on
+    the writer lock).
 
     ``storage`` is typed ``object`` because the StorageProvider Protocol
     deliberately exposes no raw-SQL surface; this helper reaches past it on
@@ -838,42 +860,55 @@ async def _purge_demo(storage: object) -> int:
     the voice-storage ADR). If the table hasn't been created yet the DELETE is
     skipped silently — ``mdk demo clear`` is idempotent across schema versions.
     """
-    from movate.core.demo import DEMO_TENANT_PREFIX  # noqa: PLC0415
+    from movate.core.demo import DEMO_TENANT_ID, DEMO_TENANT_PREFIX  # noqa: PLC0415
 
-    like = f"{DEMO_TENANT_PREFIX}%"
-    # Core tables the seeder always writes. Each carries a tenant_id column.
-    # `--full` adds the scenario tables (agents + workflow registry, graph
-    # entities/relations) and the analyzer's insight rows — all demo-tenant
-    # scoped, so the same LIKE predicate purges them. Listed unconditionally:
-    # a telemetry-only seed simply has no rows in the scenario tables, so the
-    # extra DELETEs are no-ops (and keep clear correct after a --full seed).
-    tables = (
+    # (predicate-fragment, parameter) per scope. The fragment is a fixed literal
+    # (never user input); only the bound parameter varies.
+    prefix_like = f"{DEMO_TENANT_PREFIX}%"
+
+    # Tables purged by the ``demo-%`` telemetry-tenant prefix. ``runs`` /
+    # ``failures`` / ``evals`` are the telemetry; ``observability_insights`` is
+    # the analyzer output (written per ``demo-`` telemetry tenant) — listed here
+    # so re-seeds don't accumulate orphan insight rows (24→48→…) across runs.
+    prefix_tables = (
         "runs",
         "failures",
         "evals",
+        "observability_insights",
+    )
+    # Tables purged by the EXACT scenario tenant. The scenario (agents +
+    # workflow + graph) is seeded under the dash-free serve --dev tenant so the
+    # live viewer can see it, so a ``demo-%`` LIKE would NOT catch these — they
+    # must be matched by exact tenant id.
+    scenario_tables = (
         "agent_bundles",
         "workflow_bundles",
         "kb_entities",
         "kb_relations",
-        "observability_insights",
     )
     # Optional table — created by the voice-storage ADR (not yet on main).
-    # Included here so `mdk demo clear` stays correct once it lands.
-    optional_tables = ("voice_turns",)
+    # Voice turns inherit their run's ``demo-`` tenant, so the prefix predicate
+    # applies. Included here so `mdk demo clear` stays correct once it lands.
+    optional_prefix_tables = ("voice_turns",)
     backend = type(storage).__name__
 
     # SQLite path — reuse the live connection opened by init().
     conn = getattr(storage, "_conn", None)
     if backend == "SqliteProvider" and conn is not None:
         deleted = 0
-        for tbl in tables:
-            # `tbl` comes only from the fixed `tables` literal allow-list above,
-            # never from user input — the f-string interpolation is safe.
-            cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (like,))
+        for tbl in prefix_tables:
+            # `tbl` comes only from the fixed literal allow-lists above, never
+            # from user input — the f-string interpolation is safe.
+            cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (prefix_like,))
             deleted += max(0, cur.rowcount or 0)
-        for tbl in optional_tables:
+        for tbl in scenario_tables:
+            cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id = ?", (DEMO_TENANT_ID,))
+            deleted += max(0, cur.rowcount or 0)
+        for tbl in optional_prefix_tables:
             try:
-                cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (like,))
+                cur = await conn.execute(
+                    f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (prefix_like,)
+                )
                 deleted += max(0, cur.rowcount or 0)
             except Exception:  # table may not exist yet — safe to skip
                 pass
@@ -885,14 +920,19 @@ async def _purge_demo(storage: object) -> int:
     if backend == "PostgresProvider" and pool is not None:
         deleted = 0
         async with pool.acquire() as pg:
-            for tbl in tables:
-                # `tbl` is from the fixed allow-list above — safe interpolation.
-                status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", like)
+            for tbl in prefix_tables:
+                # `tbl` is from the fixed allow-lists above — safe interpolation.
+                status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", prefix_like)
                 # asyncpg returns a status string like "DELETE 42".
                 deleted += int(status.split()[-1]) if status else 0
-            for tbl in optional_tables:
+            for tbl in scenario_tables:
+                status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id = $1", DEMO_TENANT_ID)
+                deleted += int(status.split()[-1]) if status else 0
+            for tbl in optional_prefix_tables:
                 try:
-                    status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", like)
+                    status = await pg.execute(
+                        f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", prefix_like
+                    )
                     deleted += int(status.split()[-1]) if status else 0
                 except Exception:  # table may not exist yet — safe to skip
                     pass

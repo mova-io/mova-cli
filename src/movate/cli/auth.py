@@ -865,6 +865,27 @@ _PROVIDERS_PROMPT_NAME = {
     # has its own multi-value login path (like telegram). DISTINCT from the
     # `azure` (Azure OpenAI) provider above — different Azure resource + key.
     "azure-speech": "Azure Speech (voice STT + TTS)",
+    # Twilio is the telephony transport (ADR 074) — phone calls to mdk voice
+    # agents. Needs an account SID + auth token (multi-value path).
+    "twilio": "Twilio (telephony transport)",
+    # Enterprise connectors (ADR 052 Phase 1 — Action Fabric). ServiceNow
+    # needs two values (API key + instance URL) — handled via a dedicated
+    # multi-value code path like telegram/azure-speech. Microsoft Graph
+    # likewise needs two values (access token + tenant ID).
+    "servicenow": "ServiceNow (enterprise connector)",
+    "msgraph": "Microsoft Graph (enterprise connector)",
+    "workday": "Workday (enterprise connector)",
+    "salesforce": "Salesforce (enterprise connector)",
+    "sap": "SAP (enterprise connector)",
+    # Temporal is the durable workflow backend (ADR 054). Per-workflow opt-in
+    # via ``workflow.yaml: runtime: temporal``. Needs a host + namespace, and
+    # optionally a TLS cert/key pair (Temporal Cloud only — self-hosted skips
+    # them). Multi-value flow like telegram / azure-speech. Same BYOK seam as
+    # every other provider credential (ADR 054 D8).
+    "temporal": "Temporal (durable workflow backend)",
+    # Neo4j is the opt-in graph database adapter for GraphRAG at scale.
+    # Needs URI + user + password — multi-value flow like temporal.
+    "neo4j": "Neo4j (graph database)",
 }
 
 _PROVIDER_TO_ENV_VAR = {
@@ -890,6 +911,30 @@ _TELEGRAM_PROVIDERS = frozenset({"telegram"})
 # provider the picker should live-verify against an LLM endpoint.
 _VOICE_PROVIDERS = frozenset({"azure-speech"})
 
+# Twilio needs TWO values (account SID + auth token) -- same multi-value
+# pattern as telegram and azure-speech. Dispatched to its own code path.
+# Kept out of _PROVIDER_TO_ENV_VAR for the same reason: its env vars
+# don't fit the one-key shape, and it isn't an LLM provider.
+_TELEPHONY_PROVIDERS = frozenset({"twilio"})
+
+# Enterprise connector providers that need TWO values — same multi-value
+# pattern as telegram/azure-speech. Dispatched to their own code paths
+# in login(). Kept out of _PROVIDER_TO_ENV_VAR for the same reason.
+_CONNECTOR_PROVIDERS = frozenset({"servicenow", "msgraph", "workday", "salesforce", "sap"})
+
+# Temporal (ADR 054) needs 2-4 values (host + namespace, plus optional TLS
+# cert/key for Temporal Cloud). Same multi-value pattern as telegram /
+# azure-speech, dispatched to its own code path. Kept out of
+# `_PROVIDER_TO_ENV_VAR` (single-key LLM table) for the same reason: its env
+# vars don't fit the one-key-per-provider shape, and it isn't an LLM provider
+# the picker should live-verify against an LLM endpoint.
+_TEMPORAL_PROVIDERS = frozenset({"temporal"})
+
+# Neo4j (opt-in graph DB, [neo4j] extra). Needs URI + user + password —
+# same multi-value pattern as temporal. Kept out of _PROVIDER_TO_ENV_VAR
+# (single-key LLM table) for the same reason.
+_NEO4J_PROVIDERS = frozenset({"neo4j"})
+
 
 @auth_app.command("login")
 def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
@@ -901,7 +946,11 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "[bold]azure[/bold], [bold]gemini[/bold], [bold]lyzr[/bold], "
             "[bold]deepgram[/bold], [bold]cartesia[/bold], "
             "[bold]elevenlabs[/bold], "
-            "[bold]azure-speech[/bold] (voice), or [bold]telegram[/bold]. "
+            "[bold]azure-speech[/bold] (voice), "
+            "[bold]servicenow[/bold], [bold]msgraph[/bold], "
+            "[bold]workday[/bold], [bold]salesforce[/bold], [bold]sap[/bold] (connectors), "
+            "[bold]telegram[/bold], or "
+            "[bold]temporal[/bold] (durable workflow backend). "
             "Omit to pick interactively."
         ),
     ),
@@ -1022,9 +1071,40 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
         _login_azure_speech(key=key, save_to=save_to)
         return
 
+    # Twilio (ADR 074) — the telephony transport. Needs account SID + auth token.
+    if provider in _TELEPHONY_PROVIDERS:
+        _login_twilio(key=key, save_to=save_to)
+        return
+
+    # Enterprise connectors (ADR 052 Phase 1) — each needs two values.
+    if provider in _CONNECTOR_PROVIDERS:
+        _login_connector(provider, key=key, save_to=save_to)
+        return
+
+    # Temporal (ADR 054) is the durable workflow backend — needs host +
+    # namespace, plus optional TLS cert/key for Temporal Cloud. Its own
+    # multi-value path, same as telegram / azure-speech.
+    if provider in _TEMPORAL_PROVIDERS:
+        _login_temporal(key=key, save_to=save_to)
+        return
+
+    # Neo4j (opt-in graph DB) — needs URI + user + password. Its own
+    # multi-value path, same as temporal / azure-speech.
+    if provider in _NEO4J_PROVIDERS:
+        _login_neo4j(key=key, save_to=save_to)
+        return
+
     if provider not in _PROVIDER_TO_ENV_VAR:
         valid = ", ".join(
-            sorted(set(_PROVIDER_TO_ENV_VAR) | _TELEGRAM_PROVIDERS | _VOICE_PROVIDERS)
+            sorted(
+                set(_PROVIDER_TO_ENV_VAR)
+                | _TELEGRAM_PROVIDERS
+                | _VOICE_PROVIDERS
+                | _TELEPHONY_PROVIDERS
+                | _CONNECTOR_PROVIDERS
+                | _TEMPORAL_PROVIDERS
+                | _NEO4J_PROVIDERS
+            )
         )
         error(f"unknown provider {provider!r}. Valid: {valid}")
         raise typer.Exit(code=2)
@@ -1566,6 +1646,31 @@ def status(
             counts,
             env_var=env_var,
             unset_hint="run [bold]mdk auth login azure-speech[/bold]",
+        )
+
+    # Separator + workflow-backends group (ADR 054). Temporal connection vars
+    # — host + namespace (required), TLS cert/key (optional, Temporal Cloud
+    # only). Same confirmed-set treatment as voice / notifications: a live
+    # probe would need the optional [temporal] extra (``temporalio`` SDK) and
+    # a server round-trip, so we just surface presence here.
+    table.add_row("", "", "", "")
+    table.add_row(
+        "[bold]Workflow backends[/bold]",
+        "",
+        "[dim]for mdk[temporal] runtime (ADR 054)[/dim]",
+        "",
+    )
+    for env_var in (
+        "TEMPORAL_HOST",
+        "TEMPORAL_NAMESPACE",
+        "TEMPORAL_TLS_CERT",
+        "TEMPORAL_TLS_KEY",
+    ):
+        _add_simple_cred_row(
+            table,
+            counts,
+            env_var=env_var,
+            unset_hint="run [bold]mdk auth login temporal[/bold]",
         )
 
     stdout.print(table)
@@ -2299,6 +2404,14 @@ def _provider_is_configured(provider: str) -> bool:
             key_source("AZURE_SPEECH_KEY") != "unset"
             and key_source("AZURE_SPEECH_REGION") != "unset"
         )
+    if provider == "temporal":
+        # Temporal needs BOTH a host AND a namespace (ADR 054 D8). The TLS
+        # pair is only required for Temporal Cloud — self-hosted leaves them
+        # unset — so don't gate "configured" on them. Show "configured" only
+        # when both required values are set.
+        return (
+            key_source("TEMPORAL_HOST") != "unset" and key_source("TEMPORAL_NAMESPACE") != "unset"
+        )
     env_var = _PROVIDER_TO_ENV_VAR.get(provider)
     if env_var is None:
         return False
@@ -2356,6 +2469,13 @@ def _provider_status(provider: str) -> ProviderState:
     # optional SDK, so we keep the picker cheap and confirm-set only.
     if provider == "azure-speech":
         return "verified" if _provider_is_configured("azure-speech") else "unset"
+
+    # Temporal isn't an LLM provider either (ADR 054). Same confirmed-set
+    # treatment as telegram / azure-speech: a live connection probe would need
+    # the optional ``temporalio`` SDK ([temporal] extra) and a server round
+    # trip, so the picker stays cheap.
+    if provider == "temporal":
+        return "verified" if _provider_is_configured("temporal") else "unset"
 
     if not _provider_is_configured(provider):
         return "unset"
@@ -2477,6 +2597,9 @@ def _prompt_for_provider() -> str:
         ("elevenlabs", _PROVIDERS_PROMPT_NAME["elevenlabs"]),
         ("telegram", _PROVIDERS_PROMPT_NAME["telegram"]),
         ("azure-speech", _PROVIDERS_PROMPT_NAME["azure-speech"]),
+        ("twilio", _PROVIDERS_PROMPT_NAME["twilio"]),
+        ("temporal", _PROVIDERS_PROMPT_NAME["temporal"]),
+        ("neo4j", _PROVIDERS_PROMPT_NAME["neo4j"]),
     ]
     stdout.print("[bold]Which provider would you like to set up?[/bold]")
     # Live-verify every configured provider in parallel BEFORE rendering
@@ -2690,6 +2813,370 @@ def _login_azure_speech(*, key: str | None, save_to: str) -> None:
         with dotenv.open("a") as fh:
             fh.write(f"AZURE_SPEECH_KEY={speech_key}\n")
             fh.write(f"AZURE_SPEECH_REGION={region}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_connector(provider: str, *, key: str | None, save_to: str) -> None:
+    """Guided enterprise-connector setup (ADR 052 Phase 1 — Action Fabric).
+
+    Each connector needs TWO values — an API key/token and a routing value
+    (instance URL, base URL, or tenant ID). Same multi-value pattern as azure-speech.
+    No live verification: the HTTP skill backend surfaces a clear error at
+    first use if the credentials are wrong.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    if key is not None and not key.strip():
+        error("empty key -- aborted.")
+        raise typer.Exit(code=2)
+
+    # Connector-specific prompts and env var names.
+    connector_config: dict[str, dict[str, str]] = {
+        "servicenow": {
+            "key_var": "SERVICENOW_API_KEY",
+            "extra_var": "SERVICENOW_INSTANCE_URL",
+            "key_prompt": "ServiceNow API key",
+            "extra_prompt": "ServiceNow instance URL (e.g. https://mycompany.service-now.com)",
+            "hint_text": (
+                "[dim]ServiceNow connector setup:\n"
+                "  1. Create an integration user with the [bold]itil[/bold] role\n"
+                "  2. Generate an API key or configure OAuth\n"
+                "  3. Note your instance URL (e.g. https://mycompany.service-now.com)[/dim]"
+            ),
+        },
+        "msgraph": {
+            "key_var": "MSGRAPH_ACCESS_TOKEN",
+            "extra_var": "MSGRAPH_TENANT_ID",
+            "key_prompt": "Microsoft Graph access token",
+            "extra_prompt": "Azure AD tenant ID",
+            "hint_text": (
+                "[dim]Microsoft Graph connector setup:\n"
+                "  1. Register an app in Azure AD\n"
+                "  2. Grant [bold]User.ReadWrite.All[/bold] + "
+                "[bold]Directory.ReadWrite.All[/bold] permissions\n"
+                "  3. Generate a client secret and obtain an access token\n"
+                "  4. Note your tenant ID from the app registration overview[/dim]"
+            ),
+        },
+        "workday": {
+            "key_var": "WORKDAY_ACCESS_TOKEN",
+            "extra_var": "WORKDAY_BASE_URL",
+            "key_prompt": "Workday access token",
+            "extra_prompt": "Workday REST API base URL (e.g. https://wd3-impl-services1.workday.com)",
+            "hint_text": (
+                "[dim]Workday connector setup:\n"
+                "  1. Create an Integration System User (ISU) in Workday\n"
+                "  2. Register an API client and generate a bearer token\n"
+                "  3. Note your REST API base URL[/dim]"
+            ),
+        },
+        "salesforce": {
+            "key_var": "SALESFORCE_ACCESS_TOKEN",
+            "extra_var": "SALESFORCE_INSTANCE_URL",
+            "key_prompt": "Salesforce access token",
+            "extra_prompt": "Salesforce instance URL (e.g. https://mycompany.my.salesforce.com)",
+            "hint_text": (
+                "[dim]Salesforce connector setup:\n"
+                "  1. Create a Connected App in Setup > App Manager\n"
+                "  2. Enable OAuth and select the [bold]api[/bold] scope\n"
+                "  3. Obtain a bearer token via OAuth 2.0\n"
+                "  4. Note your instance URL from the login response[/dim]"
+            ),
+        },
+        "sap": {
+            "key_var": "SAP_API_KEY",
+            "extra_var": "SAP_BASE_URL",
+            "key_prompt": "SAP API key",
+            "extra_prompt": "SAP S/4HANA base URL (e.g. https://my-s4hana.sap-api.com)",
+            "hint_text": (
+                "[dim]SAP connector setup:\n"
+                "  1. Set up a Communication Arrangement (Cloud) or enable "
+                "OData services (on-premise)\n"
+                "  2. Create a communication user with the required authorizations\n"
+                "  3. Note your system base URL and API key[/dim]"
+            ),
+        },
+    }
+
+    cfg = connector_config.get(provider)
+    if cfg is None:
+        error(f"unknown connector provider {provider!r}.")
+        raise typer.Exit(code=2)
+
+    hint(cfg["hint_text"])
+
+    api_key = (
+        key.strip()
+        if key is not None
+        else typer.prompt(cfg["key_prompt"], hide_input=True, confirmation_prompt=False).strip()
+    )
+    if not api_key:
+        error("empty key -- aborted.")
+        raise typer.Exit(code=2)
+
+    extra_value = typer.prompt(cfg["extra_prompt"]).strip()
+    if not extra_value:
+        error(f"empty {cfg['extra_var']} -- aborted.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set(cfg["key_var"], api_key)
+        store.set(cfg["extra_var"], extra_value)
+        success(
+            f"saved [bold]{cfg['key_var']}[/bold] + "
+            f"[bold]{cfg['extra_var']}[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"{cfg['key_var']}={api_key}\n")
+            fh.write(f"{cfg['extra_var']}={extra_value}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_temporal(*, key: str | None, save_to: str) -> None:
+    """Guided Temporal (durable workflow backend) setup — ADR 054.
+
+    Temporal needs 2-4 values (multi-value flow like telegram / azure-speech;
+    same BYOK seam per ADR 054 D8):
+
+      * ``TEMPORAL_HOST`` — gRPC endpoint (e.g. ``localhost:7233`` for
+        ``temporal server start-dev`` or ``<ns>.tmprl.cloud:7233`` for
+        Temporal Cloud).
+      * ``TEMPORAL_NAMESPACE`` — workflow namespace (defaults to ``default``
+        on a vanilla self-hosted server; named ``<account>.<region>`` on
+        Temporal Cloud).
+      * ``TEMPORAL_TLS_CERT`` *(optional, Temporal Cloud only)* — filesystem
+        path to the client TLS certificate.
+      * ``TEMPORAL_TLS_KEY`` *(optional, Temporal Cloud only)* — filesystem
+        path to the client TLS private key.
+
+    Self-hosted Temporal (``temporal server start-dev`` locally, AKS,
+    docker-compose) skips the TLS pair — press Enter to leave them unset.
+
+    No live verification: a connect call would need the optional ``temporalio``
+    SDK (``mdk[temporal]``) AND a server round-trip; the worker / compiler
+    surface a clear error at first use if the values are wrong. Persists to
+    ``~/.movate/credentials`` (default) or project ``.env`` via the same
+    save-to dispatch as the LLM-provider flow.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    # ``--key`` doesn't apply — Temporal needs at minimum two values (host +
+    # namespace). Same rationale as telegram: rather than invent a parsing
+    # convention for an N-tuple flag, require interactive input.
+    if key is not None:
+        error(
+            "[bold]--key[/bold] doesn't apply to temporal (we need a host AND a "
+            "namespace, plus optional TLS cert/key for Temporal Cloud). Re-run "
+            "without [bold]--key[/bold] for the interactive flow, or set "
+            "[bold]TEMPORAL_HOST[/bold] + [bold]TEMPORAL_NAMESPACE[/bold] "
+            "(and the TLS pair for Cloud) directly via [bold]mdk secrets set[/bold] "
+            "/ your shell."
+        )
+        raise typer.Exit(code=2)
+
+    hint(
+        "[dim]Temporal setup (ADR 054 — durable workflow backend):\n"
+        "  • Self-hosted (recommended for local dev): run "
+        "[bold]temporal server start-dev[/bold] — host is "
+        "[bold]localhost:7233[/bold], namespace [bold]default[/bold]\n"
+        "  • Temporal Cloud: copy host + namespace from the Cloud UI's "
+        "[bold]Namespaces[/bold] page; download the client TLS cert + key from "
+        "the namespace's [bold]Settings[/bold] tab[/dim]"
+    )
+
+    host = typer.prompt("Temporal host (e.g. localhost:7233)").strip()
+    if not host:
+        error("empty host — aborted.")
+        raise typer.Exit(code=2)
+
+    namespace = typer.prompt("Temporal namespace", default="default").strip()
+    if not namespace:
+        error("empty namespace — aborted.")
+        raise typer.Exit(code=2)
+
+    # TLS cert/key are optional — Temporal Cloud needs them; self-hosted does
+    # not. Prompt with empty default so the operator can press Enter to skip.
+    tls_cert = typer.prompt(
+        "Temporal TLS cert path (Temporal Cloud only; press Enter to skip if "
+        "using self-hosted Temporal)",
+        default="",
+        show_default=False,
+    ).strip()
+    tls_key = ""
+    if tls_cert:
+        tls_key = typer.prompt(
+            "Temporal TLS key path (matches the cert above)",
+            default="",
+            show_default=False,
+        ).strip()
+        if not tls_key:
+            error(
+                "TLS cert was supplied but TLS key was empty — Temporal Cloud "
+                "needs BOTH (or neither, for self-hosted). Aborted."
+            )
+            raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("TEMPORAL_HOST", host)
+        store.set("TEMPORAL_NAMESPACE", namespace)
+        saved_vars = ["TEMPORAL_HOST", "TEMPORAL_NAMESPACE"]
+        if tls_cert:
+            store.set("TEMPORAL_TLS_CERT", tls_cert)
+            store.set("TEMPORAL_TLS_KEY", tls_key)
+            saved_vars += ["TEMPORAL_TLS_CERT", "TEMPORAL_TLS_KEY"]
+        pretty = " + ".join(f"[bold]{v}[/bold]" for v in saved_vars)
+        success(f"saved {pretty} to [cyan]{store.path}[/cyan] (mode 0600).")
+        hint(
+            "[dim]Every [bold]mdk[/bold] invocation on this machine now picks "
+            "up these for the Temporal backend. Install the SDK with "
+            "[bold]uv add 'movate-cli[temporal]'[/bold] to run workflows with "
+            "[bold]runtime: temporal[/bold] (ADR 054).[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"TEMPORAL_HOST={host}\n")
+            fh.write(f"TEMPORAL_NAMESPACE={namespace}\n")
+            if tls_cert:
+                fh.write(f"TEMPORAL_TLS_CERT={tls_cert}\n")
+                fh.write(f"TEMPORAL_TLS_KEY={tls_key}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_twilio(*, key: str | None, save_to: str) -> None:
+    """Guided Twilio setup for telephony transport (ADR 074).
+
+    Twilio needs TWO values:
+      * ``TWILIO_ACCOUNT_SID`` -- the Account SID from the Twilio console.
+      * ``TWILIO_AUTH_TOKEN`` -- the Auth Token from the Twilio console.
+
+    No live verification: verifying would need the optional ``twilio`` SDK
+    (``mdk[telephony]``) and a billable roundtrip; the transport surfaces a
+    clear error at first use if the pair is wrong. Persists to
+    ``~/.movate/credentials`` (default) or project ``.env``.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    hint(
+        "[dim]Twilio telephony setup:\n"
+        "  1. Log in to [bold]console.twilio.com[/bold]\n"
+        "  2. Copy your [bold]Account SID[/bold] from the dashboard\n"
+        "  3. Copy your [bold]Auth Token[/bold] (click 'Show' to reveal)[/dim]"
+    )
+
+    # Accept --key as the account SID when passed (CI ergonomics),
+    # otherwise prompt for it.
+    account_sid = key.strip() if key is not None else typer.prompt("Twilio Account SID").strip()
+    if not account_sid:
+        error("empty Account SID -- aborted.")
+        raise typer.Exit(code=2)
+
+    auth_token = typer.prompt(
+        "Twilio Auth Token", hide_input=True, confirmation_prompt=False
+    ).strip()
+    if not auth_token:
+        error("empty Auth Token -- aborted.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("TWILIO_ACCOUNT_SID", account_sid)
+        store.set("TWILIO_AUTH_TOKEN", auth_token)
+        success(
+            f"saved [bold]TWILIO_ACCOUNT_SID[/bold] + "
+            f"[bold]TWILIO_AUTH_TOKEN[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+        hint(
+            "[dim]Every [bold]mdk[/bold] invocation on this machine now picks "
+            "up these for the Twilio telephony transport. Install the SDK with "
+            "[bold]uv add 'movate-cli[telephony]'[/bold] to use it.[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"TWILIO_ACCOUNT_SID={account_sid}\n")
+            fh.write(f"TWILIO_AUTH_TOKEN={auth_token}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_neo4j(*, key: str | None, save_to: str) -> None:
+    """Multi-value login for Neo4j (opt-in graph database adapter).
+
+    Prompts for URI (bolt:// or neo4j://), user, and password. No live
+    verification: a connect call would need the optional ``neo4j`` SDK
+    (``mdk[neo4j]``) and a running instance; the adapter validates on
+    ``init()``.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    if key is not None:
+        error(
+            "[bold]--key[/bold] doesn't apply to neo4j (we need a URI AND "
+            "user AND password); please use the interactive prompts instead."
+        )
+        raise typer.Exit(code=2)
+
+    uri = typer.prompt(
+        "Neo4j URI (e.g. bolt://localhost:7687 or neo4j+s://host:7687)",
+    )
+    user = typer.prompt("Neo4j user", default="neo4j")
+    password = typer.prompt("Neo4j password", hide_input=True)
+
+    if not uri.strip():
+        error("URI cannot be empty.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("NEO4J_URI", uri.strip())
+        store.set("NEO4J_USER", user.strip())
+        store.set("NEO4J_PASSWORD", password.strip())
+        success(
+            "saved [bold]NEO4J_URI[/bold] + [bold]NEO4J_USER[/bold] + "
+            f"[bold]NEO4J_PASSWORD[/bold] to [cyan]{store.path}[/cyan] "
+            "(mode 0600)."
+        )
+        hint(
+            "[dim]Set [bold]MOVATE_GRAPH_BACKEND=neo4j[/bold] to route graph "
+            "operations to Neo4j. Install the driver with "
+            "[bold]uv add 'movate-cli[neo4j]'[/bold].[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"NEO4J_URI={uri.strip()}\n")
+            fh.write(f"NEO4J_USER={user.strip()}\n")
+            fh.write(f"NEO4J_PASSWORD={password.strip()}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")

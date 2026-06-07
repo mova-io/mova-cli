@@ -247,3 +247,11 @@ These five ship as **governed pattern templates**, not as a new framework:
   turn/iteration caps, and fan-out widths per template are an implementation
   detail for the companion PR to set (and for customers to override), not fixed
   by this ADR.
+
+### Composition with execution runtimes (ADR 030, ADR 054)
+
+Patterns are runner-agnostic topologies. The execution runtime is chosen per
+workflow via the `runtime:` key — `native` (default), `langgraph` (ADR 030),
+or `temporal` (ADR 054). Any pattern composes with any runner. See ADR 054
+§"Patterns × runners: the cross product" for the matrix and the three
+patterns that specifically benefit from Temporal.

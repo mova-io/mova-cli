@@ -28,6 +28,7 @@ from movate.cli._runtime import build_local_runtime, shutdown_runtime
 from movate.core.job_retry import DEFAULT_VISIBILITY_TIMEOUT_SECONDS
 from movate.core.models import JobRecord, JobStatus
 from movate.core.notify import build_dispatcher
+from movate.runtime.alert_worker import build_alert_worker
 from movate.runtime.dispatch import DispatchOutcome, WorkerDispatch
 from movate.runtime.registry import scan_agents, scan_workflows
 from movate.runtime.webhook_worker import WebhookWorker, WebhookWorkerConfig
@@ -298,6 +299,16 @@ async def _run_worker(
         config=WebhookWorkerConfig(tenant_id=tenant_id),
     )
 
+    # ADR 057 step 2 — alert-router consumer runs in the SAME process / loop.
+    # It drains ``alert.raised`` events (raised by the drift / dead-letter /
+    # budget sources) and routes them to the configured sinks. Opt-in: with no
+    # ``alerts:`` routes + no sink env vars the router is inactive and this is a
+    # pure no-op (zero behavior change). Fully independent of the job/webhook
+    # workers (separate task; a sink that hangs can't sink dispatch).
+    alert_worker = build_alert_worker(storage=rt.storage, tenant_id=tenant_id)
+    if alert_worker.is_active:
+        hint("[dim]alert routing: active (ADR 057)[/dim]")
+
     stop_event = asyncio.Event()
 
     def _handle_signal(*_: object) -> None:
@@ -320,6 +331,7 @@ async def _run_worker(
         await asyncio.gather(
             worker_obj.run_forever(stop_event),
             webhook_worker.run_forever(stop_event),
+            alert_worker.run_forever(stop_event),
             return_exceptions=True,
         )
     finally:
@@ -349,7 +361,9 @@ async def _run_temporal_worker(
     from movate.providers.pricing import load_pricing  # noqa: PLC0415
     from movate.runtime.registry import scan_workflows  # noqa: PLC0415
     from movate.runtime.workflow_backend import (  # noqa: PLC0415
+        DEFAULT_TASK_QUEUE,
         WorkflowBackendError,
+        _resolve_temporal_connection,
         require_backend_available,
         run_temporal_worker,
     )
@@ -362,6 +376,18 @@ async def _run_temporal_worker(
         raise typer.Exit(code=2) from None
 
     rt = await build_local_runtime(mock=mock)
+    # Initialize OTel metrics + log correlation + pool gauges at startup, exactly
+    # like the native worker above (_run_worker) — without this the Temporal
+    # worker emits NO metrics, so mdk.workflow.completed (ADR 082) and the
+    # asyncpg pool gauges would silently never export. All three are complete
+    # no-ops when the otel extra is absent / the OTLP sink is off; none raise.
+    from movate.cli._runtime import register_pool_observability  # noqa: PLC0415
+    from movate.tracing import init_metrics, install_log_correlation  # noqa: PLC0415
+
+    init_metrics()
+    install_log_correlation()
+    register_pool_observability(rt.storage)
+
     workflows = scan_workflows(workflows_path)
     temporal_wfs = {
         name: g for name, g in workflows.items() if getattr(g, "runtime", "native") == "temporal"
@@ -384,12 +410,33 @@ async def _run_temporal_worker(
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
+    # Resolve connection details for the startup banner (ADR 054 D8/D12).
+    # require_backend_available already validated; this is a cheap re-resolve.
+    conn = _resolve_temporal_connection()
+    # Mirror the activities registered by run_temporal_worker() in
+    # workflow_backend.py — keep this banner list in sync with that worker's
+    # activities=[...] so the startup banner doesn't under-report what's wired.
+    activity_names = [
+        "call_agent_activity",
+        "call_skill_activity",
+        "call_gate_activity",
+        "call_judge_activity",
+        "call_human_activity",
+        "persist_workflow_result_activity",
+    ]
+
     if temporal_wfs:
         success(f"{len(temporal_wfs)} temporal workflow(s) registering:")
         for name in sorted(temporal_wfs):
             err.print(f"  - {name}")
+    hint(f"[dim]host: {conn.host}[/dim]")
+    hint(f"[dim]namespace: {conn.namespace}[/dim]")
+    hint(f"[dim]task queue: {DEFAULT_TASK_QUEUE}[/dim]")
+    hint(f"[dim]tls: {'yes (' + conn.tls_cert_path + ')' if conn.tls_cert_path else 'no'}[/dim]")
+    hint(f"[dim]activities: {', '.join(activity_names)}[/dim]")
     err.print(
         f"[bold]movate worker[/bold] (temporal) — tenant={tenant_id or '<all>'} "
+        f"host={conn.host} ns={conn.namespace} queue={DEFAULT_TASK_QUEUE} "
         f"workflows={len(temporal_wfs)} — waiting for Temporal workflow tasks"
     )
     try:

@@ -152,6 +152,30 @@ class HumanNodeSpec(BaseModel):
         default_factory=list,
         description="State keys the human's response is expected to contribute (optional)",
     )
+    approvers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Principals/roles allowed to respond (ADR 062 D3). Optional; "
+            "enforced at the signal endpoint. Carried on the pause record so a "
+            "transport can address the approval."
+        ),
+    )
+    timeout: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Durable deadline in seconds (ADR 062 D4). Only the Temporal backend "
+            "honors it (native waits indefinitely). On expiry the node takes "
+            "'on_timeout'. Omit to wait forever."
+        ),
+    )
+    on_timeout: str | None = Field(
+        default=None,
+        description=(
+            "Node id to route to when 'timeout' elapses (ADR 062 D4). Required "
+            "when 'timeout' is set; ignored otherwise."
+        ),
+    )
 
     @field_validator("id")
     @classmethod
@@ -161,6 +185,17 @@ class HumanNodeSpec(BaseModel):
                 f"node id {v!r} must be lowercase alphanumeric with hyphens/underscores"
             )
         return v
+
+    @model_validator(mode="after")
+    def _validate_timeout_pair(self) -> HumanNodeSpec:
+        # A durable timeout needs a route to take on expiry — fail loud at
+        # compile time rather than emitting a node that raises at runtime.
+        if self.timeout is not None and not self.on_timeout:
+            raise ValueError(
+                f"human node {self.id!r}: 'on_timeout' (a node id) is required "
+                "when 'timeout' is set"
+            )
+        return self
 
 
 class JudgeNodeSpec(BaseModel):

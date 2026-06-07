@@ -482,6 +482,9 @@ async def test_runner_pauses_at_human_gate(
     assert wf.human_task == {
         "prompt": "Approve before step 2?",
         "output_contract": ["decision"],
+        # ADR 083: approvers ride the pause record (parity with the Temporal
+        # path); empty here since this gate declares none.
+        "approvers": [],
     }
     # Tenant correctly stamped on the paused record.
     assert wf.tenant_id == runner._tenant_id
@@ -775,7 +778,7 @@ async def test_resume_multi_gate_repauses_at_next_gate(
     rec2 = await storage.get_workflow_run(p1.workflow_run_id, tenant_id=runner._tenant_id)
     assert rec2 is not None
     assert rec2.paused_node_id == "gate2"
-    assert rec2.human_task == {"prompt": "gate 2?", "output_contract": ["d2"]}
+    assert rec2.human_task == {"prompt": "gate 2?", "output_contract": ["d2"], "approvers": []}
     # The merged state carried forward: step1 + step2 + d1 captured at gate2.
     assert rec2.paused_state == {
         "text": "seed",

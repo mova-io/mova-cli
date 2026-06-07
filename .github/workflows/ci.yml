@@ -2,17 +2,26 @@ name: ci
 
 on:
   pull_request:
-    # Include ready_for_review so the version gate (skipped on drafts, below)
-    # runs when a draft is marked ready — not only on a subsequent push.
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # ADR 059 D4 — run the required checks inside the GitHub merge queue. The
+  # queue tests each PR against the latest `main` on a temporary
+  # `gh-readonly-queue/*` ref via the `merge_group` event; without this trigger
+  # the required checks never run in the queue and PRs hang forever.
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 — the version is git-derived (ADR 066): the editable
+      # install below runs the hatch metadata hook, which counts commits to
+      # compute the CalVer counter N. A shallow clone would undercount N.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -22,26 +31,12 @@ jobs:
       - name: Set up Python
         run: uv python install 3.11
 
-      # Enforce "increment the version on every PR". The pre-commit hook
-      # bumps the CalVer version locally; this catches a stale/colliding
-      # version (e.g. two PRs branched off the same base computing the same
-      # next N — which is how 2026.5.22.19 once landed on two merges). Only
-      # meaningful on PRs; skipped on push-to-main. Pure stdlib, no deps.
-      #
-      # Compare against the PR's FROZEN base commit (pull_request.base.sha),
-      # NOT live origin/main: with auto-merge enabled the PR can land on main
-      # before this step runs, so fetching live main would compare the PR
-      # against its own already-merged version and false-fail.
-      - name: Version bump gate
-        # Skip on drafts: they aren't merging, so the "must bump past base"
-        # rule is pure churn (a draft can't stay ahead of a moving main). The
-        # gate re-applies when the PR is marked ready (ready_for_review above).
-        if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
-          python3 scripts/bump_version.py --gate-ahead-of "${BASE_SHA}"
+      # NOTE (ADR 066): the version is DERIVED FROM GIT at build time and is not
+      # committed in any file — so PRs never carry a version diff and never
+      # conflict on a version line (this supersedes ADR 059's at-merge bump,
+      # which couldn't push to protected main). The pyproject↔uv.lock consistency
+      # check below stays (it catches a real dep-drift bug, orthogonal to
+      # versioning; uv.lock no longer pins movate-cli's own version).
 
       # Catches pyproject.toml ↔ uv.lock drift. If you bump a dep in
       # pyproject.toml without re-running `uv lock`, the Docker build's
@@ -83,6 +78,14 @@ jobs:
       # allowlist + the process to add a new license entry.
       - name: License gate
         run: uv run python scripts/check_licenses.py --strict
+
+      # Roadmap freshness gate — fails the build if ROADMAP.md is stale
+      # relative to roadmap.yaml / shipped.jsonl. Mirrors the License gate /
+      # bump_version --check freshness-check convention: the rendered roadmap
+      # is a generated artifact and CANNOT drift from its CalVer-keyed source
+      # of truth. See scripts/gen_roadmap.py + ADR 058.
+      - name: Roadmap freshness
+        run: uv run python scripts/gen_roadmap.py --check
 
   # Postgres conformance — runs the same parametrized storage suite
   # against a real Postgres 16, exercising what the default ``lint-and-test``

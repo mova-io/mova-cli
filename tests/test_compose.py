@@ -476,11 +476,23 @@ class TestLanggraphCompilerGrowth:
             state_schema=_TYPED_SCHEMA,
         )
         source = compile_langgraph(graph)
-        ns: dict = {}
-        exec(compile(source, "<generated-langgraph>", "exec"), ns)
-        builder = ns["build_graph"]()
-        compiled = builder.compile()
-        assert compiled is not None
+        # Exec the generated source as a REAL module (registered in sys.modules)
+        # so langgraph (1.x) get_type_hints() on the generated State TypedDict can
+        # resolve its annotations via the module globals — the way the exported
+        # file is actually consumed (imported / `python generated.py`). A bare
+        # exec into a dict leaves State.__module__ unresolvable, so Any wouldn't
+        # be found (the langgraph-1.x behavior change this guards against).
+        import sys as _sys  # noqa: PLC0415
+        import types as _types  # noqa: PLC0415
+
+        _mod = _types.ModuleType("_mdk_generated_langgraph")
+        _sys.modules["_mdk_generated_langgraph"] = _mod
+        try:
+            exec(compile(source, "<generated-langgraph>", "exec"), _mod.__dict__)
+            compiled = _mod.build_graph().compile()
+            assert compiled is not None
+        finally:
+            _sys.modules.pop("_mdk_generated_langgraph", None)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,220 @@
+# Salesforce REST API connector -- account, case, contact management (ADR 052 Phase 1).
+#
+# Three skill variants against the Salesforce REST API v59.0. Each uses
+# kind: http through the existing HttpSkillBackend. The instance host
+# is passed as an input field and templated into the URL at call time.
+# Auth is bearer-from-env:SALESFORCE_ACCESS_TOKEN.
+#
+# Usage in agent.yaml:
+#   tools:
+#     - salesforce-account-get@1.0.0
+#     - salesforce-case-create@1.0.0
+#     - salesforce-contact-search@1.0.0
+
+actions:
+
+  # -----------------------------------------------------------------------
+  # salesforce-account-get -- GET /services/data/v59.0/sobjects/Account/{id}
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: salesforce-account-get
+    version: 1.0.0
+    description: >-
+      Retrieve a Salesforce Account record by its Account ID. Returns
+      the full account object including name, industry, billing
+      address, and ownership information.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "Salesforce instance hostname (e.g. mycompany.my.salesforce.com)."
+          account_id:
+            type: string
+            description: "Salesforce Account ID (18-char, e.g. 001xx000003DGbYAAW)."
+        required:
+          - instance_host
+          - account_id
+      output:
+        type: object
+        properties:
+          Id:
+            type: string
+          Name:
+            type: string
+          Industry:
+            type: string
+          Type:
+            type: string
+            description: "Account type (e.g. Customer, Partner, Prospect)."
+          BillingCity:
+            type: string
+          BillingState:
+            type: string
+          BillingCountry:
+            type: string
+          Phone:
+            type: string
+          Website:
+            type: string
+          OwnerId:
+            type: string
+          AnnualRevenue:
+            type: number
+          NumberOfEmployees:
+            type: integer
+          CreatedDate:
+            type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/services/data/v59.0/sobjects/Account/{{ input.account_id }}"
+      method: GET
+      auth: bearer-from-env:SALESFORCE_ACCESS_TOKEN
+      headers:
+        Accept: application/json
+    side_effects: read-only
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # salesforce-case-create -- POST /services/data/v59.0/sobjects/Case
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: salesforce-case-create
+    version: 1.0.0
+    description: >-
+      Create a new Case in Salesforce. Populates the case record with
+      the provided fields and returns the created record including the
+      system-generated Case ID and Case Number.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "Salesforce instance hostname (e.g. mycompany.my.salesforce.com)."
+          Subject:
+            type: string
+            description: "Brief summary of the case."
+          Description:
+            type: string
+            description: "Detailed description of the case."
+          Priority:
+            type: string
+            enum: ["High", "Medium", "Low"]
+            description: "Case priority level."
+          Status:
+            type: string
+            description: "Initial status (e.g. New, Working, Escalated)."
+          Origin:
+            type: string
+            description: "How the case was created (e.g. Web, Phone, Email)."
+          AccountId:
+            type: string
+            description: "Salesforce Account ID the case is associated with."
+          ContactId:
+            type: string
+            description: "Salesforce Contact ID of the person who reported the case."
+          Type:
+            type: string
+            description: "Case type (e.g. Problem, Feature Request, Question)."
+          Reason:
+            type: string
+            description: "Case reason (e.g. Installation, Performance, Crash)."
+        required:
+          - instance_host
+          - Subject
+      output:
+        type: object
+        properties:
+          id:
+            type: string
+            description: "Salesforce Case ID."
+          success:
+            type: boolean
+          errors:
+            type: array
+            items:
+              type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/services/data/v59.0/sobjects/Case"
+      method: POST
+      auth: bearer-from-env:SALESFORCE_ACCESS_TOKEN
+      headers:
+        Content-Type: application/json
+        Accept: application/json
+    side_effects: mutates-state
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # salesforce-contact-search -- GET /services/data/v59.0/query/?q={soql}
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: salesforce-contact-search
+    version: 1.0.0
+    description: >-
+      Search Salesforce contacts using a SOQL query. Executes the
+      provided SOQL query against the Salesforce REST API and returns
+      matching records. Use for flexible contact lookups by name,
+      email, account, or any standard/custom field.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "Salesforce instance hostname (e.g. mycompany.my.salesforce.com)."
+          soql:
+            type: string
+            description: >-
+              SOQL query string (e.g.
+              SELECT Id, FirstName, LastName, Email FROM Contact WHERE LastName = 'Smith').
+        required:
+          - instance_host
+          - soql
+      output:
+        type: object
+        properties:
+          totalSize:
+            type: integer
+            description: "Total number of records matching the query."
+          done:
+            type: boolean
+            description: "Whether all results were returned in this response."
+          records:
+            type: array
+            items:
+              type: object
+              properties:
+                Id:
+                  type: string
+                FirstName:
+                  type: string
+                LastName:
+                  type: string
+                Email:
+                  type: string
+                Phone:
+                  type: string
+                AccountId:
+                  type: string
+                Title:
+                  type: string
+                Department:
+                  type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/services/data/v59.0/query/?q={{ input.soql }}"
+      method: GET
+      auth: bearer-from-env:SALESFORCE_ACCESS_TOKEN
+      headers:
+        Accept: application/json
+    side_effects: read-only
+    cost:
+      per_call_usd: 0.0
