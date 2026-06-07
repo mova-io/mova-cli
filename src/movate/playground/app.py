@@ -639,7 +639,7 @@ async def on_pick_agent(action: cl.Action) -> None:
         fields = ", ".join(f"`{p}`" for p in props[:6])
         more = ", …" if len(props) > 6 else ""
         schema_hint = (
-            f"\n\n*Power tip: paste a JSON object to set structured fields "
+            "\n\n*Power tip: paste a JSON object to set structured fields "
             f"({fields}{more}) — or just chat normally.*"
         )
 
