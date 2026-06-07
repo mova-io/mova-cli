@@ -627,14 +627,20 @@ async def on_pick_agent(action: cl.Action) -> None:
         detail = {}
     cl.user_session.set(_K_AGENT_DETAIL, detail)
 
+    # A compact, one-line power-user hint — NOT the raw schema. Chainlit's
+    # markdown doesn't render <details>/<summary>, so the old collapsible dumped
+    # the full JSON schema (+ raw HTML tags) into the chat. Just name the
+    # top-level fields so power users know what they can paste; everyone else
+    # ignores it and types normally.
     schema = detail.get("input_schema") or detail.get("schema", {}).get("input") or {}
     schema_hint = ""
-    if schema:
-        schema_json = json.dumps(schema, indent=2)
+    props = list((schema.get("properties") or {}).keys()) if isinstance(schema, dict) else []
+    if props:
+        fields = ", ".join(f"`{p}`" for p in props[:6])
+        more = ", …" if len(props) > 6 else ""
         schema_hint = (
-            "\n\n<details><summary>Advanced: input schema (paste JSON to "
-            f"set structured fields)</summary>\n\n```json\n{schema_json}\n```\n"
-            "</details>"
+            f"\n\n*Power tip: paste a JSON object to set structured fields "
+            f"({fields}{more}) — or just chat normally.*"
         )
 
     await cl.Message(
