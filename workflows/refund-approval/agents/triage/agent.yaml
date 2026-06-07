@@ -1,0 +1,38 @@
+api_version: movate/v1
+kind: Agent
+
+name: refund-triage
+version: 0.1.0
+description: |
+  Refund triage node. Reads the customer `request` from workflow state and
+  produces a short `summary` plus a `recommended_decision` (approve/deny) for
+  the human approver downstream.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.2
+    max_tokens: 256
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input:
+    request: string
+  output:
+    summary: string
+    recommended_decision: string
+
+timeouts:
+  call_ms: 30000
+  total_ms: 45000
+
+budget:
+  max_cost_usd_per_run: 0.05
+
+tags:
+  - refund
+  - triage

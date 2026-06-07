@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from collections import deque
 
-from movate.core.workflow.ir import EdgeKind, WorkflowGraph
+from movate.core.workflow.ir import EdgeKind, NodeType, WorkflowGraph
 
 # LangGraph's default recursion guard. Generated graphs pass this to
 # ``invoke(...)`` so cyclic workflows (ReAct / reflection / retry-until) can
@@ -178,6 +178,13 @@ def _emit_routers(graph: WorkflowGraph, back_edges: set[tuple[str, str]]) -> lis
         cond_edges = [e for e in graph.successors(nid) if e.kind is EdgeKind.CONDITIONAL]
         if not cond_edges:
             continue
+        node = graph.nodes[nid]
+        # JUDGE nodes (ADR 056 D5) route on the VERDICT the node function
+        # stamps into ``state[nid]`` — not on a free-text condition. Emit a
+        # verdict-aware router so the LangGraph export gates correctly.
+        if node.type is NodeType.JUDGE:
+            lines.extend(_emit_judge_router(nid, node, graph, back_edges))
+            continue
         fn = _router_name(nid)
         lines.append("")
         lines.append("")
@@ -197,6 +204,53 @@ def _emit_routers(graph: WorkflowGraph, back_edges: set[tuple[str, str]]) -> lis
             lines.append(f"        return {e.to_id!r}")
         lines.append("    return END")
     return lines
+
+
+def _emit_judge_router(
+    nid: str, node: object, graph: WorkflowGraph, back_edges: set[tuple[str, str]]
+) -> list[str]:
+    """Emit a verdict-driven router for a JUDGE node (ADR 056 D5).
+
+    The judge node function stamps the canonical D2 verdict into
+    ``state[nid]`` (``{verdict, score, feedback, terminate}``). This router
+    gates on ``terminate``: accept routes to ``on_accept`` (or END); revise
+    routes to ``on_revise`` (or the sequential/back-edge successor, the
+    reflection loop's producer). The bounded loop rides the module-level
+    ``RECURSION_LIMIT`` guard like every other cycle (ADR 030 D2), so a judge
+    that never accepts can never run away.
+    """
+    meta = getattr(node, "metadata", {}) or {}
+    on_accept = meta.get("on_accept")
+    on_revise = meta.get("on_revise")
+    # The non-synthetic successor (the reflection back-edge / continue edge).
+    seq_targets = [e.to_id for e in graph.successors(nid) if not e.metadata.get("synthetic")]
+    seq_next = seq_targets[0] if seq_targets else None
+
+    accept_target = on_accept or seq_next
+    revise_target = on_revise or seq_next
+
+    def _ret(target: str | None) -> str:
+        return repr(target) if target is not None else "END"
+
+    fn = _router_name(nid)
+    revise_loop = (
+        "  # loop-back edge" if revise_target and (nid, revise_target) in back_edges else ""
+    )
+    return [
+        "",
+        "",
+        f"def {fn}(state: State) -> str:",
+        f'    """Verdict router for JUDGE node {nid!r} (ADR 056 D5).',
+        "",
+        "    Gates on the D2 verdict the judge node stamped into state. accept",
+        "    (terminate) → on_accept/END; revise → on_revise/back-edge. The",
+        "    bounded loop is held by the module RECURSION_LIMIT guard.",
+        '    """',
+        f"    verdict = state.get({nid!r}) or {{}}",
+        "    if verdict.get('terminate'):",
+        f"        return {_ret(accept_target)}",
+        f"    return {_ret(revise_target)}{revise_loop}",
+    ]
 
 
 def compile_langgraph(graph: WorkflowGraph) -> str:

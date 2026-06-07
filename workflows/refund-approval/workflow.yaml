@@ -1,0 +1,61 @@
+api_version: movate/v1
+kind: Workflow
+
+name: refund-approval
+version: 0.1.0
+description: |
+  Durable human-in-the-loop refund approval (ADR 062). A triage agent
+  assesses the request, the workflow then PAUSES durably at a HUMAN node
+  until a finance approver signals a decision (it survives worker/runtime
+  restarts for days), and a finalize agent records the outcome.
+
+  This is the canonical durable-HITL demo: deploy it on the Temporal
+  worker (runtime: temporal), watch it park at the approval node via
+  GET /api/v1/workflow-runs?status=paused, then resume it with
+  POST /api/v1/workflow-runs/{id}/signal. The same flow as a plain
+  conversational agent was unreliable; as a durable workflow with a
+  HUMAN gate it is deterministic every run.
+owner: ""
+
+# Durable execution on Temporal — the HUMAN node pauses via wait_condition
+# and resumes on a typed signal (ADR 062 D1). Native is byte-for-byte the
+# same flow minus the cross-restart durability.
+runtime: temporal
+
+state_schema: ./state.json
+entrypoint: triage
+
+nodes:
+  - id: triage
+    type: agent
+    ref: ./agents/triage
+
+  # Durable pause: persists an awaiting-human record (listable + renderable),
+  # then parks until POST /workflow-runs/{id}/signal delivers the decision.
+  # output_contract = the state keys the human's response contributes.
+  - id: approval
+    type: human
+    prompt: |
+      A refund needs your approval. Review the triage summary and recommended
+      decision in the run state, then respond with `decision` ("approve" or
+      "deny") and your name in `approver`.
+    output_contract:
+      - decision
+      - approver
+    approvers:
+      - finance-approver
+
+  - id: finalize
+    type: agent
+    ref: ./agents/finalize
+
+edges:
+  - from: triage
+    to: approval
+  - from: approval
+    to: finalize
+
+tags:
+  - temporal
+  - hitl
+  - demo

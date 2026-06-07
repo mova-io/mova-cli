@@ -1,0 +1,38 @@
+api_version: movate/v1
+kind: Agent
+
+name: __AGENT_NAME__
+version: 0.1.0
+description: |
+  Producer node for the reflective-agent workflow. Writes an `answer` from a
+  `topic`, folding in the judge's `feedback` on a revision pass (ADR 056 D4).
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.7
+    max_tokens: 512
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input: ./schema/input.yaml
+  output: ./schema/output.yaml
+
+evals:
+  dataset: ./evals/dataset.jsonl
+
+timeouts:
+  call_ms: 30000
+  total_ms: 60000
+
+budget:
+  max_cost_usd_per_run: 0.20
+
+tags:
+  - workflow
+  - reflection
+  - produce
