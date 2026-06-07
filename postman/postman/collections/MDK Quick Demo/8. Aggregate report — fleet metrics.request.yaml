@@ -1,0 +1,4 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/report"
+method: GET
+order: 12000

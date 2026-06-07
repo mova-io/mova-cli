@@ -377,9 +377,13 @@ class WorkflowRunner:
                 # this record, merges the human's decision into ``paused_state``,
                 # and continues from this node's sequential successor.
                 finished = time.monotonic()
+                approvers = list(node.metadata.get("approvers", []))
                 human_task = {
                     "prompt": node.metadata.get("prompt", ""),
                     "output_contract": list(node.metadata.get("output_contract", [])),
+                    # Carry approvers on the pause record too (parity with the
+                    # Temporal path) so the inventory + notification agree.
+                    "approvers": approvers,
                 }
                 paused_state = dict(state)
                 wf_record = WorkflowRunRecord(
@@ -395,6 +399,27 @@ class WorkflowRunner:
                     human_task=human_task,
                 )
                 await self._storage.save_workflow_run(wf_record)
+                # Escalate to the approval channel (ADR 083). Fire-and-forget +
+                # never raises — the pause is already persisted; notification is
+                # best-effort. No-op until MOVATE_NOTIFIER is configured.
+                from movate.core.notifier import (  # noqa: PLC0415
+                    HumanPause,
+                    notify_human_pause_safe,
+                )
+
+                await notify_human_pause_safe(
+                    HumanPause(
+                        run_id=wf_id,
+                        workflow_name=graph.name,
+                        workflow_version=graph.version,
+                        node_id=node_id,
+                        prompt=str(node.metadata.get("prompt", "")),
+                        output_contract=list(node.metadata.get("output_contract", [])),
+                        approvers=approvers,
+                        tenant_id=self._tenant_id,
+                        runtime="native",
+                    )
+                )
                 return WorkflowResult(
                     workflow_run_id=wf_id,
                     status=WorkflowStatus.PAUSED,

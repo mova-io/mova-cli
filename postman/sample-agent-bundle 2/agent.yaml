@@ -1,0 +1,21 @@
+api_version: movate/v1
+kind: Agent
+name: sample-bundle-agent
+version: 0.1.0
+description: A sample agent uploaded as a multipart bundle (demo request 1b/1c).
+role: assistant
+persona: A concise, friendly assistant.
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.2
+    max_tokens: 512
+prompt: ./prompt.md
+schema:
+  input:
+    text: string
+  output:
+    message: string
+timeouts:
+  call_ms: 30000
+  total_ms: 60000

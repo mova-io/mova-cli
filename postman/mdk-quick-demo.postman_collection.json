@@ -1,0 +1,332 @@
+{
+  "info": {
+    "name": "MDK Quick Demo",
+    "_postman_id": "mdk-quick-demo-collection",
+    "description": "End-to-end demo: create agent → chat → add knowledge → chat again (grounded) → multi-turn session → voice.\n\nSee QUICK-DEMO-TONIGHT.md for the talk track.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{api_key}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [""]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Reset — delete demo agent (safe to re-run)",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "{{agent_name}}"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "1. Create agent — one API call, agent is live",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.response.code === 201) {",
+              "    pm.test('Agent created', () => pm.response.to.have.status(201));",
+              "    console.log('✅ Agent created: ' + pm.environment.get('agent_name'));",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"{{agent_name}}\",\n  \"agent_provider\": \"Movate\",\n  \"agent_type\": \"Task Agent\",\n  \"role\": \"Assistant\",\n  \"description\": \"Movate product support agent. Answers pricing and plan questions.\",\n  \"agent_role\": \"Concise, friendly support agent.\",\n  \"agent_goal\": \"Answer product and pricing FAQs accurately using the knowledge base.\",\n  \"agent_prompt\": \"You are a Movate product support agent. Answer the user's question concisely using the provided knowledge base context. If you don't have the information, say so honestly. Keep answers under 3 sentences unless asked for detail.\",\n  \"reference_output\": \"The Standard plan includes 10 user seats, 100GB storage, and 5 AI agents for $99/month.\",\n  \"ai_model\": \"openai/gpt-4o-mini-2024-07-18\",\n  \"ai_foundation\": \"Azure\"\n}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/from-wizard",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "from-wizard"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "2. Ask a question — agent guesses (no KB yet)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    var body = pm.response.json();",
+              "    if (body.run_id) pm.environment.set('run_id', body.run_id);",
+              "    console.log('💬 Agent said: ' + JSON.stringify(body.output || body.answer || '(see response)').substring(0, 200));",
+              "    console.log('⏱ Latency: ' + (body.latency_ms || '?') + 'ms | Cost: $' + (body.cost_usd || '?'));",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"input\": {\n    \"input\": \"What does the standard plan include?\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "{{agent_name}}", "runs"],
+          "query": [{ "key": "wait", "value": "true" }]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "3. Add knowledge — product pricing (KB ingest)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    var body = pm.response.json();",
+              "    console.log('📚 Chunks saved: ' + (body.chunks_saved || body.chunks || '?'));",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"kind\": \"text\",\n  \"title\": \"product-pricing\",\n  \"content\": \"# Movate Product Plans\\n\\n## Starter Plan ($29/mo)\\n- 3 user seats\\n- 10GB storage\\n- Email support (business hours)\\n- 1 AI agent\\n\\n## Standard Plan ($99/mo)\\n- 10 user seats\\n- 100GB storage\\n- Priority email + chat support\\n- 5 AI agents\\n- Knowledge base (RAG)\\n- Basic analytics\\n\\n## Enterprise Plan (custom pricing)\\n- Unlimited seats\\n- Unlimited storage\\n- 24/7 dedicated support + SLA\\n- Unlimited AI agents\\n- Knowledge graphs + advanced RAG\\n- SSO / SAML\\n- Custom model fine-tuning\\n- On-premise deployment option\\n\\n## Add-ons\\n- Voice agent: +$20/mo per agent\\n- Phone bridge (Twilio): +$50/mo\\n- Advanced analytics dashboard: +$30/mo\"\n}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/kb",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "{{agent_name}}", "kb"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "4. Verify — KB search for 'standard plan'",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"standard plan pricing\",\n  \"top_k\": 3\n}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/kb/search",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "{{agent_name}}", "kb", "search"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "5. Ask again — NOW grounded in real data ✨",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    var body = pm.response.json();",
+              "    if (body.run_id) pm.environment.set('run_id', body.run_id);",
+              "    console.log('💬 GROUNDED answer: ' + JSON.stringify(body.output || body.answer || '(see response)').substring(0, 300));",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"input\": {\n    \"input\": \"What does the standard plan include?\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "{{agent_name}}", "runs"],
+          "query": [{ "key": "wait", "value": "true" }]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "6. View run trace — full execution breakdown",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/runs/{{run_id}}/trace",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "runs", "{{run_id}}", "trace"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "7a. Create session — server-side memory",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.response.code === 201 || pm.response.code === 200) {",
+              "    var body = pm.response.json();",
+              "    var sid = body.session_id || body.id;",
+              "    if (sid) { pm.environment.set('session_id', sid); }",
+              "    console.log('🧠 Session created: ' + sid);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/sessions",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "sessions"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "7b. Session turn 1 — 'What does standard include?'",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"input\": {\n    \"input\": \"What does the standard plan include?\"\n  },\n  \"session_id\": \"{{session_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "{{agent_name}}", "runs"],
+          "query": [{ "key": "wait", "value": "true" }]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "7c. Session turn 2 — 'How much more is enterprise?' (context!)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"input\": {\n    \"input\": \"How much more does the enterprise plan cost compared to that?\"\n  },\n  \"session_id\": \"{{session_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "{{agent_name}}", "runs"],
+          "query": [{ "key": "wait", "value": "true" }]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "7d. Session turn 3 — 'Can I add voice to it?'",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"input\": {\n    \"input\": \"Can I add voice capabilities to my agents? What does that cost?\"\n  },\n  \"session_id\": \"{{session_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "agents", "{{agent_name}}", "runs"],
+          "query": [{ "key": "wait", "value": "true" }]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "8. Aggregate report — fleet metrics",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/report",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "report"]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "9. Capabilities — what this runtime supports",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{runtime_url}}/api/v1/capabilities",
+          "host": ["{{runtime_url}}"],
+          "path": ["api", "v1", "capabilities"]
+        }
+      },
+      "response": []
+    }
+  ]
+}

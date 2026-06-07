@@ -4037,6 +4037,62 @@ class GraphSearchView(BaseModel):
     count: int = 0
 
 
+class GraphAssertNodeIn(BaseModel):
+    """One node to assert (ADR 079). ``type`` + ``name`` form its identity, and
+    re-asserting the same pair merges into the existing node."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    name: str
+    description: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class GraphAssertEdgeIn(BaseModel):
+    """A directed relation between two asserted nodes, referenced by ``name``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    src: str
+    dst: str
+    type: str
+    description: str | None = None
+    weight: float = 1.0
+    metadata: dict[str, Any] | None = None
+
+
+class GraphAssertRequest(BaseModel):
+    """``POST /api/v1/projects/{project}/graph/assert`` body (ADR 079 D2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[GraphAssertNodeIn] = Field(default_factory=list)
+    edges: list[GraphAssertEdgeIn] = Field(default_factory=list)
+    project_id: str | None = None
+
+
+class SkippedEdgeView(BaseModel):
+    """One requested edge the assert dropped (endpoint didn't resolve / self-loop)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    src: str
+    dst: str
+    type: str
+    reason: str
+
+
+class GraphAssertView(BaseModel):
+    """``POST …/graph/assert`` response — applied counts + skipped-edge report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    applied_nodes: int = 0
+    applied_edges: int = 0
+    skipped_edges: list[SkippedEdgeView] = Field(default_factory=list)
+
+
 class GraphQueryRequest(BaseModel):
     """``POST /api/v1/graph/query`` body — a bounded traverse/subgraph.
 

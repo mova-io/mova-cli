@@ -300,6 +300,8 @@ from movate.runtime.schemas import (
     FeedbackSubmission,
     FeedbackView,
     GeneratedEvalCaseView,
+    GraphAssertRequest,
+    GraphAssertView,
     GraphCentralityView,
     GraphCommunitiesView,
     GraphologyView,
@@ -371,6 +373,7 @@ from movate.runtime.schemas import (
     SessionMessageView,
     SessionView,
     SkillCreatedView,
+    SkippedEdgeView,
     ThreadCreateSubmission,
     ThreadListView,
     ThreadMessageSubmission,
@@ -7852,6 +7855,111 @@ def build_app(  # noqa: PLR0912
             min_confidence=min_confidence,
         )
         return GraphologyView.model_validate(doc.model_dump())
+
+    @v1.post(
+        "/projects/{project_id}/graph/assert",
+        response_model=GraphAssertView,
+        status_code=200,
+        tags=["agents-v1", "graph"],
+        dependencies=[_scope("kb:write")],
+    )
+    async def v1_project_graph_assert(
+        project_id: str,
+        body: GraphAssertRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> GraphAssertView:
+        """Deterministically **assert** structured facts into the agent's graph
+        (ADR 079 D2) — the write counterpart to LLM extraction.
+
+        Where extraction *discovers* a probabilistic graph from prose, this
+        *writes* known nodes/edges with a guaranteed, searchable identity: a
+        node's ``content_hash`` dedups on ``(agent, tenant_id, content_hash)`` so
+        re-asserting **merges** instead of duplicating, and every asserted record
+        carries ``metadata.source = "assert"`` + ``confidence = 1.0`` (so it
+        survives the ADR 046 ``min_confidence`` floor and renders as "asserted"
+        in the UI). The first producer is the POS-demo call-ingest asserting a
+        ServiceNow incident + its store/lane/symptom edges.
+
+        Nodes are upserted **before** edges; an edge whose ``src`` / ``dst`` name
+        isn't in the asserted node set is **skipped and reported**, never fatal.
+        Cross-source reconciliation: a node previously created by *extraction*
+        (random ``entity_id``) is merged onto its existing id (looked up by
+        ``content_hash``) so asserted edges link to the stored row.
+
+        Tenant-scoped — records are stamped with the caller's tenant, so a write
+        can never land in another tenant's graph. Requires the ``kb:write``
+        scope. ``project_id`` (path) is the agent that owns the graph;
+        ``body.project_id`` is the optional ADR 046 D1 project tag.
+
+        Errors: **401** unauthed, **403** missing ``kb:write`` scope.
+        """
+        from movate.kb import graph_assert  # noqa: PLC0415 — lazy, matches kb usage
+
+        store: StorageProvider = request.app.state.storage
+        nodes = [
+            graph_assert.AssertNode(
+                type=n.type, name=n.name, description=n.description, metadata=n.metadata
+            )
+            for n in body.nodes
+        ]
+        edges = [
+            graph_assert.AssertEdge(
+                src=e.src,
+                dst=e.dst,
+                type=e.type,
+                description=e.description,
+                weight=e.weight,
+                metadata=e.metadata,
+            )
+            for e in body.edges
+        ]
+
+        # Reconciliation map: existing (content_hash -> entity_id) for this
+        # agent, so a node previously EXTRACTED under a random uuid merges onto
+        # that id (no new storage seam — reuses list_entities).
+        existing = await store.list_entities(
+            agent=project_id, tenant_id=ctx.tenant_id, limit=5000, project_id=body.project_id
+        )
+        hash_to_id = {e.content_hash: e.entity_id for e in existing}
+
+        entities, relations = await graph_assert.build_asserted_graph(
+            nodes,
+            edges,
+            agent=project_id,
+            tenant_id=ctx.tenant_id,
+            project_id=body.project_id,
+            resolve_existing_id=hash_to_id.get,
+        )
+        for ent in entities:
+            await store.upsert_entity(ent)
+        for rel in relations:
+            await store.upsert_relation(rel)
+
+        # Skip report: requested edges the builder dropped (unresolved endpoint
+        # or self-loop). Computed with the builder's own name normalization.
+        asserted = {graph_assert.normalize_name(n.name) for n in body.nodes}
+        skipped = [
+            SkippedEdgeView(
+                src=e.src,
+                dst=e.dst,
+                type=e.type,
+                reason=(
+                    "self-loop"
+                    if graph_assert.normalize_name(e.src) == graph_assert.normalize_name(e.dst)
+                    else "unresolved endpoint"
+                ),
+            )
+            for e in body.edges
+            if graph_assert.normalize_name(e.src) not in asserted
+            or graph_assert.normalize_name(e.dst) not in asserted
+            or graph_assert.normalize_name(e.src) == graph_assert.normalize_name(e.dst)
+        ]
+        return GraphAssertView(
+            applied_nodes=len(entities),
+            applied_edges=len(relations),
+            skipped_edges=skipped,
+        )
 
     @v1.get(
         "/graph/nodes/{node_id}",

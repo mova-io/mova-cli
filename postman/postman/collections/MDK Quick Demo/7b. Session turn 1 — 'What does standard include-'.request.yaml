@@ -1,0 +1,20 @@
+$kind: http-request
+name: 7b. Session turn 1 — 'What does standard include?'
+url: "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true"
+method: POST
+headers:
+  Content-Type: application/json
+queryParams:
+  wait: "true"
+body:
+  type: text
+  content: |-
+    {
+      "input": {
+        "input": {
+          "question": "What does the standard plan include?"
+        }
+      },
+      "session_id": "{{session_id}}"
+    }
+order: 9000

@@ -584,6 +584,26 @@ async def call_human_activity(
     )
     await ctx.storage.save_workflow_run(record)
 
+    # Escalate to the approval channel (ADR 083) — parity with the native
+    # runner's HUMAN-pause branch. Fire-and-forget + never raises (side effects
+    # in activities, ADR 054 D10; the pause is already persisted). No-op until
+    # MOVATE_NOTIFIER is configured.
+    from movate.core.notifier import HumanPause, notify_human_pause_safe  # noqa: PLC0415
+
+    await notify_human_pause_safe(
+        HumanPause(
+            run_id=run_id,
+            workflow_name=workflow_name,
+            workflow_version=workflow_version,
+            node_id=node_id,
+            prompt=prompt,
+            output_contract=list(output_contract),
+            approvers=list(approvers),
+            tenant_id=record.tenant_id,
+            runtime="temporal",
+        )
+    )
+
 
 @_activity.defn  # type: ignore[untyped-decorator]
 async def persist_workflow_result_activity(
@@ -628,6 +648,24 @@ async def persist_workflow_result_activity(
         runtime="temporal",
     )
     await ctx.storage.save_workflow_run(record)
+
+    # Operational signal (ADR 082): durable workflows never hit the native
+    # dispatch edge that powers mdk.jobs.completed, so emit a first-class
+    # completion counter here for the Temporal workbook. Fail-soft + lazy import
+    # so a metrics hiccup never fails the terminal persist (the record above is
+    # the source of truth; the metric is best-effort telemetry). No-op when the
+    # OTLP sink is off / OTel absent.
+    try:
+        from movate.tracing import record_workflow_completed  # noqa: PLC0415
+
+        record_workflow_completed(
+            workflow=workflow_name,
+            status=record.status.value,
+            runtime="temporal",
+            tenant_id=record.tenant_id,
+        )
+    except Exception:  # pragma: no cover - telemetry must never break execution
+        pass
 
 
 __all__ = [
