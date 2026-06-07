@@ -178,4 +178,74 @@ class GenericWebhookNotifier:
         return True
 
 
-__all__ = ["GenericWebhookNotifier", "TeamsNotifier"]
+class SlackNotifier:
+    """POST a Slack message (incoming webhook) for a paused HUMAN node.
+
+    Uses Slack's incoming-webhook contract: a ``text`` fallback plus Block Kit
+    ``blocks`` for a readable card. Same fire-and-forget posture as the other
+    sinks — a transport error / non-2xx logs and returns ``False``, never raises.
+    """
+
+    def __init__(
+        self,
+        *,
+        webhook_url: str,
+        name: str = "slack",
+        timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        self._webhook_url = webhook_url
+        self.name = name
+        self._timeout = timeout
+
+    def _payload(self, pause: HumanPause) -> dict[str, Any]:
+        prompt = pause.prompt or "A workflow is paused awaiting a human decision."
+        contract = ", ".join(pause.output_contract) or "(no contract)"
+        fields = (
+            f"*Run:* {pause.run_id}\n"
+            f"*Node:* {pause.node_id}\n"
+            f"*Workflow:* {pause.workflow_name} v{pause.workflow_version}\n"
+            f"*Backend:* {pause.runtime}\n"
+            f"*Approvers:* {_approvers_label(pause.approvers)}\n"
+            f"*Decision must supply:* {contract}\n"
+            f"*Decide via:* {pause.resume_url()}"
+        )
+        return {
+            # Plain-text fallback (notifications / no-Block-Kit clients).
+            "text": f":pause_button: Human approval needed — {pause.workflow_name}: {prompt}",
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"⏸ Human approval needed — {pause.workflow_name}",
+                    },
+                },
+                {"type": "section", "text": {"type": "mrkdwn", "text": prompt}},
+                {"type": "section", "text": {"type": "mrkdwn", "text": fields}},
+            ],
+        }
+
+    async def notify_human_pause(self, pause: HumanPause) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(self._webhook_url, json=self._payload(pause))
+        except httpx.HTTPError:
+            logger.warning(
+                "notifier_slack_transport_error run_id=%s node=%s — not delivered",
+                pause.run_id,
+                pause.node_id,
+                exc_info=True,
+            )
+            return False
+        if not resp.is_success:
+            logger.warning(
+                "notifier_slack_non2xx run_id=%s node=%s status=%s",
+                pause.run_id,
+                pause.node_id,
+                resp.status_code,
+            )
+            return False
+        return True
+
+
+__all__ = ["GenericWebhookNotifier", "SlackNotifier", "TeamsNotifier"]
