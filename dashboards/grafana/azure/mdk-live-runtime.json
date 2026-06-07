@@ -1,0 +1,979 @@
+{
+  "uid": "mdk-demo",
+  "title": "MDK \u2014 Live Runtime (Azure Monitor)",
+  "schemaVersion": 39,
+  "version": 0,
+  "editable": true,
+  "refresh": "30s",
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "tags": [
+    "mdk",
+    "runtime",
+    "azure-monitor"
+  ],
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 1,
+      "title": "Runtime health \u2014 Container Apps (api \u00b7 worker \u00b7 temporal-worker)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 2,
+      "title": "Requests / min (api)",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "Requests",
+            "aggregation": "Total",
+            "timeGrainUnit": "auto",
+            "resources": [
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-api"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 3,
+      "title": "CPU usage (nanocores)",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "CpuUsage",
+            "aggregation": "Average",
+            "timeGrainUnit": "auto",
+            "resources": [
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-api"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-worker"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-temporal-worker"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "Memory working set",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "MemoryWorkingSetBytes",
+            "aggregation": "Average",
+            "timeGrainUnit": "auto",
+            "resources": [
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-api"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-worker"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-temporal-worker"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 5,
+      "title": "Replica count",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "Replicas",
+            "aggregation": "Average",
+            "timeGrainUnit": "auto",
+            "resources": [
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-api"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-worker"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-temporal-worker"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 6,
+      "title": "Restart count (crash-loop watch)",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "RestartCount",
+            "aggregation": "Maximum",
+            "timeGrainUnit": "auto",
+            "resources": [
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-api"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-worker"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-temporal-worker"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 7,
+      "title": "Rx/Tx bytes",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "RxBytes",
+            "aggregation": "Total",
+            "timeGrainUnit": "auto",
+            "resources": [
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-api"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-worker"
+              },
+              {
+                "resourceGroup": "movate-dev-rg",
+                "resourceName": "movate-dev-temporal-worker"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 8,
+      "title": "App throughput & latency \u2014 agent/job telemetry (App Insights)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 9,
+      "title": "Jobs completed / 5m by status",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.jobs.completed\"\n| extend status = tostring(Properties[\"status\"])\n| summarize Jobs = sum(Sum) by status, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "agent.execute latency p50 / p95 (ms)",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppDependencies\n| where Name == \"agent.execute\"\n| summarize p50 = percentile(DurationMs, 50), p95 = percentile(DurationMs, 95) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "agent.execute error rate %",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppDependencies\n| where Name == \"agent.execute\"\n| summarize total = count(), failed = countif(Success == false) by bin(TimeGenerated, 5m)\n| extend ErrorPct = iff(total == 0, 0.0, round(100.0 * failed / total, 2))\n| project TimeGenerated, ErrorPct\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 12,
+      "title": "Recent failed agent.execute (last 50)",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppDependencies\n| where Name == \"agent.execute\" and Success == false\n| project TimeGenerated, DurationMs, ResultCode, OperationId, AppRoleInstance\n| order by TimeGenerated desc\n| take 50",
+            "resultFormat": "table"
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 13,
+      "title": "Cost & usage \u2014 LLM tokens / spend / in-flight",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 14,
+      "title": "LLM tokens / 5m",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.run.tokens\"\n| summarize Tokens = sum(Sum) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 15,
+      "title": "LLM cost (USD) / 5m",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.run.cost_usd\"\n| summarize CostUSD = sum(Sum) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 16,
+      "title": "Jobs in-flight",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.jobs.in_flight\"\n| summarize InFlight = avg(Sum) by bin(TimeGenerated, 1m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 17,
+      "title": "Database connection pool \u2014 asyncpg saturation (ADR 034 D3)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 18,
+      "title": "Pool in-use vs max",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name in (\"mdk.db.pool.in_use\", \"mdk.db.pool.max\")\n| summarize Value = avg(Sum) by Name, bin(TimeGenerated, 1m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 19,
+      "title": "Pool waiting (blocked acquirers \u2014 early warning)",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.db.pool.waiting\"\n| summarize Waiting = max(Sum) by bin(TimeGenerated, 1m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 20,
+      "title": "Pool idle / size",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 68,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name in (\"mdk.db.pool.idle\", \"mdk.db.pool.size\")\n| summarize Value = avg(Sum) by Name, bin(TimeGenerated, 1m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    }
+  ]
+}

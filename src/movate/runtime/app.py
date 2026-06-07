@@ -4783,7 +4783,7 @@ def _load_sample_cases(bundle: AgentBundle, *, limit: int = 3) -> list[dict[str,
     return rows
 
 
-def build_app(
+def build_app(  # noqa: PLR0912
     storage: StorageProvider,
     *,
     agents: list[AgentBundle] | None = None,
@@ -15866,7 +15866,7 @@ def build_app(
             _twilio_active_agent_name = agents_reg[0].spec.name if agents_reg else ""
         if not _twilio_active_agent_name:
             return Response(
-                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured.</Say></Response>',
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured.</Say></Response>',  # noqa: E501
                 media_type="application/xml",
             )
         # Redirect to the per-agent TwiML endpoint.
@@ -15988,7 +15988,7 @@ def build_app(
         try:
             from twilio.rest import Client as TwilioClient  # noqa: PLC0415
         except ImportError:
-            raise HTTPException(
+            raise HTTPException(  # noqa: B904
                 status_code=501,
                 detail="twilio SDK not installed; add mdk[telephony]",
             )
@@ -16008,7 +16008,7 @@ def build_app(
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(
+            raise HTTPException(  # noqa: B904
                 status_code=502,
                 detail=f"Twilio API error: {exc}",
             )
@@ -16108,7 +16108,7 @@ def build_app(
         # Voice-context cue: nudge the agent to respond conversationally
         # (short sentences, no markdown) so TTS sounds natural. Same hint
         # used by the standalone demo server (server.py _LYZR_VOICE_HINT).
-        _VOICE_HINT = (
+        _VOICE_HINT = (  # noqa: N806
             "please respond conversationally in 1-3 short sentences suitable "
             "for text-to-speech playback. Do not use markdown, headers, bullet "
             "lists, numbered steps, or section labels. Summarize key info "
@@ -16573,7 +16573,7 @@ def build_app(
     import time as _time_mod  # noqa: PLC0415
 
     _lyzr_agents_cache: dict[str, tuple[float, dict[str, object]]] = {}
-    _LYZR_AGENTS_TTL_S = 60.0
+    _LYZR_AGENTS_TTL_S = 60.0  # noqa: N806
 
     def _resolve_lyzr_key(request: Request) -> str:
         header_key = (request.headers.get("x-lyzr-api-key") or "").strip()
@@ -16608,7 +16608,7 @@ def build_app(
 
         def _summary(a: dict[str, object]) -> dict[str, object]:
             tools = a.get("tools") or []
-            tool_names = [t.get("name") for t in tools if isinstance(t, dict)]
+            tool_names = [t.get("name") for t in tools if isinstance(t, dict)]  # type: ignore[attr-defined]
             instructions = str(a.get("agent_instructions") or "")
             return {
                 "id": a.get("_id"),
@@ -16616,7 +16616,7 @@ def build_app(
                 "description": (str(a.get("description") or ""))[:200],
                 "role": a.get("agent_role") or "",
                 "instructions_snippet": instructions[:280]
-                + ("..." if len(instructions) > 280 else ""),
+                + ("..." if len(instructions) > 280 else ""),  # noqa: PLR2004
                 "tools": tool_names,
                 "features": a.get("features") or [],
             }
@@ -16665,7 +16665,7 @@ def build_app(
     # Fetches live from Cartesia's /voices API (cached 1h), falls back
     # to a single default voice if the API is unreachable.
     # ------------------------------------------------------------------
-    _OPENAI_VOICES = [
+    _OPENAI_VOICES = [  # noqa: N806
         {
             "id": "alloy",
             "label": "Alloy",
@@ -16704,7 +16704,7 @@ def build_app(
         },
     ]
     _cartesia_cache: tuple[float, list[dict[str, str]]] | None = None
-    _CARTESIA_TTL = 3600.0
+    _CARTESIA_TTL = 3600.0  # noqa: N806
 
     def _classify_use_case(desc: str) -> str:
         d = desc.lower()
@@ -16736,8 +16736,8 @@ def build_app(
             voices = r.json() or []
         except Exception:
             return []
-        SKIP = ("fairy", "gaming", "pikachu", "robot", "elf", "demon", "ghost", "alien")
-        PREFERRED = (
+        SKIP = ("fairy", "gaming", "pikachu", "robot", "elf", "demon", "ghost", "alien")  # noqa: N806
+        PREFERRED = (  # noqa: N806
             "support",
             "professional",
             "natural",
@@ -16761,12 +16761,12 @@ def build_app(
             and not any(s in (v.get("name") or "").lower() for s in SKIP)
         ]
 
-        def score(v: dict) -> int:
+        def score(v: dict) -> int:  # type: ignore[type-arg]
             d = str(v.get("description") or "").lower()
             return sum(1 for k in PREFERRED if k in d)
 
         en.sort(key=lambda v: (-score(v), str(v.get("name") or "")))
-        by_gender: dict[str, list] = {"f": [], "m": []}
+        by_gender: dict[str, list] = {"f": [], "m": []}  # type: ignore[type-arg]
         seen: set[str] = set()
         for v in en:
             nm = str(v.get("name") or "").split(" - ")[0].strip().lower()
@@ -16774,15 +16774,15 @@ def build_app(
                 continue
             seen.add(nm)
             g = "f" if str(v.get("gender") or "").lower().startswith("fem") else "m"
-            if len(by_gender[g]) < 8:
+            if len(by_gender[g]) < 8:  # noqa: PLR2004
                 by_gender[g].append(v)
         picked = by_gender["f"] + by_gender["m"]
 
-        def norm(v: dict) -> dict[str, str]:
+        def norm(v: dict) -> dict[str, str]:  # type: ignore[type-arg]
             name = str(v.get("name") or "").split(" - ")[0].strip()
             gs = "F" if str(v.get("gender") or "").lower().startswith("fem") else "M"
             desc = str(v.get("description") or "").strip().rstrip(".")
-            if len(desc) > 80:
+            if len(desc) > 80:  # noqa: PLR2004
                 desc = desc[:77] + "..."
             return {
                 "id": str(v["id"]),
