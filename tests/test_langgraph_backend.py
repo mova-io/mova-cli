@@ -42,6 +42,7 @@ _STATE_SCHEMA: dict[str, Any] = {
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
+
 def _make_agent(
     agent_dir: Path,
     *,
@@ -162,6 +163,7 @@ def _scaffold_two_step(tmp_path: Path) -> Path:
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def pricing():
     return load_pricing()
@@ -195,9 +197,7 @@ async def test_linear_two_agents(
     graph = compile_workflow(spec, parent)
 
     provider = MockProvider(response='{"step1_out": "from-step1", "step2_out": "from-step2"}')
-    executor = Executor(
-        provider=provider, pricing=pricing, storage=storage, tracer=tracer
-    )
+    executor = Executor(provider=provider, pricing=pricing, storage=storage, tracer=tracer)
 
     result = await run_langgraph_workflow(
         graph,
@@ -240,9 +240,7 @@ async def test_single_node_workflow(
     graph = compile_workflow(spec, parent)
 
     provider = MockProvider(response='{"step1_out": "done"}')
-    executor = Executor(
-        provider=provider, pricing=pricing, storage=storage, tracer=tracer
-    )
+    executor = Executor(provider=provider, pricing=pricing, storage=storage, tracer=tracer)
 
     result = await run_langgraph_workflow(
         graph,
@@ -282,9 +280,7 @@ async def test_human_node_rejected(
     graph = compile_workflow(spec, parent)
 
     provider = MockProvider(response='{"step1_out": "ok"}')
-    executor = Executor(
-        provider=provider, pricing=pricing, storage=storage, tracer=tracer
-    )
+    executor = Executor(provider=provider, pricing=pricing, storage=storage, tracer=tracer)
 
     with pytest.raises(LangGraphBackendError, match=r"HUMAN.*not yet supported"):
         await run_langgraph_workflow(

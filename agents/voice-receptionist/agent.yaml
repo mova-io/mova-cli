@@ -16,9 +16,18 @@ model:
 
 prompt: ./prompt.md
 
-# No schema — voice agents output free-form natural speech text.
-# The voice pipeline feeds transcribed speech as the input and
-# synthesizes the text response via TTS.
+# Voice agents speak free-form, but text I/O is still the contract
+# (ADR 048 D1): STT feeds transcribed speech in as `text`, and the
+# response `text` is synthesized back via TTS. Declaring it explicitly
+# keeps the agent valid under `movate validate --strict`.
+schema:
+  input:
+    question: string
+  output:
+    answer: string
+
+evals:
+  dataset: ./evals/dataset.jsonl
 
 timeouts:
   call_ms: 15000
