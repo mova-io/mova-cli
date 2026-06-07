@@ -625,6 +625,7 @@ async def persist_workflow_result_activity(
     error: str | None,
     workflow_name: str,
     workflow_version: str,
+    duration_ms: float | None = None,
 ) -> None:
     """Write the TERMINAL ``WorkflowRunRecord`` for a Temporal run (ADR 080 D2).
 
@@ -667,7 +668,10 @@ async def persist_workflow_result_activity(
     # the source of truth; the metric is best-effort telemetry). No-op when the
     # OTLP sink is off / OTel absent.
     try:
-        from movate.tracing import record_workflow_completed  # noqa: PLC0415
+        from movate.tracing import (  # noqa: PLC0415
+            record_workflow_completed,
+            record_workflow_duration,
+        )
 
         record_workflow_completed(
             workflow=workflow_name,
@@ -675,6 +679,18 @@ async def persist_workflow_result_activity(
             runtime="temporal",
             tenant_id=record.tenant_id,
         )
+        # Latency companion (ADR 082 follow-on): the compiled workflow computes
+        # duration_ms from workflow.info().start_time → workflow.now() (both
+        # deterministic) and passes it here. Older compiled workflows (no
+        # duration arg) pass None → skip; never fabricate a value.
+        if duration_ms is not None:
+            record_workflow_duration(
+                workflow=workflow_name,
+                status=record.status.value,
+                runtime="temporal",
+                tenant_id=record.tenant_id,
+                duration_ms=duration_ms,
+            )
     except Exception:  # pragma: no cover - telemetry must never break execution
         pass
 

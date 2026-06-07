@@ -107,6 +107,12 @@ def test_compile_chatbot_pattern() -> None:
     assert "call_agent_activity" in result.activity_names
     # Reads cleanly under D10 — control flow only, conversation in session.
     assert "run_id = workflow.info().workflow_id" in result.module_source
+    # ADR 082 follow-on — duration instrumentation: capture the deterministic
+    # start time and pass the computed duration to the terminal persist activity
+    # on BOTH terminal paths (success + handled error).
+    src = result.module_source
+    assert "_wf_start = workflow.info().start_time" in src
+    assert src.count("(workflow.now() - _wf_start).total_seconds() * 1000.0") == 2
 
 
 @pytest.mark.unit

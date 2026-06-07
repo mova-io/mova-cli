@@ -96,6 +96,15 @@ METRIC_RUN_COST_USD = "mdk.run.cost_usd"
 # Backs the Temporal operational workbook (throughput + success/failure rate).
 METRIC_WORKFLOW_COMPLETED = "mdk.workflow.completed"
 
+# Wall-clock duration of a durable (Temporal) workflow, ms — the latency
+# companion to ``mdk.workflow.completed`` (ADR 082 deferred it). Computed inside
+# the compiled workflow from ``workflow.info().start_time`` → ``workflow.now()``
+# (both deterministic) and recorded from the terminal activity, so the Temporal
+# dashboard shows p50/p95 execution time, not just throughput. Temporal-only:
+# native workflows already get duration via ``mdk.job.duration_ms``
+# (kind=WORKFLOW). Attrs: ``workflow``, ``status``, ``runtime``, ``tenant``.
+METRIC_WORKFLOW_DURATION_MS = "mdk.workflow.duration_ms"
+
 # ADR 034 D3 — Postgres connection-pool saturation. Observable gauges sampled
 # from the LIVE per-pod asyncpg pool at collection time (see
 # :func:`register_pool_metrics`), not recorded at a hot edge. The scale risk
@@ -143,6 +152,7 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_RUN_TOKENS,
         METRIC_RUN_COST_USD,
         METRIC_WORKFLOW_COMPLETED,
+        METRIC_WORKFLOW_DURATION_MS,
         METRIC_DB_POOL_SIZE,
         METRIC_DB_POOL_IDLE,
         METRIC_DB_POOL_IN_USE,
@@ -179,6 +189,7 @@ class _State:
     run_tokens: Any = None  # Counter[int]
     run_cost_usd: Any = None  # Counter[float]
     workflow_completed: Any = None  # Counter[int]  (ADR 082)
+    workflow_duration_ms: Any = None  # Histogram[float]  (ADR 082 follow-on)
     sse_connections_active: Any = None  # UpDownCounter[int]
     voice_responded_ms: Any = None  # Histogram[float]
     voice_stt_final_ms: Any = None  # Histogram[float]
@@ -314,6 +325,15 @@ def init_metrics(*, reader: Any | None = None) -> None:
             "Durable workflows reaching a terminal status (success/error), "
             "emitted from the Temporal terminal activity (ADR 082). Attrs: "
             "workflow, status, runtime, tenant."
+        ),
+    )
+    _state.workflow_duration_ms = meter.create_histogram(
+        METRIC_WORKFLOW_DURATION_MS,
+        unit="ms",
+        description=(
+            "Wall-clock duration of a durable (Temporal) workflow from start to "
+            "terminal status (ADR 082 follow-on). Attrs: workflow, status, "
+            "runtime, tenant."
         ),
     )
     _state.sse_connections_active = meter.create_up_down_counter(
@@ -603,6 +623,40 @@ def record_workflow_completed(
     )
 
 
+def record_workflow_duration(
+    *,
+    workflow: str,
+    status: str,
+    runtime: str,
+    tenant_id: str,
+    duration_ms: float,
+) -> None:
+    """Record a durable workflow's wall-clock duration (ADR 082 follow-on).
+
+    Records ``mdk.workflow.duration_ms`` (attrs: ``workflow``, ``status``,
+    ``runtime``, ``tenant``) — the latency companion to
+    :func:`record_workflow_completed`. ``duration_ms`` is computed inside the
+    compiled workflow from ``workflow.info().start_time`` → ``workflow.now()``
+    (both deterministic) so it's replay-safe. Emitted from the Temporal terminal
+    activity; the native path already gets duration via ``mdk.job.duration_ms``.
+    No-op when metrics are off / OTel absent (the instrument is ``None``); a
+    negative value (clock skew) is dropped rather than recorded.
+    """
+    if _state.workflow_duration_ms is None:
+        return
+    if duration_ms < 0:
+        return
+    _state.workflow_duration_ms.record(
+        float(duration_ms),
+        {
+            "workflow": workflow,
+            "status": status,
+            "runtime": runtime,
+            "tenant": tenant_id,
+        },
+    )
+
+
 def record_voice_turn(
     *,
     tenant_id: str,
@@ -692,6 +746,7 @@ __all__ = [
     "METRIC_VOICE_TTS_FIRST_AUDIO_MS",
     "METRIC_VOICE_TURNS",
     "METRIC_WORKFLOW_COMPLETED",
+    "METRIC_WORKFLOW_DURATION_MS",
     "PoolStatsCallback",
     "dec_in_flight",
     "dec_sse_connections",
@@ -702,5 +757,6 @@ __all__ = [
     "record_run_usage",
     "record_voice_turn",
     "record_workflow_completed",
+    "record_workflow_duration",
     "register_pool_metrics",
 ]

@@ -452,6 +452,10 @@ class TemporalCompiler:
             # loop mutates ``state`` in place (ADR 080 D2).
             "        _initial_state: dict[str, Any] = dict(initial_state)",
             "        run_id = workflow.info().workflow_id",
+            # ADR 082 follow-on — capture the workflow start (deterministic) so
+            # the terminal activity can record mdk.workflow.duration_ms. Both
+            # workflow.info().start_time and workflow.now() are replay-safe.
+            "        _wf_start = workflow.info().start_time",
             f"        current: str | None = {spec.entrypoint!r}",
             "        # Cycle guard — mirrors the native runner; a revisited node means",
             "        # a non-deterministic loop the bounded patterns never produce.",
@@ -528,7 +532,8 @@ class TemporalCompiler:
             "                persist_workflow_result_activity,",
             (
                 f"                args=[run_id, 'success', _initial_state, state, None, "
-                f"{spec.name!r}, {spec.version!r}],"
+                f"{spec.name!r}, {spec.version!r}, "
+                "(workflow.now() - _wf_start).total_seconds() * 1000.0],"
             ),
             "                schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
             "                retry_policy=_RETRY_POLICY,",
@@ -539,7 +544,8 @@ class TemporalCompiler:
             "                persist_workflow_result_activity,",
             (
                 f"                args=[run_id, 'error', _initial_state, state, str(_exc), "
-                f"{spec.name!r}, {spec.version!r}],"
+                f"{spec.name!r}, {spec.version!r}, "
+                "(workflow.now() - _wf_start).total_seconds() * 1000.0],"
             ),
             "                schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
             "                retry_policy=_RETRY_POLICY,",

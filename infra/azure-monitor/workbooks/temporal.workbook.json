@@ -5,7 +5,7 @@
     {
       "type": 1,
       "content": {
-        "json": "# mdk - temporal workbook (durable workflows)\n\n**Persona:** operator of the self-hosted Temporal backend (ADR 078) — \"are durable workflows completing, and at what success rate?\".\n\nThis workbook surfaces the **operational** view of `runtime: temporal` workflows. It is built on the **`mdk.workflow.completed`** counter (ADR 082), which the Temporal terminal activity (`persist_workflow_result_activity`) emits as each durable workflow reaches `success` / `error`. A Temporal-executed workflow runs in the Temporal worker and never hits the native dispatch edge, so this is its first-class throughput + success/failure signal.\n\n**Scope.** Bind this workbook to the Log Analytics workspace the deployment writes to (`logs.outputs.workspaceId` in `infra/azure/main.bicep`); the OTel Collector's `azuremonitor` exporter (ADR 020) lands the counter in `AppMetrics` (Name == `mdk.workflow.completed`, attributes under `Properties[...]`).\n\n**Two complementary surfaces.** Use **this workbook** for aggregate trends (throughput, success rate, per-workflow volume, failure breakdown). Use the **Temporal Web UI** (ADR 078 D6, `enableTemporalUi`) for *per-workflow* history, timing, pending HUMAN-node signals, and replay — that's where individual durable execution timelines live."
+        "json": "# mdk - temporal workbook (durable workflows)\n\n**Persona:** operator of the self-hosted Temporal backend (ADR 078) \u2014 \"are durable workflows completing, and at what success rate?\".\n\nThis workbook surfaces the **operational** view of `runtime: temporal` workflows. It is built on the **`mdk.workflow.completed`** counter (ADR 082), which the Temporal terminal activity (`persist_workflow_result_activity`) emits as each durable workflow reaches `success` / `error`. A Temporal-executed workflow runs in the Temporal worker and never hits the native dispatch edge, so this is its first-class throughput + success/failure signal.\n\n**Scope.** Bind this workbook to the Log Analytics workspace the deployment writes to (`logs.outputs.workspaceId` in `infra/azure/main.bicep`); the OTel Collector's `azuremonitor` exporter (ADR 020) lands the counter in `AppMetrics` (Name == `mdk.workflow.completed`, attributes under `Properties[...]`).\n\n**Two complementary surfaces.** Use **this workbook** for aggregate trends (throughput, success rate, per-workflow volume, failure breakdown). Use the **Temporal Web UI** (ADR 078 D6, `enableTemporalUi`) for *per-workflow* history, timing, pending HUMAN-node signals, and replay \u2014 that's where individual durable execution timelines live."
       },
       "name": "title"
     },
@@ -23,17 +23,24 @@
         "query": "AppMetrics\n| where Name == \"mdk.workflow.completed\"\n| extend status = tostring(Properties[\"status\"]), runtime = tostring(Properties[\"runtime\"])\n| where runtime == \"temporal\"\n| summarize Total = sum(Sum), Failed = sumif(Sum, status == \"error\")\n| extend SuccessPct = iff(Total == 0, 0.0, round(100.0 * (Total - Failed) / Total, 2))\n| project Total, Failed, SuccessPct",
         "size": 4,
         "title": "durable workflows - total / failed / success% (window)",
-        "timeContext": {"durationMs": 21600000},
+        "timeContext": {
+          "durationMs": 21600000
+        },
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
         "visualization": "tiles",
         "tileSettings": {
           "showBorder": false,
-          "titleContent": {"columnMatch": "SuccessPct", "formatter": 1},
+          "titleContent": {
+            "columnMatch": "SuccessPct",
+            "formatter": 1
+          },
           "leftContent": {
             "columnMatch": "Failed",
             "formatter": 12,
-            "formatOptions": {"palette": "redBright"}
+            "formatOptions": {
+              "palette": "redBright"
+            }
           }
         }
       },
@@ -42,7 +49,7 @@
     {
       "type": 1,
       "content": {
-        "json": "## 2. Throughput by status\n\n**What.** `mdk.workflow.completed` summed by `status` over 5-minute bins — durable-workflow completion volume split success vs error.\n\n**Normal.** Steady `success` bars; `error` near zero.\n\n**If red, do.** A rising `error` band -> open the failure-breakdown table below to see which `workflow` regressed, then the Temporal Web UI for that workflow's history."
+        "json": "## 2. Throughput by status\n\n**What.** `mdk.workflow.completed` summed by `status` over 5-minute bins \u2014 durable-workflow completion volume split success vs error.\n\n**Normal.** Steady `success` bars; `error` near zero.\n\n**If red, do.** A rising `error` band -> open the failure-breakdown table below to see which `workflow` regressed, then the Temporal Web UI for that workflow's history."
       },
       "name": "throughput-header"
     },
@@ -53,7 +60,9 @@
         "query": "AppMetrics\n| where Name == \"mdk.workflow.completed\"\n| extend status = tostring(Properties[\"status\"]), runtime = tostring(Properties[\"runtime\"])\n| where runtime == \"temporal\"\n| summarize Workflows = sum(Sum) by status, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
         "size": 0,
         "title": "mdk.workflow.completed by status (5m bins)",
-        "timeContext": {"durationMs": 21600000},
+        "timeContext": {
+          "durationMs": 21600000
+        },
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
         "visualization": "barchart"
@@ -63,7 +72,7 @@
     {
       "type": 1,
       "content": {
-        "json": "## 3. Completions by workflow\n\n**What.** `mdk.workflow.completed` summed by `workflow` name over the window — which durable workflows are actually running, and how often.\n\n**Normal.** Matches your expected mix of deployed `runtime: temporal` workflows.\n\n**If red, do.** A workflow you expected at zero (or a deprecated one still firing) -> check the registered workflows in the worker startup log (`N temporal workflow(s) registering`)."
+        "json": "## 3. Completions by workflow\n\n**What.** `mdk.workflow.completed` summed by `workflow` name over the window \u2014 which durable workflows are actually running, and how often.\n\n**Normal.** Matches your expected mix of deployed `runtime: temporal` workflows.\n\n**If red, do.** A workflow you expected at zero (or a deprecated one still firing) -> check the registered workflows in the worker startup log (`N temporal workflow(s) registering`)."
       },
       "name": "by-workflow-header"
     },
@@ -74,7 +83,9 @@
         "query": "AppMetrics\n| where Name == \"mdk.workflow.completed\"\n| extend workflow = tostring(Properties[\"workflow\"]), status = tostring(Properties[\"status\"]), runtime = tostring(Properties[\"runtime\"])\n| where runtime == \"temporal\"\n| summarize Total = sum(Sum), Failed = sumif(Sum, status == \"error\") by workflow\n| extend SuccessPct = iff(Total == 0, 0.0, round(100.0 * (Total - Failed) / Total, 2))\n| order by Total desc",
         "size": 0,
         "title": "Completions + success% by workflow (window)",
-        "timeContext": {"durationMs": 21600000},
+        "timeContext": {
+          "durationMs": 21600000
+        },
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
         "visualization": "table"
@@ -84,7 +95,7 @@
     {
       "type": 1,
       "content": {
-        "json": "## 4. Failure breakdown\n\n**What.** Only the `status == \"error\"` slice of `mdk.workflow.completed`, by `workflow` over time — the durable-workflow error trend.\n\n**Normal.** Empty / flat at zero.\n\n**If red, do.** Identify the workflow + the time window, then open that run in the **Temporal Web UI** (ADR 078 D6) — its event history shows the exact activity that failed, the retry attempts, and the terminal error. The mdk store also has the terminal `WorkflowRunRecord` (`mdk runs show <id>`) with the captured error message."
+        "json": "## 4. Failure breakdown\n\n**What.** Only the `status == \"error\"` slice of `mdk.workflow.completed`, by `workflow` over time \u2014 the durable-workflow error trend.\n\n**Normal.** Empty / flat at zero.\n\n**If red, do.** Identify the workflow + the time window, then open that run in the **Temporal Web UI** (ADR 078 D6) \u2014 its event history shows the exact activity that failed, the retry attempts, and the terminal error. The mdk store also has the terminal `WorkflowRunRecord` (`mdk runs show <id>`) with the captured error message."
       },
       "name": "failures-header"
     },
@@ -95,7 +106,9 @@
         "query": "AppMetrics\n| where Name == \"mdk.workflow.completed\"\n| extend workflow = tostring(Properties[\"workflow\"]), status = tostring(Properties[\"status\"]), runtime = tostring(Properties[\"runtime\"])\n| where runtime == \"temporal\" and status == \"error\"\n| summarize Errors = sum(Sum) by workflow, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
         "size": 0,
         "title": "Durable-workflow errors by workflow (15m bins)",
-        "timeContext": {"durationMs": 86400000},
+        "timeContext": {
+          "durationMs": 86400000
+        },
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
         "visualization": "timechart"
@@ -105,7 +118,7 @@
     {
       "type": 1,
       "content": {
-        "json": "## 5. Temporal SDK metrics (worker + task-queue health)\n\n**What.** The Temporal Python SDK's built-in worker/client telemetry, now exported to OTLP (ADR 082 follow-on, `mdk worker --backend temporal`) and landing in `AppMetrics` as `temporal_*` series. These cover the signals the completion counter can't: task-queue backlog (schedule-to-start latency), worker slot availability, and RPC health.\n\n**Note.** Exact series + attributes depend on the temporalio SDK version, so the queries below use `startswith` / `has` and a discovery table — they stay correct across SDK upgrades. If a panel is empty, the worker either predates this wiring or has no OTLP endpoint configured.\n\n**Requires.** The worker exports these only when an OTLP endpoint is set (`OTEL_EXPORTER_OTLP_ENDPOINT`) and the sink is OTLP/both — the same condition the `mdk.*` metrics use."
+        "json": "## 5. Temporal SDK metrics (worker + task-queue health)\n\n**What.** The Temporal Python SDK's built-in worker/client telemetry, now exported to OTLP (ADR 082 follow-on, `mdk worker --backend temporal`) and landing in `AppMetrics` as `temporal_*` series. These cover the signals the completion counter can't: task-queue backlog (schedule-to-start latency), worker slot availability, and RPC health.\n\n**Note.** Exact series + attributes depend on the temporalio SDK version, so the queries below use `startswith` / `has` and a discovery table \u2014 they stay correct across SDK upgrades. If a panel is empty, the worker either predates this wiring or has no OTLP endpoint configured.\n\n**Requires.** The worker exports these only when an OTLP endpoint is set (`OTEL_EXPORTER_OTLP_ENDPOINT`) and the sink is OTLP/both \u2014 the same condition the `mdk.*` metrics use."
       },
       "name": "sdk-metrics-header"
     },
@@ -115,8 +128,10 @@
         "version": "KqlItem/1.0",
         "query": "AppMetrics\n| where Name startswith \"temporal_\"\n| summarize Datapoints = count(), Last = max(TimeGenerated) by Name\n| order by Name asc",
         "size": 0,
-        "title": "Available temporal_* SDK metrics (discovery — what's actually flowing)",
-        "timeContext": {"durationMs": 21600000},
+        "title": "Available temporal_* SDK metrics (discovery \u2014 what's actually flowing)",
+        "timeContext": {
+          "durationMs": 21600000
+        },
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
         "visualization": "table"
@@ -129,8 +144,10 @@
         "version": "KqlItem/1.0",
         "query": "AppMetrics\n| where Name startswith \"temporal_worker_task_slots_available\"\n| summarize AvailableSlots = avg(Sum) by Name, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
         "size": 0,
-        "title": "Worker task-slot availability (avg, 5m bins) — low/zero = worker saturated",
-        "timeContext": {"durationMs": 21600000},
+        "title": "Worker task-slot availability (avg, 5m bins) \u2014 low/zero = worker saturated",
+        "timeContext": {
+          "durationMs": 21600000
+        },
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
         "visualization": "timechart"
@@ -144,7 +161,9 @@
         "query": "AppMetrics\n| where Name has \"schedule_to_start\"\n| summarize Latency = avg(Sum) by Name, bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
         "size": 0,
         "title": "Schedule-to-start latency (task-queue backlog signal, 5m bins)",
-        "timeContext": {"durationMs": 21600000},
+        "timeContext": {
+          "durationMs": 21600000
+        },
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
         "visualization": "timechart"
@@ -157,8 +176,10 @@
         "version": "KqlItem/1.0",
         "query": "AppMetrics\n| where Name has \"request_failure\"\n| summarize Failures = sum(Sum) by Name, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
         "size": 0,
-        "title": "Temporal RPC failures (client/worker → server, 15m bins)",
-        "timeContext": {"durationMs": 86400000},
+        "title": "Temporal RPC failures (client/worker \u2192 server, 15m bins)",
+        "timeContext": {
+          "durationMs": 86400000
+        },
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
         "visualization": "timechart"
@@ -168,11 +189,36 @@
     {
       "type": 1,
       "content": {
-        "json": "## Still elsewhere\n\n- **Per-workflow execution timeline / history / pending signals** — the **Temporal Web UI** (ADR 078 D6, `enableTemporalUi`). This workbook is aggregate trends; the Web UI is per-run drill-down.\n- **Per-workflow duration histogram** — derivable from the SDK metrics above once a stable activity/workflow-latency series is confirmed for your SDK version (see the discovery table)."
+        "json": "## 6. Workflow duration (latency)\n\n**What.** Wall-clock execution time of durable workflows from `mdk.workflow.duration_ms` (ADR 082 follow-on) \u2014 the latency companion to the completion counter. The compiled workflow computes it from `workflow.info().start_time` \u2192 `workflow.now()` (both deterministic) and the terminal activity records it as a histogram, so this is the aggregate **mean** per bin (Sum / ItemCount); per-run timing lives in the Temporal Web UI.\n\n**Normal.** Stable mean within each workflow's expected envelope.\n\n**If red, do.** A rising mean for one `workflow` \u2192 open a recent run in the Temporal Web UI; a HUMAN-node pause inflates duration by design (wall-clock includes the wait) \u2014 separate durable HITL workflows from straight-through ones when reading this."
+      },
+      "name": "duration-header"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.workflow.duration_ms\"\n| extend workflow = tostring(Properties[\"workflow\"]), runtime = tostring(Properties[\"runtime\"])\n| where runtime == \"temporal\"\n| summarize AvgMs = sum(Sum) / sum(ItemCount) by workflow, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "title": "Workflow duration (mean ms by workflow, 15m bins)",
+        "timeContext": {
+          "durationMs": 21600000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "duration-by-workflow"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Still elsewhere\n\n- **Per-workflow execution timeline / history / pending signals** \u2014 the **Temporal Web UI** (ADR 078 D6, `enableTemporalUi`). This workbook is aggregate trends; the Web UI is per-run drill-down.\n- **Per-workflow duration histogram** \u2014 derivable from the SDK metrics above once a stable activity/workflow-latency series is confirmed for your SDK version (see the discovery table)."
       },
       "name": "elsewhere-note"
     }
   ],
-  "fallbackResourceIds": ["Azure Monitor"],
+  "fallbackResourceIds": [
+    "Azure Monitor"
+  ],
   "fromTemplateId": "mdk-temporal-workbook"
 }
