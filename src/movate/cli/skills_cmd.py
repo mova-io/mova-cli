@@ -83,6 +83,8 @@ def _register_skill_backends() -> None:
     with contextlib.suppress(ImportError):
         importlib.import_module("movate.core.skill_backend.agent")
     with contextlib.suppress(ImportError):
+        importlib.import_module("movate.core.skill_backend.workflow")
+    with contextlib.suppress(ImportError):
         importlib.import_module("movate.core.skill_backend.exec")
 
 

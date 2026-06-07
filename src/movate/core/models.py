@@ -473,6 +473,14 @@ class SkillImplementationKind(StrEnum):
     up in the runtime registry and called synchronously. Enables
     cross-agent orchestration without the v1.1 LangGraph machinery."""
 
+    WORKFLOW = "workflow"
+    """Hand off to a deployed workflow (ADR 077): the skill submits a
+    ``JobKind.WORKFLOW`` run for ``target_workflow`` and (``await`` mode)
+    returns its outcome — so a thin conversational agent can delegate a
+    multi-step, branch-on-result procedure to the deterministic workflow
+    engine instead of orchestrating it itself (the empirically-unreliable
+    path). ``detach`` mode returns the ``run_id`` immediately."""
+
     EXEC = "exec"
     """Run any executable as a tool via subprocess + JSON stdin/stdout.
     The raw-script escape hatch per ADR 052 D2 -- how a Node CLI, a Java
@@ -582,6 +590,17 @@ class SkillImplementation(BaseModel):
             "Name of the deployed MDK agent to call. Required for "
             "``kind: agent``; ignored for all other kinds. Must match "
             "the agent's registered name in the runtime registry."
+        ),
+    )
+
+    # ---- Workflow-only field (ADR 077; ignored for other kinds) ----
+
+    target_workflow: str | None = Field(
+        default=None,
+        description=(
+            "Name of the deployed workflow to dispatch. Required for "
+            "``kind: workflow``; ignored for all other kinds. The skill "
+            "submits a JobKind.WORKFLOW run for this target."
         ),
     )
 
@@ -821,6 +840,12 @@ class SkillSpec(BaseModel):
                 "agent skill implementation.target_agent is required "
                 "(the name of the deployed MDK agent to call); "
                 "empty target_agent would mean 'no agent selected'"
+            )
+        if v.kind == SkillImplementationKind.WORKFLOW and not v.target_workflow:
+            raise ValueError(
+                "workflow skill implementation.target_workflow is required "
+                "(the name of the deployed workflow to dispatch); "
+                "empty target_workflow would mean 'no workflow selected'"
             )
         return v
 
