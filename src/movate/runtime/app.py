@@ -1028,6 +1028,18 @@ async def _finalize_voice_turn(
     latency = compute_turn_latency(result.events)
     audio_dur_s = (latency.stt_final_ms or 0.0) / 1000.0
 
+    # Bridge the per-turn voice latency to OTel — once per turn, at this edge,
+    # alongside cost recording (voice observability). No-op when metrics are off.
+    from movate.tracing import record_voice_turn  # noqa: PLC0415
+
+    record_voice_turn(
+        tenant_id=tenant_id,
+        responded_ms=latency.responded_in_ms,
+        stt_final_ms=latency.stt_final_ms,
+        tts_first_audio_ms=latency.tts_first_audio_ms,
+        interrupted=str(getattr(result, "status", "")).lower() == "interrupted",
+    )
+
     run_record = await store.get_run(result.run_id, tenant_id=tenant_id)
     if run_record is None:
         return
