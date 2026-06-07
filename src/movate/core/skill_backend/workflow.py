@@ -76,8 +76,7 @@ class WorkflowDispatchSkillBackend:
             raise SkillError(
                 type=SkillErrorType.BACKEND_ERROR,
                 message=(
-                    f"workflow skill {skill.spec.name!r}: "
-                    "implementation.target_workflow is empty"
+                    f"workflow skill {skill.spec.name!r}: implementation.target_workflow is empty"
                 ),
             )
 
