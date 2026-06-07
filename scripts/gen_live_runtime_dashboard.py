@@ -86,6 +86,32 @@ def metric_panel(
     apps: list[str] | None = None,
 ) -> dict:
     apps = apps or APPS
+    # ONE single-resource target PER app — NOT one multi-resource target.
+    # A multi-resource Azure Monitor query uses the subscription-level batch
+    # API, which needs Monitoring Reader at SUBSCRIPTION scope; the Grafana MSI
+    # only has it at the resource-GROUP scope, so a multi-resource query 403s
+    # ("AuthorizationFailed") → "No data". Per-resource queries hit the
+    # per-resource metrics API, which the RG-scoped role covers. (Grafana renders
+    # one series per target — same visual, working permission.)
+    targets = [
+        {
+            "refId": chr(ord("A") + i),
+            "datasource": DS,
+            "queryType": "Azure Monitor",
+            "subscription": SUB,
+            "azureMonitor": {
+                "metricNamespace": CA_NS,
+                "metricName": metric,
+                "aggregation": agg,
+                # Grafana's Azure Monitor query model field is `timeGrain`
+                # (a string like "auto"/"PT1M"). The earlier `timeGrainUnit` was
+                # silently ignored → no interval sent → panels rendered "No data".
+                "timeGrain": "auto",
+                "resources": [{"resourceGroup": RG, "resourceName": a}],
+            },
+        }
+        for i, a in enumerate(apps)
+    ]
     return {
         "type": "timeseries",
         "id": _next_id(),
@@ -94,25 +120,7 @@ def metric_panel(
         "gridPos": _grid(x, y, w, h),
         "fieldConfig": _fieldcfg(unit),
         "options": _opts(),
-        "targets": [
-            {
-                "refId": "A",
-                "datasource": DS,
-                "queryType": "Azure Monitor",
-                "subscription": SUB,
-                "azureMonitor": {
-                    "metricNamespace": CA_NS,
-                    "metricName": metric,
-                    "aggregation": agg,
-                    # Grafana's Azure Monitor query model field is `timeGrain`
-                    # (a string like "auto"/"PT1M"). The earlier `timeGrainUnit`
-                    # was silently ignored → no interval sent → platform panels
-                    # rendered "No data". (Fix: the field name must be timeGrain.)
-                    "timeGrain": "auto",
-                    "resources": [{"resourceGroup": RG, "resourceName": a} for a in apps],
-                },
-            }
-        ],
+        "targets": targets,
     }
 
 

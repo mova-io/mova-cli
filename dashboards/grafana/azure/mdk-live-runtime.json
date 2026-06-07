@@ -143,11 +143,45 @@
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-api"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "UsageNanoCores",
+            "aggregation": "Average",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-worker"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "UsageNanoCores",
+            "aggregation": "Average",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-temporal-worker"
@@ -209,11 +243,45 @@
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-api"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "WorkingSetBytes",
+            "aggregation": "Average",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-worker"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "WorkingSetBytes",
+            "aggregation": "Average",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-temporal-worker"
@@ -274,11 +342,45 @@
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-api"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "Replicas",
+            "aggregation": "Average",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-worker"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "Replicas",
+            "aggregation": "Average",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-temporal-worker"
@@ -339,11 +441,45 @@
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-api"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "RestartCount",
+            "aggregation": "Maximum",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-worker"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "RestartCount",
+            "aggregation": "Maximum",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-temporal-worker"
@@ -405,11 +541,45 @@
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-api"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "RxBytes",
+            "aggregation": "Total",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-worker"
-              },
+              }
+            ]
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Monitor",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureMonitor": {
+            "metricNamespace": "microsoft.app/containerapps",
+            "metricName": "RxBytes",
+            "aggregation": "Total",
+            "timeGrain": "auto",
+            "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
                 "resourceName": "movate-dev-temporal-worker"
