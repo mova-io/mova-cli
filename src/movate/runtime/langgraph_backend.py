@@ -125,7 +125,7 @@ async def run_langgraph_workflow(  # noqa: PLR0912
                 _token_cb = None
                 if on_node_token is not None:
 
-                    def _token_cb(token: str) -> None:  # type: ignore[misc]
+                    def _token_cb(token: str) -> None:
                         on_node_token(node.id, token)
 
                 response = await executor.execute(
@@ -265,10 +265,10 @@ async def run_langgraph_workflow(  # noqa: PLR0912
 
                 return route_fn
 
-            builder.add_conditional_edges(  # type: ignore[arg-type]
+            builder.add_conditional_edges(
                 source_id,
                 _make_router(decision_key, mapping),
-                mapping,
+                mapping,  # type: ignore[arg-type]
             )
 
         # Wire sinks → END.
@@ -282,7 +282,7 @@ async def run_langgraph_workflow(  # noqa: PLR0912
         checkpointer: Any
         try:
             checkpointer = await MdkCheckpointSaver.from_storage(storage)
-            log.debug("langgraph: using MdkCheckpointSaver (%s)", storage.name)
+            log.debug("langgraph: using MdkCheckpointSaver (%s)", storage.name)  # type: ignore[attr-defined]
         except (TypeError, Exception):
             log.debug("langgraph: falling back to MemorySaver")
             checkpointer = MemorySaver()
