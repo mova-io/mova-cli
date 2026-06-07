@@ -1,0 +1,232 @@
+# Workday HCM API connector -- worker + time-off management (ADR 052 Phase 1).
+#
+# Three skill variants against the Workday REST API. Each uses
+# kind: http through the existing HttpSkillBackend. The instance host
+# is passed as an input field and templated into the URL at call time.
+# Auth is bearer-from-env:WORKDAY_ACCESS_TOKEN.
+#
+# Usage in agent.yaml:
+#   tools:
+#     - workday-worker-get@1.0.0
+#     - workday-worker-create@1.0.0
+#     - workday-timeoff-balance@1.0.0
+
+actions:
+
+  # -----------------------------------------------------------------------
+  # workday-worker-get -- GET /ccx/api/v1/{tenant}/workers/{worker_id}
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: workday-worker-get
+    version: 1.0.0
+    description: >-
+      Retrieve an employee (worker) record from Workday by worker ID.
+      Returns the worker profile including legal name, hire date,
+      job information, and contact details.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "Workday REST API hostname (e.g. wd3-impl-services1.workday.com)."
+          tenant:
+            type: string
+            description: "Workday tenant name (e.g. mycompany)."
+          worker_id:
+            type: string
+            description: "Workday worker ID (WID) of the employee to retrieve."
+        required:
+          - instance_host
+          - tenant
+          - worker_id
+      output:
+        type: object
+        properties:
+          workerID:
+            type: string
+          legalName:
+            type: object
+            properties:
+              firstName:
+                type: string
+              lastName:
+                type: string
+          hireDate:
+            type: string
+            description: "ISO 8601 date (e.g. 2024-01-15)."
+          jobTitle:
+            type: string
+          department:
+            type: string
+          employeeStatus:
+            type: string
+            description: "Active, Terminated, On Leave, etc."
+          email:
+            type: string
+          location:
+            type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/ccx/api/v1/{{ input.tenant }}/workers/{{ input.worker_id }}"
+      method: GET
+      auth: bearer-from-env:WORKDAY_ACCESS_TOKEN
+      headers:
+        Accept: application/json
+    side_effects: read-only
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # workday-worker-create -- POST /ccx/api/v1/{tenant}/workers
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: workday-worker-create
+    version: 1.0.0
+    description: >-
+      Create a new worker (employee onboarding) in Workday. Populates
+      the worker record with the provided fields and returns the created
+      record including the system-generated worker ID.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "Workday REST API hostname (e.g. wd3-impl-services1.workday.com)."
+          tenant:
+            type: string
+            description: "Workday tenant name (e.g. mycompany)."
+          firstName:
+            type: string
+            description: "Legal first name of the new worker."
+          lastName:
+            type: string
+            description: "Legal last name of the new worker."
+          hireDate:
+            type: string
+            description: "Hire date in ISO 8601 format (e.g. 2024-03-01)."
+          jobTitle:
+            type: string
+            description: "Job title for the new worker."
+          department:
+            type: string
+            description: "Department the worker is assigned to."
+          email:
+            type: string
+            description: "Work email address."
+          location:
+            type: string
+            description: "Work location (e.g. San Francisco, CA)."
+          managerId:
+            type: string
+            description: "Worker ID of the manager."
+          employeeType:
+            type: string
+            description: "Employment type (e.g. Full-Time, Part-Time, Contractor)."
+        required:
+          - instance_host
+          - tenant
+          - firstName
+          - lastName
+          - hireDate
+      output:
+        type: object
+        properties:
+          workerID:
+            type: string
+          legalName:
+            type: object
+            properties:
+              firstName:
+                type: string
+              lastName:
+                type: string
+          hireDate:
+            type: string
+          jobTitle:
+            type: string
+          department:
+            type: string
+          employeeStatus:
+            type: string
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/ccx/api/v1/{{ input.tenant }}/workers"
+      method: POST
+      auth: bearer-from-env:WORKDAY_ACCESS_TOKEN
+      headers:
+        Content-Type: application/json
+        Accept: application/json
+    side_effects: mutates-state
+    cost:
+      per_call_usd: 0.0
+
+  # -----------------------------------------------------------------------
+  # workday-timeoff-balance -- GET /ccx/api/v1/{tenant}/workers/{worker_id}/timeOffBalance
+  # -----------------------------------------------------------------------
+  - api_version: movate/v1
+    kind: Skill
+    name: workday-timeoff-balance
+    version: 1.0.0
+    description: >-
+      Retrieve time-off balance for a worker from Workday. Returns
+      balances for each time-off type (vacation, sick, personal, etc.)
+      including used, available, and total entitlement amounts.
+    schema:
+      input:
+        type: object
+        properties:
+          instance_host:
+            type: string
+            description: "Workday REST API hostname (e.g. wd3-impl-services1.workday.com)."
+          tenant:
+            type: string
+            description: "Workday tenant name (e.g. mycompany)."
+          worker_id:
+            type: string
+            description: "Workday worker ID (WID) of the employee."
+        required:
+          - instance_host
+          - tenant
+          - worker_id
+      output:
+        type: object
+        properties:
+          workerID:
+            type: string
+          balances:
+            type: array
+            items:
+              type: object
+              properties:
+                timeOffType:
+                  type: string
+                  description: "Type of time off (e.g. Vacation, Sick, Personal)."
+                balanceAmount:
+                  type: number
+                  description: "Available balance in days or hours."
+                usedAmount:
+                  type: number
+                  description: "Amount already used in the current period."
+                totalEntitlement:
+                  type: number
+                  description: "Total entitlement for the current period."
+                unit:
+                  type: string
+                  description: "Unit of measurement (Days or Hours)."
+                asOfDate:
+                  type: string
+                  description: "Date the balance was calculated."
+    implementation:
+      kind: http
+      entry: "https://{{ input.instance_host }}/ccx/api/v1/{{ input.tenant }}/workers/{{ input.worker_id }}/timeOffBalance"
+      method: GET
+      auth: bearer-from-env:WORKDAY_ACCESS_TOKEN
+      headers:
+        Accept: application/json
+    side_effects: read-only
+    cost:
+      per_call_usd: 0.0

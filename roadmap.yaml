@@ -1,0 +1,189 @@
+# roadmap.yaml — the single durable source of truth for the mdk roadmap.
+#
+# Per ADR 058 (docs/adr/058-roadmap-calver-sync.md):
+#   * This file holds EVERY roadmap item: planned, in_progress, shipped, dropped.
+#   * `planned`/`in_progress` items are HAND-AUTHORED — intent lives with humans.
+#   * The `pr` / `shipped_version` / `status: shipped` fields are the truth
+#     projected from CalVer at merge. In step 1 (this file's first revision)
+#     they are back-filled from git history; in step 2 the auto-stamp Action
+#     fills them on every merge so humans never hand-write "done @ version".
+#
+# CalVer is the join key (ADR 058 D2): every merge bumps YYYY.M.D.N exactly
+# once, so `shipped_version` is a dense per-PR identifier. The append-only
+# ledger lives in shipped.jsonl.
+#
+# ROADMAP.md is GENERATED from this file + shipped.jsonl by
+# scripts/gen_roadmap.py and freshness-gated in CI — never hand-edit it.
+# After editing this file, run:  python3 scripts/gen_roadmap.py
+#
+# Item schema:
+#   id:              stable kebab-case identifier (never reused/renamed)
+#   title:           human-readable one-liner
+#   status:          planned | in_progress | shipped | dropped
+#   pr:              (shipped) the PR number that delivered it
+#   shipped_version: (shipped) the CalVer at merge
+#   adr:             (optional) the ADR number that governs it
+#   depends_on:      (optional) list of ids this item builds on
+
+items:
+  # --- Shipped (back-filled from git history this session, ADR 058 step 1) ---
+
+  - id: temporal-track-b-compiler
+    title: "Temporal Track B — workflow compiler skeleton + node mapping"
+    status: shipped
+    pr: 605
+    shipped_version: 2026.5.30.4
+    adr: "054"
+
+  - id: adr-055-runtime-dispatch-fork
+    title: "ADR 055 — workflow runtime selection dispatch fork (native / LangGraph / Temporal)"
+    status: shipped
+    pr: 606
+    shipped_version: 2026.5.30.5
+    adr: "055"
+
+  - id: graph-viewer-bakeoff
+    title: "Resolve graph viewer bake-off (sigma.js sole v1 viewer) + chainlit welcome"
+    status: shipped
+    pr: 607
+    shipped_version: 2026.5.30.5
+
+  - id: voice-byok-key-resolution
+    title: "Per-tenant BYOK key resolution for voice STT/TTS/realtime at the WS edge"
+    status: shipped
+    pr: 608
+    shipped_version: 2026.5.30.5
+    adr: "049"
+
+  - id: temporal-track-c-activities
+    title: "Temporal Track C — activity wrappers around Executor/SkillBackend"
+    status: shipped
+    pr: 609
+    shipped_version: 2026.5.30.5
+    adr: "054"
+    depends_on: [temporal-track-b-compiler]
+
+  - id: adr-056-judge-node
+    title: "ADR 056 — JUDGE as a first-class workflow node (verdict-gated branching + reflection)"
+    status: shipped
+    pr: 611
+    shipped_version: 2026.5.30.5
+    adr: "056"
+
+  - id: cli-api-parity-gate
+    title: "CLI <-> API drift gate — every remote verb maps to a route"
+    status: shipped
+    pr: 612
+    shipped_version: 2026.5.30.5
+    adr: "050"
+
+  - id: demo-seed-analyzer
+    title: "Run observability analyzer after demo seed so dashboards light up"
+    status: shipped
+    pr: 613
+    shipped_version: 2026.5.30.5
+
+  - id: log-trace-correlation
+    title: "Wire log <-> trace correlation into runtime + worker"
+    status: shipped
+    pr: 614
+    shipped_version: 2026.5.30.5
+
+  - id: voice-barge-in
+    title: "Playground voice polish — live transcript, barge-in, latency badge"
+    status: shipped
+    pr: 616
+    shipped_version: 2026.5.30.6
+
+  - id: eval-in-the-loop
+    title: "eval-in-the-loop for mdk dev (--eval-sample-size)"
+    status: shipped
+    pr: 617
+    shipped_version: 2026.5.30.6
+
+  - id: temporal-exec-backend
+    title: "Runtime dispatch fork + Temporal as an executable backend"
+    status: shipped
+    pr: 618
+    shipped_version: 2026.5.30.6
+    adr: "055"
+    depends_on: [adr-055-runtime-dispatch-fork, temporal-track-b-compiler, temporal-track-c-activities]
+
+  - id: demo-runbook-doctor
+    title: "Bulletproof demo flow — one-command seed + demo doctor + runbook"
+    status: shipped
+    pr: 619
+    shipped_version: 2026.5.30.6
+    depends_on: [demo-seed-analyzer]
+
+  - id: mission-control-dashboard
+    title: "Mission-control single-pane operator dashboard"
+    status: shipped
+    pr: 620
+    shipped_version: 2026.5.30.6
+
+  - id: graph-viz-live-growth
+    title: "Knowledge-graph viz — paced live growth + confidence dimming + centrality cues"
+    status: shipped
+    pr: 621
+    shipped_version: 2026.5.30.6
+    adr: "046"
+    depends_on: [graph-viewer-bakeoff]
+
+  # --- In progress / Planned (hand-authored intent; ADR 058 D1) ---
+
+  - id: judge-node-impl
+    title: "JUDGE node implementation — verdict-gated branching at runtime"
+    status: in_progress
+    adr: "056"
+    depends_on: [adr-056-judge-node, temporal-exec-backend]
+
+  - id: durable-hitl
+    title: "Durable HITL on Temporal (HUMAN node — durable pause/resume)"
+    status: planned
+    adr: "054"
+    depends_on: [temporal-exec-backend]
+
+  - id: temporal-conformance-suite
+    title: "Temporal conformance suite — parity across native/LangGraph/Temporal backends"
+    status: planned
+    adr: "055"
+    depends_on: [temporal-exec-backend]
+
+  - id: replay-cli
+    title: "Workflow replay CLI — deterministic re-execution from event history"
+    status: planned
+    adr: "054"
+    depends_on: [temporal-exec-backend]
+
+  - id: alert-routing
+    title: "Observability alert routing — thresholded insights to operator channels"
+    status: planned
+    depends_on: [log-trace-correlation]
+
+  - id: dead-letter-mgmt
+    title: "Dead-letter management — inspect, retry, and purge failed jobs"
+    status: planned
+
+  - id: nl-query
+    title: "Natural-language query over observability + graph (ADR 047)"
+    status: planned
+    adr: "047"
+    depends_on: [log-trace-correlation]
+
+  - id: graphrag-storage-protocol
+    title: "GraphRAG behind the StorageProvider Protocol (SQLite + Postgres, Neo4j optional)"
+    status: planned
+    adr: "046"
+    depends_on: [graph-viz-live-growth]
+
+  - id: temporal-composition
+    title: "Temporal workflow composition — child workflows + signals across agents"
+    status: planned
+    adr: "054"
+    depends_on: [temporal-exec-backend]
+
+  - id: production-hardening
+    title: "Production hardening — retries, timeouts, backpressure, partial-failure recovery"
+    status: planned
+    depends_on: [temporal-exec-backend]

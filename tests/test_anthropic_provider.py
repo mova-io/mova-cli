@@ -44,6 +44,7 @@ class _FakeUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
 
 
 @dataclass
@@ -186,6 +187,9 @@ async def test_complete_splits_system_message_to_kwarg() -> None:
                 Message(role="system", content="you are concise"),
                 Message(role="user", content="explain quicksort"),
             ],
+            # Disable caching here so this test stays focused on system
+            # extraction — the cache_control placement has dedicated tests.
+            params={"cache_prompt": False},
         )
     )
     # System extracted; messages array contains only the user turn.
@@ -498,9 +502,131 @@ async def test_complete_passes_tools_through_to_sdk() -> None:
             provider="claude-sonnet-4-6",
             messages=[Message(role="user", content="2+2?")],
             tools=tool_specs,
+            # Disable caching so this test asserts pure pass-through; the
+            # cache_control-on-last-tool behavior has its own test below.
+            params={"cache_prompt": False},
         )
     )
     assert fake.messages.last_create_call.get("tools") == tool_specs
+
+
+# ---------------------------------------------------------------------------
+# Prompt caching — cache_control breakpoint placement (default on)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_complete_marks_cache_breakpoint_on_system_and_last_tool() -> None:
+    """Default-on caching tags the system block + the LAST tool with
+    ``cache_control: ephemeral``; earlier tools and the user turn stay
+    unmarked. This is the stable-prefix breakpoint."""
+    fake = _FakeClient()
+    fake.messages.create_response = _FakeMessage(
+        content=[_FakeTextBlock(text="ok")], usage=_FakeUsage()
+    )
+    provider = AnthropicProvider(client=fake)  # type: ignore[arg-type]
+
+    tools = [
+        {"name": "first", "description": "a", "input_schema": {"type": "object"}},
+        {"name": "second", "description": "b", "input_schema": {"type": "object"}},
+    ]
+    await provider.complete(
+        CompletionRequest(
+            provider="claude-sonnet-4-6",
+            messages=[
+                Message(role="system", content="you are a helpful agent"),
+                Message(role="user", content="hi"),
+            ],
+            tools=tools,
+        )
+    )
+
+    # System became a single text block carrying the breakpoint.
+    system = fake.messages.last_create_call["system"]
+    assert system == [
+        {
+            "type": "text",
+            "text": "you are a helpful agent",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    # Only the LAST tool carries cache_control; the first is untouched.
+    sent_tools = fake.messages.last_create_call["tools"]
+    assert "cache_control" not in sent_tools[0]
+    assert sent_tools[-1]["cache_control"] == {"type": "ephemeral"}
+    # The user turn (variable suffix) is never marked.
+    assert fake.messages.last_create_call["messages"] == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.unit
+async def test_complete_cache_does_not_mutate_caller_tools() -> None:
+    """Marking the breakpoint must not mutate ``request.tools`` — the
+    executor caches the tool_specs list across turns."""
+    fake = _FakeClient()
+    fake.messages.create_response = _FakeMessage(
+        content=[_FakeTextBlock(text="ok")], usage=_FakeUsage()
+    )
+    provider = AnthropicProvider(client=fake)  # type: ignore[arg-type]
+
+    tools = [{"name": "calc", "description": "Adds", "input_schema": {"type": "object"}}]
+    await provider.complete(
+        CompletionRequest(
+            provider="claude-sonnet-4-6",
+            messages=[Message(role="user", content="2+2?")],
+            tools=tools,
+        )
+    )
+    assert "cache_control" not in tools[0]
+
+
+@pytest.mark.unit
+async def test_complete_cache_disabled_leaves_system_and_tools_untouched() -> None:
+    """``cache_prompt: false`` ⇒ byte-for-byte the pre-caching behavior:
+    plain string system, untagged tools, no leftover toggle on the wire."""
+    fake = _FakeClient()
+    fake.messages.create_response = _FakeMessage(
+        content=[_FakeTextBlock(text="ok")], usage=_FakeUsage()
+    )
+    provider = AnthropicProvider(client=fake)  # type: ignore[arg-type]
+
+    tools = [{"name": "calc", "description": "Adds", "input_schema": {"type": "object"}}]
+    await provider.complete(
+        CompletionRequest(
+            provider="claude-sonnet-4-6",
+            messages=[
+                Message(role="system", content="be concise"),
+                Message(role="user", content="hi"),
+            ],
+            tools=tools,
+            params={"cache_prompt": False},
+        )
+    )
+    assert fake.messages.last_create_call["system"] == "be concise"
+    assert fake.messages.last_create_call["tools"] == tools
+    # The movate-only toggle never reaches the SDK call.
+    assert "cache_prompt" not in fake.messages.last_create_call
+
+
+@pytest.mark.unit
+async def test_complete_cache_prompt_toggle_never_reaches_sdk_when_on() -> None:
+    """Even with caching ON, ``cache_prompt`` is stripped from params —
+    it is not an Anthropic API field."""
+    fake = _FakeClient()
+    fake.messages.create_response = _FakeMessage(
+        content=[_FakeTextBlock(text="ok")], usage=_FakeUsage()
+    )
+    provider = AnthropicProvider(client=fake)  # type: ignore[arg-type]
+
+    await provider.complete(
+        CompletionRequest(
+            provider="claude-sonnet-4-6",
+            messages=[Message(role="user", content="hi")],
+            params={"cache_prompt": True, "temperature": 0.2},
+        )
+    )
+    assert "cache_prompt" not in fake.messages.last_create_call
+    # Real params still pass through.
+    assert fake.messages.last_create_call["temperature"] == 0.2
 
 
 @pytest.mark.unit
@@ -1013,19 +1139,29 @@ def test_to_completion_response_text_preceding_tool_use() -> None:
 
 @pytest.mark.unit
 def test_to_completion_response_usage_cache_tokens_mapped() -> None:
-    """cache_read_input_tokens → TokenUsage.cached_input."""
+    """cache_read folds into ``input`` (as a subset, OpenAI convention);
+    cache_creation → ``cache_write`` (a separate bucket)."""
     from types import SimpleNamespace  # noqa: PLC0415
 
     resp = SimpleNamespace(
         content=[SimpleNamespace(type="text", text="ok")],
-        usage=SimpleNamespace(input_tokens=100, output_tokens=20, cache_read_input_tokens=75),
+        usage=SimpleNamespace(
+            input_tokens=100,  # uncached remainder on the wire
+            output_tokens=20,
+            cache_read_input_tokens=75,
+            cache_creation_input_tokens=40,
+        ),
         model="claude-sonnet",
         stop_reason="end_turn",
     )
     result = _to_completion_response(resp)
-    assert result.tokens.input == 100
+    # input = uncached (100) + cache reads (75); cached_input is that subset.
+    assert result.tokens.input == 175
     assert result.tokens.output == 20
     assert result.tokens.cached_input == 75
+    assert result.tokens.cache_write == 40
+    # The uncached remainder (full-price portion) is input - cached_input.
+    assert result.tokens.input - result.tokens.cached_input == 100
 
 
 # ---------------------------------------------------------------------------
@@ -1116,14 +1252,22 @@ def test_tokens_from_usage_none_returns_empty() -> None:
 
 @pytest.mark.unit
 def test_tokens_from_usage_maps_all_fields() -> None:
-    """All three usage fields map correctly."""
+    """Cache reads fold into ``input`` (as a subset) to match the OpenAI
+    convention the cost calc assumes; cache writes land in ``cache_write``."""
     from types import SimpleNamespace  # noqa: PLC0415
 
-    usage = SimpleNamespace(input_tokens=50, output_tokens=15, cache_read_input_tokens=30)
+    usage = SimpleNamespace(
+        input_tokens=50,  # uncached remainder on the wire
+        output_tokens=15,
+        cache_read_input_tokens=30,
+        cache_creation_input_tokens=12,
+    )
     tokens = _tokens_from_usage(usage)
-    assert tokens.input == 50
+    # input = uncached (50) + cache reads (30) = 80, with cached a subset.
+    assert tokens.input == 80
     assert tokens.output == 15
     assert tokens.cached_input == 30
+    assert tokens.cache_write == 12
 
 
 # ---------------------------------------------------------------------------

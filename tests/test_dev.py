@@ -16,15 +16,23 @@ tested in test_contexts_cmd.py.)
 
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
 
 import movate.cli.dev_cmd as dc
 from movate.cli.main import app as cli_app
-from movate.cli.watch import _compute_watched_paths, _print_output_diff, dispatch_run_once
+from movate.cli.watch import (
+    _compute_watched_paths,
+    _print_output_diff,
+    dispatch_run_once,
+    run_loop,
+)
+from movate.core.eval import DimensionalMeans
 from movate.testing import scaffold_agent
 
 runner = CliRunner(mix_stderr=False)
@@ -343,3 +351,140 @@ def test_has_grounding_gap_swallows_errors(tmp_path: Path, monkeypatch: pytest.M
     # Must not raise; a non-RAG scaffold is False anyway, but the broad
     # except also covers the storage explosion for a RAG-shaped agent.
     assert dc._has_grounding_gap(agent_dir) is False
+
+
+# ---------------------------------------------------------------------------
+# Eval-in-the-loop (--eval-sample-size)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_eval_in_loop_disabled_by_default(tmp_path: Path) -> None:
+    """--eval-sample-size 0 (default) → disabled: no hook, no eval, no output.
+
+    The byte-for-byte back-compat guard: a default dev session never touches the
+    eval engine, so the live loop is exactly what it was before this flag.
+    """
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    loop = dc._EvalInLoop(agent_dir, sample_size=0, mock=True)
+    assert loop.enabled is False
+    # after_run is a no-op when disabled, even on a clean run.
+    loop.after_run(0)
+    assert loop._prev_mean is None
+
+
+@pytest.mark.unit
+def test_eval_in_loop_scores_first_n_cases_under_mock(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--eval-sample-size N>0 scores the first N cases and prints a scorecard.
+
+    Hermetic via --mock (dataset-aware MockProvider), so the loop is free /
+    offline. The scaffold dataset has 8 rows; capping to 3 must score exactly 3.
+    """
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    loop = dc._EvalInLoop(agent_dir, sample_size=3, mock=True)
+    assert loop.enabled is True
+
+    loop.after_run(0)
+    err = capsys.readouterr().err
+    assert "eval" in err
+    assert "3 case" in err  # capped to the requested sample size
+    assert "accuracy" in err
+    assert "baseline" in err  # first iteration has no prior mean to diff
+
+
+@pytest.mark.unit
+def test_eval_in_loop_shows_delta_across_iterations(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two successive scorecards print the mean-accuracy delta (▲/▼/=).
+
+    Drives ``_print_scorecard`` directly with synthetic summaries so the delta
+    math is asserted independent of provider behavior: 0.50 → 0.80 is a rise,
+    0.80 → 0.40 is a drop, 0.40 → 0.40 is unchanged.
+    """
+
+    def _summary(accuracy: float) -> object:
+        return SimpleNamespace(
+            sample_count=2,
+            mean_score=accuracy,
+            dimensional_means=DimensionalMeans(accuracy=accuracy),
+        )
+
+    loop = dc._EvalInLoop(Path("."), sample_size=2, mock=True)
+
+    loop._print_scorecard(_summary(0.50))  # type: ignore[arg-type]
+    assert "baseline" in capsys.readouterr().err
+
+    loop._print_scorecard(_summary(0.80))  # type: ignore[arg-type]
+    rise = capsys.readouterr().err
+    assert "▲" in rise
+    assert "+0.30" in rise
+
+    loop._print_scorecard(_summary(0.40))  # type: ignore[arg-type]
+    drop = capsys.readouterr().err
+    assert "▼" in drop
+    assert "-0.40" in drop
+
+    loop._print_scorecard(_summary(0.40))  # type: ignore[arg-type]
+    same = capsys.readouterr().err
+    assert "no change" in same
+
+
+@pytest.mark.unit
+def test_eval_in_loop_degrades_gracefully_without_dataset(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No eval dataset → a one-line hint, then quiet; never crashes the loop.
+
+    The dataset-less agent shouldn't spam the loop, so the hint fires once and
+    subsequent iterations stay silent. ``after_run`` must not raise either way.
+    """
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    (agent_dir / "evals" / "dataset.jsonl").unlink()  # drop the dataset file
+
+    loop = dc._EvalInLoop(agent_dir, sample_size=3, mock=True)
+    loop.after_run(0)
+    first = capsys.readouterr().err
+    assert "no eval dataset" in first
+
+    loop.after_run(0)  # second pass: silent (no repeat spam)
+    assert "no eval dataset" not in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_eval_in_loop_survives_a_buggy_eval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A crash inside the eval run degrades to a one-line note, never raises —
+    the dev loop must survive a bad dataset / engine error (rule 10)."""
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    loop = dc._EvalInLoop(agent_dir, sample_size=2, mock=True)
+
+    def _boom(self: object) -> object:
+        raise RuntimeError("eval blew up")
+
+    monkeypatch.setattr(dc._EvalInLoop, "_run_capped_eval", _boom)
+    loop.after_run(0)  # must not raise
+    assert "eval-in-loop skipped" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_eval_in_loop_skips_failed_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A failed live run (exit_code != 0) scores nothing — there's no useful
+    output to evaluate, and the run's own error already surfaced."""
+    agent_dir = scaffold_agent(tmp_path / "demo", name="demo")
+    loop = dc._EvalInLoop(agent_dir, sample_size=2, mock=True)
+    loop.after_run(2)
+    assert capsys.readouterr().err == ""
+    assert loop._prev_mean is None
+
+
+@pytest.mark.unit
+def test_run_loop_hook_default_none_is_unchanged(tmp_path: Path) -> None:
+    """``run_loop``'s new ``on_iteration`` defaults to None — the existing
+    callers (``mdk watch --run``) pass nothing, so behavior is unchanged. We
+    just assert the signature is back-compatible (keyword-defaulted)."""
+    sig = inspect.signature(run_loop)
+    assert sig.parameters["on_iteration"].default is None

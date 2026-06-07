@@ -19,7 +19,7 @@ path end-to-end without subprocess gymnastics.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -28,7 +28,7 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app as cli_app
-from movate.core.auth import mint_api_key
+from movate.core.auth import ALL_SCOPES, mint_api_key
 from movate.core.client import MovateClient, MovateClientError
 from movate.core.models import ApiKeyEnv, JobKind, JobStatus
 from movate.core.user_config import TargetConfig, UserConfig, save_user_config
@@ -414,7 +414,12 @@ async def cli_env(tmp_path: Path, monkeypatch):
     storage = InMemoryStorage()
     await storage.init()
     tenant_id = uuid4().hex
-    minted = mint_api_key(tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="test")
+    # Full-scope key (read+run+eval+admin) so admin-gated verbs like
+    # ``jobs dead-letter purge`` work through this fixture; the existing
+    # read/run verbs are unaffected (a superset of their required scopes).
+    minted = mint_api_key(
+        tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="test", scopes=list(ALL_SCOPES)
+    )
     await storage.save_api_key(minted.record)
     monkeypatch.setenv("MOVATE_TEST_KEY", minted.full_key)
 
@@ -646,6 +651,130 @@ def test_cli_jobs_list_agents(cli_env) -> None:
 
     payload = json.loads(result.stdout)
     assert "agents" in payload
+
+
+# ---------------------------------------------------------------------------
+# CLI: `jobs dead-letter` — operate retry-exhausted jobs (list/show/retry/
+# purge) against the test-app via the monkeypatched client.
+# ---------------------------------------------------------------------------
+
+
+def _seed_dead_letter_sync(storage, *, tenant_id: str, target: str = "alpha") -> str:
+    """Persist a DEAD_LETTER JobRecord via a one-shot asyncio.run. Returns
+    the job_id."""
+    import asyncio  # noqa: PLC0415
+    from uuid import uuid4 as _uuid4  # noqa: PLC0415
+
+    from movate.core.models import ErrorInfo, JobKind, JobRecord  # noqa: PLC0415
+
+    job_id = str(_uuid4())
+    job = JobRecord(
+        job_id=job_id,
+        tenant_id=tenant_id,
+        kind=JobKind.AGENT,
+        target=target,
+        status=JobStatus.DEAD_LETTER,
+        input={"text": "hi"},
+        attempt_count=3,
+        error=ErrorInfo(type="provider_error", message="exhausted", retryable=True),
+        completed_at=datetime.now(UTC),
+    )
+    asyncio.run(storage.save_job(job))
+    return job_id
+
+
+@pytest.mark.unit
+def test_cli_dead_letter_list(cli_env) -> None:
+    import json  # noqa: PLC0415
+
+    job_id = _seed_dead_letter_sync(cli_env.storage, tenant_id=cli_env.tenant_id)
+    result = runner.invoke(cli_app, ["jobs", "dead-letter", "list", "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["jobs"][0]["job_id"] == job_id
+    assert payload["jobs"][0]["status"] == "dead_letter"
+
+
+@pytest.mark.unit
+def test_cli_dead_letter_list_empty(cli_env) -> None:
+    import json  # noqa: PLC0415
+
+    result = runner.invoke(cli_app, ["jobs", "dead-letter", "list", "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"jobs": [], "count": 0}
+
+
+@pytest.mark.unit
+def test_cli_dead_letter_retry_requeues(cli_env) -> None:
+    """`retry <id>` requeues the job; a follow-up `jobs show` sees it queued."""
+    import json  # noqa: PLC0415
+
+    job_id = _seed_dead_letter_sync(cli_env.storage, tenant_id=cli_env.tenant_id)
+    result = runner.invoke(cli_app, ["jobs", "dead-letter", "retry", job_id, "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["requeued"] == [job_id]
+
+    show = runner.invoke(cli_app, ["jobs", "show", job_id, "--output", "json"])
+    assert json.loads(show.stdout)["status"] == "queued"
+
+
+@pytest.mark.unit
+def test_cli_dead_letter_retry_all(cli_env) -> None:
+    import json  # noqa: PLC0415
+
+    a = _seed_dead_letter_sync(cli_env.storage, tenant_id=cli_env.tenant_id, target="alpha")
+    b = _seed_dead_letter_sync(cli_env.storage, tenant_id=cli_env.tenant_id, target="beta")
+    result = runner.invoke(cli_app, ["jobs", "dead-letter", "retry", "--all", "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 2
+    assert set(payload["requeued"]) == {a, b}
+
+
+@pytest.mark.unit
+def test_cli_dead_letter_retry_rejects_both_id_and_all(cli_env) -> None:
+    """Passing both <job_id> and --all (or neither) is a usage error."""
+    result = runner.invoke(cli_app, ["jobs", "dead-letter", "retry", "some-id", "--all"])
+    assert result.exit_code == 2
+    assert "exactly one" in result.stderr
+
+
+@pytest.mark.unit
+def test_cli_dead_letter_retry_non_dead_letter_404(cli_env) -> None:
+    """Retrying a non-dead-letter id surfaces the runtime's clean 404."""
+    submit = runner.invoke(cli_app, ["submit", "alpha", "{}"])
+    import json  # noqa: PLC0415
+
+    job_id = json.loads(submit.stdout)["job_id"]
+    result = runner.invoke(cli_app, ["jobs", "dead-letter", "retry", job_id])
+    assert result.exit_code == 4  # HTTP 4xx class
+
+
+@pytest.mark.unit
+def test_cli_dead_letter_purge_with_yes(cli_env) -> None:
+    import json  # noqa: PLC0415
+
+    _seed_dead_letter_sync(cli_env.storage, tenant_id=cli_env.tenant_id)
+    result = runner.invoke(cli_app, ["jobs", "dead-letter", "purge", "--yes", "--output", "json"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["purged"] == 1
+
+
+@pytest.mark.unit
+def test_cli_dead_letter_purge_confirm_abort(cli_env) -> None:
+    """Without --yes, answering 'n' at the prompt aborts (exit 1, nothing
+    purged)."""
+    job_id = _seed_dead_letter_sync(cli_env.storage, tenant_id=cli_env.tenant_id)
+    result = runner.invoke(cli_app, ["jobs", "dead-letter", "purge"], input="n\n")
+    assert result.exit_code == 1
+    # The dead-letter survives.
+    show = runner.invoke(cli_app, ["jobs", "show", job_id, "--output", "json"])
+    import json  # noqa: PLC0415
+
+    assert json.loads(show.stdout)["status"] == "dead_letter"
 
 
 # ---------------------------------------------------------------------------

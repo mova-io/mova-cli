@@ -300,6 +300,40 @@ incident-resolution, batch lanes for evals) — Phase 3.
 
 ---
 
+## Patterns × runners: the cross product
+
+**Principle.** Patterns produce `workflow.yaml` (the IR). The runner Protocol
+executes it. Patterns never know which backend is running them; backends never
+know which pattern produced the workflow. Patterns × runners is a clean cross
+product.
+
+| Pattern (ADR 038) | native (default) | langgraph (ADR 030) | temporal (ADR 054) |
+|---|---|---|---|
+| chatbot | in-process, fast | exportable | works (overkill for chatbot) |
+| task-oriented | in-process, bounded fan-out | LangGraph DAG | Temporal parent + child activities |
+| goal-oriented | bounded loop (unrolled) | LangGraph | bounded loop in workflow body — deterministic, durable iteration |
+| monitor | in-process | LangGraph | Temporal cron + signal-driven |
+| simulation | bounded turns + judge | LangGraph | Temporal parent + roster activities |
+
+Three patterns specifically benefit from Temporal:
+
+- **goal-oriented + Temporal** — long iterative agents that survive restarts; deterministic replay across iterations.
+- **monitor + Temporal** — production-grade alerting agents with Temporal cron + signal-driven action workflows; replay debugging audit-ready.
+- **simulation + Temporal** — multi-day agent debate / negotiation; each turn an activity with retry/heartbeat.
+
+**Compiler responsibility.** The Phase 1 compiler must lower each pattern's
+structural primitives to Temporal correctly: bounded fan-out →
+`execute_activities_in_parallel`; bounded loop → `for _ in range(N)` in workflow
+body; HUMAN node → `wait_condition + signal` (Phase 2); JUDGE → activity
+returning verdict. See items 1.6 / 1.7 / 2.1 of the Three-phase plan below.
+
+**Governance preservation.** Budget caps tracked via `workflow.info()`
+accumulator; eval-gates remain JUDGE activities; bounded fan-out enforced at
+compile time. Pattern governance metadata (ADR 038) flows through to the
+compiled workflow unchanged.
+
+---
+
 ## Three-phase plan
 
 | Phase | Scope | Effort |

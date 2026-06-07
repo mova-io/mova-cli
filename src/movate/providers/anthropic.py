@@ -102,17 +102,37 @@ class AnthropicProvider(BaseLLMProvider):
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         try:
+            # ``cache_prompt`` is a movate-side toggle, NOT an Anthropic API
+            # field — pop it before building the SDK call. Defaults ON for
+            # native Anthropic (the whole point of this runtime is to use
+            # SDK features LiteLLM surfaces lossily). Opt out per-agent with
+            # ``model.params.cache_prompt: false``.
+            params, cache_prompt = _pop_cache_prompt(request.params)
+
             # Translate the executor's OpenAI-style history into the
             # shape the Anthropic SDK expects: system as a separate
             # kwarg, plus messages with content-block arrays for
             # ``tool_use`` / ``tool_result`` turns.
             system, user_messages = _translate_messages(request.messages)
             extra_kwargs: dict[str, Any] = {}
-            if request.tools:
+            tools = request.tools
+            if cache_prompt:
+                # Mark the stable prefix (system + contexts + tool specs)
+                # with an ephemeral cache breakpoint. The variable suffix
+                # (the user turn) stays uncached. The breakpoint sits on the
+                # END of the stable region: the last tool spec when tools are
+                # present (tools render last in the prefix: tools→system→msgs
+                # is the API order, but the cache key walks the whole prefix),
+                # otherwise the system block. We set BOTH the system block and
+                # the last tool so the prefix is fully covered regardless of
+                # which renders last.
+                system = _cache_system(system)
+                tools = _cache_last_tool(tools)
+            if tools:
                 # to_tool_spec already produced Anthropic-shaped specs
                 # (flat ``{name, description, input_schema}``). Pass
-                # through unchanged.
-                extra_kwargs["tools"] = request.tools
+                # through (with the breakpoint applied above, if any).
+                extra_kwargs["tools"] = tools
             # mypy: the SDK declares ``messages`` as ``Iterable[MessageParam]``
             # (a TypedDict). Our user_messages are runtime-typed dicts with
             # the same keys — the SDK accepts them but the strict type
@@ -122,7 +142,7 @@ class AnthropicProvider(BaseLLMProvider):
                 messages=user_messages,  # type: ignore[arg-type]  # runtime dicts match MessageParam
                 system=system,
                 **extra_kwargs,
-                **_translate_params(request.params),
+                **_translate_params(params),
             )
         except Exception as exc:
             _translate_exception(exc)
@@ -139,12 +159,15 @@ class AnthropicProvider(BaseLLMProvider):
         and the final usage on the closing chunk — same contract as
         :class:`LiteLLMProvider`."""
         try:
+            params, cache_prompt = _pop_cache_prompt(request.params)
             system, user_messages = _translate_messages(request.messages)
+            if cache_prompt:
+                system = _cache_system(system)
             async with self._client.messages.stream(
                 model=request.provider,
                 messages=user_messages,  # type: ignore[arg-type]  # runtime dicts match MessageParam
                 system=system,
-                **_translate_params(request.params),
+                **_translate_params(params),
             ) as event_stream:
                 async for event in event_stream:
                     chunk = _stream_chunk_from_event(event)
@@ -289,6 +312,65 @@ def _translate_messages(
     return ("\n\n".join(system_parts) if system_parts else ""), out
 
 
+_EPHEMERAL = {"type": "ephemeral"}
+
+
+def _pop_cache_prompt(params: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Split the movate-only ``cache_prompt`` toggle out of ``params``.
+
+    Returns ``(sdk_params, cache_enabled)``. ``cache_prompt`` is NOT an
+    Anthropic API field, so it must be removed before the dict is splatted
+    into ``messages.create`` / ``messages.stream`` (which would 400 on an
+    unknown kwarg). Defaults to ``True`` for native Anthropic — prompt
+    caching is on unless the agent opts out with
+    ``model.params.cache_prompt: false``. Accepts the JSON/YAML-ish truthy
+    spellings an ``agent.yaml`` author might write."""
+    out = dict(params)
+    raw = out.pop("cache_prompt", True)
+    if isinstance(raw, str):
+        enabled = raw.strip().lower() not in {"false", "0", "no", "off", ""}
+    else:
+        enabled = bool(raw)
+    return out, enabled
+
+
+def _cache_system(system: str) -> Any:
+    """Mark the system prompt as a cache breakpoint.
+
+    movate sends the rendered prompt (system prompt + shared contexts) as
+    the ``system=`` kwarg when any ``role="system"`` message is present;
+    in the common movate path the rendered text rides a ``user`` message
+    instead and ``system`` is ``""``. An empty system has nothing to
+    cache — return it unchanged (the tool breakpoint, if any, still
+    covers the prefix). A non-empty system becomes a single text block
+    tagged ``cache_control: ephemeral`` so everything up to and including
+    it is cached and reused across requests."""
+    if not system:
+        return system
+    return [{"type": "text", "text": system, "cache_control": dict(_EPHEMERAL)}]
+
+
+def _cache_last_tool(
+    tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Tag the LAST tool spec with ``cache_control: ephemeral``.
+
+    Tool definitions are part of the stable, reused prefix — they don't
+    change per request. A breakpoint on the last tool caches every tool
+    spec before it (Anthropic walks the whole prefix up to the marker).
+    Returns a NEW list with a shallow-copied last entry so the caller's
+    ``request.tools`` (and the executor's cached ``tool_specs``) are never
+    mutated — re-tagging the same dict every turn would still be correct,
+    but copying keeps the breakpoint a pure function of this call."""
+    if not tools:
+        return tools
+    out = list(tools)
+    last = dict(out[-1])
+    last["cache_control"] = dict(_EPHEMERAL)
+    out[-1] = last
+    return out
+
+
 def _translate_params(params: dict[str, Any]) -> dict[str, Any]:
     """Anthropic requires ``max_tokens``. If the user didn't set it,
     pick a sane default — matches LiteLLM's default for Anthropic
@@ -376,15 +458,30 @@ def _tokens_from_usage(usage: Any) -> TokenUsage:
 
     Anthropic returns ``input_tokens`` + ``output_tokens`` (+ optional
     ``cache_creation_input_tokens`` / ``cache_read_input_tokens`` for
-    prompt caching). We map cache reads to ``cached_input`` to match
-    the OpenAI convention; cache writes don't have a counterpart yet
-    in our :class:`TokenUsage` model — that's tracked but not surfaced."""
+    prompt caching). On the wire these three input counts are DISJOINT:
+    ``input_tokens`` is the uncached remainder only, ``cache_read_*`` are
+    tokens served from cache, and ``cache_creation_*`` are tokens written
+    to cache this request.
+
+    :class:`TokenUsage` uses the OpenAI convention where ``cached_input``
+    is a SUBSET of ``input`` (see :meth:`PricingTable.cost_for`). To stay
+    consistent we fold cache reads back INTO ``input`` (``input_tokens +
+    cache_read_input_tokens``) and report ``cached_input`` as that subset.
+    The cost calc then prices ``input - cached_input`` (the true uncached
+    remainder) at the full rate and ``cached_input`` at the read rate —
+    same arithmetic as the OpenAI/LiteLLM path. Cache writes are a
+    separate billable bucket (not part of ``input``) carried in
+    ``cache_write`` and priced at the write premium."""
     if usage is None:
         return TokenUsage()
+    uncached = int(getattr(usage, "input_tokens", 0) or 0)
+    cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    cache_write = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
     return TokenUsage(
-        input=int(getattr(usage, "input_tokens", 0) or 0),
+        input=uncached + cache_read,
         output=int(getattr(usage, "output_tokens", 0) or 0),
-        cached_input=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        cached_input=cache_read,
+        cache_write=cache_write,
     )
 
 

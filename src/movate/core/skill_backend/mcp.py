@@ -1,9 +1,28 @@
-"""MCP skill backend — talk to a Model Context Protocol server over stdio.
+"""MCP skill backend — talk to a Model Context Protocol server over stdio or HTTP/SSE.
 
 Third backend per ADR 002. Lets skills invoke tools exposed by an MCP
 server (Anthropic's Model Context Protocol). The server can be any
 process that speaks MCP — internal tool servers, npx-installed
-community servers, customer-hosted bridges to legacy systems.
+community servers, customer-hosted bridges to legacy systems — **or** a
+hosted MCP server reachable over HTTP/SSE (GitHub, Slack, Jira community
+servers, customer-hosted SaaS bridges).
+
+Two transport modes (selected automatically from ``entry``):
+
+* **stdio** (default) — ``entry`` is a shell command; the backend spawns
+  a subprocess, connects via newline-delimited JSON-RPC over stdin/stdout.
+* **HTTP/SSE** — ``entry`` starts with ``http://`` or ``https://``; the
+  backend POSTs JSON-RPC requests to the URL and reads SSE responses.
+  Connection pooling per URL mirrors the subprocess pool per command.
+
+Two tool modes:
+
+* **Single-tool** (``tool:`` specified in skill.yaml) — backward-compatible;
+  the skill invokes exactly one named tool on the server.
+* **Multi-tool** (``tool:`` omitted) — the backend calls ``tools/list``,
+  registers every tool as a namespaced callable
+  (``<skill-name>.<tool-name>``), and the executor sees multiple tools
+  from one skill declaration.
 
 Why hand-rolled instead of the official ``mcp`` Python SDK?
 
@@ -13,20 +32,23 @@ to implement cleanly. The official SDK pulls in a transitive
 dependency tree that's heavy for the slice we use, and would add
 another ``[mcp]`` optional-extra to install. A focused implementation
 keeps the dep footprint small and gives us tight control over the
-error → :class:`SkillError` mapping.
+error → :class:`SkillError` mapping. The HTTP/SSE transport reuses
+the existing ``httpx`` dep (already in ``pyproject.toml``).
 
 Lifecycle:
 
 * First invocation of a skill referencing a particular ``entry``
-  command spawns the subprocess + performs the MCP handshake.
-* Subsequent calls reuse the running subprocess (one connection pool
-  per unique server command).
-* :meth:`MCPSkillBackend.aclose` terminates every subprocess
-  gracefully on executor shutdown.
+  command spawns the subprocess (or opens an HTTP client) + performs
+  the MCP handshake.
+* Subsequent calls reuse the running session (one connection pool
+  per unique ``entry``).
+* :meth:`MCPSkillBackend.aclose` terminates every subprocess and
+  closes every HTTP client gracefully on executor shutdown.
 
 Failure → :class:`SkillError` mapping:
 
 * Subprocess fails to start (binary missing, exits early) → ``backend_error``
+* HTTP connection fails (DNS, TLS, timeout) → ``backend_error``
 * MCP handshake fails (bad protocol version, malformed JSON-RPC) → ``backend_error``
 * Tool name doesn't appear in the server's ``tools/list`` → ``backend_error``
 * Server returns an error response → ``backend_error`` with the server's message
@@ -40,18 +62,15 @@ Tracing (ADR 024):
 When ``ctx.tracer`` is set the backend opens an ``mcp.call`` child span
 under ``ctx.parent_span`` and closes it on success/error. The span carries
 the ``entry`` command, ``tool`` name, and — on error — the bounded stderr
-ring-buffer so operators can see why a server misbehaved.
-
-Scope today (v0.6): stdio transport, single tool per skill (skill
-yaml declares ``tool:`` for the specific tool to call). HTTP/SSE
-transport and multi-tool batching land in a follow-up if real
-customer demand surfaces.
+ring-buffer (stdio) or HTTP status (HTTP/SSE) so operators can see why a
+server misbehaved.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shlex
 import time
 from collections import deque
@@ -67,8 +86,11 @@ from movate.core.skill_backend.base import (
 )
 
 if TYPE_CHECKING:
+    import httpx
+
     from movate.core.skill_loader import SkillBundle
 
+_log = logging.getLogger(__name__)
 
 # MCP protocol version we negotiate. Locking to a known version makes
 # debugging easier; we'll bump deliberately when MCP servers in the
@@ -86,6 +108,12 @@ _INITIAL_ID = 1
 # memory on a long-running session. Kept intentionally small — the
 # goal is crash diagnostics, not a full log stream.
 _STDERR_RING_MAX = 50
+
+
+def _is_http_entry(entry: str) -> bool:
+    """Return True when *entry* looks like an HTTP/SSE URL."""
+    lower = entry.lower()
+    return lower.startswith("http://") or lower.startswith("https://")
 
 
 @dataclass
@@ -117,13 +145,34 @@ class _Session:
     _stderr_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
-class MCPSkillBackend:
-    """Dispatches ``kind: mcp`` skills via subprocess + JSON-RPC stdio.
+@dataclass
+class _HttpSession:
+    """One HTTP/SSE connection to a remote MCP server.
 
-    Per-instance lifecycle: one ``_Session`` per unique ``entry``
-    command. The executor's tool-use loop hits ``execute()``; this
-    backend spawns + handshakes lazily, then reuses the subprocess for
-    every subsequent call to the same server.
+    Held in :attr:`MCPSkillBackend._http_sessions` keyed by the URL.
+    Mirrors ``_Session`` for the stdio path but uses an
+    ``httpx.AsyncClient`` + plain HTTP POST for JSON-RPC instead of
+    subprocess I/O.
+    """
+
+    client: httpx.AsyncClient
+    url: str
+    next_id: int = _INITIAL_ID
+    initialized: bool = False
+    # Tools the server reported via tools/list — populated lazily.
+    tools_known: set[str] | None = None
+    # Full tools/list response: list of tool descriptors (name, description,
+    # inputSchema). Stored for multi-tool discovery.
+    tools_descriptors: list[dict[str, Any]] = field(default_factory=list)
+
+
+class MCPSkillBackend:
+    """Dispatches ``kind: mcp`` skills via subprocess stdio or HTTP/SSE.
+
+    Per-instance lifecycle: one ``_Session`` (stdio) or ``_HttpSession``
+    (HTTP) per unique ``entry``. The executor's tool-use loop hits
+    ``execute()``; this backend spawns + handshakes lazily, then reuses
+    the connection for every subsequent call to the same server.
     """
 
     kind = SkillImplementationKind.MCP
@@ -133,6 +182,8 @@ class MCPSkillBackend:
         # (e.g. ``./mcp-servers/github``); we deduplicate by command
         # so two skills pointing at the same server share one process.
         self._sessions: dict[str, _Session] = {}
+        # URL → HTTP session. Same deduplication for HTTP/SSE servers.
+        self._http_sessions: dict[str, _HttpSession] = {}
         # Guards concurrent first-call spawns so two simultaneous
         # tool calls to a new server don't race on subprocess startup.
         self._spawn_lock = asyncio.Lock()
@@ -144,11 +195,37 @@ class MCPSkillBackend:
         ctx: SkillExecutionContext,
     ) -> dict[str, Any]:
         impl = skill.spec.implementation
-        if not impl.tool:  # pragma: no cover — model validator catches this
+        is_http = _is_http_entry(impl.entry)
+
+        # Resolve the tool name.  In single-tool mode (tool: specified),
+        # use it directly.  In multi-tool mode (tool: omitted), the
+        # caller passes ``__tool__`` in the input dict — the executor
+        # injects it when dispatching a namespaced tool call like
+        # ``github.create_issue``.  If neither is present, error early.
+        tool_name = impl.tool or input.pop("__tool__", None)
+        if not tool_name:
             raise SkillError(
                 type=SkillErrorType.BACKEND_ERROR,
-                message=f"mcp skill {skill.spec.name!r}: implementation.tool is empty",
+                message=(
+                    f"mcp skill {skill.spec.name!r}: no tool specified "
+                    "(set implementation.tool in skill.yaml, or pass "
+                    "__tool__ in the input for multi-tool mode)"
+                ),
             )
+
+        if is_http:
+            return await self._execute_http(skill, tool_name, input, ctx)
+        return await self._execute_stdio(skill, tool_name, input, ctx)
+
+    async def _execute_stdio(
+        self,
+        skill: SkillBundle,
+        tool: str,
+        input: dict[str, Any],
+        ctx: SkillExecutionContext,
+    ) -> dict[str, Any]:
+        """Execute a tool call via the stdio transport."""
+        impl = skill.spec.implementation
 
         # Spawn the subprocess + handshake on first use. Concurrent
         # calls for a brand-new server bottleneck on the same lock so
@@ -162,12 +239,12 @@ class MCPSkillBackend:
         # and inconsistent).
         if session.tools_known is None:
             session.tools_known = await self._list_tools(session, skill.spec.name)
-        if impl.tool not in session.tools_known:
+        if tool not in session.tools_known:
             raise SkillError(
                 type=SkillErrorType.BACKEND_ERROR,
                 message=(
                     f"mcp skill {skill.spec.name!r}: server has no tool "
-                    f"{impl.tool!r}; available: {sorted(session.tools_known)}"
+                    f"{tool!r}; available: {sorted(session.tools_known)}"
                 ),
             )
 
@@ -182,18 +259,15 @@ class MCPSkillBackend:
                 {
                     "skill": skill.spec.name,
                     "entry": impl.entry,
-                    "tool": impl.tool,
+                    "tool": tool,
                 },
                 parent=ctx.parent_span,
             )
 
         try:
-            # Make the tools/call request. Schema validation happens one
-            # layer up in dispatch_skill, both directions; here we just
-            # produce a dict from whatever the server returned.
             result = await self._call_tool(
                 session,
-                tool=impl.tool,
+                tool=tool,
                 arguments=input,
                 skill_name=skill.spec.name,
             )
@@ -214,9 +288,64 @@ class MCPSkillBackend:
                 ctx.tracer.end_span(_span, status="error")
             raise
 
+    async def _execute_http(
+        self,
+        skill: SkillBundle,
+        tool: str,
+        input: dict[str, Any],
+        ctx: SkillExecutionContext,
+    ) -> dict[str, Any]:
+        """Execute a tool call via the HTTP/SSE transport."""
+        impl = skill.spec.implementation
+
+        async with self._spawn_lock:
+            http_session = await self._ensure_http_session(impl.entry, skill.spec.name)
+
+        if http_session.tools_known is None:
+            tools_known, descriptors = await self._http_list_tools(http_session, skill.spec.name)
+            http_session.tools_known = tools_known
+            http_session.tools_descriptors = descriptors
+        if tool not in http_session.tools_known:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill.spec.name!r}: server has no tool "
+                    f"{tool!r}; available: {sorted(http_session.tools_known)}"
+                ),
+            )
+
+        _span = None
+        _t0 = 0.0
+        if ctx.tracer is not None:
+            _t0 = time.monotonic()
+            _span = ctx.tracer.start_span(
+                "mcp.call",
+                {"skill": skill.spec.name, "entry": impl.entry, "tool": tool},
+                parent=ctx.parent_span,
+            )
+
+        try:
+            result = await self._http_call_tool(
+                http_session,
+                tool=tool,
+                arguments=input,
+                skill_name=skill.spec.name,
+            )
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="ok")
+            return result
+        except Exception:
+            if _span is not None and ctx.tracer is not None:
+                lat = (time.monotonic() - _t0) * 1000
+                ctx.tracer.set_attribute(_span, "latency_ms", round(lat, 1))
+                ctx.tracer.end_span(_span, status="error")
+            raise
+
     async def aclose(self) -> None:
-        """Terminate every cached subprocess. Safe to call multiple
-        times; missing processes are silently skipped."""
+        """Terminate every cached subprocess and close HTTP clients.
+        Safe to call multiple times; missing processes are silently skipped."""
         for entry, session in list(self._sessions.items()):
             # Cancel the background stderr-drain task before terminating
             # the process so we don't leave a dangling task behind.
@@ -225,6 +354,9 @@ class MCPSkillBackend:
                 await asyncio.gather(session._stderr_task, return_exceptions=True)
             await _terminate_process(session.process)
             del self._sessions[entry]
+        for url, http_session in list(self._http_sessions.items()):
+            await http_session.client.aclose()
+            del self._http_sessions[url]
 
     # ------------------------------------------------------------------
     # Session management
@@ -478,6 +610,304 @@ class MCPSkillBackend:
             message["params"] = params
         await _write_message(session, message, skill_name=skill_name)
 
+    # ------------------------------------------------------------------
+    # Multi-tool discovery (both transports)
+    # ------------------------------------------------------------------
+
+    async def discover_tools(
+        self,
+        entry: str,
+        skill_name: str,
+    ) -> list[dict[str, Any]]:
+        """Return the full tools/list descriptors for *entry*.
+
+        Used by ``mdk skills add-mcp`` to discover and display available
+        tools. Returns a list of ``{"name": ..., "description": ...,
+        "inputSchema": ...}`` dicts.
+        """
+        if _is_http_entry(entry):
+            async with self._spawn_lock:
+                http_session = await self._ensure_http_session(entry, skill_name)
+            if http_session.tools_known is None:
+                tools_known, descriptors = await self._http_list_tools(http_session, skill_name)
+                http_session.tools_known = tools_known
+                http_session.tools_descriptors = descriptors
+            return http_session.tools_descriptors
+        else:
+            async with self._spawn_lock:
+                session = await self._ensure_session(entry, skill_name)
+            if session.tools_known is None:
+                session.tools_known = await self._list_tools(session, skill_name)
+            # Re-fetch full descriptors (the _list_tools path only stored
+            # names). This is a one-off discovery call so the extra
+            # round-trip is acceptable.
+            result = await self._rpc_call(
+                session,
+                method="tools/list",
+                params={},
+                skill_name=skill_name,
+            )
+            if isinstance(result, dict):
+                return [
+                    t
+                    for t in result.get("tools", [])
+                    if isinstance(t, dict) and isinstance(t.get("name"), str)
+                ]
+            return []
+
+    # ------------------------------------------------------------------
+    # HTTP/SSE session management
+    # ------------------------------------------------------------------
+
+    async def _ensure_http_session(self, url: str, skill_name: str) -> _HttpSession:
+        """Get or create an HTTP/SSE session for *url*."""
+        existing = self._http_sessions.get(url)
+        if existing is not None:
+            return existing
+        session = await self._http_spawn(url, skill_name)
+        self._http_sessions[url] = session
+        return session
+
+    async def _http_spawn(self, url: str, skill_name: str) -> _HttpSession:
+        """Open an HTTP client and perform the MCP handshake."""
+        import httpx as _httpx  # noqa: PLC0415
+
+        client = _httpx.AsyncClient(
+            timeout=_httpx.Timeout(30.0, connect=10.0),
+            follow_redirects=True,
+        )
+        session = _HttpSession(client=client, url=url)
+
+        try:
+            handshake_result = await self._http_rpc_call(
+                session,
+                method="initialize",
+                params={
+                    "protocolVersion": _MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "movate", "version": "0.6.0"},
+                },
+                skill_name=skill_name,
+            )
+        except SkillError:
+            await client.aclose()
+            raise
+
+        if not isinstance(handshake_result, dict) or "protocolVersion" not in handshake_result:
+            await client.aclose()
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: HTTP server's initialize "
+                    f"response missing protocolVersion: {handshake_result!r}"
+                ),
+            )
+
+        # Send initialized notification (fire-and-forget).
+        await self._http_rpc_notify(
+            session,
+            method="notifications/initialized",
+            skill_name=skill_name,
+        )
+        session.initialized = True
+        return session
+
+    async def _http_list_tools(
+        self, session: _HttpSession, skill_name: str
+    ) -> tuple[set[str], list[dict[str, Any]]]:
+        """Query the HTTP server's tool catalog."""
+        result = await self._http_rpc_call(
+            session,
+            method="tools/list",
+            params={},
+            skill_name=skill_name,
+        )
+        if not isinstance(result, dict):
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: tools/list response wasn't "
+                    f"a JSON object: {result!r}"
+                ),
+            )
+        tools = result.get("tools", [])
+        names: set[str] = set()
+        descriptors: list[dict[str, Any]] = []
+        for entry in tools:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                names.add(entry["name"])
+                descriptors.append(entry)
+        return names, descriptors
+
+    async def _http_call_tool(
+        self,
+        session: _HttpSession,
+        *,
+        tool: str,
+        arguments: dict[str, Any],
+        skill_name: str,
+    ) -> dict[str, Any]:
+        """Make a tools/call RPC over HTTP and parse the response."""
+        result = await self._http_rpc_call(
+            session,
+            method="tools/call",
+            params={"name": tool, "arguments": arguments},
+            skill_name=skill_name,
+        )
+        if not isinstance(result, dict):
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: tools/call response wasn't "
+                    f"a JSON object: {result!r}"
+                ),
+            )
+
+        if result.get("isError"):
+            err_text = _extract_text(result.get("content"))
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: server reported tool error: "
+                    f"{err_text or '<no error text>'}"
+                ),
+            )
+
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured
+
+        text = _extract_text(result.get("content"))
+        if text is None:
+            raise SkillError(
+                type=SkillErrorType.VALIDATION_FAILED,
+                message=(
+                    f"mcp skill {skill_name!r}: server returned neither "
+                    "structuredContent nor any text content; can't extract a "
+                    "result dict"
+                ),
+            )
+        try:
+            parsed = json.loads(text)
+        except ValueError as exc:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: server's content text wasn't valid JSON: {exc}"
+                ),
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise SkillError(
+                type=SkillErrorType.VALIDATION_FAILED,
+                message=(
+                    f"mcp skill {skill_name!r}: server returned content of "
+                    f"type {type(parsed).__name__}, expected a JSON object"
+                ),
+            )
+        return parsed
+
+    # ------------------------------------------------------------------
+    # HTTP/SSE JSON-RPC wire protocol
+    # ------------------------------------------------------------------
+
+    async def _http_rpc_call(
+        self,
+        session: _HttpSession,
+        *,
+        method: str,
+        params: dict[str, Any],
+        skill_name: str,
+    ) -> Any:
+        """POST a JSON-RPC request to the server, parse the response.
+
+        The MCP HTTP/SSE transport sends JSON-RPC as a POST body and
+        receives a JSON-RPC response (possibly SSE-wrapped). We handle
+        both plain JSON and SSE (``text/event-stream``) responses for
+        maximum compatibility with hosted servers.
+        """
+        request_id = session.next_id
+        session.next_id += 1
+        request = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        try:
+            resp = await session.client.post(
+                session.url,
+                json=request,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+        except Exception as exc:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: HTTP request to "
+                    f"{session.url} failed: {type(exc).__name__}: {exc}"
+                ),
+            ) from exc
+
+        if resp.is_error:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: HTTP {resp.status_code} "
+                    f"from {session.url}: {resp.text[:500]}"
+                ),
+            )
+
+        # Parse response — may be plain JSON or SSE.
+        content_type = resp.headers.get("content-type", "")
+        if "text/event-stream" in content_type:
+            return _parse_sse_response(resp.text, request_id, method, skill_name)
+        # Plain JSON response.
+        try:
+            message = resp.json()
+        except ValueError as exc:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: HTTP response from "
+                    f"{session.url} wasn't valid JSON: {exc}"
+                ),
+            ) from exc
+
+        if not isinstance(message, dict):
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: HTTP response wasn't a JSON object: {message!r}"
+                ),
+            )
+
+        if "error" in message:
+            err = message["error"]
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: server returned JSON-RPC error on {method}: {err}"
+                ),
+            )
+        return message.get("result")
+
+    async def _http_rpc_notify(
+        self,
+        session: _HttpSession,
+        *,
+        method: str,
+        skill_name: str,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        """POST a JSON-RPC notification (no id, no response expected)."""
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        import contextlib  # noqa: PLC0415
+
+        with contextlib.suppress(Exception):
+            await session.client.post(session.url, json=message)
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers (testable independently)
@@ -672,6 +1102,56 @@ def _extract_text(content: Any) -> str | None:
             if isinstance(text, str):
                 return text
     return None
+
+
+def _parse_sse_response(
+    body: str,
+    expected_id: int,
+    method: str,
+    skill_name: str,
+) -> Any:
+    """Parse a ``text/event-stream`` body for the JSON-RPC response.
+
+    SSE frames look like::
+
+        event: message
+        data: {"jsonrpc":"2.0","id":1,"result":{...}}
+
+    We look for the first ``data:`` line whose parsed JSON has an
+    ``id`` matching ``expected_id``.
+    """
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("data:"):
+            continue
+        payload = stripped[len("data:") :].strip()
+        if not payload:
+            continue
+        try:
+            message = json.loads(payload)
+        except ValueError:
+            continue
+        if not isinstance(message, dict):
+            continue
+        if message.get("id") != expected_id:
+            continue
+        if "error" in message:
+            err = message["error"]
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: server returned JSON-RPC error on {method}: {err}"
+                ),
+            )
+        return message.get("result")
+
+    raise SkillError(
+        type=SkillErrorType.BACKEND_ERROR,
+        message=(
+            f"mcp skill {skill_name!r}: SSE response from server "
+            f"contained no matching JSON-RPC reply for id={expected_id}"
+        ),
+    )
 
 
 # Auto-register on import. The executor + skills_cmd import this

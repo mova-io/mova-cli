@@ -103,6 +103,11 @@ class OpenAIProvider(BaseLLMProvider):
         extra_kwargs: dict[str, Any] = {}
         if request.tools:
             extra_kwargs["tools"] = request.tools
+        # ``cache_prompt`` is the Anthropic-caching toggle and a no-op here:
+        # OpenAI prompt caching is automatic and server-side, with no
+        # ``cache_control`` markers to set. Strip it so it never reaches
+        # the OpenAI SDK as an unknown kwarg (which would 400).
+        params = {k: v for k, v in request.params.items() if k != "cache_prompt"}
         try:
             resp = await self._client.chat.completions.create(
                 model=request.provider,
@@ -110,7 +115,7 @@ class OpenAIProvider(BaseLLMProvider):
                 # (a TypedDict); our runtime dicts satisfy the same keys.
                 messages=[m.model_dump(exclude_none=True) for m in request.messages],  # type: ignore[misc]
                 **extra_kwargs,
-                **request.params,
+                **params,
             )
         except Exception as exc:
             _translate_exception(exc)
@@ -125,6 +130,8 @@ class OpenAIProvider(BaseLLMProvider):
         usage stats — cost accounting downstream would read zero.
         Force it on like LiteLLMProvider does."""
         params = dict(request.params)
+        # No-op Anthropic-caching toggle — strip before it reaches the SDK.
+        params.pop("cache_prompt", None)
         existing_opts = params.pop("stream_options", None) or {}
         params["stream_options"] = {**existing_opts, "include_usage": True}
 

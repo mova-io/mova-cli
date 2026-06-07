@@ -133,6 +133,17 @@ def run(  # noqa: PLR0912 — flat mode-dispatch (remote/replay/estimate/workflo
             "cost). No effect on non-RAG agents or without --estimate."
         ),
     ),
+    runtime: str = typer.Option(
+        None,
+        "--runtime",
+        help=(
+            "Override the workflow execution backend for THIS run only (ADR 055 D3): "
+            "[bold]native[/bold] (in-process, default), [bold]temporal[/bold] (durable/"
+            "deterministic, needs mdk[temporal] + TEMPORAL_HOST), or [bold]langgraph[/bold] "
+            "(not yet wired — fails loud). Precedence: this flag > workflow.yaml 'runtime:' "
+            "field > native. Read-only — never mutates the spec. Agent runs ignore it."
+        ),
+    ),
     output_format: Run = typer.Option(
         _default_output_format,
         "--output",
@@ -268,8 +279,23 @@ def run(  # noqa: PLR0912 — flat mode-dispatch (remote/replay/estimate/workflo
             # silently ignoring the flag.
             console.print("[red]✗[/red] --stream supports agents only; workflow streaming is TBD")
             raise typer.Exit(code=2)
-        _dispatch_workflow(path, input_flag or input_arg, mock=mock, output_format=output_format)
+        _dispatch_workflow(
+            path,
+            input_flag or input_arg,
+            mock=mock,
+            output_format=output_format,
+            runtime_override=runtime,
+        )
     else:
+        if runtime is not None:
+            # --runtime selects a *workflow* execution backend; it has no
+            # meaning for a single agent run. Fail loud rather than silently
+            # ignoring it (the operator clearly expected it to do something).
+            console.print(
+                "[red]✗[/red] --runtime applies to workflows only; "
+                "this path is an agent. Drop --runtime."
+            )
+            raise typer.Exit(code=2)
         _dispatch_agent(
             path,
             input_flag or input_arg,
@@ -870,7 +896,14 @@ def _streaming_callback() -> Callable[[str], None]:
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_workflow(path: Path, raw: str | None, *, mock: bool, output_format: Run) -> None:
+def _dispatch_workflow(
+    path: Path,
+    raw: str | None,
+    *,
+    mock: bool,
+    output_format: Run,
+    runtime_override: str | None = None,
+) -> None:
     try:
         spec, parent = load_workflow_spec(path)
     except WorkflowSpecLoadError as exc:
@@ -890,7 +923,15 @@ def _dispatch_workflow(path: Path, raw: str | None, *, mock: bool, output_format
     else:
         initial_state = _coerce_workflow_input(raw)
 
-    asyncio.run(_run_local_workflow(graph, initial_state, output_format=output_format, mock=mock))
+    asyncio.run(
+        _run_local_workflow(
+            graph,
+            initial_state,
+            output_format=output_format,
+            mock=mock,
+            runtime_override=runtime_override,
+        )
+    )
 
 
 def _coerce_workflow_input(arg: str) -> dict[str, Any]:
@@ -917,15 +958,75 @@ async def _run_local_workflow(
     *,
     output_format: Run,
     mock: bool,
+    runtime_override: str | None = None,
 ) -> None:
-    rt = await build_local_runtime(mock=mock)
-    runner = WorkflowRunner(executor=rt.executor, storage=rt.storage)
+    # ADR 055 D2/D3 — the single dispatch fork. Resolve the effective runtime
+    # (override > workflow.yaml 'runtime:' > native), fail loud on an
+    # unavailable backend (D6), then route. The native branch is byte-for-byte
+    # today's path (no compile, no temporalio import).
+    from movate.runtime.langgraph_backend import (  # noqa: PLC0415
+        run_langgraph_workflow,
+    )
+    from movate.runtime.workflow_backend import (  # noqa: PLC0415
+        WorkflowBackendError,
+        require_backend_available,
+        resolve_effective_runtime,
+        run_temporal_workflow,
+    )
+
     try:
-        try:
-            result = await runner.run(graph, initial_state=initial_state)
-        except WorkflowRunError as exc:
-            console.print(f"[red]✗ workflow failed:[/red] {exc}")
-            raise typer.Exit(code=2) from None
+        effective = resolve_effective_runtime(graph, runtime_override)
+        require_backend_available(effective)
+    except WorkflowBackendError as exc:
+        console.print(f"[red]✗ runtime unavailable:[/red] {exc}")
+        raise typer.Exit(code=2) from None
+
+    rt = await build_local_runtime(mock=mock)
+    try:
+        if effective == "native":
+            runner = WorkflowRunner(executor=rt.executor, storage=rt.storage)
+            try:
+                result = await runner.run(graph, initial_state=initial_state)
+            except WorkflowRunError as exc:
+                console.print(f"[red]✗ workflow failed:[/red] {exc}")
+                raise typer.Exit(code=2) from None
+        elif effective == "langgraph":
+            # ADR 030 D1 — LangGraph in-process execution. Builds a StateGraph
+            # from the IR and executes via the same Executor the native runner
+            # uses (ADR 054 D3 reuse). Requires mdk[langgraph] extra.
+            try:
+                result = await run_langgraph_workflow(
+                    graph,
+                    initial_state,
+                    executor=rt.executor,
+                    tracer=rt.tracer,
+                    storage=rt.storage,
+                    tenant_id="local",
+                    mock=mock,
+                )
+            except Exception as exc:
+                console.print(f"[red]✗ langgraph execution failed:[/red] {exc}")
+                raise typer.Exit(code=2) from None
+        else:
+            # temporal — compile (Track B) + execute on Temporal via Track C
+            # activities. Reuses the SAME provider/pricing/tracer/storage the
+            # native runner uses (ADR 054 D3, one execution model).
+            from movate.providers.pricing import load_pricing  # noqa: PLC0415
+
+            try:
+                result = await run_temporal_workflow(
+                    graph,
+                    initial_state,
+                    storage=rt.storage,
+                    pricing=load_pricing(),
+                    tracer=rt.tracer,
+                    provider=rt.provider,
+                    tenant_id="local",
+                    mock=mock,
+                )
+            except WorkflowBackendError as exc:
+                console.print(f"[red]✗ temporal execution failed:[/red] {exc}")
+                raise typer.Exit(code=2) from None
     finally:
         await shutdown_runtime(rt.storage, rt.tracer)
 

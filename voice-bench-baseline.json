@@ -1,0 +1,69 @@
+{
+  "stt": [
+    {
+      "provider": "fake_stt",
+      "mean_wer": 0.85,
+      "p50_latency_ms": 0.0,
+      "p95_latency_ms": 0.0,
+      "items": [
+        {
+          "reference": "hello how are you today",
+          "hypothesis": "hello",
+          "wer": 0.8,
+          "latency_ms": 0.0
+        },
+        {
+          "reference": "one two three four five",
+          "hypothesis": "hello",
+          "wer": 1.0,
+          "latency_ms": 0.0
+        },
+        {
+          "reference": "I need help with my account please",
+          "hypothesis": "hello",
+          "wer": 1.0,
+          "latency_ms": 0.0
+        },
+        {
+          "reference": "reset the VPN connection and restart",
+          "hypothesis": "hello",
+          "wer": 0.8333,
+          "latency_ms": 0.0
+        }
+      ]
+    }
+  ],
+  "tts": [
+    {
+      "provider": "fake_tts",
+      "mean_first_byte_ms": 0.0,
+      "mean_total_ms": 0.0,
+      "items": [
+        {
+          "phrase": "hello how are you today",
+          "first_byte_ms": 0.0,
+          "total_ms": 0.0,
+          "audio_bytes": 23
+        },
+        {
+          "phrase": "one two three four five",
+          "first_byte_ms": 0.0,
+          "total_ms": 0.0,
+          "audio_bytes": 23
+        },
+        {
+          "phrase": "I need help with my account please",
+          "first_byte_ms": 0.0,
+          "total_ms": 0.0,
+          "audio_bytes": 35
+        },
+        {
+          "phrase": "reset the VPN connection and restart",
+          "first_byte_ms": 0.0,
+          "total_ms": 0.0,
+          "audio_bytes": 37
+        }
+      ]
+    }
+  ]
+}

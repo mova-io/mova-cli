@@ -465,3 +465,158 @@ def _humanize_bytes(n: int) -> str:
     if n < _MB:
         return f"{n / _KB:.1f} KB"
     return f"{n / _MB:.1f} MB"
+
+
+# ── mdk export langgraph ─────────────────────────────────────────────────
+
+
+@export_app.command("langgraph")
+def export_langgraph(
+    path: str = typer.Argument(
+        ...,
+        help="Path to a workflow.yaml file or the workflow directory.",
+    ),
+    output: str = typer.Option(
+        "",
+        "--output",
+        "-o",
+        help="Output file path (default: <workflow-name>_langgraph.py).",
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing file."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the generated Python to stdout instead of writing."
+    ),
+) -> None:
+    """Export a workflow as a standalone LangGraph Python module.
+
+    Compiles the workflow IR to a self-contained Python file with a
+    ``StateGraph``, typed state, and a ``build_graph()`` function. The
+    generated code does NOT require the mdk runtime — it uses only the
+    ``langgraph`` SDK and can be run, customized, or integrated into any
+    LangChain/LangGraph pipeline.
+
+    This command does NOT require the ``mdk[langgraph]`` extra — it
+    generates code, it doesn't run it.
+    """
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    from rich.console import Console  # noqa: PLC0415
+
+    from movate.core.workflow.compiler import compile_workflow  # noqa: PLC0415
+    from movate.core.workflow.compilers.langgraph import (  # noqa: PLC0415
+        compile_langgraph,
+    )
+    from movate.core.workflow.spec import load_workflow_spec  # noqa: PLC0415
+
+    console = Console()
+
+    yaml_path = _Path(path)
+    if yaml_path.is_dir():
+        yaml_path = yaml_path / "workflow.yaml"
+
+    if not yaml_path.exists():
+        console.print(f"[red]✗ not found:[/red] {yaml_path}")
+        raise typer.Exit(code=1)
+
+    try:
+        spec, wf_dir = load_workflow_spec(yaml_path)
+        graph = compile_workflow(spec, wf_dir, allow_cycles=True)
+        source = compile_langgraph(graph)
+    except Exception as exc:
+        console.print(f"[red]✗ compilation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from None
+
+    if dry_run:
+        console.print(source)
+        return
+
+    out_path = _Path(output) if output else _Path(f"{graph.name}_langgraph.py")
+    if out_path.exists() and not force:
+        console.print(
+            f"[yellow]✗ {out_path} already exists.[/yellow] Use [bold]--force[/bold] to overwrite."
+        )
+        raise typer.Exit(code=1)
+
+    out_path.write_text(source)
+    console.print(
+        f"[green]✓[/green] exported [bold]{graph.name}[/bold] → {out_path} "
+        f"({len(source)} chars, {len(graph.nodes)} nodes)"
+    )
+
+
+# ── mdk export temporal ──────────────────────────────────────────────────
+
+
+@export_app.command("temporal")
+def export_temporal(
+    path: str = typer.Argument(
+        ...,
+        help="Path to a workflow.yaml file or the workflow directory.",
+    ),
+    output: str = typer.Option(
+        "",
+        "--output",
+        "-o",
+        help="Output file path (default: <workflow-name>_temporal.py).",
+    ),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing file."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the generated Python to stdout instead of writing."
+    ),
+) -> None:
+    """Export a workflow as a standalone Temporal Python module.
+
+    Compiles the workflow IR to a self-contained Python file with a
+    ``@workflow.defn`` class, activity stubs, and a ``main()`` that
+    executes it. The generated code uses the ``temporalio`` SDK.
+
+    This command does NOT require a running Temporal server — it
+    generates code, it doesn't run it. However, ``mdk[temporal]`` must
+    be installed for the compiler to resolve the SDK types.
+    """
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    from rich.console import Console  # noqa: PLC0415
+
+    from movate.core.workflow.compiler import compile_workflow  # noqa: PLC0415
+    from movate.core.workflow.compilers.temporal import (  # noqa: PLC0415
+        TemporalCompiler,
+    )
+    from movate.core.workflow.spec import load_workflow_spec  # noqa: PLC0415
+
+    console = Console()
+
+    yaml_path = _Path(path)
+    if yaml_path.is_dir():
+        yaml_path = yaml_path / "workflow.yaml"
+
+    if not yaml_path.exists():
+        console.print(f"[red]✗ not found:[/red] {yaml_path}")
+        raise typer.Exit(code=1)
+
+    try:
+        spec, wf_dir = load_workflow_spec(yaml_path)
+        graph = compile_workflow(spec, wf_dir)
+        compiled = TemporalCompiler().compile(graph)
+        source = compiled.module_source
+    except Exception as exc:
+        console.print(f"[red]✗ compilation failed:[/red] {exc}")
+        raise typer.Exit(code=1) from None
+
+    if dry_run:
+        console.print(source)
+        return
+
+    out_path = _Path(output) if output else _Path(f"{graph.name}_temporal.py")
+    if out_path.exists() and not force:
+        console.print(
+            f"[yellow]✗ {out_path} already exists.[/yellow] Use [bold]--force[/bold] to overwrite."
+        )
+        raise typer.Exit(code=1)
+
+    out_path.write_text(source)
+    console.print(
+        f"[green]✓[/green] exported [bold]{graph.name}[/bold] → {out_path} "
+        f"({len(source)} chars, {len(graph.nodes)} nodes, "
+        f"class={compiled.workflow_class_name})"
+    )

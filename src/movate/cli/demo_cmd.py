@@ -342,6 +342,14 @@ _INSERT_CONCURRENCY = 16
 # lights them up after a seed. Matches the CLI/runtime default project id.
 _DEMO_INSIGHT_PROJECT = "default"
 
+# The (tenant, agent) the --full scenario seeds its sample agents + graph under.
+# Re-exported from core.demo so the seed summary + `mdk demo doctor` agree on
+# exactly where to look. Kept as module constants here (not re-imported at call
+# time) so the summary panel can reference them without a core import in the hot
+# path.
+from movate.core.demo import DEMO_GRAPH_AGENT as _SCENARIO_AGENT  # noqa: E402
+from movate.core.demo import DEMO_TENANT_ID as _SCENARIO_TENANT  # noqa: E402
+
 
 def _looks_like_prod(target: str) -> bool:
     """True if ``target`` contains a prod marker (case-insensitive)."""
@@ -460,6 +468,57 @@ async def _run_observability_analysis(
     return written
 
 
+async def _persist_scenario(storage: object, scenario: object) -> None:
+    """Persist the demo scenario (agents + workflow + graph) through the Protocol.
+
+    Each of the four record kinds is written behind its own ``callable``-guard
+    so a backend that predates one of the seams (e.g. an older custom
+    StorageProvider without ``upsert_entity``) degrades to a logged skip rather
+    than crashing the seed — the rest of the scenario (and all telemetry) still
+    lands. The endpoint entities are upserted BEFORE the relations (the storage
+    layer doesn't auto-create dangling endpoints).
+
+    ``storage`` / ``scenario`` are typed ``object`` to keep this CLI helper from
+    importing the concrete StorageProvider / ScenarioBundle types eagerly; the
+    attributes accessed are part of the documented Protocol + dataclass surface.
+    """
+    sc = scenario  # narrow alias for readability
+    save_agent = getattr(storage, "save_agent_bundle", None)
+    if callable(save_agent):
+        for agent in sc.agents:  # type: ignore[attr-defined]
+            try:
+                await save_agent(agent)
+            except Exception:  # pragma: no cover - duplicate (name,version) on re-seed
+                logger.info("demo_seed_agent_skipped name=%s — already present", agent.name)
+    else:
+        logger.info("demo_seed_scenario_agents_skipped — backend has no agent registry")
+
+    save_workflow = getattr(storage, "save_workflow_bundle", None)
+    if callable(save_workflow):
+        for wf in sc.workflows:  # type: ignore[attr-defined]
+            try:
+                await save_workflow(wf)
+            except Exception:  # pragma: no cover - duplicate on re-seed
+                logger.info("demo_seed_workflow_skipped name=%s — already present", wf.name)
+    else:
+        logger.info("demo_seed_scenario_workflows_skipped — backend has no workflow registry")
+
+    upsert_entity = getattr(storage, "upsert_entity", None)
+    upsert_relation = getattr(storage, "upsert_relation", None)
+    if callable(upsert_entity) and callable(upsert_relation):
+        # Entities first (endpoints must exist before edges), then relations.
+        await _gather_bounded(
+            [upsert_entity(e) for e in sc.entities],  # type: ignore[attr-defined]
+            limit=_INSERT_CONCURRENCY,
+        )
+        await _gather_bounded(
+            [upsert_relation(r) for r in sc.relations],  # type: ignore[attr-defined]
+            limit=_INSERT_CONCURRENCY,
+        )
+    else:
+        logger.info("demo_seed_scenario_graph_skipped — backend has no graph store")
+
+
 def seed(
     target: str = typer.Option(
         "local",
@@ -498,8 +557,21 @@ def seed(
         False,
         "--with-voice",
         help=(
-            "Also seed voice-turn records (Deepgram STT + Cartesia TTS) for "
-            "each successful run. Realistic latency/cost figures, same seeded RNG."
+            "Also GENERATE voice-turn records (Deepgram STT + Cartesia TTS) for "
+            "each successful run — realistic latency/cost figures, same seeded "
+            "RNG. NOTE: these are generated + counted but NOT persisted yet "
+            "(no voice_turns table on the StorageProvider Protocol); the flag "
+            "exercises the generation path until the voice-storage ADR lands."
+        ),
+    ),
+    full: bool = typer.Option(
+        True,
+        "--full/--telemetry-only",
+        help=(
+            "Also seed the demo SCENARIO — sample agents (incl. one voice-capable "
+            "+ one workflow) and a Movate-themed knowledge graph — so the "
+            "registry, graph viewer, and playground light up too, not just the "
+            "dashboards. Pass --telemetry-only for the historical telemetry-only seed."
         ),
     ),
 ) -> None:
@@ -511,9 +583,11 @@ def seed(
     injected anomalies (a cost spike + a latency regression after a deploy) so
     the anomaly + narrative dashboard panels have a story to tell.
 
-    Pass [bold]--with-voice[/bold] to also seed voice-turn rows (Deepgram STT
-    + Cartesia TTS) alongside each successful run — lights up any voice-latency
-    panels in the demo dashboards.
+    Pass [bold]--with-voice[/bold] to also GENERATE voice-turn records (Deepgram
+    STT + Cartesia TTS) alongside each successful run. These are generated +
+    counted but [bold]not persisted yet[/bold] (no voice_turns table on the
+    StorageProvider Protocol) — the flag exercises the generation path until the
+    voice-storage ADR lands.
 
     [bold]Safety.[/bold] Every seeded row is tagged: its tenant_id starts with
     [cyan]demo-[/cyan] and its input carries a [cyan]__mdk_demo__[/cyan] marker.
@@ -530,7 +604,7 @@ def seed(
       [dim]$ mdk demo seed --agents 4 --days 14         # smaller fleet[/dim]
       [dim]$ mdk demo seed --clear-first --seed 42      # reproducible reset[/dim]
     """
-    from movate.core.demo import SeedConfig, generate_bundle  # noqa: PLC0415
+    from movate.core.demo import SeedConfig, generate_bundle, generate_scenario  # noqa: PLC0415
     from movate.storage import build_storage  # noqa: PLC0415
 
     if _looks_like_prod(target) and not force:
@@ -553,6 +627,12 @@ def seed(
         with_voice=with_voice,
     )
     bundle = generate_bundle(cfg)
+
+    # The demo SCENARIO — sample agents + workflow + a knowledge graph — so the
+    # registry, graph viewer, and playground light up alongside the dashboards.
+    # Generated only when --full (the default); --telemetry-only keeps the
+    # historical telemetry-only behavior. Pure + deterministic (no RNG / clock).
+    scenario = generate_scenario() if full else None
 
     # The distinct demo tenant ids the analyzer must run for (telemetry is
     # scoped by tenant_id). Derived from the bundle so it stays in lockstep
@@ -577,6 +657,14 @@ def seed(
             await _gather_bounded(
                 [storage.save_eval(e) for e in bundle.evals], limit=_INSERT_CONCURRENCY
             )
+            # The demo SCENARIO — sample agents + workflow + knowledge graph.
+            # Persisted through the same StorageProvider Protocol surface
+            # (save_agent_bundle / save_workflow_bundle / upsert_entity /
+            # upsert_relation). Degrades gracefully on a backend missing any of
+            # these seams (CLAUDE.md rule 5/10): the telemetry seed never fails
+            # because the scenario couldn't be written.
+            if scenario is not None:
+                await _persist_scenario(storage, scenario)
             # Voice turns are stored as JSON blobs in the runs table's extra
             # data (no dedicated voice_turns table on the StorageProvider
             # Protocol today). They are carried on the bundle for CLI display
@@ -609,7 +697,12 @@ def seed(
     table.add_row("evals", f"{s['evals']:,}")
     table.add_row("failures", f"{s['failures']:,}")
     if with_voice:
-        table.add_row("voice turns", f"{s['voice_turns']:,}")
+        # Voice turns are generated but NOT persisted yet — there is no
+        # voice_turns table on the StorageProvider Protocol (see the
+        # TODO(voice-storage) note in _persist). Label the count clearly as
+        # generated-not-stored so the summary never implies queryable data that
+        # the dashboards / `mdk demo doctor` would then fail to find.
+        table.add_row("voice turns (generated, not stored)", f"{s['voice_turns']:,}")
     table.add_row("agents x tenants", f"{s['agents']} x {s['tenants']}")
     table.add_row("days of history", str(days))
     table.add_row("success rate", f"{s['success_rate_pct']}%")
@@ -621,7 +714,33 @@ def seed(
     # exec dashboards render with live data. 0 means the analyst/insight store
     # was unavailable and the seed degraded gracefully (see the logged reason).
     table.add_row("insights analyzed", f"{insights_written:,}")
+    # Scenario stats (--full) — the registry + graph that light up the
+    # playground and graph viewer alongside the dashboards.
+    if scenario is not None:
+        sc_stats = scenario.stats
+        table.add_row("sample agents", f"{sc_stats['agents']} ({sc_stats['voice_agents']} voice)")
+        table.add_row("sample workflows", f"{sc_stats['workflows']}")
+        table.add_row(
+            "graph nodes / edges",
+            f"{sc_stats['graph_nodes']} / {sc_stats['graph_edges']}",
+        )
     console.print(table)
+
+    scenario_line = (
+        (
+            "Playground + graph viewer populated — "
+            f"{scenario.stats['agents']} sample agents (incl. voice + workflow) and a "
+            f"{scenario.stats['graph_nodes']}-node knowledge graph under "
+            f"[cyan]{_SCENARIO_TENANT}[/cyan] / agent [cyan]{_SCENARIO_AGENT}[/cyan] "
+            "(the [bold]mdk serve --dev[/bold] tenant — the live browser viewer "
+            "sees it directly)."
+        )
+        if scenario is not None
+        else (
+            "Telemetry-only seed (--telemetry-only) — no sample agents/graph. "
+            "Re-run with --full to light up the playground + graph viewer."
+        )
+    )
 
     insight_line = (
         "Insight-fed + exec dashboards populated — "
@@ -642,9 +761,11 @@ def seed(
                 for e in bundle.events
             )
             + f"\n\n[bold]{insight_line}[/bold]"
+            + f"\n[bold]{scenario_line}[/bold]"
             + "\n\n[dim]All rows tagged tenant=demo-* + input.__mdk_demo__=true. "
-            "Purge anytime with [bold]mdk demo clear[/bold].[/dim]",
-            title="[green]✓[/green] Dashboards seeded",
+            "Purge anytime with [bold]mdk demo clear[/bold].[/dim]\n"
+            "[dim]Verify the demo is GO with [bold]mdk demo doctor[/bold].[/dim]",
+            title="[green]✓[/green] Demo seeded",
             title_align="left",
             border_style="green",
         )
@@ -700,7 +821,8 @@ def clear(
     console.print(
         Panel(
             f"Deleted [bold]{deleted:,}[/bold] demo-tagged rows "
-            "(runs, evals, failures, voice turns if present).",
+            "(runs, evals, failures, sample agents/workflows, graph "
+            "entities/relations, insights, voice turns if present).",
             title="[green]✓[/green] Demo data cleared",
             title_align="left",
             border_style="green",
@@ -711,14 +833,24 @@ def clear(
 async def _purge_demo(storage: object) -> int:
     """Delete every demo-tagged row across the storage backend.
 
-    Demo data is identified solely by the ``demo-`` tenant prefix. The
-    StorageProvider Protocol has no "delete run/eval by id" method (runs are
+    Demo data lives under two disjoint tenant scopes, both purged here:
+
+    * the **telemetry** rows (runs / failures / evals) and the analyzer's
+      **insight** rows — tagged with the ``demo-`` tenant *prefix*
+      (``tenant_id LIKE 'demo-%'``); and
+    * the **scenario** rows (sample agents + workflow registry + the knowledge
+      graph) — tagged with the single scenario tenant
+      :data:`~movate.core.demo.DEMO_TENANT_ID` (the serve --dev tenant, a
+      *dash-free exact* id, NOT a ``demo-`` prefix). These are matched by an
+      exact ``tenant_id = ?`` predicate.
+
+    The StorageProvider Protocol has no "delete by id" method (runs are
     immutable history by design), so the purge DELETEs directly against the
-    backend's tables, scoped to ``tenant_id LIKE 'demo-%'`` — the one place
-    this command has to know the backend's table shape. The WHERE clause is the
-    hard guarantee that only synthetic rows are touched. We reuse the already-
-    ``init()``-ed connection/pool (do NOT open a second handle — a separate
-    sqlite connection would deadlock on the writer lock).
+    backend's tables — the one place this command has to know the backend's
+    table shape. The WHERE clauses are the hard guarantee that only synthetic
+    rows are touched. We reuse the already-``init()``-ed connection/pool (do
+    NOT open a second handle — a separate sqlite connection would deadlock on
+    the writer lock).
 
     ``storage`` is typed ``object`` because the StorageProvider Protocol
     deliberately exposes no raw-SQL surface; this helper reaches past it on
@@ -728,28 +860,55 @@ async def _purge_demo(storage: object) -> int:
     the voice-storage ADR). If the table hasn't been created yet the DELETE is
     skipped silently — ``mdk demo clear`` is idempotent across schema versions.
     """
-    from movate.core.demo import DEMO_TENANT_PREFIX  # noqa: PLC0415
+    from movate.core.demo import DEMO_TENANT_ID, DEMO_TENANT_PREFIX  # noqa: PLC0415
 
-    like = f"{DEMO_TENANT_PREFIX}%"
-    # Core tables the seeder always writes. Each carries a tenant_id column.
-    tables = ("runs", "failures", "evals")
+    # (predicate-fragment, parameter) per scope. The fragment is a fixed literal
+    # (never user input); only the bound parameter varies.
+    prefix_like = f"{DEMO_TENANT_PREFIX}%"
+
+    # Tables purged by the ``demo-%`` telemetry-tenant prefix. ``runs`` /
+    # ``failures`` / ``evals`` are the telemetry; ``observability_insights`` is
+    # the analyzer output (written per ``demo-`` telemetry tenant) — listed here
+    # so re-seeds don't accumulate orphan insight rows (24→48→…) across runs.
+    prefix_tables = (
+        "runs",
+        "failures",
+        "evals",
+        "observability_insights",
+    )
+    # Tables purged by the EXACT scenario tenant. The scenario (agents +
+    # workflow + graph) is seeded under the dash-free serve --dev tenant so the
+    # live viewer can see it, so a ``demo-%`` LIKE would NOT catch these — they
+    # must be matched by exact tenant id.
+    scenario_tables = (
+        "agent_bundles",
+        "workflow_bundles",
+        "kb_entities",
+        "kb_relations",
+    )
     # Optional table — created by the voice-storage ADR (not yet on main).
-    # Included here so `mdk demo clear` stays correct once it lands.
-    optional_tables = ("voice_turns",)
+    # Voice turns inherit their run's ``demo-`` tenant, so the prefix predicate
+    # applies. Included here so `mdk demo clear` stays correct once it lands.
+    optional_prefix_tables = ("voice_turns",)
     backend = type(storage).__name__
 
     # SQLite path — reuse the live connection opened by init().
     conn = getattr(storage, "_conn", None)
     if backend == "SqliteProvider" and conn is not None:
         deleted = 0
-        for tbl in tables:
-            # `tbl` comes only from the fixed `tables` literal allow-list above,
-            # never from user input — the f-string interpolation is safe.
-            cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (like,))
+        for tbl in prefix_tables:
+            # `tbl` comes only from the fixed literal allow-lists above, never
+            # from user input — the f-string interpolation is safe.
+            cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (prefix_like,))
             deleted += max(0, cur.rowcount or 0)
-        for tbl in optional_tables:
+        for tbl in scenario_tables:
+            cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id = ?", (DEMO_TENANT_ID,))
+            deleted += max(0, cur.rowcount or 0)
+        for tbl in optional_prefix_tables:
             try:
-                cur = await conn.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (like,))
+                cur = await conn.execute(
+                    f"DELETE FROM {tbl} WHERE tenant_id LIKE ?", (prefix_like,)
+                )
                 deleted += max(0, cur.rowcount or 0)
             except Exception:  # table may not exist yet — safe to skip
                 pass
@@ -761,14 +920,19 @@ async def _purge_demo(storage: object) -> int:
     if backend == "PostgresProvider" and pool is not None:
         deleted = 0
         async with pool.acquire() as pg:
-            for tbl in tables:
-                # `tbl` is from the fixed allow-list above — safe interpolation.
-                status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", like)
+            for tbl in prefix_tables:
+                # `tbl` is from the fixed allow-lists above — safe interpolation.
+                status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", prefix_like)
                 # asyncpg returns a status string like "DELETE 42".
                 deleted += int(status.split()[-1]) if status else 0
-            for tbl in optional_tables:
+            for tbl in scenario_tables:
+                status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id = $1", DEMO_TENANT_ID)
+                deleted += int(status.split()[-1]) if status else 0
+            for tbl in optional_prefix_tables:
                 try:
-                    status = await pg.execute(f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", like)
+                    status = await pg.execute(
+                        f"DELETE FROM {tbl} WHERE tenant_id LIKE $1", prefix_like
+                    )
                     deleted += int(status.split()[-1]) if status else 0
                 except Exception:  # table may not exist yet — safe to skip
                     pass
@@ -808,3 +972,10 @@ def _demo_callback(ctx: typer.Context) -> None:
 demo_app.command("new")(scaffold)
 demo_app.command("seed")(seed)
 demo_app.command("clear")(clear)
+
+# `mdk demo doctor` — Monday-demo readiness check. Lives in its own module
+# (_demo_doctor.py) to keep this file focused on scaffold + seed/clear; wired
+# here so it shares the `mdk demo` command group.
+from movate.cli._demo_doctor import doctor as _demo_doctor  # noqa: E402
+
+demo_app.command("doctor")(_demo_doctor)

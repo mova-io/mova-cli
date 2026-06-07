@@ -1,0 +1,49 @@
+{
+  "version": "1.0.0",
+  "description": "Golden audio corpus for voice eval/regression harness (ADR 049 D5). Synthetic PCM16 WAV files for deterministic STT/TTS benchmarking.",
+  "sample_rate": 16000,
+  "channels": 1,
+  "bits_per_sample": 16,
+  "items": [
+    {
+      "id": "greeting-en",
+      "filename": "greeting-en.wav",
+      "expected_transcript": "hello how are you today",
+      "language": "en-US",
+      "speaker_type": "synthetic",
+      "description": "Short English greeting \u2014 baseline accuracy check",
+      "duration_s": 1.2,
+      "size_bytes": 38444
+    },
+    {
+      "id": "numbers-en",
+      "filename": "numbers-en.wav",
+      "expected_transcript": "one two three four five",
+      "language": "en-US",
+      "speaker_type": "synthetic",
+      "description": "Number sequence \u2014 tests digit recognition",
+      "duration_s": 1.0,
+      "size_bytes": 32044
+    },
+    {
+      "id": "support-en",
+      "filename": "support-en.wav",
+      "expected_transcript": "I need help with my account please",
+      "language": "en-US",
+      "speaker_type": "synthetic",
+      "description": "Customer support phrase \u2014 enterprise use case",
+      "duration_s": 1.5,
+      "size_bytes": 48044
+    },
+    {
+      "id": "technical-en",
+      "filename": "technical-en.wav",
+      "expected_transcript": "reset the VPN connection and restart",
+      "language": "en-US",
+      "speaker_type": "synthetic",
+      "description": "Technical instruction with acronym \u2014 tests domain vocab",
+      "duration_s": 1.3,
+      "size_bytes": 41644
+    }
+  ]
+}

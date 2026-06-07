@@ -1541,16 +1541,21 @@ def ingest(
             "for that source path. Useful in CI to avoid re-embedding unchanged docs."
         ),
     ),
-    build_graph: bool = typer.Option(
+    skip_graph: bool = typer.Option(
+        False,
+        "--skip-graph",
+        help=(
+            "Skip the knowledge-graph extraction step. By default every ingest "
+            "now builds the graph (entities + relations) for GraphRAG retrieval. "
+            "Pass --skip-graph to opt out (e.g. when running without an "
+            "ANTHROPIC_API_KEY or when you only need vector search)."
+        ),
+    ),
+    _build_graph_deprecated: bool = typer.Option(
         False,
         "--build-graph",
-        help=(
-            "Also extract a knowledge graph (entities + relations) from each "
-            "document for GraphRAG retrieval. Runs an extra LLM pass per chunk — "
-            "set the extraction provider's env var (default Anthropic → "
-            "ANTHROPIC_API_KEY). Combine with --clean-source to rebuild a "
-            "source's graph from scratch instead of merging into the existing one."
-        ),
+        hidden=True,
+        help="Deprecated no-op (graph is now built by default). Use --skip-graph to opt out.",
     ),
     ocr_lang: str = typer.Option(
         "",
@@ -1641,6 +1646,16 @@ def ingest(
     import os  # noqa: PLC0415
 
     from movate.kb.web import is_url  # noqa: PLC0415
+
+    # ── Derive build_graph from the new --skip-graph / deprecated --build-graph flags ──
+    # Graph is now built by default; --skip-graph opts out.
+    # --build-graph is a deprecated no-op (graph already on) — warn once.
+    if _build_graph_deprecated:
+        err_console.print(
+            "[yellow]⚠[/yellow] [bold]--build-graph[/bold] is deprecated and has no effect — "
+            "the knowledge graph is now built by default. Use [bold]--skip-graph[/bold] to opt out."
+        )
+    build_graph = not skip_graph
 
     # ── Interactive guided helpers when arguments are omitted ──────────────
     if agent is None:

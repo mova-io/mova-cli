@@ -424,6 +424,85 @@ async def test_sse_growth_stream_shape(client: TestClient, storage: InMemoryStor
     assert done == {"nodes": 2, "edges": 1}
 
 
+async def test_sse_growth_stream_paced_still_complete(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    """A paced snapshot replay (``?pace=``) still emits every node/edge frame
+    plus the terminal ``done`` with correct totals — pacing only spaces the
+    frames in time, it never drops or reorders them (the demo 'watch it grow'
+    contract is additive over the snapshot contract)."""
+    tenant, auth = await _mint(storage)
+    await _seed_basic(storage, tenant)
+
+    resp = client.get(
+        f"/api/v1/projects/{AGENT}/graph/stream",
+        params={"pace": 0.01},
+        headers={"Authorization": auth},
+    )
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    kinds = [e for e, _ in events]
+    assert kinds.count("node.added") == 2
+    assert kinds.count("edge.added") == 1
+    assert kinds[-1] == "done"
+    assert next(d for e, d in events if e == "done") == {"nodes": 2, "edges": 1}
+
+
+# ----------------------------------------------------------------------
+# Confidence floor (ADR 046 D2) — opt-in read-path filter on /graph
+# ----------------------------------------------------------------------
+
+
+async def _seed_confidence(storage: InMemoryStorage, tenant: str) -> None:
+    """A high-confidence node linked to a low-confidence one + an unscored one."""
+    await storage.upsert_entity(
+        _entity("hi", "Confident", "Feature", tenant=tenant, metadata={"confidence": 0.9})
+    )
+    await storage.upsert_entity(
+        _entity("lo", "Shaky", "Feature", tenant=tenant, metadata={"confidence": 0.1})
+    )
+    await storage.upsert_entity(_entity("none", "Unscored", "Feature", tenant=tenant))
+    await storage.upsert_relation(_relation("e1", "hi", "lo", tenant=tenant, weight=0.5))
+
+
+async def test_graph_min_confidence_default_unchanged(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    """No ``min_confidence`` (or 0.0) → every node, including low-confidence
+    and unscored ones (backward-compatible default)."""
+    tenant, auth = await _mint(storage)
+    await _seed_confidence(storage, tenant)
+
+    resp = client.get(f"/api/v1/projects/{AGENT}/graph", headers={"Authorization": auth})
+    assert resp.status_code == 200
+    keys = {n["key"] for n in resp.json()["nodes"]}
+    assert keys == {"hi", "lo", "none"}
+    # The high-confidence node carries its score on the wire for the viewer.
+    hi = next(n for n in resp.json()["nodes"] if n["key"] == "hi")
+    assert hi["attributes"]["confidence"] == 0.9
+
+
+async def test_graph_min_confidence_filters_low(
+    client: TestClient, storage: InMemoryStorage
+) -> None:
+    """``min_confidence`` drops low-confidence nodes (and their dangling edges)
+    but keeps unscored nodes."""
+    tenant, auth = await _mint(storage)
+    await _seed_confidence(storage, tenant)
+
+    resp = client.get(
+        f"/api/v1/projects/{AGENT}/graph",
+        params={"min_confidence": 0.5},
+        headers={"Authorization": auth},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    keys = {n["key"] for n in body["nodes"]}
+    assert keys == {"hi", "none"}  # lo dropped, unscored kept
+    # The hi→lo edge dangles once lo is filtered out, so it is pruned.
+    assert body["edges"] == []
+
+
 # ----------------------------------------------------------------------
 # Auth: read scope + tenant scoping
 # ----------------------------------------------------------------------

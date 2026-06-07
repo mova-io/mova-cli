@@ -56,6 +56,16 @@
   var liveSource = null;            // EventSource for live growth
   var palette = {};                 // type/community -> color
   var paletteIdx = 0;
+  // Confidence dimming (ADR 046 D2): fade nodes whose stored `confidence`
+  // attribute is below this floor so the audience sees the graph is honest
+  // about uncertainty. 0 (default) = show everything at full strength —
+  // back-compat, no visual change unless an operator drags the slider. A node
+  // with no recorded confidence is treated as full-confidence (never dimmed).
+  var minConfidence = 0;
+  // How long the paced snapshot replay sleeps between frames server-side, so
+  // the live-growth toggle makes the graph visibly ASSEMBLE node-by-node even
+  // for a graph that was built atomically before the viewer opened.
+  var LIVE_REPLAY_PACE_S = 0.12;
 
   // ---- analytics state (ADR 046) -----------------------------------------
   // All analytics are OFF by default — base render, drill-down, and live-growth
@@ -123,6 +133,23 @@
     var stops = ["#1f3b73", "#3b6fb0", "#56d4dd", "#e3b341", "#f0883e", "#f85149"];
     var t = s * (stops.length - 1);
     return stops[Math.round(t)];
+  }
+
+  // Confidence of a node from its stored `confidence` attribute (ADR 046 D2).
+  // Returns a number in [0,1], or null when no score was recorded (the node is
+  // then treated as full-confidence — never dimmed).
+  function confidenceOf(node) {
+    var c = graph.getNodeAttribute(node, "confidence");
+    return (typeof c === "number") ? c : null;
+  }
+
+  // True iff a node should be dimmed for being below the confidence floor.
+  // A node with no recorded confidence is never dimmed (full-confidence
+  // assumption); the floor at 0 dims nothing (back-compat default).
+  function isLowConfidence(node) {
+    if (minConfidence <= 0) return false;
+    var c = confidenceOf(node);
+    return c !== null && c < minConfidence;
   }
 
   function styleNode(node, attrs) {
@@ -253,6 +280,17 @@
       var res = Object.assign({}, data);
       var kind = graph.getNodeAttribute(node, "kind");
       if (disabledTypes.has(kind)) { res.hidden = true; return res; }
+      // Confidence dimming (ADR 046 D2): a node below the confidence floor
+      // fades to a muted grey and shrinks, and drops its label so the eye
+      // settles on the confident core of the graph. Computed before the
+      // focus/path/live decorations below so those (which the operator is
+      // actively driving) can still override it for a dimmed node they click.
+      if (isLowConfidence(node)) {
+        res.color = "#3a4048";
+        res.label = "";
+        res.size = (res.size || 4) * 0.6;
+        res.zIndex = 0;
+      }
       if (selectedNode) {
         if (node === selectedNode) {
           res.highlighted = true;
@@ -297,6 +335,11 @@
       if (disabledTypes.has(graph.getNodeAttribute(s, "kind")) ||
           disabledTypes.has(graph.getNodeAttribute(t, "kind"))) {
         res.hidden = true; return res;
+      }
+      // Fade an edge whose endpoint is below the confidence floor so a dimmed
+      // node doesn't leave a vivid edge dangling into the confident core.
+      if (isLowConfidence(s) || isLowConfidence(t)) {
+        res.color = "#22272e"; res.zIndex = 0;
       }
       if (selectedNode) {
         if (s === selectedNode || t === selectedNode) {
@@ -579,7 +622,9 @@
   function updateStats() {
     var visN = 0;
     graph.forEachNode(function (node, attrs) {
-      if (!disabledTypes.has(attrs.kind)) visN++;
+      if (disabledTypes.has(attrs.kind)) return;
+      if (isLowConfidence(node)) return;  // dimmed by the confidence floor
+      visN++;
     });
     el("stat-nodes").textContent = visN;
     el("stat-edges").textContent = graph.size;
@@ -759,7 +804,11 @@
       // ?live=true engages the live-tail (without it the stream is a one-shot
       // snapshot). The {project} path param is the agent the snapshot used, so
       // the live-tail is scoped to the SAME graph the viewer is showing.
-      var url = "/api/v1/projects/" + encodeURIComponent(CFG.project) + "/graph/stream?live=true";
+      // &pace= sleeps that many seconds between snapshot frames server-side so
+      // the graph visibly ASSEMBLES node-by-node when the toggle flips — the
+      // demo "watch it grow" moment even for an already-built graph.
+      var url = "/api/v1/projects/" + encodeURIComponent(CFG.project) +
+        "/graph/stream?live=true&pace=" + encodeURIComponent(LIVE_REPLAY_PACE_S);
       liveSource = new EventSource(url, { withCredentials: true });
       liveSource.addEventListener("node.added", function (ev) { onLiveNode(ev); });
       liveSource.addEventListener("edge.added", function (ev) { onLiveEdge(ev); });
@@ -774,6 +823,42 @@
       liveSource.close(); liveSource = null;
       status("live growth OFF");
     }
+  }
+
+  // Replay growth: clear the loaded graph, then open a PACED snapshot stream so
+  // the graph visibly re-assembles node-by-node from the server — the demo's
+  // "watch it grow" moment, decoupled from whether a real ingest is running.
+  // Uses the snapshot stream (no ?live), which still honors ?pace and ends with
+  // a `done` frame; each re-imported node/edge is genuinely new after the
+  // clear, so the existing highlight-halo path fires. Read-only: it only
+  // re-reads what the server already serves.
+  var replaySource = null;
+  function replayGrowth() {
+    if (replaySource) { replaySource.close(); replaySource = null; }
+    // Tearing the live-tail down first (if any) avoids two streams racing to
+    // import the same keys; the operator can re-enable live afterward.
+    if (liveSource) { liveSource.close(); liveSource = null; el("live-toggle").checked = false; el("live-toggle").parentElement.classList.remove("on"); }
+    clearFocus();
+    graph.clear();
+    if (renderer) renderer.refresh();
+    rebuildTypeFilters();
+    updateStats();
+    var url = "/api/v1/projects/" + encodeURIComponent(CFG.project) +
+      "/graph/stream?pace=" + encodeURIComponent(LIVE_REPLAY_PACE_S);
+    replaySource = new EventSource(url, { withCredentials: true });
+    replaySource.addEventListener("node.added", function (ev) { onLiveNode(ev); });
+    replaySource.addEventListener("edge.added", function (ev) { onLiveEdge(ev); });
+    replaySource.addEventListener("done", function () {
+      if (replaySource) { replaySource.close(); replaySource = null; }
+      startLayout(2500);
+      status("replay complete — " + graph.order + " nodes");
+    });
+    replaySource.onerror = function () {
+      // A snapshot stream closes the connection after `done`; some browsers
+      // surface that as an error. Only warn if we never finished assembling.
+      if (replaySource && graph.order === 0) status("replay stream unavailable (graph still interactive)");
+    };
+    status("replaying growth…");
   }
 
   function parseEvent(ev) { try { return JSON.parse(ev.data); } catch (_) { return null; } }
@@ -871,6 +956,15 @@
     el("size-by-degree").addEventListener("change", function (e) {
       sizeByDegree = e.target.checked; restyleAll();
     });
+    el("min-confidence").addEventListener("input", function (e) {
+      minConfidence = parseFloat(e.target.value) || 0;
+      el("min-confidence-val").textContent = minConfidence.toFixed(2);
+      // Pure viewer-side dimming: just refresh the reducers + the stat count.
+      // No re-fetch, no data mutation — dragging back to 0 fully restores.
+      if (renderer) renderer.refresh();
+      updateStats();
+    });
+    el("replay-btn").addEventListener("click", function () { replayGrowth(); });
     el("live-toggle").addEventListener("change", function (e) { setLive(e.target.checked); });
     el("detail-close").addEventListener("click", function () {
       detailPanel.classList.add("hidden"); detailPanel.setAttribute("aria-hidden", "true");
