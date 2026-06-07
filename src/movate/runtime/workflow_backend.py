@@ -182,6 +182,63 @@ async def get_temporal_client() -> Any:
     return await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
 
 
+def _build_temporal_metrics_runtime() -> Any | None:
+    """A ``temporalio`` Runtime that exports the SDK's built-in metrics to OTLP.
+
+    The Temporal Python SDK emits worker/client telemetry — task-queue backlog
+    (``temporal_*_schedule_to_start_latency``), worker slot availability, poll
+    success, sticky-cache hit rate, request latency/failures — that mdk's own
+    instruments can't see (ADR 082 follow-on). Wiring a Runtime with an
+    OpenTelemetry metrics exporter pushes them to the SAME OTLP collector the
+    app's spans/metrics use (ADR 020), so they land in App Insights / Prometheus
+    as ``temporal_*`` series alongside the ``mdk.*`` ones.
+
+    Returns ``None`` (→ caller uses temporalio's default Runtime, zero SDK
+    metrics, unchanged behavior) when no OTLP endpoint / metrics sink is
+    configured, AND on any error building the Runtime — telemetry must never stop
+    a worker from starting (fail-soft, mirrors ``init_metrics``). Only the
+    long-lived worker calls this: one Runtime per process (a fresh Runtime per
+    short-lived client would re-init core telemetry needlessly).
+    """
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if not endpoint:
+        return None
+    # Gate on the same condition mdk's own metrics use, so an operator who turned
+    # the sink off (MOVATE_TRACE_SINK=none / langfuse) doesn't get Temporal metrics.
+    try:
+        from movate.tracing.metrics import _otlp_metrics_enabled  # noqa: PLC0415
+
+        if not _otlp_metrics_enabled():
+            return None
+    except Exception:  # pragma: no cover - tracing import shouldn't fail
+        pass
+    try:
+        from temporalio.runtime import (  # noqa: PLC0415
+            OpenTelemetryConfig,
+            Runtime,
+            TelemetryConfig,
+        )
+
+        protocol = (
+            os.environ.get("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "").strip().lower()
+            or os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "").strip().lower()
+        )
+        is_http = protocol in ("http/protobuf", "http", "httpprotobuf")
+        return Runtime(
+            telemetry=TelemetryConfig(metrics=OpenTelemetryConfig(url=endpoint, http=is_http))
+        )
+    except Exception as exc:  # pragma: no cover - fail-soft like init_metrics
+        import sys  # noqa: PLC0415
+
+        sys.stderr.write(
+            f"[movate] Temporal SDK metrics unavailable, using default runtime: {exc}\n"
+        )
+        return None
+
+
 def load_compiled_workflow_class(module_source: str, class_name: str) -> Any:
     """Exec a :class:`CompiledWorkflow.module_source` and return its workflow class.
 
@@ -474,7 +531,14 @@ async def run_temporal_worker(
 
         tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
 
-    client = await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
+    # Export the Temporal SDK's built-in worker/client metrics to OTLP (ADR 082
+    # follow-on) when an OTLP endpoint is configured — one Runtime for this
+    # long-lived worker process; None → temporalio's default Runtime (unchanged).
+    metrics_runtime = _build_temporal_metrics_runtime()
+    connect_kwargs: dict[str, Any] = {"namespace": conn.namespace, "tls": tls}
+    if metrics_runtime is not None:
+        connect_kwargs["runtime"] = metrics_runtime
+    client = await Client.connect(conn.host, **connect_kwargs)
 
     worker = Worker(
         client,

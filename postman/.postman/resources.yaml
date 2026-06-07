@@ -1,0 +1,29 @@
+# Use this workspace to collaborate
+workspace:
+  id: ed421fad-14d7-4d53-93d6-c499f69b8a76
+
+localResources:
+  collections:
+    - ../movate-core-flow.postman_collection.json
+  environments:
+    - ../movate-azure.postman_environment.json
+    - ../movate.postman_environment.json
+  docs:
+    - ../sample-agent-bundle/README.md
+    - ../sample-faq.md
+    - ../README.md
+    - ../sample-agent-bundle/prompt.md
+    - ../POSTMAN-DEMO-GUIDE.md
+    - ../E2E-DEMO-FLOW.md
+    - ../POSTMAN-TALK-TRACK.md
+    - ../sample-agent-edit/prompt.md
+    - ../CLI-VOICE-DEMO.md
+    - ../CLI-VOICE-FAQ-DEMO.md
+    - ../sample-agent-bundle 2/prompt.md
+    - ../CHEATSHEET.md
+
+# Each entry here maps a local resource to one or more corresponding objects in Postman Cloud
+
+cloudResources:
+  collections:
+    ../postman/collections/MDK Quick Demo: 98823673-f747-486b-b0ad-1520d9a4b6c7

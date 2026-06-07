@@ -64,6 +64,7 @@ from movate.tracing.metrics import (
     record_job_completed,
     record_run_usage,
     record_voice_turn,
+    record_workflow_completed,
     register_pool_metrics,
 )
 from movate.tracing.null import SilentTracer
@@ -105,6 +106,7 @@ __all__ = [
     "record_job_completed",
     "record_run_usage",
     "record_voice_turn",
+    "record_workflow_completed",
     "register_pool_metrics",
 ]
 

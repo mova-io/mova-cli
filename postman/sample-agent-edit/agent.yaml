@@ -1,0 +1,11 @@
+api_version: movate/v1
+kind: Agent
+name: faq-bot
+version: 0.1.0
+description: "FAQ assistant — v2: friendlier tone, now cites sources."
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+prompt: ./prompt.md
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json

@@ -1,0 +1,13 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/agents/{{agent_name}}/kb/search"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: text
+  content: |-
+    {
+      "query": "standard plan pricing",
+      "top_k": 3
+    }
+order: 5000
