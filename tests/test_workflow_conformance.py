@@ -107,9 +107,11 @@ from movate.core.workflow.compilers.temporal import TemporalCompiler
 from movate.core.workflow.temporal_activities import (
     call_agent_activity,
     call_gate_activity,
+    call_human_activity,
     call_judge_activity,
     call_skill_activity,
     configure_activities,
+    persist_workflow_result_activity,
 )
 from movate.runtime.workflow_backend import (
     DEFAULT_TASK_QUEUE,
@@ -584,6 +586,8 @@ async def _run_temporal(
                 call_skill_activity,
                 call_gate_activity,
                 call_judge_activity,
+                call_human_activity,
+                persist_workflow_result_activity,
             ],
             workflow_runner=UnsandboxedWorkflowRunner(),
         ),
