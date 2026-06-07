@@ -50,6 +50,7 @@ from movate.core.workflow.temporal_activities import (  # noqa: E402
     call_judge_activity,
     call_skill_activity,
     configure_activities,
+    persist_workflow_result_activity,
 )
 from movate.providers.base import (  # noqa: E402
     BaseLLMProvider,
@@ -246,6 +247,7 @@ async def _run_and_capture_history(
                 call_skill_activity,
                 call_gate_activity,
                 call_judge_activity,
+                persist_workflow_result_activity,
             ],
             workflow_runner=UnsandboxedWorkflowRunner(),
         ),
@@ -299,39 +301,45 @@ async def test_replay_deterministic_with_mocked_history(tmp_path: Path) -> None:
 @pytest.mark.temporal
 @pytest.mark.smoke
 async def test_replay_detects_divergence_on_altered_workflow(tmp_path: Path) -> None:
-    """Replay a captured history against an ALTERED workflow that would make
-    different decisions.
+    """Replay a captured history against an ALTERED workflow whose COMMAND
+    SEQUENCE diverges from what the history recorded.
 
     The Replayer should detect the non-determinism and report a failure
     (``replay_failure is not None``). This validates that the divergence-
     detection path actually catches real determinism violations.
 
-    We alter the workflow by changing the node order (second before first)
-    which changes the entrypoint, causing a different execution path than
-    what the history recorded.
+    What makes the divergence detectable: Temporal compares the command
+    *type/sequence* a replayed workflow emits against the recorded history —
+    NOT which activity (by name/args) was scheduled. The history recorded TWO
+    ``call_agent_activity`` calls (``first`` then ``second``), i.e. two
+    ``ScheduleActivityTask`` commands followed by ``CompleteWorkflowExecution``.
+    We drop the ``second`` node so the altered workflow emits only ONE
+    ``ScheduleActivityTask`` then completes: after ``first`` resolves, the
+    history's next event is another ``ScheduleActivityTask`` but the workflow
+    instead completes — a structural command mismatch the Replayer flags.
+
+    (A prior version of this test merely *reversed* the two nodes' order. That
+    does NOT diverge: both orderings emit the same ``ScheduleActivityTask`` ->
+    ``ScheduleActivityTask`` -> ``CompleteWorkflowExecution`` command stream;
+    swapping which agent runs first changes only the activity identity, which
+    Temporal's non-determinism check ignores. See the TemporalCompiler's
+    per-node emission in compilers/temporal.py — one activity call per node.)
     """
     history, _compiled, _original_cls = await _run_and_capture_history(tmp_path)
 
-    # Build a DIFFERENT workflow that reverses the node order.
-    # The history was recorded with entrypoint='first' executing first,
-    # but we'll compile with entrypoint='second' -- the Replayer should
-    # detect the workflow took a different path.
+    # Build a DIFFERENT workflow with FEWER activity calls than the history.
     workflows_root = tmp_path / "altered_workflows"
     wf_dir = workflows_root / "replay-det-wf"
-    # Reuse the same agent scaffolding
+    # Only the 'first' node is referenced by the altered spec below.
     _make_agent(
         wf_dir / "agents" / "first", name="first-agent", input_key="text", output_key="step1"
     )
-    _make_agent(
-        wf_dir / "agents" / "second",
-        name="second-agent",
-        input_key="step1",
-        output_key="step2",
-    )
     wf_dir.mkdir(parents=True, exist_ok=True)
     (wf_dir / "state.json").write_text(json.dumps(_STATE_SCHEMA))
-    # Entrypoint is 'second' instead of 'first' -- this changes what
-    # activity the workflow calls first, diverging from the recorded history.
+    # Single-node workflow: emits ONE ScheduleActivityTask then completes,
+    # whereas the recorded history has TWO. The shorter command stream
+    # diverges from history once 'first' resolves -- a real non-determinism
+    # violation the Replayer must catch.
     altered_body: dict[str, Any] = {
         "api_version": "movate/v1",
         "kind": "Workflow",
@@ -339,12 +347,11 @@ async def test_replay_detects_divergence_on_altered_workflow(tmp_path: Path) -> 
         "version": "0.1.0",
         "runtime": "temporal",
         "state_schema": "./state.json",
-        "entrypoint": "second",
+        "entrypoint": "first",
         "nodes": [
             {"id": "first", "type": "agent", "ref": "./agents/first"},
-            {"id": "second", "type": "agent", "ref": "./agents/second"},
         ],
-        "edges": [{"from": "second", "to": "first"}],
+        "edges": [],
     }
     (wf_dir / "workflow.yaml").write_text(yaml.safe_dump(altered_body))
 
