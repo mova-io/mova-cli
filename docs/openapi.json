@@ -2228,6 +2228,154 @@
         "title": "BenchSubmission",
         "type": "object"
       },
+      "Body_openai_audio_transcriptions_v1_audio_transcriptions_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "description": "The audio file to transcribe (multipart part), per the OpenAI Audio API.",
+            "title": "File",
+            "type": "string"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional BCP-47 language hint forwarded to the STT adapter.",
+            "title": "Language"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "OpenAI-compat field (e.g. ``whisper-1``); accepted and ignored for provider selection \u2014 mdk transcribes with its configured STT adapter.",
+            "title": "Model"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "title": "Body_openai_audio_transcriptions_v1_audio_transcriptions_post",
+        "type": "object"
+      },
+      "Body_v1_agent_voice_oneshot_api_v1_agents__name__voice_post": {
+        "properties": {
+          "audio": {
+            "anyOf": [
+              {
+                "contentMediaType": "application/octet-stream",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The inbound audio as a multipart file part (ADR 050 D10 \u2014 never base64-in-JSON). Either this or ``audio_url`` is required.",
+            "title": "Audio"
+          },
+          "audio_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A URL the runtime fetches the inbound audio from (ADR 050 D10 \u2014 the large / already-hosted path, e.g. a telephony recording). Alternative to the ``audio`` multipart part.",
+            "title": "Audio Url"
+          },
+          "codec": {
+            "default": "pcm16",
+            "description": "Codec of the inbound audio bytes (pcm16 / opus / mulaw).",
+            "title": "Codec",
+            "type": "string"
+          },
+          "input_key": {
+            "default": "text",
+            "description": "The agent-input field the transcript is bound to (default ``text``).",
+            "title": "Input Key",
+            "type": "string"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "STT language hint for this turn (ADR 050 D6).",
+            "title": "Language"
+          },
+          "mock": {
+            "default": false,
+            "description": "Run the agent stage offline with MockProvider (test hook; mirrors WS).",
+            "title": "Mock",
+            "type": "boolean"
+          },
+          "stt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "STT provider override for this turn (ADR 050 D6).",
+            "title": "Stt"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Text to speak instead of audio in (the ``mdk voice say`` path, ADR 050 D11). When set, STT is bypassed \u2014 the text IS the transcript and the SAME pipeline runs agent \u2192 TTS. Mutually exclusive with ``audio`` / ``audio_url``.",
+            "title": "Text"
+          },
+          "tts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "TTS provider override for this turn (ADR 050 D6).",
+            "title": "Tts"
+          },
+          "voice_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "TTS voice id override for this turn (ADR 050 D6).",
+            "title": "Voice Id"
+          }
+        },
+        "title": "Body_v1_agent_voice_oneshot_api_v1_agents__name__voice_post",
+        "type": "object"
+      },
       "Body_v1_create_agent_api_v1_agents_post": {
         "properties": {
           "agent_yaml": {
@@ -3104,6 +3252,20 @@
               }
             ]
           },
+          "resources": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CapabilityResourceView"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resources"
+          },
           "scopes_supported": {
             "anyOf": [
               {
@@ -3214,6 +3376,39 @@
           "byok_configured"
         ],
         "title": "CapabilityModelsView",
+        "type": "object"
+      },
+      "CapabilityResourceView": {
+        "additionalProperties": false,
+        "description": "One managed resource type in the capabilities matrix.\n\nLets an API-first client (e.g. a front end or an integrator) discover the\n*manageable resource surface* \u2014 agents, projects, skills, contexts, KB \u2014\nwithout crawling the route table itself. Like every other capability field,\nit's derived from the *deployed* route table: ``operations`` lists exactly\nthe CRUD verbs registered on THIS build, so a half-managed resource\n(skills: create-only today) and a not-yet-shipped one (contexts, until\nADR 060) are reported honestly rather than promised.",
+        "properties": {
+          "managed": {
+            "title": "Managed",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "operations": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Operations",
+            "type": "array"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "operations",
+          "managed"
+        ],
+        "title": "CapabilityResourceView",
         "type": "object"
       },
       "CapabilityVoiceView": {
@@ -3836,6 +4031,69 @@
         "title": "ContextAddFixView",
         "type": "object"
       },
+      "ContextCreateRequest": {
+        "additionalProperties": false,
+        "description": "``POST /api/v1/contexts`` request body \u2014 create the first version.\n\n``name`` is the registry key (the stem an ``agent.yaml`` ``contexts:``\nentry references). ``version`` defaults to ``\"v1\"``.",
+        "properties": {
+          "body": {
+            "minLength": 1,
+            "title": "Body",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "version": {
+            "default": "v1",
+            "minLength": 1,
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "body"
+        ],
+        "title": "ContextCreateRequest",
+        "type": "object"
+      },
+      "ContextListResponse": {
+        "additionalProperties": false,
+        "description": "``GET /api/v1/contexts`` response \u2014 latest-per-name, newest-first.",
+        "properties": {
+          "contexts": {
+            "items": {
+              "$ref": "#/components/schemas/ContextView"
+            },
+            "title": "Contexts",
+            "type": "array"
+          },
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "contexts",
+          "count"
+        ],
+        "title": "ContextListResponse",
+        "type": "object"
+      },
       "ContextRemoveFixView": {
         "additionalProperties": false,
         "description": "Remove a named context from the agent.",
@@ -3865,6 +4123,139 @@
           "name"
         ],
         "title": "ContextRemoveFixView",
+        "type": "object"
+      },
+      "ContextUpsertRequest": {
+        "additionalProperties": false,
+        "description": "``PUT /api/v1/contexts/{name}`` request body \u2014 publish a new version.\n\nUpdate is a NEW version (immutable rows). ``version`` is required and\nmust not collide with an existing ``(name, version)``.",
+        "properties": {
+          "body": {
+            "minLength": 1,
+            "title": "Body",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "version": {
+            "minLength": 1,
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "body"
+        ],
+        "title": "ContextUpsertRequest",
+        "type": "object"
+      },
+      "ContextVersionsResponse": {
+        "additionalProperties": false,
+        "description": "``GET /api/v1/contexts/{name}/versions`` response \u2014 newest-first.",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/ContextView"
+            },
+            "title": "Versions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "versions",
+          "count"
+        ],
+        "title": "ContextVersionsResponse",
+        "type": "object"
+      },
+      "ContextView": {
+        "additionalProperties": false,
+        "description": "``GET /api/v1/contexts/{name}`` (and list / create / update) response \u2014\na managed shared-context record (ADR 060 D2).\n\nMirror of :class:`movate.core.models.ContextRecord`. The payload is the\nsingle Markdown ``body`` (the prompt fragment ADR 002 injects).",
+        "properties": {
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "content_hash": {
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "tenant_id",
+          "version",
+          "content_hash",
+          "body",
+          "created_at"
+        ],
+        "title": "ContextView",
+        "type": "object"
+      },
+      "DeadLetterPurgeView": {
+        "additionalProperties": false,
+        "description": "``POST /api/v1/jobs/dead-letter/purge`` response.\n\n``purged`` is the number of ``DEAD_LETTER`` rows deleted for the\nauthenticated tenant. Envelope (not a bare int) so the response can\ngrow back-compatibly (e.g. a future ``cutoff`` echo).",
+        "properties": {
+          "purged": {
+            "title": "Purged",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "purged"
+        ],
+        "title": "DeadLetterPurgeView",
         "type": "object"
       },
       "DescribeAgentRequest": {
@@ -5538,6 +5929,230 @@
         "title": "FindingView",
         "type": "object"
       },
+      "FineTuneAcceptedView": {
+        "additionalProperties": false,
+        "description": "``POST /api/v1/agents/{name}/finetune`` response (202) \u2014 the async handle.\n\nPoll ``GET /api/v1/jobs/{job_id}`` until terminal; the job's output payload\nthen carries ``{model_id, eval_id}`` (the registered fine-tuned model + the\neval-vs-base scorecard).",
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "message": {
+            "default": "",
+            "title": "Message",
+            "type": "string"
+          },
+          "status": {
+            "default": "queued",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "FineTuneAcceptedView",
+        "type": "object"
+      },
+      "FineTuneSubmission": {
+        "additionalProperties": false,
+        "description": "``POST /api/v1/agents/{name}/finetune`` request body (ADR 063).\n\nKicks off an async fine-tune: the worker builds a training set from the\nagent's golden/graded eval cases (``min_score`` floor), dispatches a hosted\nfine-tune via the ``FineTuneProvider`` seam (BYOK), registers the resulting\nmodel, and runs eval-vs-base \u2014 promoting only when ``promote_if_better``.\nMirrors the ``mdk finetune`` flag set; the endpoint returns 202 + a\n``job_id`` to poll (``GET /api/v1/jobs/{job_id}``).",
+        "properties": {
+          "base_model": {
+            "minLength": 1,
+            "title": "Base Model",
+            "type": "string"
+          },
+          "min_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Score"
+          },
+          "promote_if_better": {
+            "default": false,
+            "title": "Promote If Better",
+            "type": "boolean"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          }
+        },
+        "required": [
+          "base_model"
+        ],
+        "title": "FineTuneSubmission",
+        "type": "object"
+      },
+      "GraphAssertEdgeIn": {
+        "additionalProperties": false,
+        "description": "A directed relation between two asserted nodes, referenced by ``name``.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "dst": {
+            "title": "Dst",
+            "type": "string"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "src": {
+            "title": "Src",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "weight": {
+            "default": 1.0,
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "src",
+          "dst",
+          "type"
+        ],
+        "title": "GraphAssertEdgeIn",
+        "type": "object"
+      },
+      "GraphAssertNodeIn": {
+        "additionalProperties": false,
+        "description": "One node to assert (ADR 079). ``type`` + ``name`` form its identity, and\nre-asserting the same pair merges into the existing node.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "name"
+        ],
+        "title": "GraphAssertNodeIn",
+        "type": "object"
+      },
+      "GraphAssertRequest": {
+        "additionalProperties": false,
+        "description": "``POST /api/v1/projects/{project}/graph/assert`` body (ADR 079 D2).",
+        "properties": {
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/GraphAssertEdgeIn"
+            },
+            "title": "Edges",
+            "type": "array"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/GraphAssertNodeIn"
+            },
+            "title": "Nodes",
+            "type": "array"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          }
+        },
+        "title": "GraphAssertRequest",
+        "type": "object"
+      },
+      "GraphAssertView": {
+        "additionalProperties": false,
+        "description": "``POST \u2026/graph/assert`` response \u2014 applied counts + skipped-edge report.",
+        "properties": {
+          "applied_edges": {
+            "default": 0,
+            "title": "Applied Edges",
+            "type": "integer"
+          },
+          "applied_nodes": {
+            "default": 0,
+            "title": "Applied Nodes",
+            "type": "integer"
+          },
+          "skipped_edges": {
+            "items": {
+              "$ref": "#/components/schemas/SkippedEdgeView"
+            },
+            "title": "Skipped Edges",
+            "type": "array"
+          }
+        },
+        "title": "GraphAssertView",
+        "type": "object"
+      },
       "GraphCentralityView": {
         "additionalProperties": false,
         "description": "``GET /api/v1/graph/analytics/centrality`` response \u2014 top-N hubs.\n\n``measure`` echoes which centrality was computed (``degree`` |\n``betweenness``); ``scores`` is highest-first, capped at the requested\n``top_n``.",
@@ -6003,7 +6618,8 @@
           "eval",
           "bench",
           "observability_analyze",
-          "audit"
+          "audit",
+          "finetune"
         ],
         "title": "JobKind",
         "type": "string"
@@ -6680,6 +7296,13 @@
         "additionalProperties": false,
         "description": "``POST /api/v1/agents/{name}/kb`` response.\n\nAggregate plus per-file detail. Total counts make the success\nsummary trivial to render in the playground UI; per-file detail\nlets the operator see exactly which uploads contributed.\n\nThe wire shape is intentionally additive across all four ingest\nkinds (``upload`` / ``text`` / ``url`` / ``generated``). The\nmultipart upload path populates ``files`` + ``total_chunks_saved``\nand leaves the new JSON-mode fields at their defaults \u2014 byte-for-byte\nbackwards compatible with the pre-JSON-modes client contract. JSON\nmodes populate ``ingest_id`` / ``kind`` / ``chunks_added`` /\n``tokens_in`` / ``embedding_cost_usd`` (and ``generated_content``\nfor ``kind=\"generated\"``) so a single response model serves every\nfront-end branch.",
         "properties": {
+          "_links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Links",
+            "type": "object"
+          },
           "agent_name": {
             "title": "Agent Name",
             "type": "string"
@@ -7722,6 +8345,13 @@
         "additionalProperties": false,
         "description": "``GET /api/v1/projects/{id}`` (and create/update) response.\n\nMirror of :class:`Project` with the ``etag`` derived from\n``updated_at`` \u2014 clients echo it back as ``If-Match`` for optimistic\nconcurrency on PUT (412 on stale).",
         "properties": {
+          "_links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Links",
+            "type": "object"
+          },
           "archived_at": {
             "anyOf": [
               {
@@ -7753,6 +8383,17 @@
           "etag": {
             "title": "Etag",
             "type": "string"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
           },
           "name": {
             "title": "Name",
@@ -8098,6 +8739,78 @@
           "top_failing_cases"
         ],
         "title": "ReportView",
+        "type": "object"
+      },
+      "ResourceAttachRequest": {
+        "additionalProperties": false,
+        "description": "``POST /api/v1/agents/{name}/skills`` and ``.../contexts`` request body\n\u2014 attach a registry skill/context to an agent by name (ADR 060 D2).\n\n``ref`` is the registry resource name; ``version`` pins an exact version\n(omit for \"latest\"). The attach records the agent\u2192resource wiring in the\nagent's bundle ``skills:`` / ``contexts:`` list \u2014 the runtime\nregistry-resolution that consumes the wiring is D4 (a separate PR), so\nthis endpoint validates + records the reference but does not yet resolve\nit at execution time.",
+        "properties": {
+          "ref": {
+            "minLength": 1,
+            "title": "Ref",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "ref"
+        ],
+        "title": "ResourceAttachRequest",
+        "type": "object"
+      },
+      "ResourceAttachView": {
+        "additionalProperties": false,
+        "description": "Response for the agent skill/context attach endpoints (ADR 060 D2).",
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "attached": {
+            "title": "Attached",
+            "type": "boolean"
+          },
+          "kind": {
+            "enum": [
+              "skill",
+              "context"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "ref": {
+            "title": "Ref",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "agent",
+          "kind",
+          "ref",
+          "attached"
+        ],
+        "title": "ResourceAttachView",
         "type": "object"
       },
       "RetrievalKChangeFixView": {
@@ -8446,6 +9159,44 @@
         "title": "RunExplainView",
         "type": "object"
       },
+      "RunReplayView": {
+        "additionalProperties": false,
+        "description": "``POST /runs/{id}/replay`` response \u2014 original vs replayed, side-by-side.\n\nADR 045 D13. ``original`` is the immutable historical run (unchanged by the\nreplay). ``replayed`` is a NEW run that re-executed ``original.input`` against\nthe agent version selected by ``against`` (``\"published\"`` = latest, or\n``\"version:X\"``). ``changed`` is a quick \"did the output differ?\" flag so a\ncaller can triage at a glance; the full before/after is in the two\n:class:`RunView`s. The replay is a normal run (persisted, metered) \u2014 it never\nmutates the original.",
+        "properties": {
+          "against": {
+            "title": "Against",
+            "type": "string"
+          },
+          "changed": {
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "cost_delta_usd": {
+            "default": 0.0,
+            "title": "Cost Delta Usd",
+            "type": "number"
+          },
+          "latency_delta_ms": {
+            "default": 0.0,
+            "title": "Latency Delta Ms",
+            "type": "number"
+          },
+          "original": {
+            "$ref": "#/components/schemas/RunView"
+          },
+          "replayed": {
+            "$ref": "#/components/schemas/RunView"
+          }
+        },
+        "required": [
+          "original",
+          "replayed",
+          "against",
+          "changed"
+        ],
+        "title": "RunReplayView",
+        "type": "object"
+      },
       "RunSubmission": {
         "additionalProperties": false,
         "description": "``POST /run`` request body.\n\n``kind`` discriminates the dispatch path; ``target`` is the agent\nor workflow name. ``input`` is the run input for an agent kind, or\nthe initial state dict for a workflow kind. Validation against the\ntarget's input schema happens in the worker \u2014 accepting any dict\nhere keeps the HTTP layer simple and lets schema errors land in\nthe persisted ``JobRecord.error`` instead of as a 4xx that's\ninvisible to ``/jobs/{id}`` polling.",
@@ -8546,6 +9297,13 @@
         "additionalProperties": false,
         "description": "``GET /runs/{id}`` response.\n\nMirror of :class:`RunRecord` minus ``tenant_id`` (audit-only,\nnever returned over the wire \u2014 same convention as ``JobView``\ndropping ``api_key_id``). Includes ``output`` so callers can see\nwhat the agent actually produced; this is the whole point of the\nendpoint vs. ``GET /jobs/{id}`` which only carries pointer state.",
         "properties": {
+          "_links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Links",
+            "type": "object"
+          },
           "agent": {
             "title": "Agent",
             "type": "string"
@@ -8852,6 +9610,25 @@
         "additionalProperties": false,
         "description": "``POST /api/v1/skills`` response \u2014 what landed under\n``<skills_path>/<name>/`` after a successful upload.\n\nThe Angular UI doesn't currently render a skills profile, but\ndeploy tooling (and operators running curl) need a confirmation\npayload with the resolved name so a subsequent agent upload that\nreferences the skill can be done with confidence the resolution\nwill succeed.\n\nMirror of :class:`AgentCreatedView` for the skill resource.",
         "properties": {
+          "_links": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Links",
+            "type": "object"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
           "description": {
             "default": "",
             "title": "Description",
@@ -8863,6 +9640,17 @@
             },
             "title": "Files Persisted",
             "type": "array"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
           },
           "name": {
             "title": "Name",
@@ -8884,6 +9672,183 @@
           "files_persisted"
         ],
         "title": "SkillCreatedView",
+        "type": "object"
+      },
+      "SkillListResponse": {
+        "additionalProperties": false,
+        "description": "``GET /api/v1/skills`` response \u2014 latest-per-name, newest-first.",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillView"
+            },
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "skills",
+          "count"
+        ],
+        "title": "SkillListResponse",
+        "type": "object"
+      },
+      "SkillUpsertRequest": {
+        "additionalProperties": false,
+        "description": "``PUT /api/v1/skills/{name}`` request body \u2014 publish a new version.\n\nUpdate is a NEW version (immutable rows; mirrors the agent registry).\n``files`` MUST include ``skill.yaml`` (the canonical spec); the route\nvalidates it via the same skill loader the bundle path uses. ``version``\nis required and must not collide with an existing ``(name, version)``.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "files": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "minProperties": 1,
+            "title": "Files",
+            "type": "object"
+          },
+          "version": {
+            "minLength": 1,
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "files"
+        ],
+        "title": "SkillUpsertRequest",
+        "type": "object"
+      },
+      "SkillVersionsResponse": {
+        "additionalProperties": false,
+        "description": "``GET /api/v1/skills/{name}/versions`` response \u2014 newest-first.",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/SkillView"
+            },
+            "title": "Versions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "versions",
+          "count"
+        ],
+        "title": "SkillVersionsResponse",
+        "type": "object"
+      },
+      "SkillView": {
+        "additionalProperties": false,
+        "description": "``GET /api/v1/skills/{name}`` (and list rows / create / update)\nresponse \u2014 a managed skill record from the registry (ADR 060 D2).\n\nMirror of :class:`movate.core.models.SkillRecord`. ``files`` carries the\nskill bundle's text files; listings omit nothing but front ends typically\nrender only ``name`` / ``version`` / ``description``.",
+        "properties": {
+          "content_hash": {
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "files": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Files",
+            "type": "object"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "tenant_id",
+          "version",
+          "content_hash",
+          "files",
+          "created_at"
+        ],
+        "title": "SkillView",
+        "type": "object"
+      },
+      "SkippedEdgeView": {
+        "additionalProperties": false,
+        "description": "One requested edge the assert dropped (endpoint didn't resolve / self-loop).",
+        "properties": {
+          "dst": {
+            "title": "Dst",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "src": {
+            "title": "Src",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "src",
+          "dst",
+          "type",
+          "reason"
+        ],
+        "title": "SkippedEdgeView",
         "type": "object"
       },
       "TemperatureChangeFixView": {
@@ -9052,6 +10017,11 @@
       "TokenUsage": {
         "additionalProperties": false,
         "properties": {
+          "cache_write": {
+            "default": 0,
+            "title": "Cache Write",
+            "type": "integer"
+          },
           "cached_input": {
             "default": 0,
             "title": "Cached Input",
@@ -9435,6 +10405,91 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "VoiceTurnView": {
+        "additionalProperties": false,
+        "description": "The JSON envelope of one one-shot voice turn (ADR 050 D2 / D10).\n\nReturned by ``POST /api/v1/agents/{name}/voice`` \u2014 the REST parity to the\nstreaming WS. It is the *same* turn as a WS turn collapsed to a single\nrequest/response: STT \u2192 the UNCHANGED Executor \u2192 TTS. The envelope carries\nthe transcript (what the caller said), the response text (what the agent\nanswered), and a **reference** to the synthesized audio \u2014 **never** the\naudio bytes inline (ADR 050 D10 rejects base64-in-JSON; the bytes ride a\nbinary side-channel / signed URL).\n\nThe three-stage cost (STT-seconds + LLM-tokens + TTS-chars, ADR 036) and\nthe per-stage latency ride the response **headers** (ADR 050 D7 /\n``X-MDK-Cost-USD`` / ``X-MDK-Voice-Latency-*``), not this body \u2014 the body\nstays clean + codegen-friendly (ADR 045 D8).\n\nCLAUDE.md rule 5 \u2014 flagged: this is the response shape of a NEW additive\n``/api/v1`` endpoint. It changes no existing endpoint's contract.",
+        "properties": {
+          "audio_bytes_b64": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Bytes B64"
+          },
+          "audio_codec": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Codec"
+          },
+          "audio_sample_rate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Sample Rate"
+          },
+          "audio_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Url"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "response_text": {
+            "title": "Response Text",
+            "type": "string"
+          },
+          "run_id": {
+            "default": "",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "transcript": {
+            "title": "Transcript",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transcript",
+          "response_text"
+        ],
+        "title": "VoiceTurnView",
         "type": "object"
       },
       "WebhookAttemptListView": {
@@ -11172,6 +12227,87 @@
         ]
       }
     },
+    "/api/v1/agents/{name}/call/twilio": {
+      "post": {
+        "description": "TwiML webhook: Twilio calls this when a phone call arrives.\n\nReturns TwiML XML that tells Twilio to open a bidirectional Media\nStream WebSocket back to the ``/call/twilio/stream`` endpoint,\nwhere the call audio is bridged into the mdk voice pipeline\n(ADR 074 D3/D4).",
+        "operationId": "v1_agent_call_twilio_api_v1_agents__name__call_twilio_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Agent Call Twilio",
+        "tags": [
+          "agents-v1"
+        ]
+      }
+    },
+    "/api/v1/agents/{name}/call/twilio/sync": {
+      "post": {
+        "description": "Sync a Twilio phone number to route calls to this agent.\n\nUpdates the Twilio Incoming Phone Number's VoiceUrl to\n``https://<host>/api/v1/agents/{name}/call/twilio`` so incoming\ncalls are handled by the named agent's voice pipeline.",
+        "operationId": "v1_agent_call_twilio_sync_api_v1_agents__name__call_twilio_sync_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response V1 Agent Call Twilio Sync Api V1 Agents  Name  Call Twilio Sync Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Agent Call Twilio Sync",
+        "tags": [
+          "agents-v1"
+        ]
+      }
+    },
     "/api/v1/agents/{name}/canary": {
       "delete": {
         "description": "Remove an agent's canary (the kill switch's hard variant).\n\nIdempotent: deleting a non-existent canary still returns 204. After\nthis the agent routes 100% to its champion. Gated on ``admin``.\n\nErrors:\n\n* **401** \u2014 bad bearer token\n* **403** \u2014 missing the ``admin`` scope",
@@ -11564,6 +12700,75 @@
         "summary": "V1 Rollback Canary",
         "tags": [
           "canary-v1"
+        ]
+      }
+    },
+    "/api/v1/agents/{name}/contexts": {
+      "post": {
+        "description": "Attach a registry context to an agent by name (ADR 060 D2).\n\nRecords the agent\u2192context wiring in the agent's published bundle\n(the agent's ``contexts:`` list), re-saving the bundle as a new\ncontent-addressed version when the wiring changes. Runtime\nregistry-resolution is **D4** (a separate PR).\n\nBoth the agent and the referenced context must exist in this tenant.\nScope: ``admin``.\n\nErrors:\n\n* **401** / **403** \u2014 auth / ``admin`` scope\n* **404** \u2014 unknown agent, or unknown context ``ref`` (/ version)",
+        "operationId": "v1_attach_context_to_agent_api_v1_agents__name__contexts_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceAttachRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceAttachView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Attach Context To Agent",
+        "tags": [
+          "contexts-v1"
         ]
       }
     },
@@ -12053,6 +13258,75 @@
           }
         },
         "summary": "V1 Eval Generate",
+        "tags": [
+          "evals-v1"
+        ]
+      }
+    },
+    "/api/v1/agents/{name}/finetune": {
+      "post": {
+        "description": "Kick off a fine-tune from the agent's graded eval cases (ADR 063).\n\nAsync by construction (a fine-tune runs minutes-to-hours): creates a\n``JobRecord(kind=FINETUNE)`` and returns **202 + ``job_id``**. The\nworker builds a training set from the agent's golden/graded cases\n(``min_score`` floor), dispatches a hosted fine-tune via the\n``FineTuneProvider`` seam (the tenant's BYOK keys), registers the\nresulting model, and runs eval-vs-base \u2014 promoting only when\n``promote_if_better``. Poll ``GET /api/v1/jobs/{job_id}`` until\nterminal; its output then carries ``{model_id, eval_id}``.\n\nErrors:\n\n* **401** \u2014 bad / missing bearer token\n* **403** \u2014 caller lacks the ``eval`` scope\n* **404** \u2014 agent not in the registry",
+        "operationId": "v1_kick_off_finetune_api_v1_agents__name__finetune_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FineTuneSubmission"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FineTuneAcceptedView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Kick Off Finetune",
         "tags": [
           "evals-v1"
         ]
@@ -13157,6 +14431,75 @@
         ]
       }
     },
+    "/api/v1/agents/{name}/skills": {
+      "post": {
+        "description": "Attach a registry skill to an agent by name (ADR 060 D2).\n\nRecords the agent\u2192skill wiring in the agent's published bundle\n``skill.yaml`` references (the agent's ``skills:`` list), re-saving the\nbundle as a new content-addressed version when the wiring changes.\nThe runtime registry-resolution that consumes the wiring at execution\ntime is **D4** (a separate PR) \u2014 this endpoint validates the\nreference + records it, returning ``attached=false`` (idempotent)\nwhen it was already present.\n\nBoth the agent and the referenced skill must exist in this tenant.\n\nScope: ``admin``.\n\nErrors:\n\n* **401** / **403** \u2014 auth / ``admin`` scope\n* **404** \u2014 unknown agent, or unknown skill ``ref`` (/ version)",
+        "operationId": "v1_attach_skill_to_agent_api_v1_agents__name__skills_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceAttachRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceAttachView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Attach Skill To Agent",
+        "tags": [
+          "skills-v1"
+        ]
+      }
+    },
     "/api/v1/agents/{name}/validate": {
       "post": {
         "description": "Run the prompt linter + cost forecast for an agent.\n\nDrives the Mova iO Angular \"is this agent shippable?\" gate\nBEFORE the user clicks Publish or Run Eval. Returns:\n\n* ``passed: bool`` \u2014 green-checkmark shortcut (zero errors)\n* ``errors[]`` \u2014 block save (red chips)\n* ``warnings[]`` \u2014 informational (yellow chips, don't block)\n* ``cost_forecast`` \u2014 pricing-table estimate for the eval\n  dataset; lets the UI render \"running this eval will cost\n  ~$0.45\" alongside the Run Eval button\n\nNote: the structural validation (Pydantic parse + I/O schema\nsanity) already ran at POST /agents time \u2014 agents that don't\npass that never make it into the registry. This endpoint is\nthe SOFT validation layer: prompt-template hygiene + cost.\n\nErrors:\n\n* **401** \u2014 missing / bad bearer token\n* **404** \u2014 agent not in the registry",
@@ -13280,6 +14623,86 @@
           }
         },
         "summary": "V1 List Agent Versions",
+        "tags": [
+          "agents-v1"
+        ]
+      }
+    },
+    "/api/v1/agents/{name}/voice": {
+      "post": {
+        "description": "Run one voice turn over REST: audio \u2192 STT \u2192 the unchanged agent \u2192 TTS.\n\nThe one-shot / batch parity to the streaming WS (ADR 050 D2). A voice\nturn **is** a run (ADR 050 D1): it runs the SAME ``run_voice_pipeline``\nthe WS drives \u2014 STT, then the **unchanged** text Executor (this route\nnever edits ``core/executor.py``; it calls the executor exactly like\nthe SSE run-stream + WS voice routes), then TTS \u2014 and the resulting run\nshows up in ``mdk runs list`` / ``/api/v1/usage`` / traces like any run.\n\nAudio I/O (ADR 050 D10): inbound audio is the ``audio`` multipart file\npart **or** an ``audio_url`` the runtime fetches; outbound audio rides a\nbinary body (``?audio=stream``) or base64 in the JSON envelope\n(``?audio=inline``), **never** base64-in-JSON by default for the\ncodegen-clean shape.\n\nPer-request ``stt`` / ``tts`` / ``voice_id`` / ``language`` overrides\n(ADR 050 D6) tune this one turn. The tenant's own BYOK STT/TTS keys are\nresolved at this edge (ADR 048 D6) \u2014 reusing the WS path's resolver, not\na second mechanism.\n\nLazily imports the ``mdk[voice]`` extra \u2014 a runtime without it returns a\nclear 503 rather than a cryptic ImportError (the REST degrade).\n\nErrors:\n\n* **400** \u2014 neither ``audio`` nor ``audio_url`` supplied, or an empty\n  audio part.\n* **404** \u2014 agent not in the registry for this tenant.\n* **503** \u2014 the ``mdk[voice]`` extra is not installed on this runtime.",
+        "operationId": "v1_agent_voice_oneshot_api_v1_agents__name__voice_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "description": "How the synthesized answer audio travels (ADR 050 D10): ``inline`` (default) = base64 in the JSON envelope (small test/telephony turns); ``stream`` = the raw audio bytes as the binary response body, transcript/response in headers; ``none`` = no audio (transcribe-only).",
+            "in": "query",
+            "name": "audio",
+            "required": false,
+            "schema": {
+              "default": "inline",
+              "description": "How the synthesized answer audio travels (ADR 050 D10): ``inline`` (default) = base64 in the JSON envelope (small test/telephony turns); ``stream`` = the raw audio bytes as the binary response body, transcript/response in headers; ``none`` = no audio (transcribe-only).",
+              "title": "Audio",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_v1_agent_voice_oneshot_api_v1_agents__name__voice_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VoiceTurnView"
+                }
+              }
+            },
+            "description": "One-shot voice turn result. JSON (the default, or ``?audio=inline``) carries the transcript + response text + an audio reference; ``?audio=stream`` (the default for a telephony bridge) returns the synthesized audio as the binary body with the transcript/response in headers."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Agent Voice Oneshot",
         "tags": [
           "agents-v1"
         ]
@@ -14013,6 +15436,89 @@
         ]
       }
     },
+    "/api/v1/call/twilio": {
+      "post": {
+        "description": "Generic Twilio webhook \u2014 routes to the currently active agent.\n\nSet once in Twilio console, then switch agents via\nPUT /api/v1/call/twilio/config.",
+        "operationId": "v1_call_twilio_generic_api_v1_call_twilio_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V1 Call Twilio Generic",
+        "tags": [
+          "voice-v1"
+        ]
+      }
+    },
+    "/api/v1/call/twilio/config": {
+      "get": {
+        "description": "Return the currently active voice agent for Twilio calls.",
+        "operationId": "v1_call_twilio_config_get_api_v1_call_twilio_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response V1 Call Twilio Config Get Api V1 Call Twilio Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "V1 Call Twilio Config Get",
+        "tags": [
+          "voice-v1"
+        ]
+      },
+      "put": {
+        "description": "Set the active voice agent for Twilio calls.\n\nBody: ``{\"agent\": \"voice-receptionist\"}``",
+        "operationId": "v1_call_twilio_config_put_api_v1_call_twilio_config_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response V1 Call Twilio Config Put Api V1 Call Twilio Config Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Call Twilio Config Put",
+        "tags": [
+          "voice-v1"
+        ]
+      }
+    },
     "/api/v1/capabilities": {
       "get": {
         "description": "Describe what THIS runtime version supports (read-only).\n\nReturns a capability matrix \u2014 reachable models, feature flags\n(detected from the live route table / importable modules, never a\nstatic dict), the scope vocabulary, this tenant's effective limits,\nand the installed optional extras.\n\nAuth:\n\n* **No / bad bearer** \u2192 a minimal subset (``mdk_version`` +\n  ``api_version``, ``minimal: true``) for version-fingerprint /\n  probe use. Never 401s.\n* **Valid bearer with the ``read`` scope** \u2192 the full matrix.\n* **Valid bearer without ``read``** \u2192 the minimal subset (the\n  richer fields stay gated, but the caller still gets a usable\n  probe rather than a 403).\n\nBYOK providers are reported by NAME only \u2014 the encrypted key value\nis never read or surfaced.",
@@ -14676,6 +16182,412 @@
         "summary": "V1 Catalog Sync",
         "tags": [
           "catalog"
+        ]
+      }
+    },
+    "/api/v1/contexts": {
+      "get": {
+        "description": "List this tenant's managed contexts \u2014 latest version per name,\nnewest-first (ADR 060 D2).",
+        "operationId": "v1_list_contexts_api_v1_contexts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 List Contexts",
+        "tags": [
+          "contexts-v1"
+        ]
+      },
+      "post": {
+        "description": "Create the first version of a managed context (ADR 060 D2).\n\n``name`` is the registry key. ``version`` defaults to ``\"v1\"``.\n\nScope: ``admin``.\n\nErrors:\n\n* **401** / **403** \u2014 auth / ``admin`` scope\n* **409** \u2014 ``(name, version)`` already exists for this tenant",
+        "operationId": "v1_create_context_api_v1_contexts_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContextCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Create Context",
+        "tags": [
+          "contexts-v1"
+        ]
+      }
+    },
+    "/api/v1/contexts/{name}": {
+      "delete": {
+        "description": "Delete a managed context (ADR 060 D2).\n\n``?version=<v>`` removes just that version; omit to remove **all**\nversions of the name. Returns the (latest) record removed.\nTenant-scoped \u2014 a cross-tenant or unknown name is **404**.\n\nScope: ``admin``.",
+        "operationId": "v1_delete_context_api_v1_contexts__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Delete Context",
+        "tags": [
+          "contexts-v1"
+        ]
+      },
+      "get": {
+        "description": "Fetch one managed context (ADR 060 D2).\n\n``?version=<v>`` pins an exact version; omit for the latest. A\ncross-tenant or unknown name is **404** (no existence leak).",
+        "operationId": "v1_get_context_api_v1_contexts__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Get Context",
+        "tags": [
+          "contexts-v1"
+        ]
+      },
+      "put": {
+        "description": "Publish a NEW version of a managed context (ADR 060 D2).\n\nRows are immutable: an update writes a new\n``(name, tenant_id, version)`` row. Scope: ``admin``.\n\nErrors:\n\n* **401** / **403** \u2014 auth / ``admin`` scope\n* **409** \u2014 ``(name, version)`` already exists for this tenant",
+        "operationId": "v1_upsert_context_api_v1_contexts__name__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContextUpsertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Upsert Context",
+        "tags": [
+          "contexts-v1"
+        ]
+      }
+    },
+    "/api/v1/contexts/{name}/versions": {
+      "get": {
+        "description": "Version history for one managed context, newest-first (ADR 060 D2).\n\nA cross-tenant or unknown name returns an empty list (no leak).",
+        "operationId": "v1_list_context_versions_api_v1_contexts__name__versions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextVersionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 List Context Versions",
+        "tags": [
+          "contexts-v1"
         ]
       }
     },
@@ -15738,6 +17650,153 @@
         ]
       }
     },
+    "/api/v1/jobs/dead-letter": {
+      "get": {
+        "description": "List this tenant's retry-exhausted (``DEAD_LETTER``) jobs.\n\nThe operator triage surface for jobs the retry policy gave up on\n(distinct from a one-off ``ERROR``). Newest-first, tenant-scoped\n(a tenant never sees another's dead-letters). ``agent`` narrows to\na single component. Limit hard-capped at 100.\n\nRead-only (``read`` scope). Recover a row with\n``POST /api/v1/jobs/{job_id}/requeue``; prune with\n``POST /api/v1/jobs/dead-letter/purge``.\n\nErrors:\n\n* **401** \u2014 missing / bad bearer token",
+        "operationId": "v1_list_dead_letter_jobs_api_v1_jobs_dead_letter_get",
+        "parameters": [
+          {
+            "description": "Narrow to one agent/workflow name (the job ``target``).",
+            "in": "query",
+            "name": "agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Narrow to one agent/workflow name (the job ``target``).",
+              "title": "Agent"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobListView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 List Dead Letter Jobs",
+        "tags": [
+          "jobs-v1"
+        ]
+      }
+    },
+    "/api/v1/jobs/dead-letter/purge": {
+      "post": {
+        "description": "Permanently delete this tenant's ``DEAD_LETTER`` jobs.\n\nDestructive housekeeping. Gated on the ``admin`` scope (the\nstrongest \u2014 it irrecoverably deletes rows) and tenant-scoped:\ndeletes ONLY this tenant's dead-letter rows, never a live job and\nnever another tenant's. ``before`` keeps recent dead-letters for\ninspection while clearing stale ones. Returns the count purged.\n\nErrors:\n\n* **401** \u2014 missing / bad bearer token\n* **403** \u2014 token lacks the ``admin`` scope",
+        "operationId": "v1_purge_dead_letter_jobs_api_v1_jobs_dead_letter_purge_post",
+        "parameters": [
+          {
+            "description": "Only purge dead-letters whose ``completed_at`` is strictly older than this ISO-8601 instant. Omit to purge all.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only purge dead-letters whose ``completed_at`` is strictly older than this ISO-8601 instant. Omit to purge all.",
+              "title": "Before"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeadLetterPurgeView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Purge Dead Letter Jobs",
+        "tags": [
+          "jobs-v1"
+        ]
+      }
+    },
     "/api/v1/jobs/{job_id}": {
       "get": {
         "description": "Versioned alias of ``GET /jobs/{job_id}``.\n\nRoutes by job_id format: ``evgen_*`` ids land in the\neval-generation table (returning :class:`EvalGenerateJobView`);\neverything else delegates to the queue ``JobView`` path. Both\nresponses use the same ``read`` scope + 404-not-403 tenant\ngating \u2014 the discriminator is the response's ``kind`` field\n(``evals_generate`` vs. ``agent`` / ``workflow`` / ``eval``). The\nqueue path also honours the ``wait`` long-poll query param.",
@@ -15942,6 +18001,65 @@
           }
         },
         "summary": "V1 Eval Generate Commit",
+        "tags": [
+          "jobs-v1"
+        ]
+      }
+    },
+    "/api/v1/jobs/{job_id}/requeue": {
+      "post": {
+        "description": "Recover a ``DEAD_LETTER`` job back onto the queue.\n\nBody-less. Resets the job to a fresh ``QUEUED`` state\n(``attempt_count=0``, ``next_retry_at`` / ``claimed_at`` /\n``completed_at`` / ``error`` cleared) so the worker claims it\nagain on the next poll. Returns the requeued :class:`JobView`.\n\nGated on the ``run`` scope (it re-enqueues work \u2014 a stronger\ncapability than the ``read`` used to list). Tenant-scoped at the\nstorage layer; status-guarded on ``DEAD_LETTER``.\n\nErrors:\n\n* **401** \u2014 missing / bad bearer token\n* **403** \u2014 token lacks the ``run`` scope\n* **404** \u2014 no ``DEAD_LETTER`` job with this id for this tenant\n  (missing, cross-tenant, or the job is not dead-lettered \u2014 you\n  can only requeue a retry-exhausted job)",
+        "operationId": "v1_requeue_dead_letter_job_api_v1_jobs__job_id__requeue_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Requeue Dead Letter Job",
         "tags": [
           "jobs-v1"
         ]
@@ -17069,7 +19187,7 @@
     },
     "/api/v1/projects/{project_id}/graph": {
       "get": {
-        "description": "A windowed subgraph for ``project_id`` as **graphology JSON**.\n\n``project_id`` (path) is the agent that owns the graph. The\nresponse is a graphology import document (``{attributes, nodes,\nedges}``) a sigma.js client feeds to ``graph.import(...)`` with\nzero transform: each node carries ``label`` / ``type`` /\ndegree-derived ``size`` / ``color`` (+ ``community`` when stored);\nlayout ``x`` / ``y`` are omitted (the client runs ForceAtlas2).\n\nQuery params:\n\n* ``mode`` \u2014 ``knowledge`` (the GraphRAG graph) or ``topology``\n  (reserved; returns empty today).\n* ``type`` \u2014 filter to one node type.\n* ``root`` \u2014 center the window on a node (bounded k-hop expansion).\n  Omit for a whole-graph overview (still capped).\n* ``depth`` \u2014 hops from ``root`` (capped at 6).\n* ``limit`` \u2014 node/edge cap (default 500, max 5000).\n* ``project`` \u2014 **ADR 046 D1** project-scope filter. When set, only\n  nodes/edges tagged with this ``project_id`` are returned (a\n  project's subgraph across the agent's KBs). Omit (default) for\n  the full per-agent graph \u2014 backward-compatible.\n\nTenant-scoped: a cross-tenant ``project_id`` / ``root`` yields an\nempty document (no leak). Read scope.",
+        "description": "A windowed subgraph for ``project_id`` as **graphology JSON**.\n\n``project_id`` (path) is the agent that owns the graph. The\nresponse is a graphology import document (``{attributes, nodes,\nedges}``) a sigma.js client feeds to ``graph.import(...)`` with\nzero transform: each node carries ``label`` / ``type`` /\ndegree-derived ``size`` / ``color`` (+ ``community`` /\n``confidence`` when stored); layout ``x`` / ``y`` are omitted (the\nclient runs ForceAtlas2).\n\nQuery params:\n\n* ``mode`` \u2014 ``knowledge`` (the GraphRAG graph) or ``topology``\n  (reserved; returns empty today).\n* ``type`` \u2014 filter to one node type.\n* ``root`` \u2014 center the window on a node (bounded k-hop expansion).\n  Omit for a whole-graph overview (still capped).\n* ``depth`` \u2014 hops from ``root`` (capped at 6).\n* ``limit`` \u2014 node/edge cap (default 500, max 5000).\n* ``project`` \u2014 **ADR 046 D1** project-scope filter. When set, only\n  nodes/edges tagged with this ``project_id`` are returned (a\n  project's subgraph across the agent's KBs). Omit (default) for\n  the full per-agent graph \u2014 backward-compatible.\n* ``min_confidence`` \u2014 **ADR 046 D2** confidence floor in ``[0, 1]``.\n  Drops nodes whose stored extraction confidence is below it (and\n  their now-dangling edges). Default ``0.0`` shows every node \u2014 an\n  opt-in, backward-compatible filter. A node with no recorded\n  confidence is treated as full-confidence (never dropped).\n\nTenant-scoped: a cross-tenant ``project_id`` / ``root`` yields an\nempty document (no leak). Read scope.",
         "operationId": "v1_project_graph_api_v1_projects__project_id__graph_get",
         "parameters": [
           {
@@ -17169,6 +19287,16 @@
                 }
               ],
               "title": "Project"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_confidence",
+            "required": false,
+            "schema": {
+              "default": 0.0,
+              "title": "Min Confidence",
+              "type": "number"
             }
           },
           {
@@ -17537,9 +19665,79 @@
         ]
       }
     },
+    "/api/v1/projects/{project_id}/graph/assert": {
+      "post": {
+        "description": "Deterministically **assert** structured facts into the agent's graph\n(ADR 079 D2) \u2014 the write counterpart to LLM extraction.\n\nWhere extraction *discovers* a probabilistic graph from prose, this\n*writes* known nodes/edges with a guaranteed, searchable identity: a\nnode's ``content_hash`` dedups on ``(agent, tenant_id, content_hash)`` so\nre-asserting **merges** instead of duplicating, and every asserted record\ncarries ``metadata.source = \"assert\"`` + ``confidence = 1.0`` (so it\nsurvives the ADR 046 ``min_confidence`` floor and renders as \"asserted\"\nin the UI). The first producer is the POS-demo call-ingest asserting a\nServiceNow incident + its store/lane/symptom edges.\n\nNodes are upserted **before** edges; an edge whose ``src`` / ``dst`` name\nisn't in the asserted node set is **skipped and reported**, never fatal.\nCross-source reconciliation: a node previously created by *extraction*\n(random ``entity_id``) is merged onto its existing id (looked up by\n``content_hash``) so asserted edges link to the stored row.\n\nTenant-scoped \u2014 records are stamped with the caller's tenant, so a write\ncan never land in another tenant's graph. Requires the ``kb:write``\nscope. ``project_id`` (path) is the agent that owns the graph;\n``body.project_id`` is the optional ADR 046 D1 project tag.\n\nErrors: **401** unauthed, **403** missing ``kb:write`` scope.",
+        "operationId": "v1_project_graph_assert_api_v1_projects__project_id__graph_assert_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GraphAssertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphAssertView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Project Graph Assert",
+        "tags": [
+          "agents-v1",
+          "graph"
+        ]
+      }
+    },
     "/api/v1/projects/{project_id}/graph/stream": {
       "get": {
-        "description": "Growth stream for ``project_id``'s graph over **SSE**.\n\nReuses the ADR 035 SSE infrastructure (:func:`_sse_frame` + the\nevents outbox). Emits the current graph as a sequence of growth\nevents the client applies incrementally:\n\n* ``event: node.added`` / ``data: <graphology doc with one node>``\n* ``event: edge.added`` / ``data: <graphology doc with one edge>``\n* ``event: done`` / ``data: {\"nodes\": N, \"edges\": M}`` \u2014 snapshot\n  mode only (terminal frame; omitted in ``?live=true``).\n\nEach ``node.added`` / ``edge.added`` payload is itself a\ngraphology-importable document (a single-element ``nodes`` or\n``edges`` list), so the client merges every frame with the same\nzero-transform ``graph.import(...)`` it uses for the windowed\nendpoints \u2014 no special-case parsing.\n\nTwo modes (``?live``, default **false** \u2014 backward-compatible):\n\n* **Snapshot** (``?live=false``) \u2014 replay the current graph, then a\n  terminal ``done`` and close. The original ADR 046 D3 contract,\n  byte-for-byte.\n* **Live-tail** (``?live=true``, ADR 046 D6) \u2014 replay the snapshot,\n  then keep the connection open and push ``node.added`` /\n  ``edge.added`` frames as KB ingest extracts + persists new\n  nodes/edges, so the sigma viewer **animates the graph growing in\n  real time**. This is a *typed projection of the ADR 035 outbox*:\n  the same SSE machinery, filtered to ``graph.*.added`` events\n  scoped to this agent. No ``done`` frame \u2014 the client closes the\n  EventSource (the live-growth toggle) or disconnects. The growth\n  events are additive over the durable store: on reconnect the\n  client re-runs the snapshot to reconcile (no event is\n  load-bearing for correctness).\n\nBounded by ``limit`` (node/edge cap). ``?project=`` (ADR 046 D1,\nadditive) scopes both the replayed window AND the live-tail to one\nproject's subgraph (a cross-project event never reaches the\nstream). Tenant-scoped. Read scope.",
+        "description": "Growth stream for ``project_id``'s graph over **SSE**.\n\nReuses the ADR 035 SSE infrastructure (:func:`_sse_frame` + the\nevents outbox). Emits the current graph as a sequence of growth\nevents the client applies incrementally:\n\n* ``event: node.added`` / ``data: <graphology doc with one node>``\n* ``event: edge.added`` / ``data: <graphology doc with one edge>``\n* ``event: done`` / ``data: {\"nodes\": N, \"edges\": M}`` \u2014 snapshot\n  mode only (terminal frame; omitted in ``?live=true``).\n\nEach ``node.added`` / ``edge.added`` payload is itself a\ngraphology-importable document (a single-element ``nodes`` or\n``edges`` list), so the client merges every frame with the same\nzero-transform ``graph.import(...)`` it uses for the windowed\nendpoints \u2014 no special-case parsing.\n\nTwo modes (``?live``, default **false** \u2014 backward-compatible):\n\n* **Snapshot** (``?live=false``) \u2014 replay the current graph, then a\n  terminal ``done`` and close. The original ADR 046 D3 contract,\n  byte-for-byte.\n* **Live-tail** (``?live=true``, ADR 046 D6) \u2014 replay the snapshot,\n  then keep the connection open and push ``node.added`` /\n  ``edge.added`` frames as KB ingest extracts + persists new\n  nodes/edges, so the sigma viewer **animates the graph growing in\n  real time**. This is a *typed projection of the ADR 035 outbox*:\n  the same SSE machinery, filtered to ``graph.*.added`` events\n  scoped to this agent. No ``done`` frame \u2014 the client closes the\n  EventSource (the live-growth toggle) or disconnects. The growth\n  events are additive over the durable store: on reconnect the\n  client re-runs the snapshot to reconcile (no event is\n  load-bearing for correctness).\n\nBounded by ``limit`` (node/edge cap). ``?project=`` (ADR 046 D1,\nadditive) scopes both the replayed window AND the live-tail to one\nproject's subgraph (a cross-project event never reaches the\nstream). ``?min_confidence=`` (ADR 046 D2, additive) applies a\nconfidence floor to the replayed window (and, in live mode, leaves\nlow-confidence live frames to the viewer's dimming) \u2014 default\n``0.0`` shows everything. ``?pace=`` (additive, default ``0.0``)\nsleeps that many seconds between snapshot frames so the viewer\nanimates the graph **assembling node-by-node** \u2014 the demo \"watch it\ngrow\" effect even for a graph that was built atomically. A paced\nreplay honors client disconnect between frames. Tenant-scoped. Read\nscope.",
         "operationId": "v1_project_graph_stream_api_v1_projects__project_id__graph_stream_get",
         "parameters": [
           {
@@ -17601,6 +19799,26 @@
               "default": false,
               "title": "Live",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_confidence",
+            "required": false,
+            "schema": {
+              "default": 0.0,
+              "title": "Min Confidence",
+              "type": "number"
+            }
+          },
+          {
+            "in": "query",
+            "name": "pace",
+            "required": false,
+            "schema": {
+              "default": 0.0,
+              "title": "Pace",
+              "type": "number"
             }
           },
           {
@@ -18351,6 +20569,85 @@
         ]
       }
     },
+    "/api/v1/runs/{run_id}/replay": {
+      "post": {
+        "description": "Re-run a historical run's recorded input against a chosen agent\nversion, side-by-side (ADR 045 D13 \u2014 run replay / time-travel).\n\n``against`` selects the version: ``\"published\"`` (default \u2192 latest) or\n``\"version:X\"`` (a pinned published version; 404 if that version doesn't\nexist for this agent/tenant). The original run is **immutable** \u2014 this\nonly reads it; the replay is a brand-new run (persisted + metered like\nany other). Returns the original and replayed :class:`RunView`s plus a\n``changed`` flag. ``mock=true`` drives the agent with ``MockProvider``\nfor offline / test use (mirrors the run-stream + voice routes).\n\nErrors: **404** original run (or the requested ``version:X``) not found\nfor this tenant; **403** token lacks ``run`` scope.",
+        "operationId": "v1_replay_run_api_v1_runs__run_id__replay_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "against",
+            "required": false,
+            "schema": {
+              "default": "published",
+              "title": "Against",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mock",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Mock",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunReplayView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Replay Run",
+        "tags": [
+          "runs-v1"
+        ]
+      }
+    },
     "/api/v1/runs/{run_id}/trace": {
       "get": {
         "description": "Reconstructed view of a run for the Angular trace-viewer.\n\nWraps the existing :func:`movate.core.replay.load_replay`\nengine (same path ``mdk trace replay`` uses) and returns the\nstructured JSON the Angular trace component renders.\n\nResolves ``run_id`` against BOTH the runs table and the\nworkflow_runs table \u2014 the same id space is shared, so a\nsingle endpoint serves both single-agent and workflow trace\nreplays. Discriminator is the ``kind`` field in the response.\n\nTenant-scoped: a cross-tenant id returns 404 (never 403),\nwhich would leak the existence of the id.\n\nErrors:\n\n* **401** \u2014 missing / bad bearer token\n* **404** \u2014 neither a run nor workflow_run matches the id\n  for this tenant",
@@ -18910,6 +21207,66 @@
       }
     },
     "/api/v1/skills": {
+      "get": {
+        "description": "List this tenant's managed skills \u2014 latest version per name,\nnewest-first (ADR 060 D2).\n\nTenant-scoped via ``ctx.tenant_id``. Mirrors ``GET /api/v1/projects``\n/ the agent registry listing.\n\nErrors:\n\n* **401** \u2014 missing / bad bearer token\n* **403** \u2014 caller lacks the ``read`` scope",
+        "operationId": "v1_list_skills_api_v1_skills_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 List Skills",
+        "tags": [
+          "skills-v1"
+        ]
+      },
       "post": {
         "description": "Create a skill bundle under ``<skills_path>/<name>/``.\n\nFixes the long-standing gap where agents declaring\n``skills: [<name>]`` 422'd on upload with \"skills resolution\nfailed: ... Available: (empty registry)\". The runtime now owns\na real skill registry that customers can populate via this\nendpoint OR implicitly via the deploy command (PR 3 in the\nsame stack).\n\nMultipart fields:\n\n* ``skill_yaml`` (required) \u2014 the spec. ``name`` field inside\n  determines the on-disk directory.\n* ``impl`` (optional) \u2014 Python implementation file.\n* ``corpus`` (optional) \u2014 JSON corpus shipped alongside.\n* ``readme`` (optional) \u2014 human-facing notes.\n\nQuery parameters:\n\n* ``force=true`` \u2014 overwrite an existing skill with the same name.\n  Without this flag a 409 is returned when the skill already exists,\n  preventing silent breakage on accidental re-deploy.\n\nCLI FLAG: ``mdk deploy --force`` / ``mdk skills upload --force``\npasses ``?force=true`` to this endpoint for intentional overwrites.\n\nErrors:\n\n* **401** \u2014 missing / bad bearer token\n* **409** \u2014 skill already exists (pass ``?force=true`` to overwrite)\n* **422** \u2014 bundle failed validation (parse / schema / shape)\n* **503** \u2014 runtime was built without a ``skills_path``",
         "operationId": "v1_create_skill_api_v1_skills_post",
@@ -18974,6 +21331,292 @@
           }
         },
         "summary": "V1 Create Skill",
+        "tags": [
+          "skills-v1"
+        ]
+      }
+    },
+    "/api/v1/skills/{name}": {
+      "delete": {
+        "description": "Delete a managed skill (ADR 060 D2).\n\n``?version=<v>`` removes just that version; omit to remove **all**\nversions of the name. Returns the (latest) record that was removed.\nTenant-scoped \u2014 a cross-tenant or unknown name is **404**.\n\nNOTE: this removes the **registry** record; the on-disk bundle under\n``skills_path`` (bundle-resolution, ADR 002) is left untouched, the\nsame separation the agent registry keeps between the durable row and\nthe working tree.\n\nScope: ``admin``.\n\nErrors:\n\n* **401** / **403** \u2014 auth / ``admin`` scope\n* **404** \u2014 no such skill (or version) in this tenant",
+        "operationId": "v1_delete_skill_api_v1_skills__name__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Delete Skill",
+        "tags": [
+          "skills-v1"
+        ]
+      },
+      "get": {
+        "description": "Fetch one managed skill (ADR 060 D2).\n\n``?version=<v>`` pins an exact published version; omit for the\nlatest. A cross-tenant or unknown name is **404** (no existence\nleak) \u2014 same contract as the agent registry.\n\nErrors:\n\n* **401** / **403** \u2014 auth / ``read`` scope\n* **404** \u2014 no such skill (or version) in this tenant",
+        "operationId": "v1_get_skill_api_v1_skills__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Get Skill",
+        "tags": [
+          "skills-v1"
+        ]
+      },
+      "put": {
+        "description": "Publish a NEW version of a managed skill (ADR 060 D2).\n\nRows are immutable (mirrors the agent registry): an update writes a\nnew ``(name, tenant_id, version)`` row. ``body.files`` MUST include\n``skill.yaml`` and is validated by the same skill loader the bundle\npath uses; the spec's ``name`` must match the path ``name``.\n\nScope: ``admin`` (matches the existing ``POST /skills`` mutate).\n\nErrors:\n\n* **401** / **403** \u2014 auth / ``admin`` scope\n* **409** \u2014 ``(name, version)`` already exists for this tenant\n* **422** \u2014 files failed validation (missing ``skill.yaml`` / spec\n  parse error / name mismatch)",
+        "operationId": "v1_upsert_skill_api_v1_skills__name__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillUpsertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 Upsert Skill",
+        "tags": [
+          "skills-v1"
+        ]
+      }
+    },
+    "/api/v1/skills/{name}/versions": {
+      "get": {
+        "description": "Version history for one managed skill, newest-first (ADR 060 D2).\n\nA cross-tenant or unknown name returns an empty list (no leak).",
+        "operationId": "v1_list_skill_versions_api_v1_skills__name__versions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillVersionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "V1 List Skill Versions",
         "tags": [
           "skills-v1"
         ]
@@ -19308,6 +21951,313 @@
         "summary": "V1 Thread Submit Message",
         "tags": [
           "threads-v1"
+        ]
+      }
+    },
+    "/api/v1/tools": {
+      "get": {
+        "description": "List tool descriptors (filterable by scope, tags, name pattern).",
+        "operationId": "list_tools_api_v1_tools_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tag"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Tools Api V1 Tools Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Tools",
+        "tags": [
+          "tools"
+        ]
+      },
+      "post": {
+        "description": "Publish a tool descriptor (tenant-scoped).",
+        "operationId": "publish_tool_api_v1_tools_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Publish Tool Api V1 Tools Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Publish Tool",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/v1/tools/{name}": {
+      "get": {
+        "description": "Get tool detail (with optional version resolution).",
+        "operationId": "get_tool_api_v1_tools__name__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Tool Api V1 Tools  Name  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Tool",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/v1/tools/{name}/{version}": {
+      "delete": {
+        "description": "Remove a tool descriptor.",
+        "operationId": "delete_tool_api_v1_tools__name___version__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": false,
+            "schema": {
+              "default": "tenant",
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Tool Api V1 Tools  Name   Version  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Tool",
+        "tags": [
+          "tools"
         ]
       }
     },
@@ -20147,7 +23097,7 @@
     },
     "/api/v1/workflow-runs/{workflow_run_id}/signal": {
       "post": {
-        "description": "Signal a human decision to resume a paused workflow run.\n\nThe human approver (an authenticated operator, gated on the ``run``\nscope) supplies their decision \u2014 a dict of the state keys the gate's\n``output_contract`` requires. The endpoint:\n\n1. Loads the run (tenant-scoped; **404** if missing / other tenant).\n2. **409** if the run is not ``PAUSED`` (already resumed / terminal \u2014\n   idempotency: a second signal must not double-resume).\n3. **422** if the decision is missing a required ``output_contract``\n   key.\n4. Merges the decision into the checkpoint's ``paused_state``\n   (decision wins) and persists the run flipped OUT of ``PAUSED``\n   (``paused_node_id`` carried forward as the resume target, but\n   ``status`` set to ``RUNNING`` so a re-signal hits the 409 in step\n   2) \u2014 the worker reads this single source of truth.\n5. Enqueues a continuation ``JobKind.WORKFLOW`` job carrying\n   ``resume_workflow_run_id``; the worker resumes the runner from the\n   gate's successor. Returns **202** ``{job_id, status}``.\n\nControl vs execution plane: the workflow is NOT run inline here \u2014 it\nis enqueued, and the worker executes it. This is the contract a Teams\nAdaptive Card button (ADR 003) would POST to in a later PR.\n\nErrors:\n\n* **401** \u2014 bad / missing bearer token\n* **404** \u2014 no paused run matches the id for this tenant\n* **409** \u2014 the run is not PAUSED (already resumed / terminal)\n* **422** \u2014 the decision omits a required output_contract key",
+        "description": "Signal a human decision to resume a paused workflow run.\n\nThe human approver (an authenticated operator, gated on the ``run``\nscope) supplies their decision \u2014 a dict of the state keys the gate's\n``output_contract`` requires. The endpoint:\n\n1. Loads the run (tenant-scoped; **404** if missing / other tenant).\n2. **409** if the run is not ``PAUSED`` (already resumed / terminal \u2014\n   idempotency: a second signal must not double-resume).\n3. **422** if the decision is missing a required ``output_contract``\n   key.\n4. Merges the decision into the checkpoint's ``paused_state``\n   (decision wins) and persists the run flipped OUT of ``PAUSED``\n   (``paused_node_id`` carried forward as the resume target, but\n   ``status`` set to ``RUNNING`` so a re-signal hits the 409 in step\n   2) \u2014 the worker reads this single source of truth.\n5. Resumes the run on its owning backend (ADR 062 D2):\n   * **native** (default) \u2014 enqueues a continuation\n     ``JobKind.WORKFLOW`` job carrying ``resume_workflow_run_id``; the\n     worker resumes the runner from the gate's successor.\n   * **temporal** (``record.runtime == 'temporal'``) \u2014 signals the\n     durable run's Temporal handle (``human_response``); its\n     ``wait_condition`` resolves and the workflow continues in the\n     Temporal worker. No job is enqueued.\n   Returns **202** ``{job_id, status}`` either way (for the durable\n   path ``job_id`` is the run id and ``status`` is ``running``).\n\nControl vs execution plane: the workflow is NOT run inline here \u2014 the\nnative run is enqueued and the durable run resumes itself; in both\ncases the worker executes it. This is the contract a Teams Adaptive\nCard button (ADR 003) would POST to in a later PR.\n\nErrors:\n\n* **401** \u2014 bad / missing bearer token\n* **404** \u2014 no paused run matches the id for this tenant\n* **409** \u2014 the run is not PAUSED (already resumed / terminal)\n* **422** \u2014 the decision omits a required output_contract key",
         "operationId": "v1_signal_workflow_run_api_v1_workflow_runs__workflow_run_id__signal_post",
         "parameters": [
           {
@@ -21537,6 +24487,184 @@
         "tags": [
           "runs",
           "feedback"
+        ]
+      }
+    },
+    "/v1/audio/transcriptions": {
+      "post": {
+        "description": "OpenAI-compatible audio transcription \u2192 mdk's STT seam (ADR 085 follow-on).\n\nLets OpenWebUI's mic (and any Whisper-style client) post audio to mdk:\nthe uploaded clip is fed through the SAME STT adapter the voice WS/REST\npaths use (``app.state.voice_stt_factory`` + per-tenant BYOK key, ADR 048\nD6 / ADR 050 D2), and the final transcript is returned as the OpenAI\n``{\"text\": ...}`` body. ``model`` is accepted for client compatibility\nbut does not select a provider (mdk uses its configured STT).\n\nErrors:\n\n* **400** \u2014 the uploaded audio is empty.\n* **503** \u2014 the ``mdk[voice]`` extra is not installed on this runtime.",
+        "operationId": "openai_audio_transcriptions_v1_audio_transcriptions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_openai_audio_transcriptions_v1_audio_transcriptions_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Openai Audio Transcriptions V1 Audio Transcriptions Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Openai Audio Transcriptions",
+        "tags": [
+          "openai-v1"
+        ]
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "description": "OpenAI-compatible chat completions \u2192 mdk Executor (ADR 085).\n\nMaps the last user message to the named agent's primary input field,\nruns the Executor, and returns an OpenAI ``chat.completion`` (or SSE\nchunks when ``stream: true``).",
+        "operationId": "openai_chat_completions_v1_chat_completions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "title": "Body",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Openai Chat Completions V1 Chat Completions Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Openai Chat Completions",
+        "tags": [
+          "openai-v1"
+        ]
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "description": "OpenAI-compatible model list \u2014 one \"model\" per deployed agent (ADR 085).",
+        "operationId": "openai_list_models_v1_models_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Openai List Models V1 Models Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Openai List Models",
+        "tags": [
+          "openai-v1"
         ]
       }
     }
