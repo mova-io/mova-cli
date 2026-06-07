@@ -17218,7 +17218,7 @@ def build_app(  # noqa: PLR0912
         # MockProvider (hermetic, no keys); everything else → LiteLLM. Mirrors
         # the run/eval endpoints' choice.
         model_str = str(getattr(getattr(bundle.spec, "model", None), "provider", "") or "")
-        provider: BaseLLMProvider = (
+        provider: Any = (
             MockProvider()
             if model_str.startswith("mock") or "mock" in model_str.lower()
             else LiteLLMProvider()
@@ -17282,6 +17282,78 @@ def build_app(  # noqa: PLR0912
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(_gen(), media_type="text/event-stream")
+
+    @app.post("/v1/audio/transcriptions", tags=["openai-v1"], dependencies=[_scope("run")])
+    async def openai_audio_transcriptions(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        file: UploadFile = File(
+            description="The audio file to transcribe (multipart part), per the OpenAI Audio API.",
+        ),
+        model: str | None = Form(
+            default=None,
+            description=(
+                "OpenAI-compat field (e.g. ``whisper-1``); accepted and ignored for "
+                "provider selection — mdk transcribes with its configured STT adapter."
+            ),
+        ),
+        language: str | None = Form(
+            default=None, description="Optional BCP-47 language hint forwarded to the STT adapter."
+        ),
+    ) -> dict[str, str]:
+        """OpenAI-compatible audio transcription → mdk's STT seam (ADR 085 follow-on).
+
+        Lets OpenWebUI's mic (and any Whisper-style client) post audio to mdk:
+        the uploaded clip is fed through the SAME STT adapter the voice WS/REST
+        paths use (``app.state.voice_stt_factory`` + per-tenant BYOK key, ADR 048
+        D6 / ADR 050 D2), and the final transcript is returned as the OpenAI
+        ``{"text": ...}`` body. ``model`` is accepted for client compatibility
+        but does not select a provider (mdk uses its configured STT).
+
+        Errors:
+
+        * **400** — the uploaded audio is empty.
+        * **503** — the ``mdk[voice]`` extra is not installed on this runtime.
+        """
+        # Voice extra gate (lazy import; clear 503 if absent) — mirrors the
+        # one-shot voice REST route: a non-voice runtime pays nothing until a
+        # transcription request actually arrives.
+        try:
+            from movate.voice.base import AudioChunk as _AudioChunk  # noqa: PLC0415
+        except ImportError as exc:
+            raise AgentCreationError(
+                "this runtime was built without the mdk[voice] extra; "
+                "POST /v1/audio/transcriptions is unavailable "
+                "(install 'movate-cli[voice]')",
+                status_code=503,
+            ) from exc
+
+        audio_data = await file.read()
+        if not audio_data:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message="the uploaded audio is empty",
+            )
+
+        store: StorageProvider = request.app.state.storage
+        _ = model  # accepted for OpenAI-client compat; not a provider selector
+
+        # The SAME STT adapter the voice WS/REST paths resolve (ADR 050 D2) —
+        # default factory; per-tenant BYOK key resolved at this edge (ADR 048 D6).
+        stt_adapter = _build_voice_adapter(request.app, "stt", None)
+        stt_api_key = await _resolve_voice_api_key(store, ctx.tenant_id, stt_adapter)
+
+        async def _audio() -> Any:
+            yield _AudioChunk(data=audio_data)
+
+        # Collect endpointed (final) transcript slices; a buffered provider
+        # (Whisper) yields one, a streaming one (Deepgram) may yield several.
+        finals: list[str] = []
+        async for chunk in stt_adapter.transcribe(_audio(), language=language, api_key=stt_api_key):
+            if getattr(chunk, "is_final", False) and chunk.text:
+                finals.append(chunk.text)
+        return {"text": " ".join(finals).strip()}
 
     return app
 

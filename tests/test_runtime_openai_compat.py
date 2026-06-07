@@ -22,6 +22,7 @@ from movate.providers.base import BaseLLMProvider, CompletionRequest, Completion
 from movate.runtime.app import build_app
 from movate.runtime.registry import scan_agents
 from movate.testing import InMemoryStorage
+from movate.voice.base import TranscriptChunk
 
 
 class _FakeProvider(BaseLLMProvider):
@@ -176,3 +177,80 @@ async def test_v1_chat_completions_empty_messages_400(tmp_path: Path) -> None:
         json={"model": "echo", "messages": []},
     )
     assert r.status_code == 400
+
+
+# --- /v1/audio/transcriptions (ADR 085 follow-on: OpenWebUI mic → STT) --------
+
+
+class _FakeSTT:
+    """Offline STT standing in for Deepgram/Whisper — no network/keys.
+
+    Drains the inbound audio stream and endpoints with a fixed transcript,
+    satisfying the SpeechToTextProvider contract (one ``is_final=True`` chunk).
+    """
+
+    name = "fake_stt"
+    version = "0.0.1"
+
+    def __init__(self, transcript: str = "hello from the microphone") -> None:
+        self._transcript = transcript
+
+    async def transcribe(self, audio: Any, **_kw: Any) -> Any:
+        async for _ in audio:
+            pass
+        yield TranscriptChunk(text=self._transcript, is_final=True, confidence=1.0)
+
+
+def _with_fake_stt(client: TestClient, transcript: str = "hello from the microphone") -> None:
+    """Swap the runtime's STT factory for a hermetic fake (no Deepgram/keys)."""
+    client.app.state.voice_stt_factory = lambda: _FakeSTT(transcript)
+
+
+@pytest.mark.unit
+async def test_v1_audio_transcriptions(tmp_path: Path) -> None:
+    _write_echo_agent(tmp_path)
+    client, headers = await _client(InMemoryStorage(), tmp_path)
+    _with_fake_stt(client, "talk to my agent")
+    r = client.post(
+        "/v1/audio/transcriptions",
+        headers=headers,
+        data={"model": "whisper-1"},
+        files={"file": ("clip.wav", b"\x00\x01\x02fake-audio-bytes", "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"text": "talk to my agent"}
+
+
+@pytest.mark.unit
+async def test_v1_audio_transcriptions_requires_auth(tmp_path: Path) -> None:
+    _write_echo_agent(tmp_path)
+    client, _ = await _client(InMemoryStorage(), tmp_path)
+    _with_fake_stt(client)
+    r = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"fake-audio-bytes", "audio/wav")},
+    )
+    assert r.status_code == 401
+
+
+@pytest.mark.unit
+async def test_v1_audio_transcriptions_empty_file_400(tmp_path: Path) -> None:
+    _write_echo_agent(tmp_path)
+    client, headers = await _client(InMemoryStorage(), tmp_path)
+    _with_fake_stt(client)
+    r = client.post(
+        "/v1/audio/transcriptions",
+        headers=headers,
+        files={"file": ("clip.wav", b"", "audio/wav")},
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.unit
+async def test_v1_audio_transcriptions_missing_file_422(tmp_path: Path) -> None:
+    _write_echo_agent(tmp_path)
+    client, headers = await _client(InMemoryStorage(), tmp_path)
+    _with_fake_stt(client)
+    # No multipart ``file`` part → FastAPI request validation rejects it.
+    r = client.post("/v1/audio/transcriptions", headers=headers, data={"model": "whisper-1"})
+    assert r.status_code == 422
