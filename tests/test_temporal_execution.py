@@ -258,11 +258,13 @@ def test_effective_runtime_rejects_bad_override(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_langgraph_execution_fails_loud() -> None:
-    """Selecting langgraph for execution is rejected (ADR 055 step 3) — not downgraded."""
-    with pytest.raises(WorkflowBackendError) as ei:
-        require_backend_available("langgraph")
-    assert "not yet wired" in str(ei.value)
+def test_langgraph_execution_available_when_extra_installed() -> None:
+    """LangGraph is a WIRED execution backend (ADR 030 D1): with the ``[langgraph]``
+    extra installed, ``require_backend_available`` accepts it — it is no longer
+    rejected as "not yet wired" (the pre-ADR-030 / ADR-055-step-3 state). The
+    extra-absent path (raising the install hint) is covered separately."""
+    pytest.importorskip("langgraph")
+    require_backend_available("langgraph")  # must not raise
 
 
 @pytest.mark.unit
