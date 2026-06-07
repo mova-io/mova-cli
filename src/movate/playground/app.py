@@ -576,7 +576,11 @@ async def start() -> None:
         cl.Action(
             name="pick_agent",
             payload={"value": a.get("name", "")},
-            label=_agent_picker_label(a),
+            # SHORT label (just the name) → Chainlit renders a compact, CLICKABLE
+            # chip. A long "name — desc [tags]" label renders as a full-width
+            # text-like row that doesn't read or behave like a button. The rich
+            # description/tags live in the tooltip + the catalog list below.
+            label=str(a.get("name") or "?"),
             tooltip=_agent_picker_tooltip(a),
         )
         for a in agents
@@ -585,11 +589,15 @@ async def start() -> None:
     # pick it (foolproof fallback if the action buttons don't render/click).
     cl.user_session.set(_K_AGENTS, [a.get("name", "") for a in agents if a.get("name")])
     where = f" on target **{target.name}** (`{target.url}`)" if target is not None else ""
+    # Rich catalog in the message body so descriptions/tags stay visible even
+    # though the buttons are now compact name-chips (reuses _agent_picker_label).
+    catalog = "\n".join(f"- {_agent_picker_label(a)}" for a in agents)
     await cl.Message(
         content=(
             f"**MDK playground** — {len(agents)} agent(s) available{where}. "
-            "**Click an agent below — or just type its name** (e.g. `demo-faq`) — "
+            "**Click an agent chip below — or just type its name** (e.g. `demo-faq`) — "
             "then start chatting.\n\n"
+            f"{catalog}\n\n"
             f"{_capability_banner(caps)}"
         ),
         actions=actions,
