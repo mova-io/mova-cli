@@ -296,13 +296,119 @@
       ]
     },
     {
-      "type": "row",
+      "type": "timeseries",
       "id": 7,
+      "title": "Workflow duration (mean ms by workflow)",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.workflow.duration_ms\"\n| extend workflow = tostring(Properties[\"workflow\"]), runtime = tostring(Properties[\"runtime\"])\n| where runtime == \"temporal\"\n| summarize AvgMs = sum(Sum) / sum(ItemCount) by workflow, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 8,
+      "title": "Workflow duration (mean ms by status)",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.workflow.duration_ms\"\n| extend status = tostring(Properties[\"status\"]), runtime = tostring(Properties[\"runtime\"])\n| where runtime == \"temporal\"\n| summarize AvgMs = sum(Sum) / sum(ItemCount) by status, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+            "resultFormat": "time_series"
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 9,
       "title": "Temporal SDK \u2014 worker & task-queue health (populates under load)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 15,
+        "y": 23,
         "w": 24,
         "h": 1
       },
@@ -310,7 +416,7 @@
     },
     {
       "type": "timeseries",
-      "id": 8,
+      "id": 10,
       "title": "Workflow task schedule-to-start latency (avg ms)",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
@@ -318,7 +424,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 16,
+        "y": 24,
         "w": 12,
         "h": 8
       },
@@ -363,7 +469,7 @@
     },
     {
       "type": "timeseries",
-      "id": 9,
+      "id": 11,
       "title": "Worker task slots available",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
@@ -371,7 +477,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 16,
+        "y": 24,
         "w": 12,
         "h": 8
       },
@@ -415,7 +521,7 @@
     },
     {
       "type": "timeseries",
-      "id": 10,
+      "id": 12,
       "title": "Temporal RPC failures / 5m",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
@@ -423,7 +529,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 24,
+        "y": 32,
         "w": 12,
         "h": 8
       },
@@ -467,7 +573,7 @@
     },
     {
       "type": "timeseries",
-      "id": 11,
+      "id": 13,
       "title": "Sticky cache hit vs miss / 5m",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
@@ -475,7 +581,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 24,
+        "y": 32,
         "w": 12,
         "h": 8
       },

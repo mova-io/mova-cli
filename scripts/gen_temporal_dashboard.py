@@ -207,6 +207,40 @@ panels += [
     ),
 ]
 y += 8
+panels += [
+    # ADR 082 follow-on (#737) — workflow latency. mdk.workflow.duration_ms is a
+    # histogram; in AppMetrics that lands as Sum + ItemCount per export, so the
+    # per-bin mean is sum(Sum)/sum(ItemCount). Excludes HITL wait time? No — it's
+    # wall-clock (workflow.info().start_time → workflow.now()), so a HUMAN-paused
+    # workflow's duration includes the wait by design; read it per workflow.
+    kql_panel(
+        "Workflow duration (mean ms by workflow)",
+        'AppMetrics\n| where Name == "mdk.workflow.duration_ms"\n'
+        '| extend workflow = tostring(Properties["workflow"]), '
+        'runtime = tostring(Properties["runtime"])\n'
+        '| where runtime == "temporal"\n'
+        "| summarize AvgMs = sum(Sum) / sum(ItemCount) by workflow, bin(TimeGenerated, 15m)\n"
+        "| order by TimeGenerated asc",
+        x=0,
+        y=y,
+        w=12,
+        unit="ms",
+    ),
+    kql_panel(
+        "Workflow duration (mean ms by status)",
+        'AppMetrics\n| where Name == "mdk.workflow.duration_ms"\n'
+        '| extend status = tostring(Properties["status"]), '
+        'runtime = tostring(Properties["runtime"])\n'
+        '| where runtime == "temporal"\n'
+        "| summarize AvgMs = sum(Sum) / sum(ItemCount) by status, bin(TimeGenerated, 15m)\n"
+        "| order by TimeGenerated asc",
+        x=12,
+        y=y,
+        w=12,
+        unit="ms",
+    ),
+]
+y += 8
 
 # ── Temporal SDK — worker & task-queue health (temporal_*) ────────────────────
 panels.append(row("Temporal SDK — worker & task-queue health (populates under load)", y))
