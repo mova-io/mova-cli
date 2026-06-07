@@ -31,10 +31,11 @@ from urllib.request import Request, urlopen
 
 import httpx
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from movate.cli import graph as graph_cmd
-from movate.cli.graph import _build_handler, _render_index
+from movate.cli.graph import _build_handler, _render_index, _resolve_viewer_runtime
 from movate.cli.graph_viewer import ASSETS_DIR
 from movate.cli.main import app
 
@@ -140,6 +141,67 @@ def test_command_is_registered_and_help_lists_flags() -> None:
     assert "--project" in plain
     assert "--port" in plain
     assert "--no-open" in plain
+    # ADR 081 headless-mode flags (hosted container path).
+    assert "--runtime-url" in plain
+    assert "--api-key" in plain
+
+
+@pytest.mark.unit
+def test_headless_resolver_uses_env_without_reading_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR 081: with both --runtime-url + --api-key, never touch ~/.movate config.
+
+    Proves the container path resolves the runtime purely from the supplied
+    values (and strips a trailing slash), without invoking the local
+    ``_resolve_target_bearer`` config pipeline.
+    """
+
+    def _boom(_target: object) -> object:  # pragma: no cover - must NOT run
+        raise AssertionError("config resolver must not be called in headless mode")
+
+    monkeypatch.setattr("movate.cli.kb_cmd._resolve_target_bearer", _boom)
+
+    name, base_url, bearer = _resolve_viewer_runtime(
+        target=None,
+        runtime_url="https://api.example.com/",
+        api_key="mvt_live_read_scoped",
+    )
+    assert name == "(env)"
+    assert base_url == "https://api.example.com"  # trailing slash stripped
+    assert bearer == "mvt_live_read_scoped"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("runtime_url", "api_key"),
+    [("https://api.example.com", None), (None, "mvt_live_x")],
+)
+def test_headless_resolver_requires_both_url_and_key(
+    runtime_url: str | None, api_key: str | None
+) -> None:
+    """Half-configured headless mode fails loud (exit 2), not silently."""
+    with pytest.raises(typer.Exit) as exc:
+        _resolve_viewer_runtime(target=None, runtime_url=runtime_url, api_key=api_key)
+    assert exc.value.exit_code == 2
+
+
+@pytest.mark.unit
+def test_resolver_falls_back_to_target_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No headless env → the unchanged ``--target`` → URL+bearer path is used."""
+    calls: list[object] = []
+
+    def _fake(target: object) -> tuple[str, object, str, str]:
+        calls.append(target)
+        return ("dev", object(), "https://dev.example.com", "mvt_dev")
+
+    monkeypatch.setattr("movate.cli.kb_cmd._resolve_target_bearer", _fake)
+
+    name, base_url, bearer = _resolve_viewer_runtime(target="dev", runtime_url=None, api_key=None)
+    assert (name, base_url, bearer) == ("dev", "https://dev.example.com", "mvt_dev")
+    assert calls == ["dev"]
 
 
 @pytest.mark.unit

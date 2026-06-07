@@ -185,6 +185,60 @@ overrides; ``-1`` means "use the module default".
 param playgroundMinReplicas int = -1
 
 @description('''
+Deploy the hosted knowledge-graph dashboard Container App (ADR 081) — a
+shareable, Entra-SSO-gated viewer for the GraphRAG knowledge graph (ADR 046),
+in the SAME Container Apps Environment as the runtime. Default-off + purely
+additive (mirrors ``enablePlayground``): when false, ZERO graph-viewer resources
+are emitted and the template is byte-for-byte unchanged.
+
+The graph QUERY API already ships inside the api app (ADR 046); this only adds
+the hosted VIEWER. Same two-pass story as the playground — the app references two
+Key Vault secrets (``graph-runtime-key``, ``graph-entra-client-secret``) that ACA
+validates at create time, so populate them first (see docs/graph-app-deploy.md),
+then flip this true.
+
+REQUIRES ``enableApiWorker = true`` (the viewer proxies the api app's in-env
+FQDN) AND ``graphEntraClientId`` set (Easy Auth binds to the operator-pre-created
+Entra app registration at create time).
+''')
+param enableGraphApp bool = false
+
+@description('''
+Entra ID (Azure AD) application **client id** for the graph dashboard's Easy
+Auth (ADR 081, mirrors ADR 053 D4). The app registration is
+**operator-pre-created** OUTSIDE Bicep via:
+    az ad app create --display-name "movate-graph-${env}" \
+        --web-redirect-uris "https://<graph-fqdn>/.auth/login/aad/callback"
+Copy the printed appId here. Required when ``enableGraphApp`` is true; ignored
+otherwise. See docs/graph-app-deploy.md for the full ordering.
+''')
+param graphEntraClientId string = ''
+
+@description('''
+Tenant id whose Entra directory issues the graph dashboard's Easy Auth tokens.
+Empty (default) → the deployment's own tenant (``subscription().tenantId``). Set
+only for a cross-tenant app registration.
+''')
+param graphEntraTenantId string = ''
+
+@description('''
+Initial knowledge-graph project id the hosted dashboard loads on open (ADR 081).
+The dashboard has an in-UI project switcher, so this only seeds the first view;
+empty (default) opens the switcher with nothing preselected.
+''')
+param graphProjectId string = ''
+
+@description('''
+Cold-start knob for the graph dashboard (ADR 081). Override for the viewer
+Container App's ``scale.minReplicas``. Leave at the ``-1`` sentinel (default) to
+keep the module default of ``0`` (scale-to-zero). Set ``1``+ to keep it warm.
+Any value ``>= 0`` overrides; ``-1`` means "use the module default".
+''')
+@minValue(-1)
+@maxValue(10)
+param graphMinReplicas int = -1
+
+@description('''
 Comma-separated list of origins (no spaces) the API's CORS layer
 allows. Becomes ``MDK_CORS_ALLOWED_ORIGINS`` on the API container.
 Empty string means "no browser callers configured" — the API still
@@ -434,6 +488,11 @@ var workerMinReplicasEffective = workerMinReplicas >= 0 ? max(workerMinReplicas,
 var playgroundMinReplicasDefault = 0
 var playgroundMinReplicasEffective = playgroundMinReplicas >= 0 ? max(playgroundMinReplicas, 0) : playgroundMinReplicasDefault
 
+// Graph dashboard minReplicas (ADR 081) — same -1-sentinel → module-default(0)
+// scheme as the playground above.
+var graphMinReplicasDefault = 0
+var graphMinReplicasEffective = graphMinReplicas >= 0 ? max(graphMinReplicas, 0) : graphMinReplicasDefault
+
 // ---------------------------------------------------------------------------
 // Resource names — see docs/v1.0-azure-design §2 for the convention.
 // ---------------------------------------------------------------------------
@@ -459,6 +518,9 @@ var saName = 'movate${env}sa${sfxNoHyphen}'
 var teamsBotName = 'movate-${env}-teams-bot'
 var botServiceName = 'movate-${env}-bot'
 var playgroundName = 'movate-${env}-playground'
+// Hosted knowledge-graph dashboard (ADR 081) — RG-scoped name; the app is gated
+// on enableGraphApp, the UAI is created unconditionally (cold-deploy safety).
+var graphName = 'movate-${env}-graph'
 // User-assigned identities for the api + worker + teams-bot apps.
 // Pre-created at this level (before the app modules) so role assignments
 // can be granted to their principalIds BEFORE the apps exist. Avoids
@@ -472,6 +534,7 @@ var apiUaiName = 'movate-${env}-api-mi'
 var workerUaiName = 'movate-${env}-worker-mi'
 var teamsBotUaiName = 'movate-${env}-teams-bot-mi'
 var playgroundUaiName = 'movate-${env}-playground-mi'
+var graphUaiName = 'movate-${env}-graph-mi'
 var langfuseName = 'movate-${env}-langfuse'
 var langfuseUaiName = 'movate-${env}-langfuse-mi'
 // Self-hosted Temporal server (ADR 078) — RG-scoped names; the app is gated
@@ -678,6 +741,15 @@ resource teamsBotUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
 // Container App's first revision tries to pull the image / read KV.
 resource playgroundUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: playgroundUaiName
+  location: location
+  tags: tags
+}
+
+// Graph dashboard app UAI (ADR 081). Same rationale as the playground UAI:
+// pre-create unconditionally so its ACR-pull + KV-secrets-read role assignments
+// land on pass 1, before the Container App's first revision.
+resource graphUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: graphUaiName
   location: location
   tags: tags
 }
@@ -1067,6 +1139,43 @@ module playground 'modules/containerapp-playground.bicep' = if (enablePlayground
 }
 
 // ---------------------------------------------------------------------------
+// Hosted knowledge-graph dashboard (ADR 081). A shareable, Entra-SSO-gated
+// viewer for the GraphRAG knowledge graph. The graph QUERY API already ships
+// inside the api app (ADR 046); this only adds the hosted VIEWER (`mdk graph
+// dashboard`, headless). Gated on enableGraphApp AND enableApiWorker (the viewer
+// proxies the api app's in-env FQDN — nothing to show without the runtime),
+// mirroring the playground. Default-off + additive: with enableGraphApp=false
+// the module isn't instantiated, so no graph app / authConfig is emitted and the
+// template is byte-for-byte unchanged.
+//
+// Easy Auth binds to an operator-pre-created Entra app registration
+// (graphEntraClientId); the client secret + the read-scoped runtime bearer are
+// read from Key Vault. The empty graphEntraTenantId default resolves to
+// subscription().tenantId inside the module.
+// ---------------------------------------------------------------------------
+module graphApp 'modules/containerapp-graph.bicep' = if (enableGraphApp && enableApiWorker) {
+  name: 'graph-${env}'
+  params: {
+    name: graphName
+    location: location
+    environmentId: cae.outputs.envId
+    acrLoginServer: acr.outputs.loginServer
+    acrResourceId: acr.outputs.registryId
+    image: image
+    keyVaultUri: kv.outputs.vaultUri
+    // Talk to the api app over the in-env ingress FQDN (same env → reachable).
+    runtimeUrl: enableApiWorker ? 'https://${api!.outputs.fqdn}' : ''
+    projectId: graphProjectId
+    entraClientId: graphEntraClientId
+    // Empty → the module falls back to subscription().tenantId.
+    entraTenantId: empty(graphEntraTenantId) ? subscription().tenantId : graphEntraTenantId
+    minReplicas: graphMinReplicasEffective
+    userAssignedIdentityId: graphUai.id
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Role assignments — give the Container Apps' managed identities the
 // permissions they need:
 //
@@ -1197,6 +1306,31 @@ resource playgroundKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   }
 }
 
+// Graph dashboard role assignments (ADR 081). Mirror the playground grants — the
+// viewer needs ACR-pull (same image) + KV-secrets-read (graph-runtime-key,
+// graph-entra-client-secret). Un-gated from enableGraphApp (the UAI always
+// exists; assignments are cheap + idempotent) so they land on pass 1 before the
+// app's first revision.
+resource graphAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: acrResource
+  name: guid(acrResource.id, graphUaiName, acrPullRoleId)
+  properties: {
+    principalId: graphUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+  }
+}
+
+resource graphKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: kvResource
+  name: guid(kvResource.id, graphUaiName, kvSecretsUserRoleId)
+  properties: {
+    principalId: graphUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
+  }
+}
+
 // Langfuse needs KV-secrets-read (DB URL + nextauth/salt/encryption-key).
 // No AcrPull grant — it runs the public langfuse/langfuse image, not ours.
 // Un-gated (the UAI always exists) so it lands on pass 1.
@@ -1247,6 +1381,9 @@ output botServiceId string = enableTeamsBot ? botService!.outputs.botServiceId :
 
 @description('Shareable (Entra-SSO-gated) URL of the hosted playground (ADR 053). Empty when enablePlayground=false. Share THIS link with invited testers; access is gated by Easy Auth.')
 output playgroundUrl string = (enablePlayground && enableApiWorker) ? playground!.outputs.playgroundUrl : ''
+
+@description('Public (Entra-SSO-gated) URL of the hosted knowledge-graph dashboard (ADR 081). Empty when enableGraphApp=false. Share THIS link; access is gated by Easy Auth.')
+output graphUrl string = (enableGraphApp && enableApiWorker) ? graphApp!.outputs.graphUrl : ''
 
 @description('Self-hosted Langfuse URL. Empty when deployLangfuse=false. Open it to create a project + mint keys, then store them in KV as langfuse-public-key / langfuse-secret-key.')
 output langfuseUrl string = deployLangfuse ? langfuse!.outputs.publicUrl : ''

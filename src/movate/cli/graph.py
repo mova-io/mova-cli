@@ -405,6 +405,39 @@ def _probe_graph_api(base_url: str, bearer: str) -> tuple[bool, str]:
     return True, "could not introspect capabilities; viewer will probe on load"
 
 
+def _resolve_viewer_runtime(
+    target: str | None,
+    runtime_url: str | None,
+    api_key: str | None,
+) -> tuple[str, str, str]:
+    """Resolve ``(target_name, base_url, bearer)`` for the viewer / dashboard.
+
+    Two modes:
+
+    * **Headless** (hosted-container path, ADR 081): when BOTH ``runtime_url``
+      and ``api_key`` are supplied — via the ``--runtime-url`` / ``--api-key``
+      flags or the ``MDK_GRAPH_RUNTIME_URL`` / ``MDK_GRAPH_API_KEY`` env vars —
+      use them directly. No ``~/.movate/config.yaml`` is read, so the viewer can
+      run in a container pointed at a deployed runtime with only env vars and no
+      local CLI config. The bearer still stays server-side (same proxy model).
+    * **Local** (default): fall back to the shared ``--target`` → URL + bearer
+      pipeline (:func:`movate.cli.kb_cmd._resolve_target_bearer`), unchanged.
+    """
+    if runtime_url and api_key:
+        return "(env)", runtime_url.rstrip("/"), api_key
+    if runtime_url or api_key:
+        err_console.print(
+            "[red]✗[/red] headless mode needs BOTH [bold]--runtime-url[/bold] "
+            "([dim]MDK_GRAPH_RUNTIME_URL[/dim]) and [bold]--api-key[/bold] "
+            "([dim]MDK_GRAPH_API_KEY[/dim]); only one was given."
+        )
+        raise typer.Exit(code=2)
+    from movate.cli.kb_cmd import _resolve_target_bearer  # noqa: PLC0415
+
+    target_name, _cfg, base_url, bearer = _resolve_target_bearer(target)  # type: ignore[arg-type]
+    return target_name, base_url, bearer
+
+
 @graph_app.command("serve")
 def serve(
     target: str | None = typer.Option(
@@ -419,9 +452,30 @@ def serve(
     project: str | None = typer.Option(
         None,
         "--project",
+        envvar="MDK_GRAPH_PROJECT_ID",
         help=(
             "Project id whose knowledge graph to view. Required to fetch "
-            "the project graph + live-growth stream."
+            "the project graph + live-growth stream. Env: MDK_GRAPH_PROJECT_ID."
+        ),
+    ),
+    runtime_url: str | None = typer.Option(
+        None,
+        "--runtime-url",
+        envvar="MDK_GRAPH_RUNTIME_URL",
+        help=(
+            "Headless mode (hosted container, ADR 081): runtime base URL to "
+            "proxy to, bypassing ~/.movate/config.yaml. Requires --api-key. "
+            "Env: MDK_GRAPH_RUNTIME_URL."
+        ),
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="MDK_GRAPH_API_KEY",
+        help=(
+            "Headless mode: read-scoped runtime bearer used server-side "
+            "(never sent to the browser). Requires --runtime-url. "
+            "Env: MDK_GRAPH_API_KEY."
         ),
     ),
     port: int = typer.Option(
@@ -449,14 +503,10 @@ def serve(
     server, prints the URL, and (unless ``--no-open``) opens it. The bearer
     stays server-side; the browser only ever talks to this local server.
     """
-    # Reuse the exact target → URL + bearer pipeline `mdk kb` uses (OIDC +
-    # static-key both supported), so a target set up for kb/deploy works here.
-    from movate.cli.kb_cmd import _resolve_target_bearer  # noqa: PLC0415
-
-    # ``_resolve_target_bearer`` delegates to ``resolve_target``, which treats
-    # ``None`` as "use the active target". Typer gives us ``None`` when
-    # ``--target`` is omitted, so pass it through unchanged for that fallback.
-    target_name, _target_cfg, base_url, bearer = _resolve_target_bearer(target)  # type: ignore[arg-type]
+    # Headless (env vars) for the hosted container path, else the shared
+    # `mdk kb`-style `--target` → URL + bearer pipeline (OIDC + static-key both
+    # supported). `None` target means "use the active target".
+    target_name, base_url, bearer = _resolve_viewer_runtime(target, runtime_url, api_key)
 
     # Up-front, friendly capability heads-up (the viewer degrades regardless).
     available, detail = _probe_graph_api(base_url, bearer)
@@ -523,9 +573,31 @@ def dashboard(
     project: str | None = typer.Option(
         None,
         "--project",
+        envvar="MDK_GRAPH_PROJECT_ID",
         help=(
             "Project id whose knowledge graph to explore. Required to "
-            "load graph data, run analytics, and stream live growth."
+            "load graph data, run analytics, and stream live growth. "
+            "Env: MDK_GRAPH_PROJECT_ID."
+        ),
+    ),
+    runtime_url: str | None = typer.Option(
+        None,
+        "--runtime-url",
+        envvar="MDK_GRAPH_RUNTIME_URL",
+        help=(
+            "Headless mode (hosted container, ADR 081): runtime base URL to "
+            "proxy to, bypassing ~/.movate/config.yaml. Requires --api-key. "
+            "Env: MDK_GRAPH_RUNTIME_URL."
+        ),
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="MDK_GRAPH_API_KEY",
+        help=(
+            "Headless mode: read-scoped runtime bearer used server-side "
+            "(never sent to the browser). Requires --runtime-url. "
+            "Env: MDK_GRAPH_API_KEY."
         ),
     ),
     port: int = typer.Option(
@@ -559,9 +631,7 @@ def dashboard(
     Use ``--host 0.0.0.0`` for hosted/shared access (the graph API is
     read-only, and the runtime gates writes via its own auth).
     """
-    from movate.cli.kb_cmd import _resolve_target_bearer  # noqa: PLC0415
-
-    target_name, _target_cfg, base_url, bearer = _resolve_target_bearer(target)  # type: ignore[arg-type]
+    target_name, base_url, bearer = _resolve_viewer_runtime(target, runtime_url, api_key)
 
     available, detail = _probe_graph_api(base_url, bearer)
     if not available:
