@@ -454,6 +454,7 @@ from movate.tracing import (
     inject_current_trace_context,
     install_log_correlation,
     record_audit_event,
+    record_run_usage,
 )
 
 if TYPE_CHECKING:
@@ -461,6 +462,40 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _record_run_usage_edge(tenant_id: str | None, run_response: Any) -> None:
+    """Record per-run token + cost volume (``mdk.run.tokens`` /
+    ``mdk.run.cost_usd``) at a *synchronous* runtime edge.
+
+    The async job worker records this in
+    :func:`movate.runtime.dispatch.WorkerDispatch._execute_agent`, but the
+    synchronous run transports — inline ``?wait=true``, the streaming SSE run,
+    and the OpenAI-compatible ``/v1/chat/completions`` shim — bypass the worker
+    entirely. Without recording here they emit ``agent.execute`` spans but never
+    the run-usage metrics, so cost/token dashboards stay empty for the traffic
+    that actually flows through the playground and OpenWebUI.
+
+    Boundary rule: recorded at the runtime edge from the ``RunResponse`` already
+    in hand, NOT inside the executor/core (core must not import tracing
+    metrics). Best-effort + fail-soft — a metrics hiccup must never break a run
+    response. No-op when metrics are disabled (``record_run_usage`` handles that).
+    """
+    try:
+        if tenant_id is None:
+            return
+        metrics = getattr(run_response, "metrics", None)
+        if metrics is None:
+            return
+        tokens = getattr(metrics, "tokens", None)
+        total_tokens = getattr(tokens, "input", 0) + getattr(tokens, "output", 0) if tokens else 0
+        record_run_usage(
+            tenant_id=tenant_id,
+            tokens=total_tokens,
+            cost_usd=getattr(metrics, "cost_usd", 0.0),
+        )
+    except Exception:  # pragma: no cover - metrics must never break a run
+        logger.debug("record_run_usage_edge failed", exc_info=True)
 
 
 def _serialize_proposed_fix(fix: Any) -> dict[str, Any]:
@@ -2051,6 +2086,9 @@ async def _sse_run_stream(
                 on_token=lambda delta: queue.put_nowait(("token", delta)),
                 tenant_id_override=tenant_id,
             )
+            # Streaming run is a synchronous edge (bypasses the job worker) —
+            # record run usage here so cost/token dashboards see SSE traffic.
+            _record_run_usage_edge(tenant_id, response)
             await queue.put(("result", response))
         except Exception as exc:  # surface ANY failure as an SSE error frame
             await queue.put(("exc", exc))
@@ -9430,6 +9468,9 @@ def build_app(  # noqa: PLR0912
                     cache=_cache_status,
                 ),
             )
+            # Inline ?wait=true is a synchronous edge (bypasses the job worker)
+            # — record run usage so cost/token dashboards see inline traffic.
+            _record_run_usage_edge(ctx.tenant_id, run_response)
 
             # Try to fetch the persisted RunRecord. On success the
             # executor always persists; on error it persists a
@@ -17950,6 +17991,10 @@ def build_app(  # noqa: PLR0912
             cache=request.app.state.llm_cache,
         )
         run_response = await executor.execute(bundle, run_request)
+        # OpenAI-compatible /v1/chat/completions is a synchronous edge (bypasses
+        # the job worker) — record run usage so cost/token dashboards see the
+        # OpenWebUI / Chainlit traffic that flows through this shim.
+        _record_run_usage_edge(ctx.tenant_id, run_response)
         text = _oai_response_text(run_response)
 
         created = int(_time.time())
