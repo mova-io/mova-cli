@@ -93,3 +93,95 @@ def resolve_data_layer_config(
     if pg:
         return DataLayerConfig(enabled=True, postgres_url=pg)
     return DataLayerConfig(enabled=True, sqlite_path=threads_db_path(home))
+
+
+# Chainlit's SQLAlchemyDataLayer (the conversation-history backend) does NOT
+# create its own schema — it issues raw INSERT/UPDATE/SELECT against tables it
+# assumes already exist. On the zero-config SQLite path nothing provisioned them,
+# so every persist raised ``no such table: threads`` / ``steps`` and the
+# playground's agent picker + chat silently broke. This DDL is the canonical
+# Chainlit data-layer schema (users / threads / steps / elements / feedbacks);
+# SQLite is dynamically typed, so the Postgres-ish type names (UUID/JSONB/TEXT[])
+# are accepted as type-affinity. ``IF NOT EXISTS`` makes it idempotent.
+_CHAINLIT_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    "id" UUID PRIMARY KEY,
+    "identifier" TEXT NOT NULL UNIQUE,
+    "metadata" JSONB NOT NULL,
+    "createdAt" TEXT
+);
+CREATE TABLE IF NOT EXISTS threads (
+    "id" UUID PRIMARY KEY,
+    "createdAt" TEXT,
+    "name" TEXT,
+    "userId" UUID,
+    "userIdentifier" TEXT,
+    "tags" TEXT,
+    "metadata" JSONB,
+    FOREIGN KEY ("userId") REFERENCES users ("id") ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS steps (
+    "id" UUID PRIMARY KEY,
+    "name" TEXT NOT NULL,
+    "type" TEXT NOT NULL,
+    "threadId" UUID NOT NULL,
+    "parentId" UUID,
+    "streaming" BOOLEAN NOT NULL,
+    "waitForAnswer" BOOLEAN,
+    "isError" BOOLEAN,
+    "metadata" JSONB,
+    "tags" TEXT,
+    "input" TEXT,
+    "output" TEXT,
+    "createdAt" TEXT,
+    "command" TEXT,
+    "start" TEXT,
+    "end" TEXT,
+    "generation" JSONB,
+    "showInput" TEXT,
+    "language" TEXT,
+    "indent" INT,
+    "defaultOpen" BOOLEAN
+);
+CREATE TABLE IF NOT EXISTS elements (
+    "id" UUID PRIMARY KEY,
+    "threadId" UUID,
+    "type" TEXT,
+    "url" TEXT,
+    "chainlitKey" TEXT,
+    "name" TEXT NOT NULL,
+    "display" TEXT,
+    "objectKey" TEXT,
+    "size" TEXT,
+    "page" INT,
+    "language" TEXT,
+    "forId" UUID,
+    "mime" TEXT,
+    "props" JSONB
+);
+CREATE TABLE IF NOT EXISTS feedbacks (
+    "id" UUID PRIMARY KEY,
+    "forId" UUID NOT NULL,
+    "threadId" UUID NOT NULL,
+    "value" INT NOT NULL,
+    "comment" TEXT
+);
+"""
+
+
+def ensure_chainlit_sqlite_schema(db_path: Path) -> None:
+    """Create the Chainlit data-layer tables in ``db_path`` if missing.
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``). Synchronous stdlib ``sqlite3``
+    — runs once at data-layer build time, before the async SQLAlchemyDataLayer
+    starts issuing queries. Raises on a genuinely broken DB so the caller can
+    degrade to no-persistence rather than ship a half-configured data layer.
+    """
+    import sqlite3  # noqa: PLC0415
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_CHAINLIT_SQLITE_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()

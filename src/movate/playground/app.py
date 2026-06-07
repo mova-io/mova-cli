@@ -102,7 +102,7 @@ from movate.playground.conversation import (
     select_backend,
 )
 from movate.playground.harvest_feedback import harvest_feedback_turn
-from movate.playground.state import resolve_data_layer_config
+from movate.playground.state import ensure_chainlit_sqlite_schema, resolve_data_layer_config
 from movate.playground.targets import (
     TARGETS_ENV_VAR,
     PlaygroundTarget,
@@ -276,6 +276,24 @@ if _DATA_LAYER_CFG.enabled:
             assert db_path is not None  # invariant: sqlite path set when no PG url
             db_path.parent.mkdir(parents=True, exist_ok=True)
             conninfo = f"sqlite+aiosqlite:///{db_path}"
+            # Chainlit's SQLAlchemyDataLayer does NOT create its schema — it
+            # assumes the tables already exist. On the zero-config SQLite path
+            # that left ``threads``/``steps`` missing, so EVERY persist (incl.
+            # the agent-pick step) raised "no such table" and the picker/chat
+            # silently broke. Provision the schema here; if it fails, degrade to
+            # no persistence (None) so the UI/picker still works — never crash
+            # or half-configure the data layer.
+            try:
+                ensure_chainlit_sqlite_schema(db_path)
+            except Exception:
+                logger.warning(
+                    "Playground history disabled: could not provision the "
+                    "Chainlit SQLite schema at %s — continuing without "
+                    "persistence so the agent picker + chat still work.",
+                    db_path,
+                    exc_info=True,
+                )
+                return None
         return SQLAlchemyDataLayer(conninfo=conninfo)
 
 
