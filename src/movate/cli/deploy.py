@@ -114,8 +114,10 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         None,
         "--only",
         help=(
-            "Update only one Container App: 'api' or 'worker'. Default updates "
-            "both. Useful when a code change is API-only or worker-only."
+            "Update only one Container App: 'api', 'worker', or "
+            "'temporal-worker'. Default rolls api + worker (and temporal-worker "
+            "when Temporal is enabled for the env). Useful when a code change is "
+            "scoped to one app."
         ),
     ),
     skip_image_parity_check: bool = typer.Option(
@@ -338,8 +340,8 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         )
         raise typer.Exit(code=2)
 
-    if only is not None and only not in ("api", "worker"):
-        error(f"--only must be 'api' or 'worker'; got {only!r}")
+    if only is not None and only not in ("api", "worker", "temporal-worker"):
+        error(f"--only must be 'api', 'worker', or 'temporal-worker'; got {only!r}")
         raise typer.Exit(code=2)
 
     try:
@@ -391,6 +393,20 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         )
         return
 
+    # Roll the temporal-worker too when it exists (Temporal enabled for this
+    # env) and the operator didn't scope to one app with --only. The
+    # temporal-worker runs the SAME image as api/worker, so a runtime feature
+    # (durable-HITL / ADR 080 terminal-sync, which MUST be on the worker image)
+    # is only live there if its image advances with the others — otherwise the
+    # post-update parity guard (which already inspects temporal-worker) fails.
+    # Existence-probed via `az ... show` so non-Temporal envs are unaffected
+    # (and a probe hiccup degrades to the old api+worker behavior).
+    if only is None:
+        tw_name = f"movate-{plan.env}-temporal-worker"
+        if _query_containerapp_image(plan, tw_name) is not None:
+            plan.apps_to_update.append(tw_name)
+            err.print(f"[dim]temporal enabled — also rolling {tw_name}[/dim]")
+
     # Pre-flight: the target Postgres must allow-list pgvector or the new
     # revision will silently ActivationFail (see _preflight_pgvector). Runs
     # before the build + revision roll so a misconfig fails fast with the fix
@@ -406,9 +422,9 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
     for app_name in plan.apps_to_update:
         _run_containerapp_update(plan, app_name)
 
-    # Post-update image-parity guard. `mdk deploy` rolls api + worker (and a
-    # `--only` roll just one of them); the temporal-worker is rolled by the
-    # bicep stack. A partial / `--only` deploy can leave them on different
+    # Post-update image-parity guard. A full `mdk deploy` now rolls api +
+    # worker + temporal-worker (when present) to the same tag; a `--only` roll
+    # advances just one. A partial / `--only` deploy can leave them on different
     # image tags — and a runtime feature that landed on one image but not the
     # others (durable-HITL / ADR 080 terminal-sync MUST be on the WORKER
     # image) then silently no-ops. Assert they match before we call the
@@ -624,6 +640,8 @@ def _build_plan(
         apps = [f"movate-{target_cfg.azure_env}-api"]
     elif only == "worker":
         apps = [f"movate-{target_cfg.azure_env}-worker"]
+    elif only == "temporal-worker":
+        apps = [f"movate-{target_cfg.azure_env}-temporal-worker"]
 
     return DeployPlan(
         target_name=target_name,
@@ -2847,8 +2865,8 @@ def _assert_image_parity(plan: DeployPlan) -> None:
         "  A runtime feature on one image but not another (e.g. durable-HITL "
         "/ ADR 080 terminal-sync, which must be on the WORKER image) will "
         "silently no-op. Re-run a full `mdk deploy` (no --only) to roll api + "
-        "worker to the same tag; redeploy the bicep stack "
-        "(scripts/deploy-temporal.sh) for the temporal-worker. Bypass with "
+        "worker + temporal-worker to the same tag (or redeploy the bicep stack, "
+        "scripts/deploy-temporal.sh). Bypass with "
         "--skip-image-parity-check for an intentional partial roll."
     )
     raise typer.Exit(code=1)

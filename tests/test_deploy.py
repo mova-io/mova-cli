@@ -279,6 +279,19 @@ def test_build_plan_only_worker_filters_apps() -> None:
 
 
 @pytest.mark.unit
+def test_build_plan_only_temporal_worker_filters_apps() -> None:
+    """--only temporal-worker scopes the roll to just the Temporal worker."""
+    plan = _build_plan(
+        target_name="prod",
+        target_cfg=_full_target(),
+        image_tag=None,
+        skip_build=False,
+        only="temporal-worker",
+    )
+    assert plan.apps_to_update == ["movate-prod-temporal-worker"]
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("field", "kwargs_override"),
     [
@@ -2594,7 +2607,12 @@ def test_cli_deploy_runs_image_parity_check_by_default(
 
 @pytest.mark.unit
 def test_cli_deploy_skip_image_parity_check_omits_reads(deploy_env, mock_subprocess) -> None:
-    """--skip-image-parity-check suppresses the post-update `show` reads."""
+    """--skip-image-parity-check suppresses the post-update PARITY reads.
+
+    A single ``az containerapp show`` may still occur — the temporal-worker
+    existence probe that decides whether to roll it (independent of the parity
+    flag). What must NOT happen is the parity guard reading api + worker back.
+    """
     result = runner.invoke(
         cli_app,
         [
@@ -2609,7 +2627,61 @@ def test_cli_deploy_skip_image_parity_check_omits_reads(deploy_env, mock_subproc
     )
     assert result.exit_code == 0, result.stdout + result.stderr
     show_calls = [c for c in mock_subprocess if c[:3] == ["az", "containerapp", "show"]]
-    assert show_calls == []
+    # The parity guard (reads api + worker images back) is skipped; the only
+    # permissible show is the temporal-worker existence probe.
+    non_probe = [c for c in show_calls if not any("temporal-worker" in tok for tok in c)]
+    assert non_probe == [], f"parity reads not skipped: {non_probe}"
+
+
+@pytest.mark.unit
+def test_cli_deploy_rolls_temporal_worker_when_present(
+    deploy_env, mock_subprocess, monkeypatch
+) -> None:
+    """A full deploy also rolls movate-<env>-temporal-worker when it exists, so
+    durable-workflow runtime features land there and image parity holds."""
+    # Every containerapp image reads back the SAME tag → temporal-worker
+    # "exists" (probe non-None) AND the parity guard passes.
+    monkeypatch.setattr(
+        "movate.cli.deploy._query_containerapp_image",
+        lambda plan, app_name: "movateprodacr.azurecr.io/movate:9.9.9-test",
+    )
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    update_calls = [c for c in mock_subprocess if c[:3] == ["az", "containerapp", "update"]]
+    updated = {
+        tok
+        for c in update_calls
+        for tok in c
+        if tok.startswith("movate-prod-") and not tok.endswith("-rg")
+    }
+    assert updated == {"movate-prod-api", "movate-prod-worker", "movate-prod-temporal-worker"}
+
+
+@pytest.mark.unit
+def test_cli_deploy_skips_temporal_worker_when_absent(
+    deploy_env, mock_subprocess, monkeypatch
+) -> None:
+    """Non-Temporal env: the probe returns None → only api + worker roll."""
+    monkeypatch.setattr(
+        "movate.cli.deploy._query_containerapp_image",
+        lambda plan, app_name: None,
+    )
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    update_calls = [c for c in mock_subprocess if c[:3] == ["az", "containerapp", "update"]]
+    updated = {
+        tok
+        for c in update_calls
+        for tok in c
+        if tok.startswith("movate-prod-") and not tok.endswith("-rg")
+    }
+    assert updated == {"movate-prod-api", "movate-prod-worker"}
 
 
 @pytest.mark.unit
