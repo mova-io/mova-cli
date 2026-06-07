@@ -104,7 +104,11 @@ def metric_panel(
                     "metricNamespace": CA_NS,
                     "metricName": metric,
                     "aggregation": agg,
-                    "timeGrainUnit": "auto",
+                    # Grafana's Azure Monitor query model field is `timeGrain`
+                    # (a string like "auto"/"PT1M"). The earlier `timeGrainUnit`
+                    # was silently ignored → no interval sent → platform panels
+                    # rendered "No data". (Fix: the field name must be timeGrain.)
+                    "timeGrain": "auto",
                     "resources": [{"resourceGroup": RG, "resourceName": a} for a in apps],
                 },
             }
@@ -155,11 +159,11 @@ panels.append(row("Runtime health — Container Apps (api · worker · temporal-
 y += 1
 panels += [
     metric_panel("Requests / min (api)", "Requests", "Total", x=0, y=y, apps=["movate-dev-api"]),
-    metric_panel("CPU usage (nanocores)", "CpuUsage", "Average", x=12, y=y),
+    metric_panel("CPU usage (nanocores)", "UsageNanoCores", "Average", x=12, y=y),
 ]
 y += 8
 panels += [
-    metric_panel("Memory working set", "MemoryWorkingSetBytes", "Average", x=0, y=y, unit="bytes"),
+    metric_panel("Memory working set", "WorkingSetBytes", "Average", x=0, y=y, unit="bytes"),
     metric_panel("Replica count", "Replicas", "Average", x=12, y=y),
 ]
 y += 8

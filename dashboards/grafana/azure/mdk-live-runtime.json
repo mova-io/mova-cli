@@ -81,7 +81,7 @@
             "metricNamespace": "microsoft.app/containerapps",
             "metricName": "Requests",
             "aggregation": "Total",
-            "timeGrainUnit": "auto",
+            "timeGrain": "auto",
             "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
@@ -136,9 +136,9 @@
           "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
           "azureMonitor": {
             "metricNamespace": "microsoft.app/containerapps",
-            "metricName": "CpuUsage",
+            "metricName": "UsageNanoCores",
             "aggregation": "Average",
-            "timeGrainUnit": "auto",
+            "timeGrain": "auto",
             "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
@@ -202,9 +202,9 @@
           "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
           "azureMonitor": {
             "metricNamespace": "microsoft.app/containerapps",
-            "metricName": "MemoryWorkingSetBytes",
+            "metricName": "WorkingSetBytes",
             "aggregation": "Average",
-            "timeGrainUnit": "auto",
+            "timeGrain": "auto",
             "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
@@ -269,7 +269,7 @@
             "metricNamespace": "microsoft.app/containerapps",
             "metricName": "Replicas",
             "aggregation": "Average",
-            "timeGrainUnit": "auto",
+            "timeGrain": "auto",
             "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
@@ -334,7 +334,7 @@
             "metricNamespace": "microsoft.app/containerapps",
             "metricName": "RestartCount",
             "aggregation": "Maximum",
-            "timeGrainUnit": "auto",
+            "timeGrain": "auto",
             "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
@@ -400,7 +400,7 @@
             "metricNamespace": "microsoft.app/containerapps",
             "metricName": "RxBytes",
             "aggregation": "Total",
-            "timeGrainUnit": "auto",
+            "timeGrain": "auto",
             "resources": [
               {
                 "resourceGroup": "movate-dev-rg",
