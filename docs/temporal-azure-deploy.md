@@ -63,6 +63,31 @@ Redeploy the image (or mount agents) so the worker picks it up; the
 `movate-<env>-temporal-worker` registers every `runtime: temporal` workflow on
 startup.
 
+## Image parity — keep the worker images in lock-step with the api
+
+The api, queue worker, and `temporal-worker` Container Apps must run the **same
+image** (the bicep deploys all three from one `image` param). A runtime feature
+only lands on the worker if its image matches — durable-HITL / ADR 080
+terminal-state sync runs on the **worker** image, so an api-only roll leaves it
+silently no-op'ing. The drift sneaks in via a manual `mdk deploy --only
+api|worker` or a partial deploy that advanced one app but not the others.
+
+`mdk deploy` guards against this automatically: after rolling the Container
+Apps it reads each app's configured image back
+(`az containerapp show … --query properties.template.containers[0].image`) and
+**fails loudly (exit 1)** if `movate-<env>-api`, `-worker`, and (when Temporal
+is enabled) `-temporal-worker` don't all match. It acts only on a confirmed
+mismatch — a single-app target or an `az` hiccup degrades to a no-op rather than
+blocking a rollout. Pass `--skip-image-parity-check` for an intentional partial
+roll, then reconcile with a full deploy. To check by hand:
+
+```bash
+for app in api worker temporal-worker; do
+  echo "movate-<env>-$app: $(az containerapp show -g <rg> -n movate-<env>-$app \
+    --query properties.template.containers[0].image -o tsv)"
+done
+```
+
 ## Validate (the ADR 080 D3 acceptance gate)
 1. **Server up:** `az containerapp logs show -n movate-<env>-temporal -g <rg>` —
    expect schema-setup success + "Started Worker"/frontend listening on 7233.

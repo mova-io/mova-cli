@@ -118,6 +118,22 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
             "both. Useful when a code change is API-only or worker-only."
         ),
     ),
+    skip_image_parity_check: bool = typer.Option(
+        False,
+        "--skip-image-parity-check",
+        help=(
+            "Skip the post-update image-parity guard. By default, after "
+            "rolling the Container Apps, [bold]mdk deploy[/bold] reads the "
+            "image back off [bold]movate-<env>-api[/bold], [bold]-worker[/bold], "
+            "and (when Temporal is enabled) [bold]-temporal-worker[/bold] and "
+            "fails loudly if they don't all match — a runtime feature that "
+            "lands on one image but not another (e.g. durable-HITL / ADR 080 "
+            "terminal-state sync, which must be on the WORKER image) silently "
+            "no-ops otherwise. Pass this for an intentional [bold]--only[/bold] "
+            "roll, or when the temporal-worker is rolled out-of-band (bicep / "
+            "[bold]scripts/deploy-temporal.sh[/bold])."
+        ),
+    ),
     notify: bool = typer.Option(
         False,
         "--notify",
@@ -389,6 +405,18 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         _run_acr_build(plan, verbose=verbose)
     for app_name in plan.apps_to_update:
         _run_containerapp_update(plan, app_name)
+
+    # Post-update image-parity guard. `mdk deploy` rolls api + worker (and a
+    # `--only` roll just one of them); the temporal-worker is rolled by the
+    # bicep stack. A partial / `--only` deploy can leave them on different
+    # image tags — and a runtime feature that landed on one image but not the
+    # others (durable-HITL / ADR 080 terminal-sync MUST be on the WORKER
+    # image) then silently no-ops. Assert they match before we call the
+    # deploy done. Runs under --no-wait too (the configured image is set
+    # synchronously by `az containerapp update`, independent of revision
+    # health). --skip-image-parity-check bypasses for intentional partials.
+    if not skip_image_parity_check:
+        _assert_image_parity(plan)
 
     if no_wait:
         err.print(
@@ -2720,6 +2748,110 @@ def _run_containerapp_update(plan: DeployPlan, app_name: str) -> None:
         err.print(f"  [green]✓[/green] {app_name}: {detail}")
     except (json.JSONDecodeError, AttributeError, KeyError):
         err.print(f"  [green]✓[/green] {app_name} updated")
+
+
+# Container App name suffixes that must all serve the SAME runtime image.
+# `mdk deploy` rolls api + worker directly; the temporal-worker is rolled by
+# the bicep stack (same `image` param) / scripts/deploy-temporal.sh. They are
+# meant to run one identical image — durable-HITL / ADR 080 terminal-state
+# sync only works if the runtime code is present on the WORKER images too.
+_PARITY_APP_SUFFIXES = ("api", "worker", "temporal-worker")
+
+# Need at least two reachable images to compare; below this we can't reason
+# about parity and degrade to a no-op rather than block the deploy.
+_PARITY_MIN_APPS = 2
+
+
+def _query_containerapp_image(plan: DeployPlan, app_name: str) -> str | None:
+    """Return the image a Container App is configured to run, or ``None``.
+
+    Reads ``properties.template.containers[0].image`` — the *configured*
+    image, which ``az containerapp update`` sets synchronously (so it's
+    accurate even before the new revision is healthy). Never raises: a missing
+    app (e.g. the temporal-worker when Temporal is disabled), a non-zero ``az``
+    exit, ``az`` not on PATH, or an empty result all degrade to ``None`` so the
+    parity guard skips that app rather than failing a deploy it can't reason
+    about — same defensive contract as :func:`_diagnose_failed_revision`.
+    """
+    if shutil.which("az") is None:
+        return None
+    cmd = [
+        "az",
+        "containerapp",
+        "show",
+        "--subscription",
+        plan.subscription,
+        "--resource-group",
+        plan.resource_group,
+        "--name",
+        app_name,
+        "--query",
+        "properties.template.containers[0].image",
+        "-o",
+        "tsv",
+    ]
+    try:
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except (OSError, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    image = result.stdout.strip()
+    return image or None
+
+
+def _assert_image_parity(plan: DeployPlan) -> None:
+    """Post-update guard: assert the runtime Container Apps share one image.
+
+    Reads the configured image of ``movate-<env>-{api,worker,temporal-worker}``
+    and fails loudly (exit 1) when the reachable ones don't all match. This is
+    the "feature shipped on the api image but not the worker image" footgun the
+    Azure demo keeps hitting: the worker apps run the SAME image as the api, so
+    a runtime feature (durable-HITL / ADR 080 terminal-state sync) is only live
+    on the worker if its image matches. The bicep deploys all three from one
+    ``image`` param, so this mainly catches a manual ``--only`` roll or a
+    partial deploy that advanced one app but not the others.
+
+    Acts only on a CONFIRMED mismatch. If fewer than two images can be read
+    back (``az`` unavailable, single-app target, transient error), it degrades
+    to a no-op — a read hiccup must never sink a rollout that already
+    succeeded. The temporal-worker is simply absent from the comparison when
+    Temporal is disabled (its ``az ... show`` returns nothing → ``None``).
+    """
+    images: dict[str, str] = {}
+    for suffix in _PARITY_APP_SUFFIXES:
+        app_name = f"movate-{plan.env}-{suffix}"
+        image = _query_containerapp_image(plan, app_name)
+        if image is not None:
+            images[app_name] = image
+
+    if len(images) < _PARITY_MIN_APPS:
+        # Can't compare (only one app reachable / az unavailable) — don't
+        # block a deploy we can't reason about.
+        return
+
+    if len(set(images.values())) == 1:
+        only_image = next(iter(images.values()))
+        err.print(
+            f"  [green]✓[/green] image parity: {len(images)} apps "
+            f"({', '.join(sorted(images))}) all on [cyan]{only_image}[/cyan]"
+        )
+        return
+
+    # Confirmed drift — list each app + image so the operator sees exactly
+    # which one is stale, then point at the fix.
+    detail = "\n".join(f"    {name}: {img}" for name, img in sorted(images.items()))
+    error(
+        "image-parity check failed — the runtime Container Apps are serving "
+        f"DIFFERENT images:\n{detail}\n"
+        "  A runtime feature on one image but not another (e.g. durable-HITL "
+        "/ ADR 080 terminal-sync, which must be on the WORKER image) will "
+        "silently no-op. Re-run a full `mdk deploy` (no --only) to roll api + "
+        "worker to the same tag; redeploy the bicep stack "
+        "(scripts/deploy-temporal.sh) for the temporal-worker. Bypass with "
+        "--skip-image-parity-check for an intentional partial roll."
+    )
+    raise typer.Exit(code=1)
 
 
 def _run_az(cmd: list[str], *, what: str) -> str:

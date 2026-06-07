@@ -32,6 +32,7 @@ from movate.cli.auth import PullRuntimeKeyError
 from movate.cli.deploy import (
     DeployConfigError,
     DeployPlan,
+    _assert_image_parity,
     _attempt_auto_recovery,
     _build_plan,
     _diagnose_failed_revision,
@@ -39,6 +40,7 @@ from movate.cli.deploy import (
     _preflight_pgvector,
     _print_next_steps,
     _print_plan,
+    _query_containerapp_image,
     _render_bearer_bootstrap_hint,
     _render_post_deploy_next_steps,
     _resolve_keyvault_name,
@@ -446,10 +448,13 @@ def test_cli_deploy_full_run_invokes_acr_build_and_two_updates(
     )
     assert result.exit_code == 0, result.stdout + result.stderr
     # Verify the shape of the subprocess calls: first an acr build, then
-    # two containerapp updates. Each call begins with 'az'. The pgvector
-    # pre-flight's read-only `az postgres ...` call is filtered out — it's a
-    # gate, not part of the build/roll shape under test.
-    deploy_calls = [c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c]
+    # two containerapp updates. Each call begins with 'az'. Read-only gates
+    # are filtered out — the pgvector pre-flight's `az postgres ...` and the
+    # post-update image-parity guard's `az containerapp show ...` reads — they
+    # aren't part of the build/roll shape under test.
+    deploy_calls = [
+        c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c and "show" not in c
+    ]
     assert len(deploy_calls) == 3
     build_cmd = deploy_calls[0]
     assert build_cmd[:3] == ["az", "acr", "build"]
@@ -482,7 +487,9 @@ def test_cli_deploy_skip_build_omits_acr_build(deploy_env, mock_subprocess) -> N
         ],
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    deploy_calls = [c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c]
+    deploy_calls = [
+        c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c and "show" not in c
+    ]
     assert len(deploy_calls) == 2
     assert all(c[:3] == ["az", "containerapp", "update"] for c in deploy_calls)
 
@@ -504,7 +511,9 @@ def test_cli_deploy_only_api_runs_one_update(deploy_env, mock_subprocess) -> Non
         ],
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    deploy_calls = [c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c]
+    deploy_calls = [
+        c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c and "show" not in c
+    ]
     assert len(deploy_calls) == 2  # build + 1 update
     update_cmd = deploy_calls[1]
     assert "movate-prod-api" in update_cmd
@@ -2391,3 +2400,241 @@ def test_resolve_keyvault_name_reads_field_else_none() -> None:
     assert _resolve_keyvault_name(_fake_target(azure_keyvault=None)) is None
     # The vault name is NOT derived from azure_env — must be explicit.
     assert _resolve_keyvault_name(SimpleNamespace(key_env="K", azure_env="dev")) is None
+
+
+# ---------------------------------------------------------------------------
+# Image-parity guard: api / worker / temporal-worker must share one image
+# (catches the "feature on the api image but not the worker image" drift)
+# ---------------------------------------------------------------------------
+
+
+def _parity_plan(env: str = "prod") -> DeployPlan:
+    """A plan whose env yields app names movate-<env>-{api,worker,...}."""
+    return DeployPlan(
+        target_name=env,
+        subscription="00000000-0000-0000-0000-000000000000",
+        resource_group=f"movate-{env}-rg",
+        acr_name=f"movate{env}acr",
+        env=env,
+        image_tag="movate:9.9.9-abc1234",
+        skip_build=False,
+        apps_to_update=[f"movate-{env}-api", f"movate-{env}-worker"],
+        version="9.9.9",
+    )
+
+
+def _image_responder(images_by_app: dict[str, str | None]):
+    """Fake ``subprocess.run`` keyed off the ``--name`` arg: maps each
+    Container App name to a configured image (``None`` → simulate "app not
+    found" / non-zero exit, e.g. the temporal-worker when Temporal is off)."""
+
+    def fake_run(cmd, *args, **kwargs):
+        name = cmd[cmd.index("--name") + 1]
+        image = images_by_app.get(name)
+        if image is None:
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="not found")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout=image + "\n", stderr="")
+
+    return fake_run
+
+
+@pytest.mark.unit
+def test_query_containerapp_image_reads_tsv_value(monkeypatch) -> None:
+    """Happy path: returns the trimmed image string from the tsv query."""
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: "/usr/bin/az")
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        _image_responder({"movate-prod-api": "acr.azurecr.io/movate:9.9.9-abc1234"}),
+    )
+    assert (
+        _query_containerapp_image(_parity_plan(), "movate-prod-api")
+        == "acr.azurecr.io/movate:9.9.9-abc1234"
+    )
+
+
+@pytest.mark.unit
+def test_query_containerapp_image_none_on_nonzero_exit(monkeypatch) -> None:
+    """A non-zero ``az`` exit (app not found) degrades to None, never raises."""
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: "/usr/bin/az")
+    monkeypatch.setattr("movate.cli.deploy.subprocess.run", _image_responder({}))
+    assert _query_containerapp_image(_parity_plan(), "movate-prod-temporal-worker") is None
+
+
+@pytest.mark.unit
+def test_query_containerapp_image_none_when_az_missing(monkeypatch) -> None:
+    """``az`` not on PATH → None, and no subprocess attempted."""
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: None)
+
+    def explode(*args, **kwargs):  # pragma: no cover — must not be reached
+        raise AssertionError("subprocess.run should not be called when az is missing")
+
+    monkeypatch.setattr("movate.cli.deploy.subprocess.run", explode)
+    assert _query_containerapp_image(_parity_plan(), "movate-prod-api") is None
+
+
+@pytest.mark.unit
+def test_assert_image_parity_passes_when_all_three_match(monkeypatch, capsys) -> None:
+    """api + worker + temporal-worker on the same image → ✓, no raise."""
+    img = "acr.azurecr.io/movate:9.9.9-abc1234"
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: "/usr/bin/az")
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        _image_responder(
+            {
+                "movate-prod-api": img,
+                "movate-prod-worker": img,
+                "movate-prod-temporal-worker": img,
+            }
+        ),
+    )
+    _assert_image_parity(_parity_plan())  # must not raise
+    out = capsys.readouterr().err
+    assert "image parity" in out
+    assert "3 apps" in out
+
+
+@pytest.mark.unit
+def test_assert_image_parity_passes_when_temporal_worker_absent(monkeypatch) -> None:
+    """Temporal disabled (temporal-worker show → non-zero) — api + worker
+    still compared, and a match passes."""
+    img = "acr.azurecr.io/movate:9.9.9-abc1234"
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: "/usr/bin/az")
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        _image_responder({"movate-prod-api": img, "movate-prod-worker": img}),
+    )
+    _assert_image_parity(_parity_plan())  # must not raise
+
+
+@pytest.mark.unit
+def test_assert_image_parity_fails_on_api_worker_drift(monkeypatch, capsys) -> None:
+    """api advanced but worker left on the old tag (the `--only` footgun) →
+    exit 1 with both images named."""
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: "/usr/bin/az")
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        _image_responder(
+            {
+                "movate-prod-api": "acr.azurecr.io/movate:9.9.9-new",
+                "movate-prod-worker": "acr.azurecr.io/movate:9.9.8-old",
+            }
+        ),
+    )
+    with pytest.raises(typer.Exit) as exc:
+        _assert_image_parity(_parity_plan())
+    assert exc.value.exit_code == 1
+    out = capsys.readouterr().err
+    assert "image-parity check failed" in out
+    assert "movate:9.9.9-new" in out
+    assert "movate:9.9.8-old" in out
+
+
+@pytest.mark.unit
+def test_assert_image_parity_fails_on_temporal_worker_drift(monkeypatch) -> None:
+    """api + worker match but the temporal-worker is stale → exit 1
+    (durable-workflow runtime code would silently no-op)."""
+    new = "acr.azurecr.io/movate:9.9.9-new"
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: "/usr/bin/az")
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        _image_responder(
+            {
+                "movate-prod-api": new,
+                "movate-prod-worker": new,
+                "movate-prod-temporal-worker": "acr.azurecr.io/movate:9.9.8-old",
+            }
+        ),
+    )
+    with pytest.raises(typer.Exit) as exc:
+        _assert_image_parity(_parity_plan())
+    assert exc.value.exit_code == 1
+
+
+@pytest.mark.unit
+def test_assert_image_parity_noop_when_only_one_app_readable(monkeypatch, capsys) -> None:
+    """Fewer than two images readable (can't reason about parity) → silent
+    no-op; never blocks a deploy on a read hiccup."""
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: "/usr/bin/az")
+    monkeypatch.setattr(
+        "movate.cli.deploy.subprocess.run",
+        _image_responder({"movate-prod-api": "acr.azurecr.io/movate:9.9.9-only"}),
+    )
+    _assert_image_parity(_parity_plan())  # must not raise
+    out = capsys.readouterr().err
+    assert "image parity" not in out
+    assert "failed" not in out
+
+
+@pytest.mark.unit
+def test_assert_image_parity_noop_when_az_missing(monkeypatch) -> None:
+    """``az`` off PATH → every read is None → no-op, no raise."""
+    monkeypatch.setattr("movate.cli.deploy.shutil.which", lambda name: None)
+    _assert_image_parity(_parity_plan())  # must not raise
+
+
+@pytest.mark.unit
+def test_cli_deploy_runs_image_parity_check_by_default(
+    deploy_env, mock_subprocess, monkeypatch
+) -> None:
+    """A full deploy issues `az containerapp show` parity reads for api +
+    worker + temporal-worker after the updates."""
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    show_calls = [c for c in mock_subprocess if c[:3] == ["az", "containerapp", "show"]]
+    queried = {c[c.index("--name") + 1] for c in show_calls}
+    assert queried == {
+        "movate-prod-api",
+        "movate-prod-worker",
+        "movate-prod-temporal-worker",
+    }
+
+
+@pytest.mark.unit
+def test_cli_deploy_skip_image_parity_check_omits_reads(deploy_env, mock_subprocess) -> None:
+    """--skip-image-parity-check suppresses the post-update `show` reads."""
+    result = runner.invoke(
+        cli_app,
+        [
+            "deploy",
+            "--target",
+            "prod",
+            "--no-wait",
+            "--skip-image-parity-check",
+            "--image-tag",
+            "movate:9.9.9-test",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    show_calls = [c for c in mock_subprocess if c[:3] == ["az", "containerapp", "show"]]
+    assert show_calls == []
+
+
+@pytest.mark.unit
+def test_cli_deploy_fails_loudly_on_image_drift(deploy_env, monkeypatch) -> None:
+    """End-to-end: drift between api and worker images aborts the deploy
+    with exit 1 (the parity guard wired into the deploy flow)."""
+
+    def drift_run(cmd, *args, **kwargs):
+        # The build/update calls don't matter here; only the parity `show`
+        # reads need to return diverging images.
+        if cmd[:3] == ["az", "containerapp", "show"]:
+            name = cmd[cmd.index("--name") + 1]
+            img = "movate:NEW" if name.endswith("-api") else "movate:OLD"
+            return subprocess.CompletedProcess(cmd, returncode=0, stdout=img + "\n", stderr="")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    def fake_popen(cmd, *args, **kwargs):
+        return _FakePopen(lines=[], returncode=0)
+
+    monkeypatch.setattr("movate.cli.deploy.subprocess.run", drift_run)
+    monkeypatch.setattr("movate.cli.deploy.subprocess.Popen", fake_popen)
+
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--no-wait", "--image-tag", "movate:9.9.9-test"],
+    )
+    assert result.exit_code == 1, result.stdout + result.stderr
+    assert "image-parity check failed" in result.stderr
