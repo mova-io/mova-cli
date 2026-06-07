@@ -39,6 +39,7 @@
       "type": "timeseries",
       "id": 2,
       "title": "Requests / min (api)",
+      "description": "**Traffic** (golden signal). Inbound HTTP requests to the api Container App. A flat line at zero usually means no callers \u2014 or the app is down (cross-check Replica count + Restart count).",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -61,8 +62,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -96,6 +102,7 @@
       "type": "timeseries",
       "id": 3,
       "title": "CPU usage (nanocores)",
+      "description": "**Saturation** (golden signal). Average CPU per app in nanocores (1e9 = 1 vCPU). Sustained near the per-replica limit drives autoscaling and latency.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -118,8 +125,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -195,6 +207,7 @@
       "type": "timeseries",
       "id": 4,
       "title": "Memory working set",
+      "description": "**Saturation** (golden signal). Resident memory per app. A steady climb that never drops is the classic leak signature; watch for it alongside RestartCount (OOM kills).",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -218,8 +231,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -295,6 +313,7 @@
       "type": "timeseries",
       "id": 5,
       "title": "Replica count",
+      "description": "Active replica count per app (KEDA/HTTP autoscale). Confirms scale-out under load and scale-to-zero when idle.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -317,8 +336,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -394,6 +418,7 @@
       "type": "timeseries",
       "id": 6,
       "title": "Restart count (crash-loop watch)",
+      "description": "**Errors** (golden signal). Container restarts \u2014 any sustained non-zero value is a crash loop (bad config, OOM, failing health probe). Amber \u22651, red \u22653 within the window.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -409,15 +434,43 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
           }
         },
         "overrides": []
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -493,6 +546,7 @@
       "type": "timeseries",
       "id": 7,
       "title": "Rx/Tx bytes",
+      "description": "Network ingress bytes per app \u2014 a coarse proxy for payload volume; useful to correlate traffic spikes with bandwidth.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -516,8 +570,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -606,6 +665,7 @@
       "type": "timeseries",
       "id": 9,
       "title": "Jobs completed / 5m by status",
+      "description": "**Traffic + Errors** (golden signals). Completed jobs per 5m split by terminal status \u2014 `completed` vs `failed` series side by side is the quickest health read on the worker.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -628,8 +688,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -658,6 +723,7 @@
       "type": "timeseries",
       "id": 10,
       "title": "agent.execute latency p50 / p95 (ms)",
+      "description": "**Latency** (golden signal). p50/p95 of the agent execution span. p95 is the tail your slowest users feel; a widening p95-vs-p50 gap means variance (cold starts, a slow downstream).",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -681,8 +747,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -711,6 +782,7 @@
       "type": "timeseries",
       "id": 11,
       "title": "agent.execute error rate %",
+      "description": "**Errors** (golden signal). Share of failed agent.execute spans per 5m. Amber \u22651%, red \u22655% \u2014 the SLO-facing error budget burn line.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -726,16 +798,44 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
           },
-          "unit": "percent"
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -764,6 +864,7 @@
       "type": "table",
       "id": 12,
       "title": "Recent failed agent.execute (last 50)",
+      "description": "The 50 most-recent failed executions with ResultCode + OperationId \u2014 the drill-down companion to the error-rate panel; copy an OperationId to trace the failing run end-to-end.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -823,6 +924,7 @@
       "type": "timeseries",
       "id": 14,
       "title": "LLM tokens / 5m",
+      "description": "Total LLM tokens (prompt + completion) consumed per 5m across all runs. The volume driver behind the cost panel to its right.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -845,8 +947,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -875,6 +982,7 @@
       "type": "timeseries",
       "id": 15,
       "title": "LLM cost (USD) / 5m",
+      "description": "Modeled LLM spend per 5m (priced from the model pricing table). A spend spike with flat traffic points at a pricier model or larger context.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -898,8 +1006,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -928,6 +1041,7 @@
       "type": "timeseries",
       "id": 16,
       "title": "Jobs in-flight",
+      "description": "**Saturation** (golden signal). Jobs currently executing on the worker. A rising floor that never drains means intake is outpacing throughput \u2014 scale workers or shed load.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -950,8 +1064,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -993,6 +1112,7 @@
       "type": "timeseries",
       "id": 18,
       "title": "Pool in-use vs max",
+      "description": "**Saturation** (golden signal). Active asyncpg connections (`in_use`) against the configured ceiling (`max`). `in_use` riding `max` means the pool is the bottleneck \u2014 raise the pool or the DB tier.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -1015,8 +1135,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -1045,6 +1170,7 @@
       "type": "timeseries",
       "id": 19,
       "title": "Pool waiting (blocked acquirers \u2014 early warning)",
+      "description": "**Saturation** (golden signal, leading indicator). Coroutines blocked waiting for a pool connection. Any sustained non-zero value means pool exhaustion is already adding latency. Amber \u22651, red \u22655.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -1060,15 +1186,43 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
           }
         },
         "overrides": []
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -1097,6 +1251,7 @@
       "type": "timeseries",
       "id": 20,
       "title": "Pool idle / size",
+      "description": "Idle (warm, unused) connections vs total pool `size`. Healthy headroom keeps a few idle; persistently zero idle while `waiting` climbs confirms the pool is undersized.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -1119,8 +1274,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
