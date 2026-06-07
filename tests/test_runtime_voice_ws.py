@@ -26,8 +26,10 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from movate.core.auth import ALL_SCOPES, SCOPE_READ, ApiKeyEnv, mint_api_key
+from movate.core.models import VoiceConfig
 from movate.core.provider_keys import ENV_PROVIDER_KEY_SECRET, mint_tenant_provider_key
 from movate.runtime import build_app
+from movate.runtime.app import _seed_voice_turn_config, _VoiceTurnConfig
 from movate.testing import InMemoryStorage
 from movate.voice import AudioChunk, FakeRealtime, FakeSTT, FakeTTS
 
@@ -341,6 +343,49 @@ def test_voice_ws_realtime_routes_to_realtime_provider(
     assert rt.voice_ids == ["rachel"]
 
 
+def test_voice_ws_realtime_seeds_voice_id_from_agent_block(
+    storage, agents_path, auth_setup
+) -> None:
+    """ADR 071 D1: an agent's voice.voice_id reaches the realtime provider with
+    NO client config frame (the block is the default)."""
+    app = build_app(storage, agents_path=agents_path)
+    rt = FakeRealtime(transcript="hi", answer="done", frames=1)
+    app.state.voice_realtime_factory = lambda: rt
+    token, _ = auth_setup
+    client = TestClient(app)
+    agent_yaml = _AGENT_YAML.replace(
+        b"description: demo agent for the voice WS transport",
+        b"description: demo agent for the voice WS transport\n"
+        b"voice:\n  enabled: true\n  voice_id: rachel",
+    )
+    r = client.post(
+        "/api/v1/agents",
+        files=[
+            ("agent_yaml", ("agent.yaml", agent_yaml, "application/x-yaml")),
+            ("prompt", ("prompt.md", _PROMPT, "text/markdown")),
+            ("input_schema", ("input.json", _INPUT_SCHEMA, "application/json")),
+            ("output_schema", ("output.json", _OUTPUT_SCHEMA, "application/json")),
+        ],
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 201, r.text
+
+    with client.websocket_connect(
+        f"/api/v1/agents/voice-demo/voice?mode=realtime&token={token}"
+    ) as ws:
+        ws.send_bytes(b"\x00\x01")  # a mic frame — NO config frame
+        ws.send_json({"type": "close"})
+        while True:
+            msg = ws.receive()
+            if msg.get("type") == "websocket.close":
+                break
+            if msg.get("text") and json.loads(msg["text"]).get("type") == "response_done":
+                break
+
+    # The agent block's voice_id reached the provider without a client frame.
+    assert rt.voice_ids == ["rachel"]
+
+
 def test_voice_ws_realtime_unconfigured_is_rejected(client: TestClient, auth_setup) -> None:
     # With no realtime factory configured (the default), ?mode=realtime must
     # degrade with a clear error frame, not hard-fail — the pipeline mode stays
@@ -539,3 +584,45 @@ async def test_voice_ws_realtime_uses_tenant_byok_key(
                 break
 
     assert rt.api_keys == ["sk-rt"]
+
+
+# ── ADR 071 — per-agent voice block seeds the per-turn config ──────────────────
+
+
+def _bundle_with_voice(**voice_fields):
+    """A minimal stand-in bundle exposing ``.spec.voice`` (a VoiceConfig)."""
+    from types import SimpleNamespace  # noqa: PLC0415 - test-local helper
+
+    voice = VoiceConfig(**voice_fields) if voice_fields else None
+    return SimpleNamespace(spec=SimpleNamespace(voice=voice))
+
+
+def test_seed_voice_turn_config_applies_agent_block() -> None:
+    """ADR 071 D1-D3: voice_id/language/tts_streaming/speculative seed from the block."""
+    cfg = _VoiceTurnConfig()
+    _seed_voice_turn_config(
+        cfg,
+        _bundle_with_voice(
+            voice_id="rachel", language="fr-FR", tts_streaming=False, speculative=True
+        ),
+    )
+    assert cfg.voice_id == "rachel"
+    assert cfg.language == "fr-FR"
+    assert cfg.tts_streaming is False
+    assert cfg.speculative is True
+
+
+def test_seed_voice_turn_config_absent_block_keeps_defaults() -> None:
+    """No voice block → runtime defaults untouched (byte-for-byte today)."""
+    cfg = _VoiceTurnConfig()
+    before = (cfg.voice_id, cfg.language, cfg.tts_streaming, cfg.speculative)
+    _seed_voice_turn_config(cfg, _bundle_with_voice())  # voice is None
+    assert (cfg.voice_id, cfg.language, cfg.tts_streaming, cfg.speculative) == before
+
+
+def test_seed_voice_turn_config_tts_streaming_none_keeps_default() -> None:
+    """tts_streaming unset (None) leaves the runtime default (True) in place."""
+    cfg = _VoiceTurnConfig()
+    assert cfg.tts_streaming is True  # runtime default
+    _seed_voice_turn_config(cfg, _bundle_with_voice(voice_id="x"))  # no tts_streaming
+    assert cfg.tts_streaming is True  # unchanged
