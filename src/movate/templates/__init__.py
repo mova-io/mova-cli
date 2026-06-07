@@ -307,6 +307,11 @@ WORKFLOW_TEMPLATES: dict[str, str] = {
     # workflow.yaml structure (ADR 017 IR). The starter referenced by
     # ADR 028 D2.
     "workflow-starter": "workflow_starter",
+    # Self-improving reflection loop (ADR 056 D4): produce → JUDGE →
+    # (revise → produce)* bounded by max_iterations, with the judge's
+    # feedback threaded into each revision. The canonical "judge node +
+    # bounded loop" reference.
+    "reflective-agent": "reflective_agent",
 }
 
 

@@ -23,6 +23,11 @@ import pytest
 
 import movate.core.workflow.temporal_activities as ta
 from movate.core.models import ErrorInfo, Metrics, RunResponse
+from movate.core.workflow.judge import (
+    build_judge_state_value,
+    derive_terminate,
+    verdict_from_response_data,
+)
 from movate.testing import InMemoryStorage, NullTracer
 
 # ---------------------------------------------------------------------------
@@ -334,41 +339,79 @@ async def test_call_skill_activity_forwards(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 # ---------------------------------------------------------------------------
-# 7: call_judge_activity returns {terminate, verdict} from state interpretation.
+# 7: call_judge_activity RUNS the judge through the Executor (ADR 056 D5).
+#
+# This resolves the ADR 054 §11 state-interpreter caveat: the activity now
+# loads the judge bundle (ref or inline criteria) + forwards to the Executor,
+# returning the canonical D2 verdict {verdict, score, feedback, terminate}.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.unit
-async def test_call_judge_activity_terminating(monkeypatch: pytest.MonkeyPatch) -> None:
-    _configure(monkeypatch)
-    out = await ta.call_judge_activity("judge-1", {"verdict": "accept"}, "run-1")
-    assert out == {"terminate": True, "verdict": "accept"}
+def _patch_judge_bundle(monkeypatch: pytest.MonkeyPatch, *, properties: dict | None = None) -> None:
+    bundle = _FakeBundle(name="judge-agent", properties=properties or {"text": {"type": "string"}})
+    monkeypatch.setattr(
+        "movate.core.workflow.judge.load_judge_bundle",
+        lambda *, judge_ref, criteria, defaults=None: bundle,
+    )
 
 
 @pytest.mark.unit
-async def test_call_judge_activity_non_terminating(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_call_judge_activity_categorical_accept(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure(monkeypatch)
-    out = await ta.call_judge_activity("judge-1", {"label": "continue"}, "run-1")
-    assert out == {"terminate": False, "verdict": "continue"}
+    _patch_judge_bundle(monkeypatch)
+    fake_exec = _FakeExecutor(_ok_response({"verdict": "accept", "feedback": ""}))
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+
+    out = await ta.call_judge_activity(
+        "judge-1", "/agents/judge", {"input_field": "answer"}, {"answer": "good"}, "run-1"
+    )
+    assert out == {"verdict": "accept", "score": None, "feedback": "", "terminate": True}
+    # The judge ran through the Executor (one execution model) with the artifact.
+    assert fake_exec.calls[0]["input"] == {"text": "good"}
+    assert fake_exec.calls[0]["node_id"] == "judge-1"
 
 
 @pytest.mark.unit
-async def test_call_judge_activity_reads_gate_decision(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A verdict left by an upstream gate's ``*_decision`` dict is honored."""
+async def test_call_judge_activity_threshold_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pass_threshold ⇒ score gates terminate (the eval-gate form)."""
     _configure(monkeypatch)
-    state = {"turn_gate_1_decision": {"label": "resolved"}}
-    out = await ta.call_judge_activity("judge-1", state, "run-1")
-    assert out == {"terminate": True, "verdict": "resolved"}
+    _patch_judge_bundle(monkeypatch)
+    fake_exec = _FakeExecutor(_ok_response({"verdict": "revise", "score": 0.85, "feedback": "x"}))
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+
+    out = await ta.call_judge_activity(
+        "judge-1", "/agents/judge", {"pass_threshold": 0.7}, {"answer": "ok"}, "run-1"
+    )
+    # score 0.85 >= 0.7 ⇒ terminate even though the categorical verdict is revise.
+    assert out["terminate"] is True
+    assert out["score"] == 0.85
 
 
 @pytest.mark.unit
-async def test_call_judge_activity_no_verdict_defaults_continue(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """No verdict signal → non-terminating (the safe bounded-loop default)."""
+async def test_call_judge_activity_custom_input_field(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure(monkeypatch)
-    out = await ta.call_judge_activity("judge-1", {"text": "no verdict here"}, "run-1")
-    assert out == {"terminate": False, "verdict": ""}
+    _patch_judge_bundle(monkeypatch)
+    fake_exec = _FakeExecutor(_ok_response({"verdict": "revise", "feedback": "fix"}))
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+
+    await ta.call_judge_activity(
+        "judge-1", "/agents/judge", {"input_field": "draft"}, {"draft": "the draft"}, "run-1"
+    )
+    assert fake_exec.calls[0]["input"] == {"text": "the draft"}
+
+
+@pytest.mark.unit
+async def test_call_judge_activity_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed judge run surfaces as an exception (Temporal retries)."""
+    _configure(monkeypatch)
+    _patch_judge_bundle(monkeypatch)
+    monkeypatch.setattr(
+        ta, "_executor_for", lambda ctx, state: _FakeExecutor(_err_response("nope"))
+    )
+
+    with pytest.raises(RuntimeError) as ei:
+        await ta.call_judge_activity("judge-1", "/agents/judge", {}, {"answer": "x"}, "run-1")
+    assert "nope" in str(ei.value)
 
 
 @pytest.mark.unit
@@ -376,4 +419,39 @@ async def test_judge_activity_unconfigured_raises() -> None:
     """The judge still enforces the configure contract (D3)."""
     assert ta._CONTEXT is None
     with pytest.raises(RuntimeError):
-        await ta.call_judge_activity("j", {"verdict": "accept"}, "r")
+        await ta.call_judge_activity("j", "/agents/judge", {}, {"answer": "x"}, "r")
+
+
+# ---------------------------------------------------------------------------
+# 8: native ↔ Temporal verdict equivalence (ADR 056 D5 / ADR 055 D7).
+#
+# The native runner and the Temporal activity must derive the SAME verdict +
+# terminate for the SAME judge output — they share core.workflow.judge.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_judge_activity_matches_native_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge_output = {"verdict": "revise", "score": 0.9, "feedback": "tighten it"}
+
+    # What the native runner would compute (eval-gate, threshold 0.7).
+    v, s, f = verdict_from_response_data(judge_output)
+    native = build_judge_state_value(
+        verdict=v,
+        score=s,
+        feedback=f,
+        terminate=derive_terminate(verdict=v, score=s, pass_threshold=0.7),
+    )
+
+    # What the Temporal activity computes for the same output.
+    _configure(monkeypatch)
+    _patch_judge_bundle(monkeypatch)
+    monkeypatch.setattr(
+        ta, "_executor_for", lambda ctx, state: _FakeExecutor(_ok_response(judge_output))
+    )
+    temporal = await ta.call_judge_activity(
+        "judge-1", "/agents/judge", {"pass_threshold": 0.7}, {"answer": "x"}, "run-1"
+    )
+
+    assert temporal == native
+    assert temporal["terminate"] is True  # 0.9 >= 0.7

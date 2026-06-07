@@ -470,68 +470,79 @@ async def call_gate_activity(
     return dict(response.data)
 
 
-# Verdict labels that mean "stop the loop". ``accept`` is the reflection
-# judge's vocabulary (movate.core.reflection.JudgeVerdict); ``resolved`` is
-# the simulation pattern's turn-judge label (pattern_simulation/turn-judge).
-_TERMINATING_VERDICTS = frozenset({"accept", "resolved", "terminate", "done"})
-
-
 @_activity.defn  # type: ignore[untyped-decorator]
 async def call_judge_activity(
     node_id: str,
+    judge_ref: str,
+    judge_config: dict[str, Any],
     state: dict[str, Any],
     run_id: str,
 ) -> dict[str, Any]:
-    """JUDGE node → return ``{"terminate": bool, "verdict": str}``.
+    """JUDGE node → run the judge through the Executor; return the D2 verdict.
 
     Compiler contract (``_emit_judge_node``): the workflow does
-    ``if <verdict>.get('terminate'): return state``, so we return a dict with
-    a boolean ``terminate`` (plus the raw ``verdict`` label for the operator).
+    ``if <verdict>.get('terminate'): return state``, so we return the canonical
+    ADR 056 D2 verdict dict ``{verdict, score, feedback, terminate}``.
 
-    Phase-1 honesty (flagged): the IR carries no dedicated JUDGE node type yet
-    — judges currently ride as ``intent-router`` nodes and therefore compile
-    to :func:`call_gate_activity`, not this function (see the
-    ``_emit_judge_node`` docstring in the compiler: it is the canonical shape
-    encoded once, *unused* by the Phase-1 emitter). The compiler also passes
-    NO agent ref to this activity — only ``(node_id, state, run_id)`` — so we
-    cannot run a judge agent here. This activity therefore *interprets a
-    verdict already present in ``state``* (a ``verdict`` or ``label`` key, or a
-    ``<node>_decision`` dict left by an upstream gate/judge that DID run a
-    classifier agent) and maps the reflection/simulation vocabulary
-    (``accept`` / ``resolved``) to ``terminate``. When ``state`` carries no
-    verdict signal the activity is non-terminating (``terminate=False``) — the
-    safe default that lets a bounded loop run to its cap.
+    [bold]Resolves the ADR 054 §11 caveat.[/bold] Track C originally shipped
+    this activity as a *state interpreter* (it read a ``verdict``/``label``
+    already in ``state``) because the IR carried no JUDGE node and the compiler
+    passed no agent ref. ADR 056 adds the JUDGE node + ref, so this activity
+    now RUNS a real judge: it loads the judge bundle (``judge_ref`` or inline
+    ``judge_config['criteria']``) and forwards to the SAME ``Executor.execute``
+    the native runner uses (ADR 054 D3 / ADR 056 D3) — one execution model,
+    tracing + metering + BYOK at the edges, no second judge engine. The verdict
+    parsing + ``terminate`` derivation reuse ``movate.core.workflow.judge`` so
+    the native runner and this activity arrive at the SAME verdict for the same
+    judge output (the conformance contract, ADR 055 D7).
 
-    A future IR JUDGE node that carries a judge-agent ref would run that agent
-    through the Executor here (ADR 054 D4 row 4); until then this stays a pure
-    state interpreter. Documented honestly per CLAUDE.md §11.
+    Arg order is fixed by the compiler's ``_emit_judge_node`` (do NOT reorder
+    without updating ``compilers/temporal.py`` in lockstep). ``judge_config``
+    carries ``criteria`` / ``input_field`` / ``pass_threshold`` (the routing
+    legs stay in workflow scope — the workflow gates on ``terminate``).
     """
-    _get_context()  # Fail loud if the worker forgot to configure (D3 contract).
+    from movate.core.models import RunRequest  # noqa: PLC0415
+    from movate.core.workflow.judge import (  # noqa: PLC0415
+        build_judge_state_value,
+        derive_terminate,
+        load_judge_bundle,
+        verdict_from_response_data,
+    )
 
-    verdict_label = _extract_verdict_label(state)
-    terminate = verdict_label.lower() in _TERMINATING_VERDICTS
-    return {"terminate": terminate, "verdict": verdict_label}
+    ctx = _get_context()
+    criteria = str(judge_config.get("criteria") or "")
+    input_field = str(judge_config.get("input_field") or "text")
+    pass_threshold = judge_config.get("pass_threshold")
 
+    bundle = load_judge_bundle(judge_ref=judge_ref, criteria=criteria, defaults=ctx.defaults)
+    artifact = state.get(input_field, "")
+    judge_input = _project_state({"text": str(artifact)}, bundle)
+    executor = _executor_for(ctx, state)
 
-def _extract_verdict_label(state: dict[str, Any]) -> str:
-    """Pull a verdict label out of ``state`` for :func:`call_judge_activity`.
+    response = await executor.execute(
+        bundle,
+        RunRequest(agent=bundle.spec.name, input=judge_input),
+        workflow_run_id=run_id,
+        node_id=node_id,
+        tenant_id_override=_resolve_tenant_id(ctx, state),
+    )
+    if response.status != "success":
+        # Surface as an exception so Temporal's retry policy (emitted by the
+        # compiler) can retry, mirroring the agent activity's posture.
+        raise RuntimeError(
+            f"judge node {node_id!r} ({judge_ref or 'inline-criteria'}) failed: "
+            f"{response.error.message if response.error else response.status}"
+        )
 
-    Looks (in order) at a top-level ``verdict`` / ``label`` string, then at any
-    ``*_decision`` dict an upstream gate stamped (carrying ``label`` /
-    ``verdict``). Returns ``""`` when nothing verdict-like is present (the
-    non-terminating default).
-    """
-    for key in ("verdict", "label"):
-        value = state.get(key)
-        if isinstance(value, str) and value:
-            return value
-    for key, value in state.items():
-        if key.endswith("_decision") and isinstance(value, dict):
-            for inner in ("label", "verdict"):
-                inner_value = value.get(inner)
-                if isinstance(inner_value, str) and inner_value:
-                    return inner_value
-    return ""
+    verdict, score, feedback = verdict_from_response_data(response.data)
+    terminate = derive_terminate(
+        verdict=verdict,
+        score=score,
+        pass_threshold=pass_threshold if isinstance(pass_threshold, (int, float)) else None,
+    )
+    return build_judge_state_value(
+        verdict=verdict, score=score, feedback=feedback, terminate=terminate
+    )
 
 
 @_activity.defn  # type: ignore[untyped-decorator]

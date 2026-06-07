@@ -31,6 +31,7 @@ from movate.core.workflow.spec import (
     AgentNodeSpec,
     HumanNodeSpec,
     IntentRouterNodeSpec,
+    JudgeNodeSpec,
     WorkflowSpec,
 )
 
@@ -141,6 +142,35 @@ def compile_workflow(
                 ref="",  # unused for human gates
                 metadata=human_metadata,
             )
+        elif isinstance(ns, JudgeNodeSpec):
+            # JUDGE node (ADR 056 D1). When a ``judge_agent`` ref is supplied
+            # it resolves to an absolute path (like an agent ref) so a typo
+            # fails loud at compile time; the inline-``criteria`` form carries
+            # no file-system ref. Routing + threshold live in metadata so the
+            # native runner (D3) and the Temporal activity (D5) read the SAME
+            # shape. Route-target validation happens below (step 3b).
+            judge_ref = ""
+            if ns.judge_agent and ns.judge_agent.strip():
+                resolved_judge = (workflow_dir / ns.judge_agent).resolve()
+                if not resolved_judge.exists():
+                    raise WorkflowCompileError(
+                        f"judge node {ns.id!r}: judge_agent ref path does not exist: "
+                        f"{resolved_judge}"
+                    )
+                judge_ref = str(resolved_judge)
+            nodes[ns.id] = WorkflowNode(
+                id=ns.id,
+                type=NodeType.JUDGE,
+                ref=judge_ref,  # absolute judge-agent path, or "" for inline criteria
+                metadata={
+                    "criteria": ns.criteria or "",
+                    "input_field": ns.input_field,
+                    "pass_threshold": ns.pass_threshold,
+                    "on_accept": ns.on_accept,
+                    "on_revise": ns.on_revise,
+                    "max_iterations": ns.max_iterations,
+                },
+            )
         else:
             raise WorkflowCompileError(f"node {ns.id!r}: unknown node type {ns.type!r}")
 
@@ -162,6 +192,24 @@ def compile_workflow(
                 raise WorkflowCompileError(
                     f"intent-router node {ns.id!r}: route target {target!r} "
                     f"is not a valid node id (known: {', '.join(sorted(nodes))})"
+                )
+
+    # 3b. Validate JUDGE routing targets (ADR 056 D1). ``on_accept`` /
+    # ``on_revise``, when set, must name valid node ids — caught here, not at
+    # run time. Unset routing legs fall through to the sequential successor
+    # (the eval-gate's default-continue / the reflection loop's back-edge).
+    for ns in spec.nodes:
+        if not isinstance(ns, JudgeNodeSpec):
+            continue
+        judge_legs: list[tuple[str, str | None]] = [
+            ("on_accept", ns.on_accept),
+            ("on_revise", ns.on_revise),
+        ]
+        for leg, leg_target in judge_legs:
+            if leg_target is not None and leg_target not in nodes:
+                raise WorkflowCompileError(
+                    f"judge node {ns.id!r}: {leg} target {leg_target!r} is not a valid "
+                    f"node id (known: {', '.join(sorted(nodes))})"
                 )
 
     # 4. Edges — explicit edges must exist + no self-loops; then inject synthetic
@@ -218,6 +266,31 @@ def compile_workflow(
                     to_id=target,
                     kind=EdgeKind.CONDITIONAL,
                     metadata={"synthetic": True, "source": "intent-router"},
+                )
+            )
+
+    # Inject synthetic edges for JUDGE branch targets (ADR 056 D1) so the
+    # graph reflects reachability. Like intent-router targets these are
+    # CONDITIONAL+synthetic (exempt from validate_linear's sequential check)
+    # and the native runner skips them when computing the sequential
+    # successor (so an unset routing leg still falls through correctly).
+    seen_judge_edges: set[tuple[str, str]] = set()
+    for ns in spec.nodes:
+        if not isinstance(ns, JudgeNodeSpec):
+            continue
+        for branch_target in (ns.on_accept, ns.on_revise):
+            if branch_target is None:
+                continue
+            pair = (ns.id, branch_target)
+            if pair in seen_judge_edges:
+                continue
+            seen_judge_edges.add(pair)
+            edges.append(
+                WorkflowEdge(
+                    from_id=ns.id,
+                    to_id=branch_target,
+                    kind=EdgeKind.CONDITIONAL,
+                    metadata={"synthetic": True, "source": "judge"},
                 )
             )
 
@@ -307,18 +380,31 @@ def validate_linear(graph: WorkflowGraph) -> None:
     at a human gate rather than executing it. TOOL / FUNCTION / sub-workflow
     node types remain rejected (they land in later phases).
 
+    ADR 056: ``judge`` nodes (``NodeType.JUDGE``) are permitted — like
+    ``intent-router`` they are a verdict-driven branching primitive, so they
+    may branch (``on_accept``/``on_revise``) and their workflows may have
+    multiple sinks. The bounded *reflection* loop (a JUDGE on a back-edge) is
+    cyclic and therefore not a linear-phase workflow; it compiles with
+    ``allow_cycles=True`` (the export/cycle-tolerant path) — this validator
+    only governs the acyclic eval-gate/branch form.
+
     Replaceable: v0.4+ phases can call a different validator (or none)
     against the same :class:`WorkflowGraph` without modifying the IR or
     the structural compiler.
     """
-    # Node types — agent + intent-router + human (HITL gate). Tools/functions/
-    # sub-workflows are still rejected. Most specific user-facing failure first.
-    _allowed_types = {NodeType.AGENT, NodeType.INTENT_ROUTER, NodeType.HUMAN}
+    # Node types — agent + intent-router + human (HITL gate) + judge. Tools/
+    # functions/sub-workflows are still rejected. Most specific failure first.
+    _allowed_types = {
+        NodeType.AGENT,
+        NodeType.INTENT_ROUTER,
+        NodeType.HUMAN,
+        NodeType.JUDGE,
+    }
     bad_types = sorted(n.id for n in graph.nodes.values() if n.type not in _allowed_types)
     if bad_types:
         raise WorkflowCompileError(
-            f"v0.3 supports only type=agent, type=intent-router, and type=human nodes; "
-            f"offenders: {', '.join(bad_types)}. "
+            f"v0.3 supports only type=agent, type=intent-router, type=human, and "
+            f"type=judge nodes; offenders: {', '.join(bad_types)}. "
             f"Tools/sub-workflows land in v1.1+."
         )
 
@@ -336,12 +422,13 @@ def validate_linear(graph: WorkflowGraph) -> None:
             f"Conditional / parallel edges land in v1.1+."
         )
 
-    # Branching / joining — intent-router nodes are allowed to branch (that's
-    # their whole purpose). We only flag non-router agent nodes that branch.
+    # Branching / joining — intent-router and judge nodes are allowed to branch
+    # (that is their whole purpose). We only flag plain agent nodes that branch.
+    _branch_types = {NodeType.INTENT_ROUTER, NodeType.JUDGE}
     branching = sorted(
         nid
         for nid in graph.nodes
-        if len(graph.successors(nid)) > 1 and graph.nodes[nid].type is not NodeType.INTENT_ROUTER
+        if len(graph.successors(nid)) > 1 and graph.nodes[nid].type not in _branch_types
     )
     if branching:
         raise WorkflowCompileError(
@@ -369,10 +456,12 @@ def validate_linear(graph: WorkflowGraph) -> None:
             f"the source node {sources[0]!r} must be the declared entrypoint {graph.entrypoint!r}"
         )
 
-    # Sink — for linear workflows exactly one; intent-router workflows may have
-    # multiple sinks (each route target that has no successor). We only enforce
-    # single-sink on pure-linear (no intent-router) workflows.
-    router_nodes = {nid for nid, n in graph.nodes.items() if n.type is NodeType.INTENT_ROUTER}
+    # Sink — for linear workflows exactly one; intent-router / judge workflows
+    # may have multiple sinks (each branch target that has no successor). We
+    # only enforce single-sink on pure-linear (no router / no judge) workflows.
+    router_nodes = {
+        nid for nid, n in graph.nodes.items() if n.type in {NodeType.INTENT_ROUTER, NodeType.JUDGE}
+    }
     if not router_nodes:
         sinks = graph.sinks()
         if len(sinks) != 1:

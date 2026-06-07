@@ -63,6 +63,14 @@ class JudgeVerdict:
       than blocking the run; a flaky judge shouldn't fail the whole
       pipeline. Tracked separately from ``accept`` for telemetry.
 
+    ``score`` is an OPTIONAL numeric grade (0..1) the judge may emit
+    alongside the categorical verdict. The in-Executor reflection loop
+    ignores it (it gates on the categorical verdict only), but the
+    workflow ``JUDGE`` node (ADR 056 D2) uses it for the eval-gate form:
+    ``score >= pass_threshold`` ⇒ accept. ``None`` when the judge emits
+    no score — the canonical absent value, never coerced to ``0.0`` (so a
+    "no score" judge is not mistaken for a "scored zero" one).
+
     ``tokens_in`` / ``tokens_out`` / ``cost_usd`` are surfaced so the
     executor can fold the judge's cost into the run's total. Tokens
     default to 0 on parse error (the call still happened; we just
@@ -71,6 +79,7 @@ class JudgeVerdict:
 
     verdict: Literal["accept", "revise", "parse_error"]
     feedback: str = ""
+    score: float | None = None
     tokens_in: int = 0
     tokens_out: int = 0
     cost_usd: float = 0.0
@@ -162,10 +171,11 @@ async def call_judge(
             exc,
         )
 
-    verdict, feedback = _parse_verdict(raw)
+    parsed = parse_verdict(raw)
     return JudgeVerdict(
-        verdict=verdict,
-        feedback=feedback,
+        verdict=parsed.verdict,
+        feedback=parsed.feedback,
+        score=parsed.score,
         tokens_in=response.tokens.input,
         tokens_out=response.tokens.output,
         cost_usd=cost_usd,
@@ -178,44 +188,94 @@ async def call_judge(
 # ---------------------------------------------------------------------------
 
 
-def _parse_verdict(raw: str) -> tuple[Literal["accept", "revise", "parse_error"], str]:
-    """Extract verdict + feedback from the judge's raw response.
+def _strip_code_fences(raw: str) -> str:
+    """Drop ```json ... ``` (or bare ``` ... ```) fences a judge may emit.
 
-    Permissive parser:
-    * Strips markdown code fences if the judge emitted them despite
-      the instruction.
-    * Accepts trailing whitespace / newlines.
-    * Falls back to ``parse_error`` if the response isn't valid JSON
-      or is missing the ``verdict`` key — we don't want a flaky judge
-      to block the run.
+    Shared by both verdict parsers so the fence-tolerance lives in one place.
     """
     cleaned = raw.strip()
-    # Strip ```json ... ``` or ``` ... ``` fences if the judge added them.
     if cleaned.startswith("```"):
-        # Drop first line (``` or ```json) and the trailing ```
         lines = cleaned.split("\n")
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
+    return cleaned
 
+
+def _coerce_score(value: object) -> float | None:
+    """Coerce a judge-emitted ``score`` into a clamped 0..1 float, or ``None``.
+
+    Permissive: accepts int/float/numeric-string; clamps out-of-range values
+    into ``[0, 1]`` (a judge that emits ``5`` on a 0-10 mental scale still
+    yields a usable upper-bound gate rather than a crash). Anything
+    non-numeric (or absent) yields ``None`` — the canonical "no score".
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+    elif isinstance(value, str):
+        try:
+            num = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return max(0.0, min(1.0, num))
+
+
+def parse_verdict(raw: str) -> JudgeVerdict:
+    """Parse a judge's raw response into a :class:`JudgeVerdict` (verdict + feedback + score).
+
+    The canonical, permissive judge-output parser (ADR 056 D2). Both the
+    in-Executor reflection loop (via :func:`call_judge`) and the workflow
+    ``JUDGE`` node (``core/workflow/runner.py`` + ``temporal_activities``)
+    parse judge output through here so there is exactly one verdict shape and
+    one parser — no backend invents its own.
+
+    Permissive:
+    * Strips markdown code fences if the judge emitted them despite the
+      JSON-only instruction.
+    * Accepts trailing whitespace / newlines.
+    * Reads an optional ``score`` (0..1, clamped; ``None`` when absent).
+    * Falls back to ``verdict="parse_error"`` if the response isn't valid
+      JSON or is missing/unknown the ``verdict`` key — a flaky judge must
+      never block the run (fail-open posture).
+
+    ``tokens_*`` / ``cost_usd`` are left at their defaults here (this parses
+    raw text only); :func:`call_judge` fills them from the provider response.
+    """
+    cleaned = _strip_code_fences(raw)
     try:
         obj = json.loads(cleaned)
     except json.JSONDecodeError:
         log.warning("reflection: judge returned non-JSON response: %r", raw[:200])
-        return ("parse_error", "")
+        return JudgeVerdict(verdict="parse_error", raw_response=raw)
 
     if not isinstance(obj, dict):
         log.warning("reflection: judge response is not a JSON object: %r", raw[:200])
-        return ("parse_error", "")
+        return JudgeVerdict(verdict="parse_error", raw_response=raw)
 
     verdict = obj.get("verdict")
     feedback = str(obj.get("feedback") or "")
+    score = _coerce_score(obj.get("score"))
     if verdict in {"accept", "revise"}:
-        return (verdict, feedback)
+        return JudgeVerdict(verdict=verdict, feedback=feedback, score=score, raw_response=raw)
     log.warning("reflection: judge returned unknown verdict %r", verdict)
-    return ("parse_error", "")
+    return JudgeVerdict(verdict="parse_error", feedback=feedback, score=score, raw_response=raw)
+
+
+def _parse_verdict(raw: str) -> tuple[Literal["accept", "revise", "parse_error"], str]:
+    """Back-compat shim: ``(verdict, feedback)`` 2-tuple (see :func:`parse_verdict`).
+
+    Retained for the in-tree callers/tests that destructure a 2-tuple. New
+    code (the JUDGE node) should call :func:`parse_verdict` to also get the
+    ``score``.
+    """
+    parsed = parse_verdict(raw)
+    return (parsed.verdict, parsed.feedback)
 
 
 def build_revision_prompt(original_user_message: str, feedback: str) -> str:

@@ -909,9 +909,16 @@ def _dispatch_workflow(
     except WorkflowSpecLoadError as exc:
         console.print(f"[red]✗ workflow.yaml load failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
+    # A JUDGE node (ADR 056) may sit on a bounded reflection back-edge, which is
+    # a cycle — so judge workflows compile on the cycle-tolerant path and skip
+    # the linear phase gate (the native runner enforces its own runaway cap, and
+    # the JUDGE node enforces its own ``max_iterations`` bound). Every non-judge
+    # workflow still goes through the unchanged ``validate_linear`` gate.
+    has_judge = any(getattr(n, "type", None) == "judge" for n in spec.nodes)
     try:
-        graph = compile_workflow(spec, parent)
-        validate_linear(graph)
+        graph = compile_workflow(spec, parent, allow_cycles=has_judge)
+        if not has_judge:
+            validate_linear(graph)
     except WorkflowCompileError as exc:
         console.print(f"[red]✗ workflow validation failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
