@@ -53,10 +53,17 @@ RUN uv sync --all-extras --no-extra airflow --no-dev --frozen --no-install-proje
 # ---------------------------------------------------------------------------
 FROM deps AS app
 
+# ADR 066 — the version is git-derived, but the Docker context excludes .git, so
+# the host passes the computed CalVer as a build-arg; the hatch metadata hook
+# reads it via MOVATE_BUILD_VERSION. hatch_build.py + scripts/calver_version.py
+# must be present for the build backend to resolve the dynamic version.
+ARG MOVATE_BUILD_VERSION=""
 COPY src/ ./src/
 COPY README.md ./
-COPY pyproject.toml uv.lock ./
-RUN uv sync --all-extras --no-extra airflow --no-dev --frozen
+COPY pyproject.toml uv.lock hatch_build.py ./
+COPY scripts/calver_version.py ./scripts/
+RUN MOVATE_BUILD_VERSION="${MOVATE_BUILD_VERSION}" \
+    uv sync --all-extras --no-extra airflow --no-dev --frozen
 
 # Bake the default templates so `movate init` works inside the
 # container if an operator shells in. Production runs ignore this.
@@ -137,10 +144,15 @@ RUN uv sync --all-extras --no-extra airflow --no-dev --frozen --no-install-proje
 
 FROM playground-deps AS playground
 
+# ADR 066 — see the `app` stage: git-derived version via MOVATE_BUILD_VERSION
+# build-arg + the hatch hook files (the build context excludes .git).
+ARG MOVATE_BUILD_VERSION=""
 COPY src/ ./src/
 COPY README.md ./
-COPY pyproject.toml uv.lock ./
-RUN uv sync --all-extras --no-extra airflow --no-dev --frozen
+COPY pyproject.toml uv.lock hatch_build.py ./
+COPY scripts/calver_version.py ./scripts/
+RUN MOVATE_BUILD_VERSION="${MOVATE_BUILD_VERSION}" \
+    uv sync --all-extras --no-extra airflow --no-dev --frozen
 
 # Bake the default templates so `movate init` works if an operator shells in.
 COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate/templates/

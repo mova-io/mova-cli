@@ -3889,7 +3889,6 @@ wheels = [
 
 [[package]]
 name = "movate-cli"
-version = "2026.6.6.3"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -4101,7 +4100,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'teams'", specifier = ">=0.29" },
     { name = "websockets", marker = "extra == 'playground'", specifier = ">=12.0" },
 ]
-provides-extras = ["runtime", "langfuse", "keychain", "cross-encoder", "neo4j", "ocr", "easyocr", "otel", "dev", "anthropic", "openai", "voice", "telephony", "langchain", "langgraph", "deepagents", "teams", "github", "prefect", "airflow", "temporal", "playground"]
+provides-extras = ["airflow", "anthropic", "cross-encoder", "deepagents", "dev", "easyocr", "github", "keychain", "langchain", "langfuse", "langgraph", "neo4j", "ocr", "openai", "otel", "playground", "prefect", "runtime", "teams", "telephony", "temporal", "voice"]
 
 [package.metadata.requires-dev]
 dev = [

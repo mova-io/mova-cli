@@ -1,0 +1,18 @@
+$kind: http-request
+name: 7c. Session turn 2 — 'How much more is enterprise?' (context!)
+url: "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true"
+method: POST
+headers:
+  Content-Type: application/json
+queryParams:
+  wait: "true"
+body:
+  type: text
+  content: |-
+    {
+      "input": {
+        "input": "How much more does the enterprise plan cost compared to that?"
+      },
+      "session_id": "{{session_id}}"
+    }
+order: 10000
