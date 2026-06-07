@@ -82,9 +82,7 @@ class LiveKitTransport:
         """The identity of the connected participant."""
         return self._participant_identity
 
-    async def connect(
-        self, session_config: dict[str, Any]
-    ) -> AsyncIterator[AudioChunk]:
+    async def connect(self, session_config: dict[str, Any]) -> AsyncIterator[AudioChunk]:
         """Connect to a LiveKit room and start receiving audio.
 
         ``session_config`` keys:
@@ -120,9 +118,7 @@ class LiveKitTransport:
         )
 
         # Publish our audio track so the participant hears TTS output.
-        local_track = rtc.LocalAudioTrack.create_audio_track(
-            "agent-voice", self._audio_source
-        )
+        local_track = rtc.LocalAudioTrack.create_audio_track("agent-voice", self._audio_source)
         publish_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
         await self._room.local_participant.publish_track(local_track, publish_options)
 
@@ -161,9 +157,7 @@ class LiveKitTransport:
             found: dict[str, Any] = {}
 
             @self._room.on("track_subscribed")  # type: ignore[untyped-decorator]
-            def on_track_subscribed(
-                track: Any, publication: Any, participant_obj: Any
-            ) -> None:
+            def on_track_subscribed(track: Any, publication: Any, participant_obj: Any) -> None:
                 if publication.kind == rtc.TrackKind.KIND_AUDIO:
                     found["track"] = track
                     found["participant"] = participant_obj
@@ -209,9 +203,7 @@ class LiveKitTransport:
 
                 # Resample to pipeline rate if needed.
                 if sample_rate != self._pipeline_rate:
-                    pcm_data = resample_pcm16(
-                        pcm_data, sample_rate, self._pipeline_rate
-                    )
+                    pcm_data = resample_pcm16(pcm_data, sample_rate, self._pipeline_rate)
 
                 yield AudioChunk(
                     data=pcm_data,

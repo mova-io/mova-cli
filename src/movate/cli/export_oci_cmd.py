@@ -533,8 +533,7 @@ def export_langgraph(
     out_path = _Path(output) if output else _Path(f"{graph.name}_langgraph.py")
     if out_path.exists() and not force:
         console.print(
-            f"[yellow]✗ {out_path} already exists.[/yellow] "
-            "Use [bold]--force[/bold] to overwrite."
+            f"[yellow]✗ {out_path} already exists.[/yellow] Use [bold]--force[/bold] to overwrite."
         )
         raise typer.Exit(code=1)
 
@@ -611,8 +610,7 @@ def export_temporal(
     out_path = _Path(output) if output else _Path(f"{graph.name}_temporal.py")
     if out_path.exists() and not force:
         console.print(
-            f"[yellow]✗ {out_path} already exists.[/yellow] "
-            "Use [bold]--force[/bold] to overwrite."
+            f"[yellow]✗ {out_path} already exists.[/yellow] Use [bold]--force[/bold] to overwrite."
         )
         raise typer.Exit(code=1)
 
