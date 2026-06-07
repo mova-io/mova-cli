@@ -128,6 +128,7 @@ logger = logging.getLogger(__name__)
 _K_CLIENT = "client"
 _K_CAPS = "capabilities"
 _K_AGENT = "agent_name"
+_K_AGENTS = "agents_available"  # list[str] of selectable agent names (typed-name fallback)
 _K_AGENT_DETAIL = "agent_detail"
 _K_BACKEND = "backend"
 _K_CONVO = "conversation_state"
@@ -388,6 +389,25 @@ async def _init_session() -> tuple[PlaygroundClient, RuntimeCapabilities]:
     return client, caps
 
 
+def match_agent_name(text: str, available: list[str]) -> str | None:
+    """Resolve a typed message to an agent name — the foolproof picker fallback.
+
+    The action-button picker can be fragile (many agents, data-layer quirks), so
+    a user can also just *type* an agent's name to select it. Matching is
+    forgiving: exact (case-insensitive) first, then a unique case-insensitive
+    prefix. Ambiguous or no match → ``None`` (treated as a normal chat turn /
+    nudge). Pure + unit-testable; no Chainlit dependency.
+    """
+    if not text or not available:
+        return None
+    needle = text.strip().lower()
+    by_lower = {name.lower(): name for name in available}
+    if needle in by_lower:
+        return by_lower[needle]
+    prefix_hits = [name for low, name in by_lower.items() if low.startswith(needle)]
+    return prefix_hits[0] if len(prefix_hits) == 1 else None
+
+
 def _bind_agent(agent_name: str, caps: RuntimeCapabilities, client: PlaygroundClient) -> None:
     """Bind the picked agent + select its conversation backend.
 
@@ -421,6 +441,7 @@ def _capability_banner(caps: RuntimeCapabilities) -> str:
 
 _AGENT_LABEL_MAX_DESC = 60  # max description chars in the picker label
 _AGENT_LABEL_MAX_TAGS = 3  # max tags shown in the label
+_SCHEMA_HINT_MAX_FIELDS = 6  # max input-field names listed in the power-user hint
 
 
 def _agent_picker_label(agent: dict[str, Any]) -> str:
@@ -556,16 +577,28 @@ async def start() -> None:
         cl.Action(
             name="pick_agent",
             payload={"value": a.get("name", "")},
-            label=_agent_picker_label(a),
+            # SHORT label (just the name) → Chainlit renders a compact, CLICKABLE
+            # chip. A long "name — desc [tags]" label renders as a full-width
+            # text-like row that doesn't read or behave like a button. The rich
+            # description/tags live in the tooltip + the catalog list below.
+            label=str(a.get("name") or "?"),
             tooltip=_agent_picker_tooltip(a),
         )
         for a in agents
     ]
+    # Stash the selectable names so a user can also just TYPE an agent name to
+    # pick it (foolproof fallback if the action buttons don't render/click).
+    cl.user_session.set(_K_AGENTS, [a.get("name", "") for a in agents if a.get("name")])
     where = f" on target **{target.name}** (`{target.url}`)" if target is not None else ""
+    # Rich catalog in the message body so descriptions/tags stay visible even
+    # though the buttons are now compact name-chips (reuses _agent_picker_label).
+    catalog = "\n".join(f"- {_agent_picker_label(a)}" for a in agents)
     await cl.Message(
         content=(
             f"**MDK playground** — {len(agents)} agent(s) available{where}. "
-            "Pick one, then just start chatting.\n\n"
+            "**Click an agent chip below — or just type its name** (e.g. `demo-faq`) — "
+            "then start chatting.\n\n"
+            f"{catalog}\n\n"
             f"{_capability_banner(caps)}"
         ),
         actions=actions,
@@ -595,14 +628,20 @@ async def on_pick_agent(action: cl.Action) -> None:
         detail = {}
     cl.user_session.set(_K_AGENT_DETAIL, detail)
 
+    # A compact, one-line power-user hint — NOT the raw schema. Chainlit's
+    # markdown doesn't render <details>/<summary>, so the old collapsible dumped
+    # the full JSON schema (+ raw HTML tags) into the chat. Just name the
+    # top-level fields so power users know what they can paste; everyone else
+    # ignores it and types normally.
     schema = detail.get("input_schema") or detail.get("schema", {}).get("input") or {}
     schema_hint = ""
-    if schema:
-        schema_json = json.dumps(schema, indent=2)
+    props = list((schema.get("properties") or {}).keys()) if isinstance(schema, dict) else []
+    if props:
+        fields = ", ".join(f"`{p}`" for p in props[:_SCHEMA_HINT_MAX_FIELDS])
+        more = ", …" if len(props) > _SCHEMA_HINT_MAX_FIELDS else ""
         schema_hint = (
-            "\n\n<details><summary>Advanced: input schema (paste JSON to "
-            f"set structured fields)</summary>\n\n```json\n{schema_json}\n```\n"
-            "</details>"
+            "\n\n*Power tip: paste a JSON object to set structured fields "
+            f"({fields}{more}) — or just chat normally.*"
         )
 
     await cl.Message(
@@ -918,8 +957,25 @@ async def on_message(message: cl.Message) -> None:
     if not agent_name or not client or backend is None:
         # An upload-only message (no text) before picking an agent is fine
         # — only nudge when there's actual text but no agent.
-        if message.content.strip():
-            await cl.Message(content="Pick an agent first from the buttons above.").send()
+        text = message.content.strip()
+        if not text:
+            return
+        # Foolproof picker fallback: if the typed text names an available agent,
+        # bind it here (works even if the action buttons didn't render/click).
+        if client is not None and caps is not None:
+            picked = match_agent_name(text, cl.user_session.get(_K_AGENTS) or [])
+            if picked:
+                _bind_agent(picked, caps, client)
+                await cl.Message(
+                    content=f"✅ Talking to **{picked}** now — go ahead, ask it anything."
+                ).send()
+                return
+        await cl.Message(
+            content=(
+                "Pick an agent first — click one of the buttons above, or "
+                "**type its name** (e.g. `demo-faq`)."
+            )
+        ).send()
         return
 
     # #216: if the ConnectionMonitor says DISCONNECTED, skip retries and
