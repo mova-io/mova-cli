@@ -351,10 +351,10 @@ class MdkCheckpointSaver:
         )
 
         return CheckpointTuple(
-            config=result_config,
-            checkpoint={**checkpoint_data, "channel_values": channel_values},
+            config=result_config,  # type: ignore[arg-type]
+            checkpoint={**checkpoint_data, "channel_values": channel_values},  # type: ignore[typeddict-item]
             metadata=metadata,
-            parent_config=parent_config,
+            parent_config=parent_config,  # type: ignore[arg-type]
             pending_writes=pending_writes if pending_writes else None,
         )
 
@@ -445,10 +445,10 @@ class MdkCheckpointSaver:
         )
 
         return CheckpointTuple(
-            config=result_config,
-            checkpoint={**checkpoint_data, "channel_values": channel_values},
+            config=result_config,  # type: ignore[arg-type]
+            checkpoint={**checkpoint_data, "channel_values": channel_values},  # type: ignore[typeddict-item]
             metadata=metadata,
-            parent_config=parent_config,
+            parent_config=parent_config,  # type: ignore[arg-type]
             pending_writes=pending_writes if pending_writes else None,
         )
 
