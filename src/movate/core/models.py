@@ -3007,6 +3007,100 @@ class WorkflowBundleRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Skills + contexts registry (ADR 060 D1) — skills + shared contexts promoted
+# from bundle-only components (ADR 002) to first-class managed resources.
+#
+# Both mirror :class:`AgentBundleRecord` (ADR 014.1) row-for-row: one
+# immutable ``(name, tenant_id, version)`` row per publish, tenant-scoped,
+# the table doubling as the version history. A skill carries the same small
+# ``files`` map a bundle-local skill ships (``skill.yaml`` + optional
+# ``impl.py`` / ``corpus.json`` / ``README.md``); a context carries a single
+# Markdown ``body`` (the prompt fragment ADR 002 injects). The managed store
+# is an ADDITIONAL surface — bundle-local authoring (ADR 002) is unchanged.
+# This is the storage layer only — registry-resolution at the runtime edge
+# (D4) is a separate follow-up.
+# ---------------------------------------------------------------------------
+
+
+class SkillRecord(BaseModel):
+    """One published, versioned **skill** (ADR 060 D1).
+
+    Skill analogue of :class:`AgentBundleRecord`. A row is **immutable**:
+    each publish of a skill writes a new ``(name, tenant_id, version)`` row,
+    so the table doubles as the version history. Tenant-scoped like every
+    other durable record.
+
+    The ``files`` map carries the skill bundle's small text files keyed by
+    relative path (``skill.yaml`` + optional ``impl.py`` / ``corpus.json`` /
+    ``README.md``) — the same canonical layout the bundle-local skill loader
+    (ADR 002) reads — JSON-serialized to a single column on every backend.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """The skill name (``skill.yaml`` ``name``) — the registry key paired
+    with ``version``."""
+    tenant_id: str
+    version: str
+    """The bundle's ``skill.yaml`` version. ``(name, tenant_id, version)``
+    is unique; a new publish bumps this and writes a new row."""
+    created_by: str | None = None
+    """Auth identity that published this version (ADR 013), or ``None`` for
+    a system/seed import. Drives the "who published what when" audit."""
+    content_hash: str
+    """Content-addressed hash of the bundle (over ``files``), so an
+    unchanged re-publish is detectable and a version can be verified."""
+    description: str = ""
+    """Human-facing one-liner (``skill.yaml`` ``description``), surfaced in
+    listings so an operator can scan the registry without fetching each
+    bundle's files."""
+    files: dict[str, str]
+    """The skill bundle's text files keyed by relative path, e.g.
+    ``skill.yaml``, ``impl.py``, ``corpus.json``, ``README.md``.
+    JSON-serializable (path -> file contents)."""
+    created_at: datetime = Field(default_factory=_now)
+
+
+class ContextRecord(BaseModel):
+    """One published, versioned **shared context** (ADR 060 D1).
+
+    Context analogue of :class:`AgentBundleRecord`. A row is **immutable**:
+    each publish writes a new ``(name, tenant_id, version)`` row, so the
+    table doubles as the version history. Tenant-scoped like every other
+    durable record.
+
+    Unlike a skill (a small file bundle) a context is a single Markdown
+    ``body`` — the prompt fragment ADR 002 prepends to an agent's system
+    prompt. Contexts had no version in the bundle-local form; the managed
+    record gains one (default ``"v1"``) so update-is-a-new-version matches
+    the agent registry's optimistic-concurrency story.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    """The context name (the stem an ``agent.yaml`` ``contexts:`` entry
+    references) — the registry key paired with ``version``."""
+    tenant_id: str
+    version: str = "v1"
+    """``(name, tenant_id, version)`` is unique; a new publish bumps this
+    and writes a new row. Defaults to ``"v1"`` (contexts had no version in
+    the bundle-local form)."""
+    created_by: str | None = None
+    """Auth identity that published this version (ADR 013), or ``None`` for
+    a system/seed import."""
+    content_hash: str
+    """Content-addressed hash over ``body``, so an unchanged re-publish is
+    detectable and a version can be verified."""
+    description: str = ""
+    """Human-facing one-liner, surfaced in listings."""
+    body: str
+    """The Markdown context body injected into the agent prompt (ADR 002)."""
+    created_at: datetime = Field(default_factory=_now)
+
+
+# ---------------------------------------------------------------------------
 # Job queue (v0.5+)
 #
 # A ``JobRecord`` is a queue entry — created on ``POST /run``, claimed by a

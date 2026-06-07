@@ -53,6 +53,7 @@ from movate.core.models import (
     CatalogEntryVersion,
     CatalogRatingsSummary,
     CatalogSource,
+    ContextRecord,
     ConversationThread,
     DiagnosisRecord,
     DiagnosisStatus,
@@ -80,6 +81,7 @@ from movate.core.models import (
     Session,
     SessionMessage,
     SkillCallRecord,
+    SkillRecord,
     Subgraph,
     TenantBudget,
     TenantProviderKey,
@@ -540,6 +542,48 @@ CREATE INDEX IF NOT EXISTS idx_agent_bundles_name
 -- Latest-version-per-name + history ordering scan.
 CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created
     ON agent_bundles(tenant_id, name, created_at DESC);
+
+-- ADR 060 D1: durable skills registry. Skill analogue of agent_bundles —
+-- one immutable (name, version) row per publish, tenant-scoped; ``files`` is
+-- JSONB (same strategy as agent_bundles.files); ``description`` is a denorm
+-- column so listings don't have to parse skill.yaml. Additive new table
+-- (CREATE TABLE IF NOT EXISTS, re-run idempotently on every init) — no ALTER,
+-- no backfill. A new publish = a new row; rows are never mutated.
+CREATE TABLE IF NOT EXISTS skills (
+    name          TEXT NOT NULL,
+    tenant_id     TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    created_by    TEXT,
+    content_hash  TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    files         JSONB NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_skills_name
+    ON skills(tenant_id, name);
+CREATE INDEX IF NOT EXISTS idx_skills_name_created
+    ON skills(tenant_id, name, created_at DESC);
+
+-- ADR 060 D1: durable contexts registry. Context analogue of skills/
+-- agent_bundles — one immutable (name, version) row per publish, tenant-scoped;
+-- the payload is a single Markdown ``body`` (the prompt fragment ADR 002
+-- injects) instead of a file bundle. Additive new table, idempotent, no ALTER.
+CREATE TABLE IF NOT EXISTS contexts (
+    name          TEXT NOT NULL,
+    tenant_id     TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    created_by    TEXT,
+    content_hash  TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    body          TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, name, version)
+);
+CREATE INDEX IF NOT EXISTS idx_contexts_name
+    ON contexts(tenant_id, name);
+CREATE INDEX IF NOT EXISTS idx_contexts_name_created
+    ON contexts(tenant_id, name, created_at DESC);
 
 -- ADR 037 D1: durable workflow registry. Workflow analogue of agent_bundles —
 -- one immutable (name, version) row per publish, tenant-scoped, ``files`` is
@@ -2726,6 +2770,218 @@ class PostgresProvider:
                 tenant_id,
             )
         # asyncpg returns a command tag like "DELETE <n>".
+        return int(status.split()[-1])
+
+    # ------------------------------------------------------------------
+    # Skills registry (ADR 060 D1) — mirrors the agent-bundle surface.
+    # ------------------------------------------------------------------
+
+    async def save_skill(self, skill: SkillRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO skills (
+                name, tenant_id, version, created_by, content_hash,
+                description, files, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8
+            )
+            """,
+            skill.name,
+            skill.tenant_id,
+            skill.version,
+            skill.created_by,
+            skill.content_hash,
+            skill.description,
+            skill.files,
+            skill.created_at,
+        )
+
+    async def get_skill(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> SkillRecord | None:
+        if version is not None:
+            row = await self._db.fetchrow(
+                "SELECT * FROM skills WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            row = await self._db.fetchrow(
+                "SELECT * FROM skills WHERE name = $1 AND tenant_id = $2 "
+                "ORDER BY created_at DESC LIMIT 1",
+                name,
+                tenant_id,
+            )
+        return _row_to_skill(row) if row else None
+
+    async def list_skills(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[SkillRecord]:
+        rows = await self._db.fetch(
+            """
+            SELECT * FROM (
+                SELECT DISTINCT ON (name) * FROM skills
+                WHERE tenant_id = $1
+                ORDER BY name, created_at DESC
+            ) latest
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            tenant_id,
+            limit,
+        )
+        return [_row_to_skill(r) for r in rows]
+
+    async def list_skill_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[SkillRecord]:
+        rows = await self._db.fetch(
+            "SELECT * FROM skills WHERE name = $1 AND tenant_id = $2 "
+            "ORDER BY created_at DESC LIMIT $3",
+            name,
+            tenant_id,
+            limit,
+        )
+        return [_row_to_skill(r) for r in rows]
+
+    async def delete_skill(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        if version is not None:
+            status = await self._db.execute(
+                "DELETE FROM skills WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            status = await self._db.execute(
+                "DELETE FROM skills WHERE name = $1 AND tenant_id = $2",
+                name,
+                tenant_id,
+            )
+        return int(status.split()[-1])
+
+    # ------------------------------------------------------------------
+    # Contexts registry (ADR 060 D1) — mirrors the skills surface (body, not files).
+    # ------------------------------------------------------------------
+
+    async def save_context(self, context: ContextRecord) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO contexts (
+                name, tenant_id, version, created_by, content_hash,
+                description, body, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8
+            )
+            """,
+            context.name,
+            context.tenant_id,
+            context.version,
+            context.created_by,
+            context.content_hash,
+            context.description,
+            context.body,
+            context.created_at,
+        )
+
+    async def get_context(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> ContextRecord | None:
+        if version is not None:
+            row = await self._db.fetchrow(
+                "SELECT * FROM contexts WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            row = await self._db.fetchrow(
+                "SELECT * FROM contexts WHERE name = $1 AND tenant_id = $2 "
+                "ORDER BY created_at DESC LIMIT 1",
+                name,
+                tenant_id,
+            )
+        return _row_to_context(row) if row else None
+
+    async def list_contexts(
+        self,
+        *,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> list[ContextRecord]:
+        rows = await self._db.fetch(
+            """
+            SELECT * FROM (
+                SELECT DISTINCT ON (name) * FROM contexts
+                WHERE tenant_id = $1
+                ORDER BY name, created_at DESC
+            ) latest
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            tenant_id,
+            limit,
+        )
+        return [_row_to_context(r) for r in rows]
+
+    async def list_context_versions(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        limit: int = 50,
+    ) -> list[ContextRecord]:
+        rows = await self._db.fetch(
+            "SELECT * FROM contexts WHERE name = $1 AND tenant_id = $2 "
+            "ORDER BY created_at DESC LIMIT $3",
+            name,
+            tenant_id,
+            limit,
+        )
+        return [_row_to_context(r) for r in rows]
+
+    async def delete_context(
+        self,
+        name: str,
+        *,
+        tenant_id: str,
+        version: str | None = None,
+    ) -> int:
+        if version is not None:
+            status = await self._db.execute(
+                "DELETE FROM contexts WHERE name = $1 AND tenant_id = $2 AND version = $3",
+                name,
+                tenant_id,
+                version,
+            )
+        else:
+            status = await self._db.execute(
+                "DELETE FROM contexts WHERE name = $1 AND tenant_id = $2",
+                name,
+                tenant_id,
+            )
         return int(status.split()[-1])
 
     # ------------------------------------------------------------------
@@ -5617,6 +5873,32 @@ def _row_to_agent_bundle(row: asyncpg.Record) -> AgentBundleRecord:
         created_by=row["created_by"],
         content_hash=row["content_hash"],
         files=dict(row["files"]),
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_skill(row: asyncpg.Record) -> SkillRecord:
+    return SkillRecord(
+        name=row["name"],
+        tenant_id=row["tenant_id"],
+        version=row["version"],
+        created_by=row["created_by"],
+        content_hash=row["content_hash"],
+        description=row["description"],
+        files=dict(row["files"]),
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_context(row: asyncpg.Record) -> ContextRecord:
+    return ContextRecord(
+        name=row["name"],
+        tenant_id=row["tenant_id"],
+        version=row["version"],
+        created_by=row["created_by"],
+        content_hash=row["content_hash"],
+        description=row["description"],
+        body=row["body"],
         created_at=row["created_at"],
     )
 

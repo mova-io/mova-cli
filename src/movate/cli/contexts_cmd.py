@@ -766,3 +766,305 @@ def detach_context(
         console.print(f"[green]✓[/green] Detached [bold]{name}[/bold] from [bold]{agent}[/bold]")
     else:
         console.print(f"[dim]{name} was not in {agent}'s contexts — nothing to do[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# ``mdk contexts remote`` — manage the runtime's MANAGED contexts registry over
+# the API (ADR 060 D3). Sibling to ``mdk project`` / ``mdk skills remote``:
+# every verb talks to a deployed runtime via :class:`MovateClient`, resolved by
+# ``--target``. The local subcommands above operate on the bundle's
+# ``contexts/`` files and are unchanged; these manage the durable, tenant-scoped,
+# versioned registry the hosted/multi-tenant story uses.
+# ---------------------------------------------------------------------------
+
+import asyncio  # noqa: E402
+
+from movate.cli._console import (  # noqa: E402
+    confirm_destructive,
+    echo_remote_context,
+    error,
+    get_global_target,
+    hint,
+    success,
+)
+from movate.cli._output import TableJson  # noqa: E402
+from movate.core.client import MovateClient, MovateClientError  # noqa: E402
+from movate.core.user_config import (  # noqa: E402
+    UserConfigError,
+    resolve_bearer_token,
+    resolve_target,
+)
+
+contexts_remote_app = typer.Typer(
+    name="remote",
+    help="Manage the runtime's MANAGED contexts registry over the API (ADR 060). Needs --target.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+contexts_app.add_typer(contexts_remote_app, name="remote")
+
+
+def _build_contexts_client(target: str | None, *, suppress: bool = False) -> MovateClient:
+    """Resolve a target name → MovateClient (mirrors ``project._build_client``)."""
+    try:
+        target_name, target_cfg = resolve_target(target or get_global_target())
+        token = resolve_bearer_token(target_cfg)
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+    echo_remote_context(target_name, target_cfg, suppress=suppress)
+    return MovateClient(base_url=target_cfg.url, api_key=token)
+
+
+@contexts_remote_app.command("list")
+def remote_list_contexts(
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """List the tenant's managed contexts (latest version per name)."""
+    client = _build_contexts_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(_remote_contexts_list(client, fmt=output_format))
+
+
+@contexts_remote_app.command("get")
+def remote_get_context(
+    name: str = typer.Argument(..., help="Context name."),
+    version: str | None = typer.Option(None, "--version", help="Pin an exact version."),
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Show one managed context (latest, or a pinned ``--version``)."""
+    client = _build_contexts_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(_remote_contexts_get(client, name=name, version=version, fmt=output_format))
+
+
+@contexts_remote_app.command("versions")
+def remote_context_versions(
+    name: str = typer.Argument(..., help="Context name."),
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """List a managed context's version history (newest-first)."""
+    client = _build_contexts_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(_remote_contexts_versions(client, name=name, fmt=output_format))
+
+
+@contexts_remote_app.command("create")
+def remote_create_context(
+    name: str = typer.Argument(..., help="Context name."),
+    file: Path = typer.Option(
+        ..., "--file", "-f", help="Markdown file whose body is the context.", exists=True
+    ),
+    description: str | None = typer.Option(None, "--description", "-d"),
+    version: str = typer.Option("v1", "--version", help="Initial version (default v1)."),
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Create the first version of a managed context from a Markdown file."""
+    body = file.read_text(encoding="utf-8")
+    client = _build_contexts_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(
+        _remote_contexts_create(
+            client,
+            name=name,
+            body=body,
+            description=description,
+            version=version,
+            fmt=output_format,
+        )
+    )
+
+
+@contexts_remote_app.command("update")
+def remote_update_context(
+    name: str = typer.Argument(..., help="Context name."),
+    file: Path = typer.Option(
+        ..., "--file", "-f", help="Markdown file whose body is the new version.", exists=True
+    ),
+    version: str = typer.Option(..., "--version", help="New version (rows are immutable)."),
+    description: str | None = typer.Option(None, "--description", "-d"),
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Publish a NEW version of a managed context (rows are immutable)."""
+    body = file.read_text(encoding="utf-8")
+    client = _build_contexts_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(
+        _remote_contexts_update(
+            client,
+            name=name,
+            body=body,
+            description=description,
+            version=version,
+            fmt=output_format,
+        )
+    )
+
+
+@contexts_remote_app.command("delete")
+def remote_delete_context(
+    name: str = typer.Argument(..., help="Context name."),
+    version: str | None = typer.Option(
+        None, "--version", help="Delete just this version (omit to delete all)."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirm prompt."),
+    target: str = typer.Option(None, "--target", "-t"),
+) -> None:
+    """Delete a managed context (a version, or all versions of the name)."""
+    confirm_destructive(
+        f"Delete managed context {name}{'@' + version if version else ' (ALL versions)'}?",
+        yes=yes,
+    )
+    client = _build_contexts_client(target)
+    asyncio.run(_remote_contexts_delete(client, name=name, version=version))
+
+
+@contexts_remote_app.command("attach")
+def remote_attach_context(
+    name: str = typer.Argument(..., help="Registry context name to attach."),
+    agent: str = typer.Option(..., "--agent", "-a", help="Agent to attach the context to."),
+    version: str | None = typer.Option(None, "--version", help="Pin an exact context version."),
+    target: str = typer.Option(None, "--target", "-t"),
+) -> None:
+    """Attach a registry context to an agent (records the ref; D4 resolves it)."""
+    client = _build_contexts_client(target)
+    asyncio.run(_remote_contexts_attach(client, agent=agent, ref=name, version=version))
+
+
+async def _remote_contexts_list(client: MovateClient, *, fmt: TableJson) -> None:
+    async with client:
+        try:
+            listing = await client.list_contexts()
+        except MovateClientError as exc:
+            error(str(exc), context="contexts.remote.list")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    if listing.count == 0:
+        hint("[dim]no managed contexts yet[/dim]")
+        return
+    table = Table(title=f"managed contexts ({listing.count})")
+    table.add_column("name", style="bold cyan")
+    table.add_column("version")
+    table.add_column("description")
+    for c in listing.contexts:
+        table.add_row(c.name, c.version, (c.description or "")[:50])
+    console.print(table)
+
+
+async def _remote_contexts_get(
+    client: MovateClient, *, name: str, version: str | None, fmt: TableJson
+) -> None:
+    async with client:
+        try:
+            view = await client.get_context(name, version=version)
+        except MovateClientError as exc:
+            error(str(exc), context="contexts.remote.get")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    console.print(Rule(f"[bold cyan]{view.name}[/bold cyan]  [dim]v{view.version}[/dim]"))
+    console.print(view.body)
+    console.print(Rule(style="dim"))
+
+
+async def _remote_contexts_versions(client: MovateClient, *, name: str, fmt: TableJson) -> None:
+    async with client:
+        try:
+            listing = await client.list_context_versions(name)
+        except MovateClientError as exc:
+            error(str(exc), context="contexts.remote.versions")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    table = Table(title=f"{name} versions ({listing.count})")
+    table.add_column("version", style="bold")
+    table.add_column("created_at", style="dim")
+    table.add_column("content_hash", style="dim")
+    for v in listing.versions:
+        table.add_row(v.version, v.created_at.isoformat(), v.content_hash[:12])
+    console.print(table)
+
+
+async def _remote_contexts_create(
+    client: MovateClient,
+    *,
+    name: str,
+    body: str,
+    description: str | None,
+    version: str,
+    fmt: TableJson,
+) -> None:
+    async with client:
+        try:
+            view = await client.create_context(
+                name=name, body=body, description=description, version=version
+            )
+        except MovateClientError as exc:
+            error(str(exc), context="contexts.remote.create")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    success(f"created context {view.name} v{view.version}")
+
+
+async def _remote_contexts_update(
+    client: MovateClient,
+    *,
+    name: str,
+    body: str,
+    description: str | None,
+    version: str,
+    fmt: TableJson,
+) -> None:
+    async with client:
+        try:
+            view = await client.upsert_context(
+                name, version=version, body=body, description=description
+            )
+        except MovateClientError as exc:
+            error(str(exc), context="contexts.remote.update")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    success(f"published context {view.name} v{view.version}")
+
+
+async def _remote_contexts_delete(client: MovateClient, *, name: str, version: str | None) -> None:
+    async with client:
+        try:
+            await client.delete_context(name, version=version)
+        except MovateClientError as exc:
+            error(str(exc), context="contexts.remote.delete")
+            raise typer.Exit(code=1) from None
+    success(f"deleted context {name}{'@' + version if version else ' (all versions)'}")
+
+
+async def _remote_contexts_attach(
+    client: MovateClient, *, agent: str, ref: str, version: str | None
+) -> None:
+    async with client:
+        try:
+            view = await client.attach_context_to_agent(agent, ref=ref, version=version)
+        except MovateClientError as exc:
+            error(str(exc), context="contexts.remote.attach")
+            raise typer.Exit(code=1) from None
+    if view.attached:
+        success(f"attached context {ref} to agent {agent}")
+    else:
+        hint(f"[dim]{ref} was already attached to {agent}[/dim]")

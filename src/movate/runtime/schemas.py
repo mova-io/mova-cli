@@ -21,6 +21,7 @@ from movate.core.models import (
     AuditFinding,
     AuditFindingSeverity,
     AuditRecord,
+    ContextRecord,
     ConversationThread,
     DiagnosisRecord,
     DiagnosisStatus,
@@ -36,6 +37,7 @@ from movate.core.models import (
     RunRecord,
     Session,
     SessionMessage,
+    SkillRecord,
     WorkflowRunRecord,
     WorkflowStatus,
 )
@@ -1903,6 +1905,198 @@ class SkillCreatedView(BaseModel):
     """Hypermedia next-calls (ADR 061 D1), serialized as ``_links``. Empty
     ``{}`` until the skill GET/attach routes ship (ADR 060) — no dead links
     (ADR 061 D4)."""
+
+
+# ---------------------------------------------------------------------------
+# Managed skills + contexts registry (ADR 060 D2) — wire types for the CRUD /
+# versions / attach surface that promotes skills + shared contexts to
+# first-class managed resources (mirrors the agent / project / workflow views).
+# ---------------------------------------------------------------------------
+
+
+class SkillView(BaseModel):
+    """``GET /api/v1/skills/{name}`` (and list rows / create / update)
+    response — a managed skill record from the registry (ADR 060 D2).
+
+    Mirror of :class:`movate.core.models.SkillRecord`. ``files`` carries the
+    skill bundle's text files; listings omit nothing but front ends typically
+    render only ``name`` / ``version`` / ``description``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    tenant_id: str
+    version: str
+    created_by: str | None = None
+    content_hash: str
+    description: str = ""
+    files: dict[str, str]
+    created_at: datetime
+
+    @classmethod
+    def from_record(cls, s: SkillRecord) -> SkillView:
+        return cls(
+            name=s.name,
+            tenant_id=s.tenant_id,
+            version=s.version,
+            created_by=s.created_by,
+            content_hash=s.content_hash,
+            description=s.description,
+            files=s.files,
+            created_at=s.created_at,
+        )
+
+
+class SkillListResponse(BaseModel):
+    """``GET /api/v1/skills`` response — latest-per-name, newest-first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    skills: list[SkillView]
+    count: int
+
+
+class SkillVersionsResponse(BaseModel):
+    """``GET /api/v1/skills/{name}/versions`` response — newest-first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    versions: list[SkillView]
+    count: int
+
+
+class SkillUpsertRequest(BaseModel):
+    """``PUT /api/v1/skills/{name}`` request body — publish a new version.
+
+    Update is a NEW version (immutable rows; mirrors the agent registry).
+    ``files`` MUST include ``skill.yaml`` (the canonical spec); the route
+    validates it via the same skill loader the bundle path uses. ``version``
+    is required and must not collide with an existing ``(name, version)``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(..., min_length=1)
+    files: dict[str, str] = Field(..., min_length=1)
+    description: str | None = None
+
+
+class ContextView(BaseModel):
+    """``GET /api/v1/contexts/{name}`` (and list / create / update) response —
+    a managed shared-context record (ADR 060 D2).
+
+    Mirror of :class:`movate.core.models.ContextRecord`. The payload is the
+    single Markdown ``body`` (the prompt fragment ADR 002 injects).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    tenant_id: str
+    version: str
+    created_by: str | None = None
+    content_hash: str
+    description: str = ""
+    body: str
+    created_at: datetime
+
+    @classmethod
+    def from_record(cls, c: ContextRecord) -> ContextView:
+        return cls(
+            name=c.name,
+            tenant_id=c.tenant_id,
+            version=c.version,
+            created_by=c.created_by,
+            content_hash=c.content_hash,
+            description=c.description,
+            body=c.body,
+            created_at=c.created_at,
+        )
+
+
+class ContextListResponse(BaseModel):
+    """``GET /api/v1/contexts`` response — latest-per-name, newest-first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    contexts: list[ContextView]
+    count: int
+
+
+class ContextVersionsResponse(BaseModel):
+    """``GET /api/v1/contexts/{name}/versions`` response — newest-first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    versions: list[ContextView]
+    count: int
+
+
+class ContextCreateRequest(BaseModel):
+    """``POST /api/v1/contexts`` request body — create the first version.
+
+    ``name`` is the registry key (the stem an ``agent.yaml`` ``contexts:``
+    entry references). ``version`` defaults to ``"v1"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=128)
+    body: str = Field(..., min_length=1)
+    description: str | None = None
+    version: str = Field(default="v1", min_length=1)
+
+
+class ContextUpsertRequest(BaseModel):
+    """``PUT /api/v1/contexts/{name}`` request body — publish a new version.
+
+    Update is a NEW version (immutable rows). ``version`` is required and
+    must not collide with an existing ``(name, version)``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(..., min_length=1)
+    body: str = Field(..., min_length=1)
+    description: str | None = None
+
+
+class ResourceAttachRequest(BaseModel):
+    """``POST /api/v1/agents/{name}/skills`` and ``.../contexts`` request body
+    — attach a registry skill/context to an agent by name (ADR 060 D2).
+
+    ``ref`` is the registry resource name; ``version`` pins an exact version
+    (omit for "latest"). The attach records the agent→resource wiring in the
+    agent's bundle ``skills:`` / ``contexts:`` list — the runtime
+    registry-resolution that consumes the wiring is D4 (a separate PR), so
+    this endpoint validates + records the reference but does not yet resolve
+    it at execution time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ref: str = Field(..., min_length=1)
+    version: str | None = None
+
+
+class ResourceAttachView(BaseModel):
+    """Response for the agent skill/context attach endpoints (ADR 060 D2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: str
+    """The agent the resource was attached to."""
+    kind: Literal["skill", "context"]
+    ref: str
+    """The registry resource name attached."""
+    version: str | None = None
+    """The pinned version, or ``None`` for latest."""
+    attached: bool
+    """``True`` if the reference was newly added; ``False`` if it was already
+    present (idempotent re-attach)."""
 
 
 class AgentDeletedView(BaseModel):

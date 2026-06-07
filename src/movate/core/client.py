@@ -32,6 +32,9 @@ from movate.runtime.schemas import (
     BatchListView,
     BatchStatusView,
     CapabilitiesView,
+    ContextListResponse,
+    ContextVersionsResponse,
+    ContextView,
     DeadLetterPurgeView,
     GroundedAnswerView,
     HealthView,
@@ -48,10 +51,14 @@ from movate.runtime.schemas import (
     ProjectMemberListView,
     ProjectMemberView,
     ProjectView,
+    ResourceAttachView,
     RunAccepted,
     RunReplayView,
     RunSubmission,
     RunView,
+    SkillListResponse,
+    SkillVersionsResponse,
+    SkillView,
     VoiceTurnView,
     WorkflowCreateRequest,
     WorkflowDetailView,
@@ -580,6 +587,141 @@ class MovateClient:
         """``DELETE /api/v1/projects/{id}/members/{principal_id}``."""
         r = await self._client.delete(f"/api/v1/projects/{project_id}/members/{principal_id}")
         self._raise_for_status(r)
+
+    # ------------------------------------------------------------------
+    # Managed skills (ADR 060 D2/D3)
+    # ------------------------------------------------------------------
+
+    async def list_skills(self, *, limit: int = 100) -> SkillListResponse:
+        """``GET /api/v1/skills`` — latest-per-name, newest-first."""
+        r = await self._client.get("/api/v1/skills", params={"limit": limit})
+        self._raise_for_status(r)
+        return SkillListResponse.model_validate(r.json())
+
+    async def get_skill(self, name: str, *, version: str | None = None) -> SkillView:
+        """``GET /api/v1/skills/{name}`` (optionally ``?version=``)."""
+        params = {"version": version} if version is not None else None
+        r = await self._client.get(f"/api/v1/skills/{name}", params=params)
+        self._raise_for_status(r)
+        return SkillView.model_validate(r.json())
+
+    async def list_skill_versions(self, name: str, *, limit: int = 50) -> SkillVersionsResponse:
+        """``GET /api/v1/skills/{name}/versions`` — newest-first."""
+        r = await self._client.get(f"/api/v1/skills/{name}/versions", params={"limit": limit})
+        self._raise_for_status(r)
+        return SkillVersionsResponse.model_validate(r.json())
+
+    async def upsert_skill(
+        self,
+        name: str,
+        *,
+        version: str,
+        files: dict[str, str],
+        description: str | None = None,
+    ) -> SkillView:
+        """``PUT /api/v1/skills/{name}`` — publish a new version.
+
+        Used for both create-as-update and update of a managed skill (rows
+        are immutable; each call is a new ``(name, version)``). ``files`` MUST
+        include ``skill.yaml``.
+        """
+        body: dict[str, Any] = {"version": version, "files": files}
+        if description is not None:
+            body["description"] = description
+        r = await self._client.put(f"/api/v1/skills/{name}", json=body)
+        self._raise_for_status(r)
+        return SkillView.model_validate(r.json())
+
+    async def delete_skill(self, name: str, *, version: str | None = None) -> SkillView:
+        """``DELETE /api/v1/skills/{name}`` (optionally ``?version=``)."""
+        params = {"version": version} if version is not None else None
+        r = await self._client.delete(f"/api/v1/skills/{name}", params=params)
+        self._raise_for_status(r)
+        return SkillView.model_validate(r.json())
+
+    async def attach_skill_to_agent(
+        self, agent: str, *, ref: str, version: str | None = None
+    ) -> ResourceAttachView:
+        """``POST /api/v1/agents/{name}/skills`` — attach a registry skill."""
+        body: dict[str, Any] = {"ref": ref}
+        if version is not None:
+            body["version"] = version
+        r = await self._client.post(f"/api/v1/agents/{agent}/skills", json=body)
+        self._raise_for_status(r)
+        return ResourceAttachView.model_validate(r.json())
+
+    # ------------------------------------------------------------------
+    # Managed contexts (ADR 060 D2/D3)
+    # ------------------------------------------------------------------
+
+    async def list_contexts(self, *, limit: int = 100) -> ContextListResponse:
+        """``GET /api/v1/contexts`` — latest-per-name, newest-first."""
+        r = await self._client.get("/api/v1/contexts", params={"limit": limit})
+        self._raise_for_status(r)
+        return ContextListResponse.model_validate(r.json())
+
+    async def create_context(
+        self,
+        *,
+        name: str,
+        body: str,
+        description: str | None = None,
+        version: str = "v1",
+    ) -> ContextView:
+        """``POST /api/v1/contexts`` — create the first version."""
+        payload: dict[str, Any] = {"name": name, "body": body, "version": version}
+        if description is not None:
+            payload["description"] = description
+        r = await self._client.post("/api/v1/contexts", json=payload)
+        self._raise_for_status(r)
+        return ContextView.model_validate(r.json())
+
+    async def get_context(self, name: str, *, version: str | None = None) -> ContextView:
+        """``GET /api/v1/contexts/{name}`` (optionally ``?version=``)."""
+        params = {"version": version} if version is not None else None
+        r = await self._client.get(f"/api/v1/contexts/{name}", params=params)
+        self._raise_for_status(r)
+        return ContextView.model_validate(r.json())
+
+    async def list_context_versions(self, name: str, *, limit: int = 50) -> ContextVersionsResponse:
+        """``GET /api/v1/contexts/{name}/versions`` — newest-first."""
+        r = await self._client.get(f"/api/v1/contexts/{name}/versions", params={"limit": limit})
+        self._raise_for_status(r)
+        return ContextVersionsResponse.model_validate(r.json())
+
+    async def upsert_context(
+        self,
+        name: str,
+        *,
+        version: str,
+        body: str,
+        description: str | None = None,
+    ) -> ContextView:
+        """``PUT /api/v1/contexts/{name}`` — publish a new version."""
+        payload: dict[str, Any] = {"version": version, "body": body}
+        if description is not None:
+            payload["description"] = description
+        r = await self._client.put(f"/api/v1/contexts/{name}", json=payload)
+        self._raise_for_status(r)
+        return ContextView.model_validate(r.json())
+
+    async def delete_context(self, name: str, *, version: str | None = None) -> ContextView:
+        """``DELETE /api/v1/contexts/{name}`` (optionally ``?version=``)."""
+        params = {"version": version} if version is not None else None
+        r = await self._client.delete(f"/api/v1/contexts/{name}", params=params)
+        self._raise_for_status(r)
+        return ContextView.model_validate(r.json())
+
+    async def attach_context_to_agent(
+        self, agent: str, *, ref: str, version: str | None = None
+    ) -> ResourceAttachView:
+        """``POST /api/v1/agents/{name}/contexts`` — attach a registry context."""
+        body: dict[str, Any] = {"ref": ref}
+        if version is not None:
+            body["version"] = version
+        r = await self._client.post(f"/api/v1/agents/{agent}/contexts", json=body)
+        self._raise_for_status(r)
+        return ResourceAttachView.model_validate(r.json())
 
     # ------------------------------------------------------------------
     # Workflow definitions (ADR 037 D1 — workflow API parity)

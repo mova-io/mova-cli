@@ -799,6 +799,313 @@ def validate_skills(
 
 
 # ---------------------------------------------------------------------------
+# ``mdk skills remote`` — manage the runtime's MANAGED skills registry over the
+# API (ADR 060 D3). Sibling to ``mdk project`` / ``mdk agent``: every verb talks
+# to a deployed runtime via :class:`MovateClient`, resolved by ``--target``. The
+# local subcommands above (``list`` / ``info`` / ``run`` / ...) operate on the
+# bundle's ``skills/`` folder and are unchanged; these manage the durable,
+# tenant-scoped, versioned registry the hosted/multi-tenant story uses.
+# ---------------------------------------------------------------------------
+
+from movate.cli._console import (  # noqa: E402
+    confirm_destructive,
+    echo_remote_context,
+    error,
+    get_global_target,
+    hint,
+    success,
+)
+from movate.cli._output import TableJson  # noqa: E402
+from movate.core.client import MovateClient, MovateClientError  # noqa: E402
+from movate.core.user_config import (  # noqa: E402
+    UserConfigError,
+    resolve_bearer_token,
+    resolve_target,
+)
+
+skills_remote_app = typer.Typer(
+    name="remote",
+    help="Manage the runtime's MANAGED skills registry over the API (ADR 060). Needs --target.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+skills_app.add_typer(skills_remote_app, name="remote")
+
+
+def _build_skills_client(target: str | None, *, suppress: bool = False) -> MovateClient:
+    """Resolve a target name → MovateClient (mirrors ``project._build_client``)."""
+    try:
+        target_name, target_cfg = resolve_target(target or get_global_target())
+        token = resolve_bearer_token(target_cfg)
+    except UserConfigError as exc:
+        error(str(exc))
+        raise typer.Exit(code=2) from None
+    echo_remote_context(target_name, target_cfg, suppress=suppress)
+    return MovateClient(base_url=target_cfg.url, api_key=token)
+
+
+@skills_remote_app.command("list")
+def remote_list_skills(
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """List the tenant's managed skills (latest version per name)."""
+    client = _build_skills_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(_remote_skills_list(client, fmt=output_format))
+
+
+@skills_remote_app.command("get")
+def remote_get_skill(
+    name: str = typer.Argument(..., help="Skill name."),
+    version: str | None = typer.Option(None, "--version", help="Pin an exact version."),
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Show one managed skill (latest, or a pinned ``--version``)."""
+    client = _build_skills_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(_remote_skills_get(client, name=name, version=version, fmt=output_format))
+
+
+@skills_remote_app.command("versions")
+def remote_skill_versions(
+    name: str = typer.Argument(..., help="Skill name."),
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """List a managed skill's version history (newest-first)."""
+    client = _build_skills_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(_remote_skills_versions(client, name=name, fmt=output_format))
+
+
+@skills_remote_app.command("create")
+def remote_create_skill(
+    skill_dir: Path = typer.Argument(
+        ...,
+        help="Local skill bundle dir (containing skill.yaml + optional impl.py/corpus.json).",
+        exists=True,
+        file_okay=False,
+        readable=True,
+    ),
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Publish a skill bundle to the managed registry (first version).
+
+    Reads ``skill.yaml`` (required) + optional ``impl.py`` / ``corpus.json`` /
+    ``README.md`` from the dir. The ``version`` comes from the skill.yaml.
+    """
+    files, name, version = _read_skill_dir(skill_dir)
+    client = _build_skills_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(
+        _remote_skills_upsert(
+            client, name=name, version=version, files=files, fmt=output_format, verb="create"
+        )
+    )
+
+
+@skills_remote_app.command("update")
+def remote_update_skill(
+    skill_dir: Path = typer.Argument(
+        ...,
+        help="Local skill bundle dir; its skill.yaml version becomes the new registry version.",
+        exists=True,
+        file_okay=False,
+        readable=True,
+    ),
+    target: str = typer.Option(None, "--target", "-t"),
+    output_format: TableJson = typer.Option(
+        TableJson.TABLE, "--output", "-o", case_sensitive=False
+    ),
+) -> None:
+    """Publish a NEW version of a managed skill (rows are immutable)."""
+    files, name, version = _read_skill_dir(skill_dir)
+    client = _build_skills_client(target, suppress=output_format == TableJson.JSON)
+    asyncio.run(
+        _remote_skills_upsert(
+            client, name=name, version=version, files=files, fmt=output_format, verb="update"
+        )
+    )
+
+
+@skills_remote_app.command("delete")
+def remote_delete_skill(
+    name: str = typer.Argument(..., help="Skill name."),
+    version: str | None = typer.Option(
+        None, "--version", help="Delete just this version (omit to delete all)."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirm prompt."),
+    target: str = typer.Option(None, "--target", "-t"),
+) -> None:
+    """Delete a managed skill (a version, or all versions of the name)."""
+    confirm_destructive(
+        f"Delete managed skill {name}{'@' + version if version else ' (ALL versions)'}?",
+        yes=yes,
+    )
+    client = _build_skills_client(target)
+    asyncio.run(_remote_skills_delete(client, name=name, version=version))
+
+
+@skills_remote_app.command("attach")
+def remote_attach_skill(
+    name: str = typer.Argument(..., help="Registry skill name to attach."),
+    agent: str = typer.Option(..., "--agent", "-a", help="Agent to attach the skill to."),
+    version: str | None = typer.Option(None, "--version", help="Pin an exact skill version."),
+    target: str = typer.Option(None, "--target", "-t"),
+) -> None:
+    """Attach a registry skill to an agent (records the ref; D4 resolves it)."""
+    client = _build_skills_client(target)
+    asyncio.run(_remote_skills_attach(client, agent=agent, ref=name, version=version))
+
+
+def _read_skill_dir(skill_dir: Path) -> tuple[dict[str, str], str, str]:
+    """Read a local skill bundle dir into a ``(files, name, version)`` tuple.
+
+    ``skill.yaml`` is required; ``impl.py`` / ``corpus.json`` / ``README.md``
+    are optional. ``name`` + ``version`` are parsed from the skill.yaml so the
+    upsert lands at the right registry coordinates.
+    """
+    import yaml  # noqa: PLC0415
+
+    yaml_path = skill_dir / "skill.yaml"
+    if not yaml_path.is_file():
+        error(f"no skill.yaml in {skill_dir}")
+        raise typer.Exit(code=2)
+    files: dict[str, str] = {"skill.yaml": yaml_path.read_text(encoding="utf-8")}
+    for optional in ("impl.py", "corpus.json", "README.md"):
+        p = skill_dir / optional
+        if p.is_file():
+            files[optional] = p.read_text(encoding="utf-8")
+    try:
+        spec = yaml.safe_load(files["skill.yaml"]) or {}
+    except yaml.YAMLError as exc:
+        error(f"skill.yaml is not valid YAML: {exc}")
+        raise typer.Exit(code=2) from None
+    name = spec.get("name")
+    version = str(spec.get("version", ""))
+    if not name or not version:
+        error("skill.yaml must declare both 'name' and 'version'")
+        raise typer.Exit(code=2)
+    return files, str(name), version
+
+
+async def _remote_skills_list(client: MovateClient, *, fmt: TableJson) -> None:
+    async with client:
+        try:
+            listing = await client.list_skills()
+        except MovateClientError as exc:
+            error(str(exc), context="skills.remote.list")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    if listing.count == 0:
+        hint("[dim]no managed skills yet[/dim]")
+        return
+    table = Table(title=f"managed skills ({listing.count})")
+    table.add_column("name", style="bold cyan")
+    table.add_column("version")
+    table.add_column("description")
+    for s in listing.skills:
+        table.add_row(s.name, s.version, (s.description or "")[:50])
+    console.print(table)
+
+
+async def _remote_skills_get(
+    client: MovateClient, *, name: str, version: str | None, fmt: TableJson
+) -> None:
+    async with client:
+        try:
+            view = await client.get_skill(name, version=version)
+        except MovateClientError as exc:
+            error(str(exc), context="skills.remote.get")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    table = Table(title=f"skill {view.name}", show_header=False)
+    table.add_column("field", style="dim")
+    table.add_column("value")
+    table.add_row("name", view.name)
+    table.add_row("version", view.version)
+    table.add_row("description", view.description or "")
+    table.add_row("content_hash", view.content_hash[:12])
+    table.add_row("files", ", ".join(sorted(view.files)))
+    console.print(table)
+
+
+async def _remote_skills_versions(client: MovateClient, *, name: str, fmt: TableJson) -> None:
+    async with client:
+        try:
+            listing = await client.list_skill_versions(name)
+        except MovateClientError as exc:
+            error(str(exc), context="skills.remote.versions")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    table = Table(title=f"{name} versions ({listing.count})")
+    table.add_column("version", style="bold")
+    table.add_column("created_at", style="dim")
+    table.add_column("content_hash", style="dim")
+    for v in listing.versions:
+        table.add_row(v.version, v.created_at.isoformat(), v.content_hash[:12])
+    console.print(table)
+
+
+async def _remote_skills_upsert(
+    client: MovateClient,
+    *,
+    name: str,
+    version: str,
+    files: dict[str, str],
+    fmt: TableJson,
+    verb: str,
+) -> None:
+    async with client:
+        try:
+            view = await client.upsert_skill(name, version=version, files=files)
+        except MovateClientError as exc:
+            error(str(exc), context=f"skills.remote.{verb}")
+            raise typer.Exit(code=1) from None
+    if fmt == TableJson.JSON:
+        console.print(view.model_dump_json(indent=2), soft_wrap=True, highlight=False)
+        return
+    success(f"published skill {view.name} v{view.version}")
+
+
+async def _remote_skills_delete(client: MovateClient, *, name: str, version: str | None) -> None:
+    async with client:
+        try:
+            await client.delete_skill(name, version=version)
+        except MovateClientError as exc:
+            error(str(exc), context="skills.remote.delete")
+            raise typer.Exit(code=1) from None
+    success(f"deleted skill {name}{'@' + version if version else ' (all versions)'}")
+
+
+async def _remote_skills_attach(
+    client: MovateClient, *, agent: str, ref: str, version: str | None
+) -> None:
+    async with client:
+        try:
+            view = await client.attach_skill_to_agent(agent, ref=ref, version=version)
+        except MovateClientError as exc:
+            error(str(exc), context="skills.remote.attach")
+            raise typer.Exit(code=1) from None
+    if view.attached:
+        success(f"attached skill {ref} to agent {agent}")
+    else:
+        hint(f"[dim]{ref} was already attached to {agent}[/dim]")
+
+
 # `mdk skills add-mcp <server-url-or-command>`
 # ---------------------------------------------------------------------------
 
