@@ -1077,6 +1077,49 @@ class EvalAcceptedView(BaseModel):
     """Failure message when ``status == "failed"``; empty otherwise."""
 
 
+class FineTuneSubmission(BaseModel):
+    """``POST /api/v1/agents/{name}/finetune`` request body (ADR 063).
+
+    Kicks off an async fine-tune: the worker builds a training set from the
+    agent's golden/graded eval cases (``min_score`` floor), dispatches a hosted
+    fine-tune via the ``FineTuneProvider`` seam (BYOK), registers the resulting
+    model, and runs eval-vs-base — promoting only when ``promote_if_better``.
+    Mirrors the ``mdk finetune`` flag set; the endpoint returns 202 + a
+    ``job_id`` to poll (``GET /api/v1/jobs/{job_id}``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_model: str = Field(..., min_length=1)
+    """The model to fine-tune (e.g. ``openai/gpt-4o-mini``). Must support
+    fine-tuning on the chosen provider."""
+    min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    """Only train on cases scoring at/above this floor (when eval scores exist);
+    ``None`` trains on every golden (reviewed) case."""
+    provider: str | None = None
+    """Fine-tune backend override (``openai`` / ``together`` / ...). ``None``
+    derives it from ``base_model``'s provider prefix."""
+    promote_if_better: bool = False
+    """When the eval-vs-base delta clears the threshold, swap the agent's model
+    to the fine-tune. Default ``False`` → the loop reports the delta and leaves
+    promotion to a human (ADR 063 D4 — no blind auto-promote)."""
+
+
+class FineTuneAcceptedView(BaseModel):
+    """``POST /api/v1/agents/{name}/finetune`` response (202) — the async handle.
+
+    Poll ``GET /api/v1/jobs/{job_id}`` until terminal; the job's output payload
+    then carries ``{model_id, eval_id}`` (the registered fine-tuned model + the
+    eval-vs-base scorecard).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    status: str = "queued"
+    message: str = ""
+
+
 class EvalScheduleSubmission(BaseModel):
     """``PUT /api/v1/agents/{name}/eval-schedule`` request body (ADR 016 D2).
 

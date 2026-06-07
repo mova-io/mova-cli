@@ -307,6 +307,8 @@ from movate.runtime.schemas import (
     FeedbackListView,
     FeedbackSubmission,
     FeedbackView,
+    FineTuneAcceptedView,
+    FineTuneSubmission,
     GeneratedEvalCaseView,
     GraphAssertRequest,
     GraphAssertView,
@@ -10483,6 +10485,59 @@ def build_app(  # noqa: PLR0912
             eval_id=record.eval_id,
             status="success",
         )
+
+    @v1.post(
+        "/agents/{name}/finetune",
+        response_model=FineTuneAcceptedView,
+        status_code=202,
+        tags=["evals-v1"],
+        dependencies=[_scope("eval"), _quota(RouteClass.EVALS)],
+    )
+    async def v1_kick_off_finetune(
+        name: str,
+        body: FineTuneSubmission,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> FineTuneAcceptedView:
+        """Kick off a fine-tune from the agent's graded eval cases (ADR 063).
+
+        Async by construction (a fine-tune runs minutes-to-hours): creates a
+        ``JobRecord(kind=FINETUNE)`` and returns **202 + ``job_id``**. The
+        worker builds a training set from the agent's golden/graded cases
+        (``min_score`` floor), dispatches a hosted fine-tune via the
+        ``FineTuneProvider`` seam (the tenant's BYOK keys), registers the
+        resulting model, and runs eval-vs-base — promoting only when
+        ``promote_if_better``. Poll ``GET /api/v1/jobs/{job_id}`` until
+        terminal; its output then carries ``{model_id, eval_id}``.
+
+        Errors:
+
+        * **401** — bad / missing bearer token
+        * **403** — caller lacks the ``eval`` scope
+        * **404** — agent not in the registry
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        if not any(b.spec.name == name for b in agents):
+            raise not_found("agent", name)
+
+        store: StorageProvider = request.app.state.storage
+        job = JobRecord(
+            job_id=str(uuid4()),
+            tenant_id=ctx.tenant_id,
+            kind=JobKind.FINETUNE,
+            target=name,
+            input={
+                "base_model": body.base_model,
+                "min_score": body.min_score,
+                "provider": body.provider,
+                "promote_if_better": body.promote_if_better,
+            },
+            api_key_id=ctx.api_key_id,
+            # ADR 019: continue the originating trace in the worker.
+            trace_context=inject_current_trace_context(),
+        )
+        await store.save_job(job)
+        return FineTuneAcceptedView(job_id=job.job_id, status="queued")
 
     @v1.get(
         "/evals/{eval_id}",
