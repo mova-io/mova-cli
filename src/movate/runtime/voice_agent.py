@@ -120,4 +120,9 @@ class ExecutorAgentTurn(AgentTurn):
             answer_text=response.human_readable or "",
             run_id=response.run_id,
             status=response.status,
+            # Carry the Executor's trace id (the one persisted on the
+            # RunRecord's ``metrics.trace_id``) onto the turn so the voice
+            # transport can deep-link to the Langfuse / OTel trace. Empty when
+            # tracing is off (SilentTracer) — the surfacing degrades to no link.
+            trace_id=response.metrics.trace_id,
         )

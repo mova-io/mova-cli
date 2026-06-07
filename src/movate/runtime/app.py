@@ -773,7 +773,13 @@ async def _send_voice_event(websocket: WebSocket, event: Any) -> None:
         await websocket.send_json(_voice_ctrl(event.kind, text=event.text))
 
 
-async def _send_voice_latency(websocket: WebSocket, events: list[Any], metrics: Any = None) -> None:
+async def _send_voice_latency(
+    websocket: WebSocket,
+    events: list[Any],
+    metrics: Any = None,
+    *,
+    trace_id: str = "",
+) -> None:
     """Emit one ``latency`` control frame for a finished pipeline turn.
 
     Derives per-stage latencies from the ``at_ms`` offsets stamped on the
@@ -788,7 +794,16 @@ async def _send_voice_latency(websocket: WebSocket, events: list[Any], metrics: 
     (started / committed / cancelled / commit_ratio / avg_head_start_ms) rides
     along — the ADR 070/073 A/B signal the demo perf panel + runbook aggregate
     to decide the ``speculative`` default-flip. Omitted when nothing speculated.
+
+    ``trace_id`` (the Executor's Langfuse/OTel trace id for this turn — ADR 689
+    voice-runs-parity + ADR 024 tracing) closes the voice-observability loop:
+    when present, ``trace_id`` and — if Langfuse is configured — ``trace_url``
+    ride along so an operator can jump straight from the live turn badge to the
+    full LLM trace. Both are omitted when tracing is off (empty trace id) or
+    Langfuse isn't configured (no URL), so the frame stays byte-for-byte
+    unchanged on the no-trace path.
     """
+    from movate.tracing.langfuse_link import langfuse_trace_url  # noqa: PLC0415
     from movate.voice.pipeline import (  # noqa: PLC0415 - lazy, voice-only path
         compute_turn_latency,
         format_latency_badge,
@@ -809,6 +824,11 @@ async def _send_voice_latency(websocket: WebSocket, events: list[Any], metrics: 
         spec = metrics.speculation_snapshot()
         if spec["started"]:
             fields["speculation"] = spec
+    if trace_id:
+        fields["trace_id"] = trace_id
+        trace_url = langfuse_trace_url(trace_id)
+        if trace_url:
+            fields["trace_url"] = trace_url
     await websocket.send_json(_voice_ctrl("latency", **fields))
 
 
@@ -867,6 +887,9 @@ class _VoicePipelineTurnResult:
     """The Executor's run_id from the ``done`` event (empty on error)."""
     status: str
     """The turn's terminal status from ``done`` (empty on error)."""
+    trace_id: str
+    """The Executor's Langfuse/OTel trace id from the ``done`` event (empty when
+    tracing is off). Surfaced in the latency badge as a deep-link to the trace."""
     transcript: str
     """The final STT transcript (the user's words)."""
     answer_text: str
@@ -915,6 +938,7 @@ async def _stream_voice_pipeline_turn(
     latency_events: list[Any] = []
     run_id = ""
     status = ""
+    trace_id = ""
     transcript = ""
     answer_parts: list[str] = []
     # Per-turn observer: tallies this turn's speculation outcomes (started /
@@ -967,9 +991,11 @@ async def _stream_voice_pipeline_turn(
             elif event.kind == "done":
                 run_id = event.run_id
                 status = event.status
+                trace_id = event.trace_id
                 # Emit the latency badge just BEFORE done so it lands inside the
-                # turn (a client draining to ``done`` still sees it).
-                await _send_voice_latency(websocket, latency_events, metrics)
+                # turn (a client draining to ``done`` still sees it). Pass the
+                # turn's trace id so the badge carries a deep-link to the trace.
+                await _send_voice_latency(websocket, latency_events, metrics, trace_id=trace_id)
             await _send_voice_event(websocket, event)
         # Feed this turn's speculation outcome to the guard; if it trips now,
         # tell the client so the UI can reflect that speculation went dormant.
@@ -1003,6 +1029,7 @@ async def _stream_voice_pipeline_turn(
         events=latency_events,
         run_id=run_id,
         status=status,
+        trace_id=trace_id,
         transcript=transcript,
         answer_text="".join(answer_parts),
     )
