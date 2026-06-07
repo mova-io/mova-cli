@@ -17087,6 +17087,202 @@ def build_app(  # noqa: PLR0912
     _ = get_openapi
     app.openapi = _patched_openapi  # type: ignore[method-assign]
 
+    # ------------------------------------------------------------------
+    # OpenAI-compatible API (ADR 085) — /v1/models + /v1/chat/completions.
+    # A protocol adapter at the edge so OpenAI clients (OpenWebUI, the
+    # openai SDK, LangChain ChatOpenAI, ...) can drive a deployed agent
+    # with zero glue. NOT a new execution path — maps onto Executor.
+    # ------------------------------------------------------------------
+    def _oai_input_field(bundle: AgentBundle) -> str:
+        """Resolve which agent input field a chat message maps to.
+
+        Mirrors the voice path's ``input_key`` idea: pick a required string
+        property, else a conventional name, else the first string property.
+        """
+        schema = getattr(bundle, "input_schema", None) or {}
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        required = schema.get("required", []) if isinstance(schema, dict) else []
+        str_props = [
+            str(k) for k, v in props.items() if isinstance(v, dict) and v.get("type") == "string"
+        ]
+        for k in required:
+            if str(k) in str_props:
+                return str(k)
+        for common in ("message", "question", "text", "input", "query", "prompt"):
+            if common in str_props:
+                return common
+        return str_props[0] if str_props else "input"
+
+    def _oai_response_text(resp: Any) -> str:
+        """Best text rendering of a RunResponse for a chat message."""
+        hr = getattr(resp, "human_readable", "") or ""
+        if hr:
+            return hr
+        data = getattr(resp, "data", {}) or {}
+        for v in data.values():
+            if isinstance(v, str) and v.strip():
+                return v
+        import json as _json  # noqa: PLC0415
+
+        return _json.dumps(data) if data else ""
+
+    def _oai_last_user_message(messages: list[dict[str, Any]]) -> str:
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content", "")
+                # OpenAI content may be a string or a list of parts.
+                if isinstance(content, list):
+                    return " ".join(
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ).strip()
+                return str(content)
+        return ""
+
+    @app.get("/v1/models", tags=["openai-v1"], dependencies=[_scope("read")])
+    async def openai_list_models(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """OpenAI-compatible model list — one "model" per deployed agent (ADR 085)."""
+        import time as _time  # noqa: PLC0415
+
+        _ = ctx
+        agents: list[AgentBundle] = request.app.state.agents
+        created = int(_time.time())
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": b.spec.name,
+                    "object": "model",
+                    "created": created,
+                    "owned_by": "movate",
+                }
+                for b in agents
+            ],
+        }
+
+    @app.post("/v1/chat/completions", tags=["openai-v1"], dependencies=[_scope("run")])
+    async def openai_chat_completions(
+        body: dict[str, Any],
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> Any:
+        """OpenAI-compatible chat completions → mdk Executor (ADR 085).
+
+        Maps the last user message to the named agent's primary input field,
+        runs the Executor, and returns an OpenAI ``chat.completion`` (or SSE
+        chunks when ``stream: true``).
+        """
+        import json as _json  # noqa: PLC0415
+        import time as _time  # noqa: PLC0415
+
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.core.models import RunRequest  # noqa: PLC0415
+        from movate.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        store: StorageProvider = request.app.state.storage
+        agents: list[AgentBundle] = request.app.state.agents
+
+        model_name = str(body.get("model") or "").strip()
+        messages = body.get("messages") or []
+        stream = bool(body.get("stream", False))
+        if not model_name:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message="`model` is required (the agent name)",
+            )
+        if not isinstance(messages, list) or not messages:
+            raise http_error(
+                ErrorCode.BAD_REQUEST,
+                status_code=400,
+                message="`messages` must be a non-empty list",
+            )
+
+        bundle = await resolve_agent_bundle(
+            store, model_name, tenant_id=ctx.tenant_id, fallback=agents
+        )
+        if bundle is None:
+            raise not_found("model", model_name)
+
+        user_text = _oai_last_user_message(messages)
+        field = _oai_input_field(bundle)
+        run_request = RunRequest(agent=model_name, input={field: user_text})
+        # Provider by the agent's model spec: mock agents → deterministic
+        # MockProvider (hermetic, no keys); everything else → LiteLLM. Mirrors
+        # the run/eval endpoints' choice.
+        model_str = str(getattr(getattr(bundle.spec, "model", None), "provider", "") or "")
+        provider: BaseLLMProvider = (
+            MockProvider()
+            if model_str.startswith("mock") or "mock" in model_str.lower()
+            else LiteLLMProvider()
+        )
+        executor = Executor(
+            provider=provider,
+            pricing=load_pricing(),
+            storage=store,
+            tracer=build_tracer(),
+            tenant_id=ctx.tenant_id,
+            cache=request.app.state.llm_cache,
+        )
+        run_response = await executor.execute(bundle, run_request)
+        text = _oai_response_text(run_response)
+
+        created = int(_time.time())
+        cmpl_id = f"chatcmpl-{getattr(run_response, 'run_id', '') or 'mdk'}"
+        tokens = getattr(getattr(run_response, "metrics", None), "tokens", None)
+        usage = {
+            "prompt_tokens": getattr(tokens, "input", 0) if tokens else 0,
+            "completion_tokens": getattr(tokens, "output", 0) if tokens else 0,
+            "total_tokens": (
+                (getattr(tokens, "input", 0) + getattr(tokens, "output", 0)) if tokens else 0
+            ),
+        }
+
+        if not stream:
+            return {
+                "id": cmpl_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage,
+            }
+
+        # stream=true: emit the response as OpenAI SSE chunks. v1 sends the
+        # completed text as a single content delta (ADR 085 non-goal: true
+        # token streaming is a fast-follow); OpenWebUI renders this correctly.
+        def _chunk(delta: dict[str, Any], finish: str | None) -> str:
+            payload = {
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            return f"data: {_json.dumps(payload)}\n\n"
+
+        async def _gen() -> Any:
+            yield _chunk({"role": "assistant"}, None)
+            if text:
+                yield _chunk({"content": text}, None)
+            yield _chunk({}, "stop")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+
     return app
 
 
