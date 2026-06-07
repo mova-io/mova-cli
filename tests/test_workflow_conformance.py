@@ -42,29 +42,30 @@ behaviour. We compare ``status`` + ``final_state`` only and DO NOT compare the
 We also strip the ``tenant_id`` the Temporal path stamps into the initial state
 for activity context (the same normalization the smoke does).
 
-Two real, currently-divergent Phase-1 limitations are surfaced by the branching
-fixtures and asserted as ``xfail(strict=True)`` so the suite stays green AND
-documents the gap — and would flip to a strict XPASS (a *failure*) the moment
-the compiler/activities close it, turning D7 into a living gate:
+Branching conformance (the gap this suite originally caught — now closed). The
+branching fixtures (``gate_router`` / ``goal_oriented`` / ``monitor`` /
+``simulation``) exercise GATE/INTENT_ROUTER routing and assert native==temporal
+just like the linear ones. They were previously ``xfail(strict=True)`` because
+of two real Phase-1 divergences:
 
-1. **The Temporal compiler does not branch.** ``TemporalCompiler._emit_gate_node``
-   emits an intent-router as a *linear* block: it records the gate decision into
-   ``state[...]`` but the route table is documentary comments only — every node
-   is emitted in topological order and executed unconditionally. The native
-   runner instead follows the *chosen* branch (under ``mock`` the first sorted
-   route key), so for any branching workflow the two backends reach different
-   ``final_state`` s.
-2. **The gate activity cannot resolve a relative classifier ref.** The IR
-   rewrites AGENT ``node.ref`` to an absolute path, but leaves a gate's
+1. **The Temporal compiler did not branch.** ``TemporalCompiler._emit_gate_node``
+   emitted an intent-router as a *linear* block (route table as comments only),
+   so every node executed unconditionally. It now emits REAL control flow — a
+   dispatch loop that follows ``routes[label]`` (or ``fallback``) on the gate
+   activity's decision, matching the native runner's chosen-branch traversal
+   (under ``mock`` the first sorted route key; each fixture's ``label`` is that
+   key, so the deterministic provider drives the same branch).
+2. **The gate activity could not resolve a relative classifier ref.** The IR
+   rewrites AGENT ``node.ref`` to an absolute path but leaves a gate's
    ``classifier_agent`` ref relative (e.g. ``./agents/goal-judge``).
-   :func:`call_gate_activity` calls ``load_agent`` on that relative ref from the
-   worker CWD and raises ``AgentLoadError`` → the Temporal workflow fails. (The
-   native runner under ``mock`` skips the classifier entirely, so it never hits
-   this.)
+   :func:`call_gate_activity` now resolves it against the workflow dir the
+   compiler bakes into the activity args (the same resolution the native runner
+   does), so ``load_agent`` succeeds on the worker.
 
-Both live in code this PR does NOT touch (the compiler and
-``temporal_activities``); they are exactly the kind of divergence D7's suite
-exists to make loud.
+The ``xfail(strict=True)`` mechanism (see :func:`_param`) is retained for any
+*future* divergence: a fixture given an ``xfail_reason`` stays green while the
+gap is open and reports a failing XPASS the moment it closes, keeping D7 a
+living gate rather than a comment.
 
 Hermetic: a deterministic offline provider (no network, no keys) +
 :class:`InMemoryStorage` + the SDK's in-memory time-skipping test server. The
@@ -106,9 +107,11 @@ from movate.core.workflow.compilers.temporal import TemporalCompiler
 from movate.core.workflow.temporal_activities import (
     call_agent_activity,
     call_gate_activity,
+    call_human_activity,
     call_judge_activity,
     call_skill_activity,
     configure_activities,
+    persist_workflow_result_activity,
 )
 from movate.runtime.workflow_backend import (
     DEFAULT_TASK_QUEUE,
@@ -155,6 +158,10 @@ class _ConformanceProvider(BaseLLMProvider):
             # linear-chain hand-built fixture
             "step1": "alpha",
             "step2": "beta",
+            # gate-router hand-built fixture (both branch outputs, so the union
+            # validates whichever branch the router chooses)
+            "high_result": "hr",
+            "low_result": "lr",
             # workflow_starter-shaped keys
             "draft": "d",
             "final": "f",
@@ -453,14 +460,6 @@ def _packaged(template: str) -> Any:
     return _build
 
 
-_NO_BRANCH = (
-    "Phase-1 Temporal compiler emits intent-routers as a LINEAR block "
-    "(TemporalCompiler._emit_gate_node — route table is documentary comments only) "
-    "AND call_gate_activity cannot resolve the relative classifier_agent ref, so a "
-    "branching workflow diverges from the native runner's chosen-branch traversal. "
-    "Real Phase-1 gap (ADR 055 D7); not papered over."
-)
-
 _FIXTURES: tuple[_Fixture, ...] = (
     # --- backends agree: linear shapes -----------------------------------
     _Fixture(
@@ -475,34 +474,35 @@ _FIXTURES: tuple[_Fixture, ...] = (
         initial_state={"request": "decompose me"},
         label="ok",
     ),
-    # --- backends diverge: branching shapes (documented xfail) -----------
+    # --- backends agree: branching shapes --------------------------------
+    # The Temporal compiler now emits REAL branching for GATE/INTENT_ROUTER
+    # nodes (TemporalCompiler._emit_gate_node → a dispatch loop that follows
+    # routes[label]/fallback) and call_gate_activity resolves the relative
+    # classifier ref against the baked-in workflow dir, so these match the
+    # native runner's chosen-branch traversal node-for-node (ADR 055 D7).
     _Fixture(
         name="gate_router",
         builder=_scaffold_gate_router,
         initial_state={"text": "hello"},
         label="high",
-        xfail_reason=_NO_BRANCH,
     ),
     _Fixture(
         name="goal_oriented",
         builder=_packaged("pattern_goal_oriented"),
         initial_state={"goal": "ship it"},
         label="continue",
-        xfail_reason=_NO_BRANCH,
     ),
     _Fixture(
         name="monitor",
         builder=_packaged("pattern_monitor"),
         initial_state={"signal": "5xx spiking"},
         label="breach",
-        xfail_reason=_NO_BRANCH,
     ),
     _Fixture(
         name="simulation",
         builder=_packaged("pattern_simulation"),
         initial_state={"scenario": "negotiate"},
         label="continue",
-        xfail_reason=_NO_BRANCH,
     ),
 )
 
@@ -586,6 +586,8 @@ async def _run_temporal(
                 call_skill_activity,
                 call_gate_activity,
                 call_judge_activity,
+                call_human_activity,
+                persist_workflow_result_activity,
             ],
             workflow_runner=UnsandboxedWorkflowRunner(),
         ),
@@ -615,12 +617,12 @@ async def test_native_temporal_conformance(fixture: _Fixture, tmp_path: Path) ->
     normalize the documented backend metadata (the empty Temporal ``runs`` list
     + the stamped ``tenant_id``).
 
-    Fixtures carrying ``xfail_reason`` are KNOWN Phase-1 divergences (branching
-    workflows — the compiler emits gates linearly and the gate activity cannot
-    resolve a relative classifier ref). They are marked ``xfail(strict=True)``
-    (see :func:`_param`) so the comparison below STILL RUNS and is expected to
-    fail today; the suite stays green, and a strict XPASS the moment the gap
-    closes forces this suite to be updated.
+    All fixtures — linear AND branching — are expected to pass: the Temporal
+    compiler now emits real branching for GATE/INTENT_ROUTER nodes and the gate
+    activity resolves the relative classifier ref, so native==temporal on the
+    whole shared subset. A fixture given an ``xfail_reason`` (none today) would
+    be marked ``xfail(strict=True)`` (see :func:`_param`) so a *future*
+    divergence stays green while open and reports a failing XPASS once closed.
     """
     yaml_path = fixture.builder(tmp_path)
 

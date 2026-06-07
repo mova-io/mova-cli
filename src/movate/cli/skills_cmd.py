@@ -1,6 +1,6 @@
 """``mdk skills`` — operator commands for the skill registry.
 
-Six subcommands:
+Seven subcommands:
 
 * ``mdk skills list`` — print every skill in the project's ``skills/``
   folder. Defaults to the current directory; pass ``--project``
@@ -20,6 +20,9 @@ Six subcommands:
   capabilities, cost, usage example.
 * ``mdk skills validate [<agent>]`` — validate declared skills are
   compatible with the agent(s) that use them.
+* ``mdk skills add-mcp <server-url-or-command>`` — register an MCP
+  server as a skill in one command. Auto-discovers tools via
+  ``tools/list`` and scaffolds a ``skills/<name>/skill.yaml``.
 """
 
 from __future__ import annotations
@@ -79,6 +82,8 @@ def _register_skill_backends() -> None:
         importlib.import_module("movate.core.skill_backend.mcp")
     with contextlib.suppress(ImportError):
         importlib.import_module("movate.core.skill_backend.agent")
+    with contextlib.suppress(ImportError):
+        importlib.import_module("movate.core.skill_backend.exec")
 
 
 console = Console()
@@ -100,6 +105,9 @@ skills_app = typer.Typer(
 # are usually testing slow HTTP skills here and the alternative is
 # baking it into a flag that nobody passes.
 _DEFAULT_SKILL_RUN_TIMEOUT_MS = 60_000
+
+# Max tools shown in the add-mcp summary line.
+_TOOLS_PREVIEW_MAX = 5
 
 
 # ---------------------------------------------------------------------------
@@ -1096,3 +1104,240 @@ async def _remote_skills_attach(
         success(f"attached skill {ref} to agent {agent}")
     else:
         hint(f"[dim]{ref} was already attached to {agent}[/dim]")
+
+
+# `mdk skills add-mcp <server-url-or-command>`
+# ---------------------------------------------------------------------------
+
+
+def _derive_skill_name(entry: str) -> str:
+    """Derive a reasonable skill name from an MCP server entry.
+
+    For URLs: use the hostname minus TLD (``mcp.github.com`` → ``github``).
+    For commands: use the last path or package component
+    (``npx -y @modelcontextprotocol/server-github`` → ``github``).
+    """
+    lower = entry.lower()
+    if lower.startswith("http://") or lower.startswith("https://"):
+        from urllib.parse import urlparse  # noqa: PLC0415
+
+        parsed = urlparse(entry)
+        parts = parsed.hostname.split(".") if parsed.hostname else ["mcp"]
+        # Pick the most meaningful part (skip www, mcp, api prefixes).
+        for p in parts:
+            if p not in {"www", "mcp", "api", "com", "org", "io", "net"}:
+                return re.sub(r"[^a-z0-9-]", "-", p).strip("-") or "mcp-server"
+        return "mcp-server"
+
+    # Shell command: take the last meaningful token.
+    import shlex  # noqa: PLC0415
+
+    try:
+        tokens = shlex.split(entry)
+    except ValueError:
+        tokens = entry.split()
+
+    min_name_len = 2
+
+    # Walk tokens backwards looking for a package-like name.
+    for raw_token in reversed(tokens):
+        if raw_token.startswith("-"):
+            continue
+        # npm scoped package: @scope/server-name → name
+        candidate = raw_token.rsplit("/", 1)[-1] if "/" in raw_token else raw_token
+        # Strip common prefixes.
+        for prefix in ("server-", "mcp-server-", "mcp-"):
+            if candidate.startswith(prefix):
+                candidate = candidate[len(prefix) :]
+                break
+        cleaned = re.sub(r"[^a-z0-9-]", "-", candidate.lower()).strip("-")
+        if cleaned and len(cleaned) >= min_name_len:
+            return cleaned
+
+    return "mcp-server"
+
+
+@skills_app.command("add-mcp")
+def add_mcp(
+    entry: str = typer.Argument(
+        ...,
+        help=(
+            "MCP server URL (https://...) or subprocess command "
+            "(e.g. 'npx -y @modelcontextprotocol/server-github')."
+        ),
+    ),
+    name: str | None = typer.Option(
+        None,
+        "--name",
+        "-n",
+        help="Override the auto-derived skill name.",
+    ),
+    tool: str | None = typer.Option(
+        None,
+        "--tool",
+        "-t",
+        help="Restrict to a single tool (single-tool mode). Omit for multi-tool.",
+    ),
+    project: Path = typer.Option(
+        Path("."),
+        "--project",
+        "-p",
+        help="Project root. The skill lands at ``<project>/skills/<name>/``.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Overwrite ``skills/<name>/`` if it already exists.",
+    ),
+) -> None:
+    """Register an MCP server as a skill in one command.
+
+    Connects to the server, discovers available tools via ``tools/list``,
+    and scaffolds a ``skills/<name>/skill.yaml`` with ``kind: mcp``.
+    When ``--tool`` is omitted, creates a multi-tool skill that exposes
+    ALL tools from the server as namespaced callables.
+
+    [bold]Examples:[/bold]
+
+      [dim]# stdio server — multi-tool[/dim]
+      $ mdk skills add-mcp 'npx -y @modelcontextprotocol/server-github'
+
+      [dim]# HTTP/SSE server — multi-tool[/dim]
+      $ mdk skills add-mcp https://mcp.example.com/api
+
+      [dim]# single tool only[/dim]
+      $ mdk skills add-mcp 'npx -y @modelcontextprotocol/server-github' --tool create_issue
+
+      [dim]# custom name[/dim]
+      $ mdk skills add-mcp https://mcp.slack.com --name slack-mcp
+    """
+    _register_skill_backends()
+
+    skill_name = name or _derive_skill_name(entry)
+    # Validate the name matches skill naming rules.
+    if not re.match(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$", skill_name):
+        err_console.print(
+            f"[red]✗ derived skill name {skill_name!r} is invalid.[/red] "
+            "Use --name to specify a valid name (lowercase, hyphens, min 2 chars)."
+        )
+        raise typer.Exit(code=2)
+
+    dest = (project / "skills" / skill_name).resolve()
+    if dest.exists() and not force:
+        err_console.print(f"[red]✗[/red] {dest} already exists (pass --force to overwrite)")
+        raise typer.Exit(code=2)
+
+    # Discover tools from the server.
+    console.print(f"[dim]connecting to MCP server: {entry}[/dim]")
+
+    from movate.core.skill_backend.mcp import MCPSkillBackend  # noqa: PLC0415
+
+    backend = MCPSkillBackend()
+    try:
+        discovered = asyncio.run(backend.discover_tools(entry, skill_name))
+    except SkillError as exc:
+        err_console.print(f"[red]✗ failed to connect to MCP server:[/red] {exc.message}")
+        raise typer.Exit(code=2) from None
+    finally:
+        asyncio.run(backend.aclose())
+
+    if not discovered:
+        err_console.print("[red]✗ server reported zero tools.[/red]")
+        raise typer.Exit(code=2)
+
+    tool_names = [t["name"] for t in discovered if isinstance(t.get("name"), str)]
+
+    # If --tool is specified, validate it exists.
+    if tool and tool not in tool_names:
+        err_console.print(
+            f"[red]✗ tool {tool!r} not found on server.[/red] Available: {sorted(tool_names)}"
+        )
+        raise typer.Exit(code=2)
+
+    # Show discovered tools.
+    table = Table(title="discovered MCP tools", show_header=True, header_style="bold")
+    table.add_column("tool", style="bold")
+    table.add_column("description", overflow="fold")
+    for t in discovered:
+        t_name = t.get("name", "?")
+        t_desc = t.get("description", "")
+        t_desc = t_desc.strip().split("\n")[0][:120] if isinstance(t_desc, str) else ""
+        marker = " [green]*[/green]" if (tool and t_name == tool) else ""
+        table.add_row(f"{t_name}{marker}", t_desc)
+    console.print(table)
+
+    # Scaffold the skill directory.
+    if dest.exists() and force:
+        import shutil  # noqa: PLC0415
+
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Build skill.yaml content.
+    mode_comment = (
+        "# Multi-tool mode: all tools from this server are exposed as\n"
+        f"# namespaced callables ({skill_name}.<tool-name>).\n"
+        "# Add 'tool: <name>' to restrict to a single tool.\n"
+        if not tool
+        else f"# Single-tool mode: only the '{tool}' tool is exposed.\n"
+    )
+    tool_line = f"  tool: {tool}\n" if tool else ""
+
+    # For multi-tool mode, use permissive schemas (any object in/out)
+    # since different tools have different schemas.
+    # For single-tool mode, try to use the tool's actual input schema.
+    if tool:
+        # Find the specific tool's inputSchema if available.
+        tool_desc = next((t for t in discovered if t.get("name") == tool), {})
+        input_schema_raw = tool_desc.get("inputSchema")
+        if isinstance(input_schema_raw, dict) and input_schema_raw.get("properties"):
+            # Convert to shorthand: {prop: type, ...}
+            props = input_schema_raw.get("properties", {})
+            shorthand_parts = []
+            for prop_name, prop_def in props.items():
+                prop_type = "string"
+                if isinstance(prop_def, dict):
+                    prop_type = prop_def.get("type", "string")
+                shorthand_parts.append(f"{prop_name}: {prop_type}")
+            input_schema = "{" + ", ".join(shorthand_parts) + "}"
+        else:
+            input_schema = "{}"
+        output_schema = "{}"
+    else:
+        # Multi-tool: use __tool__ + permissive.
+        input_schema = "{__tool__: string}"
+        output_schema = "{}"
+
+    yaml_content = (
+        f"api_version: movate/v1\n"
+        f"kind: Skill\n"
+        f"name: {skill_name}\n"
+        f"version: 0.1.0\n"
+        f"description: 'MCP server: {entry}'\n"
+        f"schema:\n"
+        f"  input: {input_schema}\n"
+        f"  output: {output_schema}\n"
+        f"{mode_comment}"
+        f"implementation:\n"
+        f"  kind: mcp\n"
+        f"  entry: '{entry}'\n"
+        f"{tool_line}"
+        f"side_effects: network\n"
+        f"tags:\n"
+        f"  - mcp\n"
+    )
+    (dest / "skill.yaml").write_text(yaml_content)
+
+    console.print(
+        f"[green]✓[/green] registered MCP skill [bold]{skill_name}[/bold] at [bold]{dest}[/bold]"
+    )
+    if tool:
+        console.print(f"  mode: single-tool ({tool})")
+    else:
+        console.print(
+            f"  mode: multi-tool ({len(tool_names)} tools: "
+            f"{', '.join(sorted(tool_names)[:_TOOLS_PREVIEW_MAX])}"
+            f"{'...' if len(tool_names) > _TOOLS_PREVIEW_MAX else ''})"
+        )
+    console.print(f"\nNext: add [bold]{skill_name}[/bold] to your agent.yaml:")
+    console.print(f"  skills:\n    - {skill_name}")

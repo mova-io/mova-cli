@@ -361,7 +361,9 @@ async def _run_temporal_worker(
     from movate.providers.pricing import load_pricing  # noqa: PLC0415
     from movate.runtime.registry import scan_workflows  # noqa: PLC0415
     from movate.runtime.workflow_backend import (  # noqa: PLC0415
+        DEFAULT_TASK_QUEUE,
         WorkflowBackendError,
+        _resolve_temporal_connection,
         require_backend_available,
         run_temporal_worker,
     )
@@ -396,12 +398,33 @@ async def _run_temporal_worker(
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
+    # Resolve connection details for the startup banner (ADR 054 D8/D12).
+    # require_backend_available already validated; this is a cheap re-resolve.
+    conn = _resolve_temporal_connection()
+    # Mirror the activities registered by run_temporal_worker() in
+    # workflow_backend.py — keep this banner list in sync with that worker's
+    # activities=[...] so the startup banner doesn't under-report what's wired.
+    activity_names = [
+        "call_agent_activity",
+        "call_skill_activity",
+        "call_gate_activity",
+        "call_judge_activity",
+        "call_human_activity",
+        "persist_workflow_result_activity",
+    ]
+
     if temporal_wfs:
         success(f"{len(temporal_wfs)} temporal workflow(s) registering:")
         for name in sorted(temporal_wfs):
             err.print(f"  - {name}")
+    hint(f"[dim]host: {conn.host}[/dim]")
+    hint(f"[dim]namespace: {conn.namespace}[/dim]")
+    hint(f"[dim]task queue: {DEFAULT_TASK_QUEUE}[/dim]")
+    hint(f"[dim]tls: {'yes (' + conn.tls_cert_path + ')' if conn.tls_cert_path else 'no'}[/dim]")
+    hint(f"[dim]activities: {', '.join(activity_names)}[/dim]")
     err.print(
         f"[bold]movate worker[/bold] (temporal) — tenant={tenant_id or '<all>'} "
+        f"host={conn.host} ns={conn.namespace} queue={DEFAULT_TASK_QUEUE} "
         f"workflows={len(temporal_wfs)} — waiting for Temporal workflow tasks"
     )
     try:

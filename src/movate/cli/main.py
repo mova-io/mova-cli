@@ -239,6 +239,7 @@ from movate.cli.snapshot_cmd import snapshot_app  # noqa: E402
 from movate.cli.teams_bot import teams_bot_app  # noqa: E402
 from movate.cli.templates_cmd import app as templates_app  # noqa: E402
 from movate.cli.tenants import tenants_app  # noqa: E402
+from movate.cli.tools_cmd import tools_app  # noqa: E402
 from movate.cli.trace import trace_app  # noqa: E402
 from movate.cli.voice_cmd import voice_app  # noqa: E402
 from movate.cli.webhooks_cmd import webhooks_app  # noqa: E402
@@ -433,6 +434,10 @@ import_app.command("state")(import_state_cmd)
 app.add_typer(import_app, name="import", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(scaffold_app, name="scaffold", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(skills_app, name="skills", rich_help_panel=PANEL_DEVELOP)
+# `tools` surfaces the shared tool registry (ADR 052) — list, inspect,
+# publish, and resolve tool descriptors. Lives next to `skills` since both
+# answer "what capabilities can my agent use?".
+app.add_typer(tools_app, name="tools", rich_help_panel=PANEL_DEVELOP)
 app.add_typer(templates_app, name="templates", rich_help_panel=PANEL_DEVELOP)
 # `patterns` surfaces the governed agent-pattern templates (ADR 038) that
 # `mdk init --pattern <name>` scaffolds.

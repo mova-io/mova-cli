@@ -89,6 +89,41 @@ def test_full_view_shape(client: TestClient, read_auth) -> None:
     assert body["extras_installed"] is not None
 
 
+def test_full_view_resources_reflect_route_table(client: TestClient, read_auth) -> None:
+    """The ``resources`` block enumerates the manageable surface, derived from
+    the live route table — agents/projects/kb are fully managed, skills is
+    create-only (``managed: false``), and contexts is absent until its API
+    ships (ADR 060)."""
+    header, _ = read_auth
+    body = client.get("/api/v1/capabilities", headers=header).json()
+
+    resources = body["resources"]
+    assert resources is not None
+    by_name = {r["name"]: r for r in resources}
+
+    # Agents / projects / KB are fully managed here.
+    for name in ("agents", "projects", "kb"):
+        assert name in by_name, f"{name} missing from resources"
+        assert by_name[name]["managed"] is True
+        assert by_name[name]["path"].startswith("/api/v1/")
+        assert by_name[name]["operations"]  # non-empty
+
+    # Skills exists but is create-only on this build → managed=false, and the
+    # honest operation list reflects exactly that.
+    assert by_name["skills"]["operations"] == ["create"]
+    assert by_name["skills"]["managed"] is False
+
+    # Contexts has no API on this build → omitted entirely (not promised).
+    assert "contexts" not in by_name
+
+
+def test_minimal_view_omits_resources(client: TestClient) -> None:
+    """The unauthenticated minimal probe carries no ``resources`` block."""
+    body = client.get("/api/v1/capabilities").json()
+    assert body["minimal"] is True
+    assert body["resources"] is None
+
+
 def test_full_view_models_match_catalog(client: TestClient, read_auth) -> None:
     header, _ = read_auth
     body = client.get("/api/v1/capabilities", headers=header).json()
@@ -247,6 +282,44 @@ def test_features_true_when_route_registered(client: TestClient, read_auth) -> N
     assert feats["workflows_api"] is True
     assert feats["provider_keys"] is True
     assert feats["batch_runs"] is True
+    # ADR 050 D2 — the one-shot REST voice surface is advertised distinctly from
+    # the WS ``voice`` transport (both are wired on the real runtime).
+    assert feats["voice"] is True
+    assert feats["voice_rest"] is True
+    # ADR 045 D13 — run replay / time-travel is wired on the real runtime.
+    assert feats["run_replay"] is True
+
+
+def test_voice_rest_flag_flips_with_route_table() -> None:
+    """``voice_rest`` is route-detected: absent on a bare app, True once the
+    one-shot POST /agents/{name}/voice APIRoute is registered (ADR 050 D2)."""
+    bare = FastAPI()
+    assert detect_features(bare)["voice_rest"] is False
+
+    router = APIRouter()
+
+    @router.post("/agents/{name}/voice")
+    async def _voice() -> dict[str, str]:  # pragma: no cover - never called
+        return {}
+
+    bare.include_router(router)
+    assert detect_features(bare)["voice_rest"] is True
+
+
+def test_run_replay_flag_flips_with_route_table() -> None:
+    """``run_replay`` is route-detected: absent on a bare app, True once the
+    POST /runs/{run_id}/replay APIRoute is registered (ADR 045 D13)."""
+    bare = FastAPI()
+    assert detect_features(bare)["run_replay"] is False
+
+    router = APIRouter()
+
+    @router.post("/runs/{run_id}/replay")
+    async def _replay() -> dict[str, str]:  # pragma: no cover - never called
+        return {}
+
+    bare.include_router(router)
+    assert detect_features(bare)["run_replay"] is True
 
 
 def test_feature_flag_flips_with_route_table() -> None:

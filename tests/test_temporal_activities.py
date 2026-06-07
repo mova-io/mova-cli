@@ -264,17 +264,28 @@ async def test_call_agent_activity_tenant_from_state(monkeypatch: pytest.MonkeyP
 @pytest.mark.unit
 async def test_call_gate_activity_returns_decision(monkeypatch: pytest.MonkeyPatch) -> None:
     _configure(monkeypatch)
-    bundle = _FakeBundle(name="turn-judge", properties={"transcript": {"type": "string"}})
+    bundle = _FakeBundle(name="turn-judge", properties={"text": {"type": "string"}})
     fake_exec = _FakeExecutor(_ok_response({"label": "resolved"}))
     monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
     monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
 
     decision = await ta.call_gate_activity(
-        "turn-gate-1", "/agents/turn-judge", {"transcript": "..."}, "run-1"
+        "turn-gate-1",
+        "/agents/turn-judge",
+        {"transcript": "the dialogue"},
+        "run-1",
+        "",
+        "transcript",
+        ["continue", "resolved"],
     )
     # The classifier's decision dict (carrying "label") is returned verbatim.
     assert decision == {"label": "resolved"}
-    assert fake_exec.calls[0]["input"] == {"transcript": "..."}
+    # The classifier sees the native-runner input shape: the input_field value
+    # mapped to "text" + the route labels (NOT a raw state projection).
+    assert fake_exec.calls[0]["input"] == {
+        "text": "the dialogue",
+        "labels": ["continue", "resolved"],
+    }
 
 
 @pytest.mark.unit

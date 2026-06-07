@@ -26,7 +26,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from movate.core.tool_registry.models import ToolDescriptor
 
 from movate.core.dr_backup import ImportResult
 from movate.core.eval_generator import EvalGenerationJob
@@ -92,6 +95,27 @@ class EvalCommitResult:
     dataset_path: str
     cases_added: int
     judge_yaml_updated: bool
+
+
+@dataclass(frozen=True)
+class RunSubmissionRecord:
+    """A persisted run-submission dedup row (item 37).
+
+    Returned by :meth:`StorageProvider.get_run_submission_record`. Carries the
+    ``job_id`` the first submission enqueued plus the ``request_hash`` — a
+    canonical fingerprint of that submission's payload — so the submit endpoint
+    can tell apart *"the same retry"* (return the prior job) from *"the same key
+    reused for a DIFFERENT payload"* (a 409 conflict; never silently return the
+    wrong run).
+
+    ``request_hash`` is ``None`` for rows recorded before the fingerprint
+    column existed (legacy / mixed-version fleets). A ``None`` fingerprint means
+    *"unknown"* — the endpoint skips the conflict check and returns the prior
+    job, preserving byte-for-byte the pre-guard behavior.
+    """
+
+    job_id: str
+    request_hash: str | None
 
 
 class StorageProvider(Protocol):
@@ -470,8 +494,26 @@ class StorageProvider(Protocol):
         first time we've seen this key for this tenant.
         """
 
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        """Return the full dedup row (``job_id`` + ``request_hash``) or ``None``.
+
+        Keyed by ``(tenant_id, idempotency_key)``. ``None`` means first-seen for
+        this tenant. The ``request_hash`` (item 37 payload-conflict guard) lets
+        the submit endpoint distinguish a genuine retry from a key reused for a
+        different payload (→ 409). ``request_hash`` is ``None`` on legacy rows
+        recorded before the fingerprint column existed → "unknown" → no
+        conflict raised (back-compat). Complements :meth:`get_run_submission`,
+        which stays job-id-only for callers that don't need the fingerprint.
+        """
+
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         """Record that ``idempotency_key`` for ``tenant_id`` enqueued ``job_id``.
 
@@ -480,6 +522,12 @@ class StorageProvider(Protocol):
         winner rather than recording two jobs. Returns ``True`` if this call
         inserted the row, ``False`` if a row already existed (the existing
         ``job_id`` is preserved — never overwritten).
+
+        ``request_hash`` (item 37 payload-conflict guard) is an optional
+        canonical fingerprint of the submitted payload, stored so a later submit
+        reusing the same key with a DIFFERENT payload can be rejected with a
+        409. ``None`` (the default) stores no fingerprint — back-compatible with
+        callers / fleets that predate the guard.
         """
 
     # ------------------------------------------------------------------
@@ -2541,5 +2589,64 @@ class StorageProvider(Protocol):
         different tenant — same 404-not-403 contract as the other
         single-record getters, so a caller can't probe for the existence
         of another tenant's diagnoses."""
+
+    # ------------------------------------------------------------------
+    # Tool registry (ADR 052) -- shared, versioned, governed tool
+    # descriptors. Additive new table ``tool_descriptors``, keyed by
+    # ``(name, version, scope, tenant_id)``. Phase 1: CRUD + list/filter;
+    # the sync protocol for ``movate``-tier tools defers to a follow-up.
+    # ------------------------------------------------------------------
+
+    async def save_tool_descriptor(
+        self,
+        descriptor: ToolDescriptor,
+    ) -> None:
+        """Upsert one tool descriptor keyed by ``(name, version, scope, tenant_id)``.
+
+        Re-publishing the same ``(name, version)`` in the same scope + tenant
+        overwrites the prior row (last write wins). Used by the publish
+        endpoint and ``mdk tools publish``.
+        """
+
+    async def get_tool_descriptor(
+        self,
+        name: str,
+        version: str | None,
+        scope: str,
+        tenant_id: str,
+    ) -> ToolDescriptor | None:
+        """Fetch one tool descriptor.
+
+        ``version=None`` returns the **latest** version (newest ``updated_at``)
+        for ``(name, scope, tenant_id)``; an explicit ``version`` returns that
+        exact version. Returns ``None`` if no match -- same no-leak contract as
+        the other single-record getters.
+        """
+
+    async def list_tool_descriptors(
+        self,
+        scope: str | None,
+        tenant_id: str,
+        tags: list[str] | None,
+    ) -> list[ToolDescriptor]:
+        """List tool descriptors, optionally filtered by scope and/or tags.
+
+        ``scope=None`` lists across all scopes visible to the tenant
+        (project + tenant + movate). ``tags`` filters to descriptors
+        containing ALL specified tags. Ordered by name ASC, version DESC.
+        """
+
+    async def delete_tool_descriptor(
+        self,
+        name: str,
+        version: str,
+        scope: str,
+        tenant_id: str,
+    ) -> bool:
+        """Delete one tool descriptor by ``(name, version, scope, tenant_id)``.
+
+        Returns ``True`` if a row was deleted, ``False`` if none matched.
+        Tenant-scoped: a wrong-tenant delete is a no-op.
+        """
 
     async def close(self) -> None: ...

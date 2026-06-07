@@ -80,6 +80,66 @@ VOICE_KEY_ENV_VARS: tuple[str, ...] = (
     "AZURE_SPEECH_REGION",
 )
 
+# Telephony-provider env vars (ADR 074, the ``[telephony]`` extra). Set via
+# ``mdk auth login twilio`` (or by hand) and consumed by the Twilio transport
+# in ``movate.voice.transports.twilio``. Kept SEPARATE from VOICE_KEY_ENV_VARS
+# because telephony is a transport concern, not a speech-adapter concern --
+# but they need the same autoload-from-credentials-file treatment.
+TELEPHONY_KEY_ENV_VARS: tuple[str, ...] = (
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+)
+
+# Enterprise connector env vars (ADR 052 Phase 1 — Action Fabric).
+# Set via ``mdk auth login servicenow`` / ``msgraph`` (or by hand) and
+# consumed by the HTTP skill backend when dispatching connector skills.
+# ServiceNow needs an API key + instance URL; Microsoft Graph needs an
+# access token + tenant ID.
+CONNECTOR_KEY_ENV_VARS: tuple[str, ...] = (
+    "SERVICENOW_API_KEY",
+    "SERVICENOW_INSTANCE_URL",
+    "MSGRAPH_ACCESS_TOKEN",
+    "MSGRAPH_TENANT_ID",
+)
+
+# Temporal connection (ADR 054) — host + namespace + optional TLS cert/key for
+# Temporal Cloud; reads from ~/.movate/credentials via ``mdk auth login
+# temporal``. Same BYOK seam as every other provider credential (ADR 054 D8) —
+# distinct from LLM keys because Temporal is a workflow BACKEND, not an LLM
+# provider, so it lives in its own group (kept out of PROVIDER_KEY_ENV_VARS so
+# ``_has_any_provider_key`` still answers "can this machine run a text agent?"
+# correctly). The TLS pair is only required for Temporal Cloud; self-hosted
+# (``temporal server start-dev`` locally, AKS, docker-compose) leaves them
+# unset. All four go through the standard autoload-from-credentials-file
+# pipeline so operators don't re-export each shell.
+TEMPORAL_KEY_ENV_VARS: tuple[str, ...] = (
+    "TEMPORAL_HOST",
+    "TEMPORAL_NAMESPACE",
+    "TEMPORAL_TLS_CERT",
+    "TEMPORAL_TLS_KEY",
+    # Set via ``mdk auth login workday`` / ``salesforce`` / ``sap`` (or by hand)
+    # and consumed by the HTTP skill backend when dispatching connector skills.
+    # Each connector needs a bearer token/API key + a routing URL.
+    "WORKDAY_ACCESS_TOKEN",
+    "WORKDAY_BASE_URL",
+    "SALESFORCE_ACCESS_TOKEN",
+    "SALESFORCE_INSTANCE_URL",
+    "SAP_API_KEY",
+    "SAP_BASE_URL",
+)
+
+# Neo4j graph adapter env vars (opt-in [neo4j] extra). Set via
+# ``mdk auth login neo4j`` (or by hand) and consumed by the Neo4j
+# storage adapter when ``MOVATE_GRAPH_BACKEND=neo4j`` is configured.
+# ``NEO4J_URI`` is the bolt:// or neo4j:// connection string;
+# ``NEO4J_USER`` + ``NEO4J_PASSWORD`` are the auth pair. Separate from
+# PROVIDER_KEY_ENV_VARS (those are LLM keys, not graph-DB keys).
+NEO4J_KEY_ENV_VARS: tuple[str, ...] = (
+    "NEO4J_URI",
+    "NEO4J_USER",
+    "NEO4J_PASSWORD",
+)
+
 # Every env var the credentials store should autoload. Union of the
 # groups above; surfaced as a constant so `autoload_credentials`
 # and any future "what does mdk track?" enumeration agree on the
@@ -89,6 +149,10 @@ ALL_AUTOLOADED_ENV_VARS: tuple[str, ...] = (
     *NOTIFICATION_KEY_ENV_VARS,
     *OBSERVABILITY_KEY_ENV_VARS,
     *VOICE_KEY_ENV_VARS,
+    *TELEPHONY_KEY_ENV_VARS,
+    *CONNECTOR_KEY_ENV_VARS,
+    *TEMPORAL_KEY_ENV_VARS,
+    *NEO4J_KEY_ENV_VARS,
 )
 
 

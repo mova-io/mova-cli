@@ -25,9 +25,12 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
+
+if TYPE_CHECKING:
+    from movate.storage.base import RunSubmissionRecord
 
 from movate.core.dr_backup import ImportResult
 from movate.core.events import Event
@@ -703,8 +706,16 @@ CREATE TABLE IF NOT EXISTS run_submissions (
     idempotency_key TEXT NOT NULL,
     job_id          TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL,
+    request_hash    TEXT,
     PRIMARY KEY (tenant_id, idempotency_key)
 );
+-- item 37 (payload-conflict guard): nullable canonical-payload fingerprint.
+-- A repeat submit reusing an Idempotency-Key with a DIFFERENT payload must 409
+-- rather than silently dedup to the original job. NULL on rows recorded before
+-- this column existed → "fingerprint unknown" → the app skips the conflict
+-- check and returns the prior job, so the upgrade is byte-for-byte
+-- back-compatible. Idempotent ADD COLUMN IF NOT EXISTS.
+ALTER TABLE run_submissions ADD COLUMN IF NOT EXISTS request_hash TEXT;
 
 -- ADR 016 D3: canary / champion-challenger rollout. One row per (tenant,
 -- agent): a challenger version + a traffic weight (0 = kill switch), with an
@@ -752,6 +763,11 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_version TEXT;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS paused_node_id TEXT;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS paused_state JSONB;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS human_task JSONB;
+-- ADR 062 D2: which backend owns this run. NULL on pre-migration / native rows
+-- → None → the resume-on-signal endpoint defaults to the native re-walk; only
+-- 'temporal' routes the resume to a Temporal signal. Additive + nullable, same
+-- backward-compatible story as the paused_* columns above.
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS runtime TEXT;
 
 -- ADR 017 D5 (PR 2): resume-on-signal. The signal endpoint enqueues a
 -- JobKind.WORKFLOW continuation job carrying the workflow_run_id to resume
@@ -1190,6 +1206,36 @@ CREATE TABLE IF NOT EXISTS session_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_session_messages_session
     ON session_messages(session_id, tenant_id, created_at);
+
+-- ADR 050 D1 — voice-as-run parity: voice-specific columns on runs.
+-- All nullable (NULL for text runs); additive, no backfill needed.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS modality TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS stt_latency_ms DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS tts_latency_ms DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS audio_duration_s DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS stt_cost_usd DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS tts_cost_usd DOUBLE PRECISION;
+-- ADR 052: tool registry descriptors. Additive + idempotent.
+CREATE TABLE IF NOT EXISTS tool_descriptors (
+    name            TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    scope           TEXT NOT NULL DEFAULT 'tenant',
+    tenant_id       TEXT NOT NULL,
+    project_id      TEXT,
+    description     TEXT NOT NULL DEFAULT '',
+    tags            JSONB NOT NULL DEFAULT '[]',
+    input_schema    JSONB NOT NULL DEFAULT '{}',
+    output_schema   JSONB NOT NULL DEFAULT '{}',
+    backend         JSONB NOT NULL DEFAULT '{}',
+    credentials_ref TEXT,
+    governance      JSONB NOT NULL DEFAULT '{}',
+    owner           TEXT,
+    created_at      TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ,
+    PRIMARY KEY (name, version, scope, tenant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tool_descriptors_scope_tenant
+    ON tool_descriptors(scope, tenant_id);
 """
 
 
@@ -1417,6 +1463,135 @@ class PostgresProvider:
             raise RuntimeError("PostgresProvider.init() not called")
         return self._pool
 
+    # ------------------------------------------------------------------
+    # Tool registry (ADR 052)
+    # ------------------------------------------------------------------
+
+    async def save_tool_descriptor(self, descriptor: Any) -> None:
+        pool = self._db
+        scope_val = (
+            descriptor.scope if isinstance(descriptor.scope, str) else descriptor.scope.value
+        )
+        backend_data = (
+            descriptor.backend.model_dump()
+            if hasattr(descriptor.backend, "model_dump")
+            else descriptor.backend
+        )
+        governance_data = (
+            descriptor.governance.model_dump()
+            if hasattr(descriptor.governance, "model_dump")
+            else descriptor.governance
+        )
+        await pool.execute(
+            """INSERT INTO tool_descriptors
+               (name, version, scope, tenant_id, project_id, description,
+                tags, input_schema, output_schema, backend, credentials_ref,
+                governance, owner, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+               ON CONFLICT (name, version, scope, tenant_id)
+               DO UPDATE SET
+                 description = EXCLUDED.description,
+                 tags = EXCLUDED.tags,
+                 input_schema = EXCLUDED.input_schema,
+                 output_schema = EXCLUDED.output_schema,
+                 backend = EXCLUDED.backend,
+                 credentials_ref = EXCLUDED.credentials_ref,
+                 governance = EXCLUDED.governance,
+                 owner = EXCLUDED.owner,
+                 project_id = EXCLUDED.project_id,
+                 updated_at = EXCLUDED.updated_at""",
+            descriptor.name,
+            descriptor.version,
+            scope_val,
+            descriptor.tenant_id,
+            descriptor.project_id,
+            descriptor.description,
+            json.dumps(descriptor.tags),
+            json.dumps(descriptor.input_schema),
+            json.dumps(descriptor.output_schema),
+            json.dumps(backend_data),
+            descriptor.credentials_ref,
+            json.dumps(governance_data),
+            descriptor.owner,
+            descriptor.created_at,
+            descriptor.updated_at,
+        )
+
+    async def get_tool_descriptor(
+        self,
+        name: str,
+        version: str | None,
+        scope: str,
+        tenant_id: str,
+    ) -> Any | None:
+        pool = self._db
+        if version is not None:
+            row = await pool.fetchrow(
+                "SELECT * FROM tool_descriptors"
+                " WHERE name = $1 AND version = $2 AND scope = $3 AND tenant_id = $4",
+                name,
+                version,
+                scope,
+                tenant_id,
+            )
+        else:
+            row = await pool.fetchrow(
+                "SELECT * FROM tool_descriptors"
+                " WHERE name = $1 AND scope = $2 AND tenant_id = $3"
+                " ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+                name,
+                scope,
+                tenant_id,
+            )
+        if row is None:
+            return None
+        return _pg_row_to_tool_descriptor(row)
+
+    async def list_tool_descriptors(
+        self,
+        scope: str | None,
+        tenant_id: str,
+        tags: list[str] | None,
+    ) -> list[Any]:
+        pool = self._db
+        if scope is not None:
+            rows = await pool.fetch(
+                "SELECT * FROM tool_descriptors"
+                " WHERE scope = $1 AND tenant_id = $2"
+                " ORDER BY name ASC, version DESC",
+                scope,
+                tenant_id,
+            )
+        else:
+            rows = await pool.fetch(
+                "SELECT * FROM tool_descriptors"
+                " WHERE tenant_id = $1 OR scope = 'movate'"
+                " ORDER BY name ASC, version DESC",
+                tenant_id,
+            )
+        result = [_pg_row_to_tool_descriptor(r) for r in rows]
+        if tags:
+            result = [d for d in result if all(t in d.tags for t in tags)]
+        return result
+
+    async def delete_tool_descriptor(
+        self,
+        name: str,
+        version: str,
+        scope: str,
+        tenant_id: str,
+    ) -> bool:
+        pool = self._db
+        status = await pool.execute(
+            "DELETE FROM tool_descriptors"
+            " WHERE name = $1 AND version = $2 AND scope = $3 AND tenant_id = $4",
+            name,
+            version,
+            scope,
+            tenant_id,
+        )
+        return bool(status.endswith("1"))
+
     async def close(self) -> None:
         if self._pool is not None:
             await self._pool.close()
@@ -1622,17 +1797,31 @@ class PostgresProvider:
     # ------------------------------------------------------------------
 
     async def save_run(self, run: RunRecord) -> None:
+        # ON CONFLICT DO UPDATE so the voice-parity handler (ADR 050 D1) can
+        # re-save a RunRecord with voice-specific fields after the Executor's
+        # initial insert. The UPDATE SET list covers only the voice-additive
+        # columns — the Executor-written columns are untouched on conflict.
         await self._db.execute(
             """
             INSERT INTO runs (
                 run_id, job_id, tenant_id, agent, agent_version, prompt_hash,
                 provider, provider_version, pricing_version, status,
                 input, output, metrics, error, created_at,
-                workflow_run_id, node_id, thread_id, skill_calls, turns
+                workflow_run_id, node_id, thread_id, skill_calls, turns,
+                modality, stt_latency_ms, tts_latency_ms, audio_duration_s,
+                stt_cost_usd, tts_cost_usd
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                $21, $22, $23, $24, $25, $26
             )
+            ON CONFLICT (run_id) DO UPDATE SET
+                modality = EXCLUDED.modality,
+                stt_latency_ms = EXCLUDED.stt_latency_ms,
+                tts_latency_ms = EXCLUDED.tts_latency_ms,
+                audio_duration_s = EXCLUDED.audio_duration_s,
+                stt_cost_usd = EXCLUDED.stt_cost_usd,
+                tts_cost_usd = EXCLUDED.tts_cost_usd
             """,
             run.run_id,
             run.job_id,
@@ -1655,6 +1844,13 @@ class PostgresProvider:
             # ADR 024 D2 — per-step retention (JSONB codec wraps json.dumps).
             [c.model_dump() for c in run.skill_calls],
             [t.model_dump() for t in run.turns],
+            # ADR 050 D1 — voice-specific fields (all None for text runs).
+            run.modality,
+            run.stt_latency_ms,
+            run.tts_latency_ms,
+            run.audio_duration_s,
+            run.stt_cost_usd,
+            run.tts_cost_usd,
         )
 
     async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
@@ -2281,21 +2477,44 @@ class PostgresProvider:
         )
         return row["job_id"] if row else None
 
+    async def get_run_submission_record(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RunSubmissionRecord | None:
+        from movate.storage.base import RunSubmissionRecord  # noqa: PLC0415
+
+        row = await self._db.fetchrow(
+            "SELECT job_id, request_hash FROM run_submissions "
+            "WHERE tenant_id = $1 AND idempotency_key = $2",
+            tenant_id,
+            idempotency_key,
+        )
+        if row is None:
+            return None
+        return RunSubmissionRecord(job_id=row["job_id"], request_hash=row["request_hash"])
+
     async def record_run_submission(
-        self, tenant_id: str, idempotency_key: str, job_id: str
+        self,
+        tenant_id: str,
+        idempotency_key: str,
+        job_id: str,
+        request_hash: str | None = None,
     ) -> bool:
         # INSERT ... ON CONFLICT DO NOTHING on the (tenant_id, idempotency_key)
         # PRIMARY KEY: the row is written only if absent, so a concurrent retry
         # races atomically to one winner. asyncpg returns the command tag
         # "INSERT 0 1" on a fresh insert, "INSERT 0 0" when the conflict
-        # suppressed it.
+        # suppressed it. ``request_hash`` (item 37 payload-conflict guard) is
+        # the canonical-payload fingerprint; None preserves the pre-guard shape.
         status: str = await self._db.execute(
-            "INSERT INTO run_submissions (tenant_id, idempotency_key, job_id, created_at) "
-            "VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
+            "INSERT INTO run_submissions "
+            "(tenant_id, idempotency_key, job_id, created_at, request_hash) "
+            "VALUES ($1, $2, $3, $4, $5) "
+            "ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
             tenant_id,
             idempotency_key,
             job_id,
             datetime.now(UTC),
+            request_hash,
         )
         return status.endswith(" 1")
 
@@ -3540,8 +3759,8 @@ class PostgresProvider:
             INSERT INTO workflow_runs (
                 workflow_run_id, tenant_id, workflow, workflow_version,
                 status, initial_state, final_state, error_node_id, error,
-                created_at, paused_node_id, paused_state, human_task
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                created_at, paused_node_id, paused_state, human_task, runtime
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (workflow_run_id) DO UPDATE SET
                 tenant_id        = EXCLUDED.tenant_id,
                 workflow         = EXCLUDED.workflow,
@@ -3554,7 +3773,8 @@ class PostgresProvider:
                 created_at       = EXCLUDED.created_at,
                 paused_node_id   = EXCLUDED.paused_node_id,
                 paused_state     = EXCLUDED.paused_state,
-                human_task       = EXCLUDED.human_task
+                human_task       = EXCLUDED.human_task,
+                runtime          = EXCLUDED.runtime
             """,
             w.workflow_run_id,
             w.tenant_id,
@@ -3569,6 +3789,7 @@ class PostgresProvider:
             w.paused_node_id,
             w.paused_state,
             w.human_task,
+            w.runtime,
         )
 
     async def get_workflow_run(
@@ -5448,6 +5669,14 @@ def _row_to_run(row: asyncpg.Record) -> RunRecord:
         thread_id=row["thread_id"],
         skill_calls=skill_calls,
         turns=turns,
+        # ADR 050 D1 — voice-specific fields. NULL on pre-migration or
+        # text-only rows → None, so existing records load unchanged.
+        modality=row.get("modality"),
+        stt_latency_ms=row.get("stt_latency_ms"),
+        tts_latency_ms=row.get("tts_latency_ms"),
+        audio_duration_s=row.get("audio_duration_s"),
+        stt_cost_usd=row.get("stt_cost_usd"),
+        tts_cost_usd=row.get("tts_cost_usd"),
     )
 
 
@@ -5838,6 +6067,8 @@ def _row_to_workflow_run(row: asyncpg.Record) -> WorkflowRunRecord:
         paused_node_id=row["paused_node_id"],
         paused_state=dict(row["paused_state"]) if row["paused_state"] else None,
         human_task=dict(row["human_task"]) if row["human_task"] else None,
+        # ADR 062 D2: backend owner. NULL on pre-migration / native rows → None.
+        runtime=row["runtime"],
     )
 
 
@@ -5985,6 +6216,50 @@ def _row_to_api_key(row: asyncpg.Record) -> ApiKeyRecord:
         expires_at=row_dict.get("expires_at"),
         scope=row_dict.get("scope"),
         scopes=scopes,
+    )
+
+
+def _pg_row_to_tool_descriptor(row: asyncpg.Record) -> Any:
+    """Convert a postgres row to a ToolDescriptor."""
+    from movate.core.tool_registry.models import (  # noqa: PLC0415
+        ToolBackendConfig,
+        ToolDescriptor,
+        ToolGovernance,
+    )
+
+    row_dict = dict(row)
+    tags = row_dict["tags"]
+    if isinstance(tags, str):
+        tags = json.loads(tags)
+    input_schema = row_dict["input_schema"]
+    if isinstance(input_schema, str):
+        input_schema = json.loads(input_schema)
+    output_schema = row_dict["output_schema"]
+    if isinstance(output_schema, str):
+        output_schema = json.loads(output_schema)
+    backend = row_dict["backend"]
+    if isinstance(backend, str):
+        backend = json.loads(backend)
+    governance = row_dict["governance"]
+    if isinstance(governance, str):
+        governance = json.loads(governance)
+
+    return ToolDescriptor(
+        name=row_dict["name"],
+        version=row_dict["version"],
+        scope=row_dict["scope"],
+        description=row_dict["description"],
+        tags=tags,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        backend=ToolBackendConfig(**backend) if isinstance(backend, dict) else backend,
+        credentials_ref=row_dict.get("credentials_ref"),
+        governance=ToolGovernance(**governance) if isinstance(governance, dict) else governance,
+        owner=row_dict.get("owner"),
+        created_at=row_dict.get("created_at"),
+        updated_at=row_dict.get("updated_at"),
+        tenant_id=row_dict["tenant_id"],
+        project_id=row_dict.get("project_id"),
     )
 
 

@@ -1,8 +1,14 @@
-"""``mdk graph serve`` — local reference viewer for the knowledge graph.
+"""``mdk graph serve`` + ``mdk graph dashboard`` — knowledge graph viewers.
 
 Starts a tiny local web server (stdlib :mod:`http.server` — no new heavy web
 dep) that serves a self-contained sigma.js + graphology viewer and **proxies**
 the runtime's graph query API. The viewer is **read-only**.
+
+``mdk graph dashboard`` serves the *enhanced* dashboard (searchable, analytics-
+enabled, shareable) from the ``graph_viewer/dashboard/`` assets. Same proxy/
+bearer model as ``serve``; the dashboard adds: entity search, analytics
+sidebar (centrality leaderboard, shortest-path finder, community browser),
+growth timeline sparkline, project switcher, and KB provenance view.
 
 Security model (the load-bearing part)::
 
@@ -62,6 +68,9 @@ from movate.cli._console import stderr as err_console
 from movate.cli.graph_cmd import graph_app
 from movate.cli.graph_viewer import ASSETS_DIR
 
+#: Dashboard assets live in a subdirectory of the base viewer.
+DASHBOARD_DIR = ASSETS_DIR / "dashboard"
+
 # Only these API path prefixes are proxied. The viewer is read-only, so the
 # proxy also refuses any non-GET method (defense in depth — the browser code
 # never mutates, and the proxy enforces it too).
@@ -82,6 +91,18 @@ _PROXY_TIMEOUT_S = 60.0
 
 def _content_type_for(path: Path) -> str:
     return _STATIC_TYPES.get(path.suffix, "application/octet-stream")
+
+
+def _render_dashboard_index(project: str | None, target_name: str) -> bytes:
+    """Read the dashboard index.html and inject the NON-SECRET runtime config.
+
+    Same security model as ``_render_index`` — only the project id + target
+    display name are injected, never the bearer token or runtime URL.
+    """
+    html = (DASHBOARD_DIR / "index.html").read_text(encoding="utf-8")
+    cfg = {"project": project, "target": target_name}
+    inject = "window.MDK_GRAPH_CONFIG = " + json.dumps(cfg) + ";"
+    return html.replace("/* __MDK_GRAPH_CONFIG__ */", inject).encode("utf-8")
 
 
 def _render_index(project: str | None, target_name: str) -> bytes:
@@ -278,6 +299,64 @@ class _GraphViewerHandler(BaseHTTPRequestHandler):
         self._send_bytes(status, text.encode("utf-8"), "text/plain; charset=utf-8")
 
 
+class _DashboardViewerHandler(_GraphViewerHandler):
+    """Serves the enhanced dashboard viewer + proxies /api/*.
+
+    Extends ``_GraphViewerHandler`` to serve the dashboard HTML/CSS/JS from
+    ``DASHBOARD_DIR`` (for ``/`` and ``/static/dashboard/*``) while inheriting
+    the base viewer's vendored JS (``/static/vendor/*``) and the proxy.
+    """
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path in ("/", "/index.html"):
+            self._serve_dashboard_index()
+        elif path.startswith("/static/dashboard/"):
+            self._serve_dashboard_static(path[len("/static/dashboard/") :])
+        elif path.startswith("/static/"):
+            self._serve_static(path[len("/static/") :])
+        elif path.startswith("/api/"):
+            self._proxy(path, parsed.query)
+        else:
+            self._send_plain(HTTPStatus.NOT_FOUND, "not found")
+
+    def _serve_dashboard_index(self) -> None:
+        body = _render_dashboard_index(self.project, self.target_name)
+        self._send_bytes(HTTPStatus.OK, body, "text/html; charset=utf-8")
+
+    def _serve_dashboard_static(self, rel: str) -> None:
+        candidate = (DASHBOARD_DIR / rel).resolve()
+        try:
+            candidate.relative_to(DASHBOARD_DIR)
+        except ValueError:
+            self._send_plain(HTTPStatus.FORBIDDEN, "forbidden")
+            return
+        if not candidate.is_file() or candidate.suffix not in _STATIC_TYPES:
+            self._send_plain(HTTPStatus.NOT_FOUND, "not found")
+            return
+        self._send_bytes(HTTPStatus.OK, candidate.read_bytes(), _content_type_for(candidate))
+
+
+def _build_dashboard_handler(
+    *, base_url: str, bearer: str, project: str | None, target_name: str
+) -> type[_DashboardViewerHandler]:
+    """Build a dashboard handler subclass carrying the per-serve config.
+
+    Same security model as ``_build_handler`` — the bearer stays in-process.
+    """
+    return type(
+        "_BoundDashboardViewerHandler",
+        (_DashboardViewerHandler,),
+        {
+            "base_url": base_url.rstrip("/"),
+            "bearer": bearer,
+            "project": project,
+            "target_name": target_name,
+        },
+    )
+
+
 def _build_handler(
     *, base_url: str, bearer: str, project: str | None, target_name: str
 ) -> type[_GraphViewerHandler]:
@@ -326,6 +405,39 @@ def _probe_graph_api(base_url: str, bearer: str) -> tuple[bool, str]:
     return True, "could not introspect capabilities; viewer will probe on load"
 
 
+def _resolve_viewer_runtime(
+    target: str | None,
+    runtime_url: str | None,
+    api_key: str | None,
+) -> tuple[str, str, str]:
+    """Resolve ``(target_name, base_url, bearer)`` for the viewer / dashboard.
+
+    Two modes:
+
+    * **Headless** (hosted-container path, ADR 081): when BOTH ``runtime_url``
+      and ``api_key`` are supplied — via the ``--runtime-url`` / ``--api-key``
+      flags or the ``MDK_GRAPH_RUNTIME_URL`` / ``MDK_GRAPH_API_KEY`` env vars —
+      use them directly. No ``~/.movate/config.yaml`` is read, so the viewer can
+      run in a container pointed at a deployed runtime with only env vars and no
+      local CLI config. The bearer still stays server-side (same proxy model).
+    * **Local** (default): fall back to the shared ``--target`` → URL + bearer
+      pipeline (:func:`movate.cli.kb_cmd._resolve_target_bearer`), unchanged.
+    """
+    if runtime_url and api_key:
+        return "(env)", runtime_url.rstrip("/"), api_key
+    if runtime_url or api_key:
+        err_console.print(
+            "[red]✗[/red] headless mode needs BOTH [bold]--runtime-url[/bold] "
+            "([dim]MDK_GRAPH_RUNTIME_URL[/dim]) and [bold]--api-key[/bold] "
+            "([dim]MDK_GRAPH_API_KEY[/dim]); only one was given."
+        )
+        raise typer.Exit(code=2)
+    from movate.cli.kb_cmd import _resolve_target_bearer  # noqa: PLC0415
+
+    target_name, _cfg, base_url, bearer = _resolve_target_bearer(target)  # type: ignore[arg-type]
+    return target_name, base_url, bearer
+
+
 @graph_app.command("serve")
 def serve(
     target: str | None = typer.Option(
@@ -340,9 +452,30 @@ def serve(
     project: str | None = typer.Option(
         None,
         "--project",
+        envvar="MDK_GRAPH_PROJECT_ID",
         help=(
             "Project id whose knowledge graph to view. Required to fetch "
-            "the project graph + live-growth stream."
+            "the project graph + live-growth stream. Env: MDK_GRAPH_PROJECT_ID."
+        ),
+    ),
+    runtime_url: str | None = typer.Option(
+        None,
+        "--runtime-url",
+        envvar="MDK_GRAPH_RUNTIME_URL",
+        help=(
+            "Headless mode (hosted container, ADR 081): runtime base URL to "
+            "proxy to, bypassing ~/.movate/config.yaml. Requires --api-key. "
+            "Env: MDK_GRAPH_RUNTIME_URL."
+        ),
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="MDK_GRAPH_API_KEY",
+        help=(
+            "Headless mode: read-scoped runtime bearer used server-side "
+            "(never sent to the browser). Requires --runtime-url. "
+            "Env: MDK_GRAPH_API_KEY."
         ),
     ),
     port: int = typer.Option(
@@ -370,14 +503,10 @@ def serve(
     server, prints the URL, and (unless ``--no-open``) opens it. The bearer
     stays server-side; the browser only ever talks to this local server.
     """
-    # Reuse the exact target → URL + bearer pipeline `mdk kb` uses (OIDC +
-    # static-key both supported), so a target set up for kb/deploy works here.
-    from movate.cli.kb_cmd import _resolve_target_bearer  # noqa: PLC0415
-
-    # ``_resolve_target_bearer`` delegates to ``resolve_target``, which treats
-    # ``None`` as "use the active target". Typer gives us ``None`` when
-    # ``--target`` is omitted, so pass it through unchanged for that fallback.
-    target_name, _target_cfg, base_url, bearer = _resolve_target_bearer(target)  # type: ignore[arg-type]
+    # Headless (env vars) for the hosted container path, else the shared
+    # `mdk kb`-style `--target` → URL + bearer pipeline (OIDC + static-key both
+    # supported). `None` target means "use the active target".
+    target_name, base_url, bearer = _resolve_viewer_runtime(target, runtime_url, api_key)
 
     # Up-front, friendly capability heads-up (the viewer degrades regardless).
     available, detail = _probe_graph_api(base_url, bearer)
@@ -430,4 +559,125 @@ def serve(
         httpd.server_close()
 
 
-__all__ = ["graph_app", "serve"]
+@graph_app.command("dashboard")
+def dashboard(
+    target: str | None = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Deployed runtime target (from ~/.movate/config.yaml). "
+            "Defaults to the active target. The bearer is resolved from the "
+            "target's key_env / OIDC and kept server-side."
+        ),
+    ),
+    project: str | None = typer.Option(
+        None,
+        "--project",
+        envvar="MDK_GRAPH_PROJECT_ID",
+        help=(
+            "Project id whose knowledge graph to explore. Required to "
+            "load graph data, run analytics, and stream live growth. "
+            "Env: MDK_GRAPH_PROJECT_ID."
+        ),
+    ),
+    runtime_url: str | None = typer.Option(
+        None,
+        "--runtime-url",
+        envvar="MDK_GRAPH_RUNTIME_URL",
+        help=(
+            "Headless mode (hosted container, ADR 081): runtime base URL to "
+            "proxy to, bypassing ~/.movate/config.yaml. Requires --api-key. "
+            "Env: MDK_GRAPH_RUNTIME_URL."
+        ),
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        envvar="MDK_GRAPH_API_KEY",
+        help=(
+            "Headless mode: read-scoped runtime bearer used server-side "
+            "(never sent to the browser). Requires --runtime-url. "
+            "Env: MDK_GRAPH_API_KEY."
+        ),
+    ),
+    port: int = typer.Option(
+        8901,
+        "--port",
+        help="Bind port for the dashboard. Defaults to 8901.",
+    ),
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        help=(
+            "Bind host. 127.0.0.1 (default) restricts to localhost. "
+            "Use 0.0.0.0 for hosted/shared access (the graph API is "
+            "read-only + auth-gated by the runtime)."
+        ),
+    ),
+    no_open: bool = typer.Option(
+        False,
+        "--no-open",
+        help="Don't auto-open the browser.",
+    ),
+) -> None:
+    """Start the hosted knowledge-graph dashboard and open it in a browser.
+
+    The dashboard extends the base ``mdk graph serve`` viewer with: entity
+    search via the runtime API, an analytics sidebar (centrality leaderboard,
+    shortest-path finder, community browser), a growth timeline sparkline,
+    a project switcher, and KB provenance view on node drill-down.
+
+    Same security model as ``serve``: the runtime bearer stays server-side.
+    Use ``--host 0.0.0.0`` for hosted/shared access (the graph API is
+    read-only, and the runtime gates writes via its own auth).
+    """
+    target_name, base_url, bearer = _resolve_viewer_runtime(target, runtime_url, api_key)
+
+    available, detail = _probe_graph_api(base_url, bearer)
+    if not available:
+        err_console.print(
+            f"[yellow]⚠[/yellow] {detail} — this runtime may predate the graph "
+            "query API (ADR 046). The dashboard will show a hint if so."
+        )
+
+    if not project:
+        err_console.print(
+            "[yellow]⚠[/yellow] no [bold]--project[/bold] given — the dashboard needs "
+            "a project id to load a graph. Pass [bold]--project <id>[/bold]."
+        )
+
+    handler = _build_dashboard_handler(
+        base_url=base_url, bearer=bearer, project=project, target_name=target_name
+    )
+
+    try:
+        httpd = ThreadingHTTPServer((host, port), handler)
+    except OSError as exc:
+        err_console.print(
+            f"[red]✗[/red] could not bind [bold]{host}:{port}[/bold]: {exc}. "
+            "Try another [bold]--port[/bold]."
+        )
+        raise typer.Exit(code=2) from None
+
+    url = f"http://{host}:{port}/"
+    err_console.print(
+        f"[bold cyan]mdk graph dashboard[/bold cyan] → target [bold]{target_name}[/bold], "
+        f"dashboard on [bold]{url}[/bold]"
+    )
+    err_console.print(
+        "[dim]Hosted graph explorer. The runtime bearer stays in this process "
+        "(proxied server-side); it is never sent to the browser.[/dim]"
+    )
+
+    if not no_open:
+        threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        err_console.print("\n[dim]graph dashboard stopped.[/dim]")
+    finally:
+        httpd.server_close()
+
+
+__all__ = ["dashboard", "graph_app", "serve"]

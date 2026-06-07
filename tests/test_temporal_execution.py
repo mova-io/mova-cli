@@ -17,6 +17,7 @@ Two layers:
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -53,9 +54,11 @@ from movate.core.workflow.compilers.temporal import TemporalCompiler  # noqa: E4
 from movate.core.workflow.temporal_activities import (  # noqa: E402
     call_agent_activity,
     call_gate_activity,
+    call_human_activity,
     call_judge_activity,
     call_skill_activity,
     configure_activities,
+    persist_workflow_result_activity,
 )
 from movate.runtime.workflow_backend import (  # noqa: E402
     DEFAULT_TASK_QUEUE,
@@ -258,11 +261,33 @@ def test_effective_runtime_rejects_bad_override(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_langgraph_execution_fails_loud() -> None:
-    """Selecting langgraph for execution is rejected (ADR 055 step 3) — not downgraded."""
+def test_langgraph_available_when_extra_present() -> None:
+    """langgraph is now a wired backend (ADR 030 D1): availability is gated on
+    the [langgraph] extra being importable, NOT rejected outright. The dev env
+    ships langgraph, so this is a no-op (it must never raise here)."""
+    require_backend_available("langgraph")  # no raise — backend is wired.
+
+
+@pytest.mark.unit
+def test_langgraph_fails_loud_when_extra_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the [langgraph] extra absent, selecting langgraph fails loud with the
+    install hint (D6) — never a silent downgrade to native."""
+
+    class _BlockLanggraphFinder:
+        def find_module(self, name: str, path: Any = None) -> Any:
+            return self if name == "langgraph" or name.startswith("langgraph.") else None
+
+        def load_module(self, name: str) -> Any:
+            raise ImportError(f"hidden by test: {name}")
+
+    blocked = [m for m in sys.modules if m == "langgraph" or m.startswith("langgraph.")]
+    for m in blocked:
+        monkeypatch.delitem(sys.modules, m, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_BlockLanggraphFinder(), *sys.meta_path])
+
     with pytest.raises(WorkflowBackendError) as ei:
         require_backend_available("langgraph")
-    assert "not yet wired" in str(ei.value)
+    assert "[langgraph] extra" in str(ei.value)
 
 
 @pytest.mark.unit
@@ -343,6 +368,7 @@ async def test_temporal_smoke_matches_native(tmp_path: Path) -> None:
                 call_skill_activity,
                 call_gate_activity,
                 call_judge_activity,
+                persist_workflow_result_activity,
             ],
             workflow_runner=UnsandboxedWorkflowRunner(),
         ),
@@ -358,3 +384,198 @@ async def test_temporal_smoke_matches_native(tmp_path: Path) -> None:
     # (modulo the tenant_id we stamp for the activity context).
     temporal_final.pop("tenant_id", None)
     assert temporal_final == native_result.final_state
+
+
+# ---------------------------------------------------------------------------
+# Durable HITL (ADR 062) — HUMAN node pauses durably + resumes on a signal,
+# matching the native runner's pause/resume final state (D7 parity), plus the
+# Temporal-only durable timeout route (D4).
+# ---------------------------------------------------------------------------
+
+
+def _scaffold_with_human(
+    tmp_path: Path, *, timeout: int | None = None, on_timeout: str | None = None
+) -> Path:
+    """``text → step1 → [HUMAN approval] → step2`` — a durable-HITL workflow.
+
+    ``runtime: temporal`` drives the Temporal backend; the native runner is
+    invoked directly in the conformance test (it ignores the field). When
+    ``timeout`` is set the HUMAN node carries the durable deadline + the
+    ``on_timeout`` route (ADR 062 D4).
+    """
+    workflow_dir = tmp_path / "wf"
+    _make_agent(
+        workflow_dir / "agents" / "first", name="first-agent", input_key="text", output_key="step1"
+    )
+    _make_agent(
+        workflow_dir / "agents" / "second",
+        name="second-agent",
+        input_key="step1",
+        output_key="step2",
+    )
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    (workflow_dir / "state.json").write_text(json.dumps(_STATE_SCHEMA))
+    approval: dict[str, Any] = {
+        "id": "approval",
+        "type": "human",
+        "prompt": "Approve the step?",
+        "output_contract": ["approved_by"],
+    }
+    if timeout is not None:
+        approval["timeout"] = timeout
+    if on_timeout is not None:
+        approval["on_timeout"] = on_timeout
+    body: dict[str, Any] = {
+        "api_version": "movate/v1",
+        "kind": "Workflow",
+        "name": "test-human-workflow",
+        "version": "0.1.0",
+        "state_schema": "./state.json",
+        "entrypoint": "first",
+        "runtime": "temporal",
+        "nodes": [
+            {"id": "first", "type": "agent", "ref": "./agents/first"},
+            approval,
+            {"id": "second", "type": "agent", "ref": "./agents/second"},
+        ],
+        "edges": [
+            {"from": "first", "to": "approval"},
+            {"from": "approval", "to": "second"},
+        ],
+    }
+    (workflow_dir / "workflow.yaml").write_text(yaml.safe_dump(body))
+    return workflow_dir / "workflow.yaml"
+
+
+def _human_worker(env: Any, workflow_cls: Any) -> Any:
+    """A Worker registering every activity the compiled workflow may call."""
+    return Worker(
+        env.client,
+        task_queue=DEFAULT_TASK_QUEUE,
+        workflows=[workflow_cls],
+        activities=[
+            call_agent_activity,
+            call_skill_activity,
+            call_gate_activity,
+            call_judge_activity,
+            call_human_activity,
+            persist_workflow_result_activity,
+        ],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+    )
+
+
+@pytest.mark.smoke
+async def test_temporal_human_node_pause_resume_matches_native(tmp_path: Path) -> None:
+    """A HUMAN node pauses durably on Temporal and resumes on a ``human_response``
+    signal to the SAME final state the native runner reaches via pause + resume
+    (ADR 062 / ADR 055 D7 — durable-HITL parity)."""
+    pricing = load_pricing()
+    initial_state = {"text": "hello"}
+    decision = {"approved_by": "alice"}
+    graph = _load_graph(_scaffold_with_human(tmp_path))
+
+    # --- NATIVE baseline: run → PAUSED, merge decision, resume → SUCCESS ---
+    native_storage = InMemoryStorage()
+    await native_storage.init()
+    native_runner = WorkflowRunner(
+        executor=_build_executor(native_storage, NullTracer(), pricing),
+        storage=native_storage,
+    )
+    paused = await native_runner.run(graph, initial_state=dict(initial_state))
+    assert paused.status is WorkflowStatus.PAUSED
+    record = await native_storage.get_workflow_run(paused.workflow_run_id, tenant_id="local")
+    assert record is not None
+    assert record.human_task is not None and record.human_task["output_contract"] == ["approved_by"]
+    # Emulate the signal endpoint: merge the decision into the checkpoint.
+    merged = {**(record.paused_state or {}), **decision}
+    resumed = record.model_copy(update={"paused_state": merged})
+    native_result = await native_runner.resume(graph, resumed)
+    assert native_result.status is WorkflowStatus.SUCCESS
+    assert native_result.final_state == {
+        "text": "hello",
+        "step1": "alpha",
+        "approved_by": "alice",
+        "step2": "beta",
+    }
+
+    # --- TEMPORAL: start → durable pause → signal → SUCCESS ---------------
+    temporal_storage = InMemoryStorage()
+    await temporal_storage.init()
+    configure_activities(
+        storage=temporal_storage,
+        pricing=pricing,
+        tracer=NullTracer(),
+        provider=_StateAwareProvider(),
+        tenant_id="local",
+    )
+    compiled = TemporalCompiler().compile(graph)
+    workflow_cls = load_compiled_workflow_class(
+        compiled.module_source, compiled.workflow_class_name
+    )
+
+    env = await WorkflowEnvironment.start_time_skipping()
+    async with env, _human_worker(env, workflow_cls):
+        handle = await env.client.start_workflow(
+            workflow_cls.run,
+            {**initial_state, "tenant_id": "local"},
+            id="conformance-human-1",
+            task_queue=DEFAULT_TASK_QUEUE,
+        )
+        # Deliver the human's decision; the durable wait_condition resolves.
+        await handle.signal("human_response", args=["approval", decision])
+        temporal_final = await handle.result()
+
+    # ADR 080 D2 — terminal-state sync: after the durable run resumes + completes,
+    # the store holds the TERMINAL record (SUCCESS, runtime temporal, final state),
+    # having overwritten the PAUSED checkpoint — so mdk runs show + the
+    # ?status=paused approvals list reflect reality.
+    final_record = await temporal_storage.get_workflow_run("conformance-human-1", tenant_id="local")
+    assert final_record is not None
+    assert final_record.runtime == "temporal"
+    assert final_record.status is WorkflowStatus.SUCCESS
+    assert final_record.final_state is not None
+    assert final_record.final_state.get("approved_by") == "alice"
+
+    temporal_final.pop("tenant_id", None)
+    assert temporal_final == native_result.final_state
+
+
+@pytest.mark.smoke
+async def test_temporal_human_node_durable_timeout_route(tmp_path: Path) -> None:
+    """With no human response before the durable deadline, the HUMAN node takes
+    the ``on_timeout`` route (ADR 062 D4). Native has no durable timer (it waits
+    forever), so this capability is Temporal-only and asserted on Temporal."""
+    pricing = load_pricing()
+    graph = _load_graph(_scaffold_with_human(tmp_path, timeout=3600, on_timeout="second"))
+
+    temporal_storage = InMemoryStorage()
+    await temporal_storage.init()
+    configure_activities(
+        storage=temporal_storage,
+        pricing=pricing,
+        tracer=NullTracer(),
+        provider=_StateAwareProvider(),
+        tenant_id="local",
+    )
+    compiled = TemporalCompiler().compile(graph)
+    workflow_cls = load_compiled_workflow_class(
+        compiled.module_source, compiled.workflow_class_name
+    )
+
+    env = await WorkflowEnvironment.start_time_skipping()
+    async with env, _human_worker(env, workflow_cls):
+        # No signal — the time-skipping server fast-forwards past the deadline,
+        # firing the durable timeout, which routes to 'second'.
+        temporal_final = await env.client.execute_workflow(
+            workflow_cls.run,
+            {"text": "hello", "tenant_id": "local"},
+            id="timeout-human-1",
+            task_queue=DEFAULT_TASK_QUEUE,
+        )
+
+    temporal_final.pop("tenant_id", None)
+    # The timeout route ran 'second' (step2 present) but no human contributed.
+    assert "approved_by" not in temporal_final
+    assert temporal_final.get("step1") == "alpha"
+    assert temporal_final.get("step2") == "beta"

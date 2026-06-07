@@ -61,6 +61,9 @@ from movate.runtime.schemas import (
 stdout = Console()
 err = Console(stderr=True)
 
+# Length of "YYYY-MM-DDTHH:MM:SS" for timestamp display truncation.
+_TS_DISPLAY_LEN = 19
+
 workflow_app = typer.Typer(
     name="workflow",
     help="Inspect + resume (HITL) workflow runs on a deployed movate runtime.",
@@ -220,6 +223,27 @@ def replay(
         "--tenant-id",
         help="Tenant scope for the storage lookup (default: 'local' for CLI use).",
     ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help="Temporal namespace / deployment target to connect to.",
+    ),
+    from_file: Path = typer.Option(
+        None,
+        "--from-file",
+        help=(
+            "Replay from an exported event-history JSON file instead of fetching "
+            "from a live Temporal server. Use [bold]mdk workflow history <run_id> "
+            "--output history.json[/bold] to export."
+        ),
+    ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Print each activity replay step as it is re-executed.",
+    ),
     as_json: bool = typer.Option(
         False, "--json", help="Emit the replay result as JSON instead of a table."
     ),
@@ -241,19 +265,34 @@ def replay(
     confirm an in-flight run's trajectory still type-checks against the new
     code, or to reproduce exactly what a past run decided.
 
+    [bold]Offline mode:[/bold] pass ``--from-file history.json`` to replay from
+    an exported event-history file (no live Temporal connection needed). Export
+    with ``mdk workflow history <run_id> --output history.json``.
+
     [bold]Examples:[/bold]
 
       [dim]# Verify a past run replays deterministically[/dim]
       $ mdk workflow replay 1f3c...
 
+      [dim]# Replay from an exported history file (offline)[/dim]
+      $ mdk workflow replay 1f3c... --from-file history.json
+
+      [dim]# Verbose output showing each activity replay step[/dim]
+      $ mdk workflow replay 1f3c... --verbose
+
       [dim]# Machine-readable result[/dim]
       $ mdk workflow replay 1f3c... --json
     """
+    # Normalize typer OptionInfo → None when called directly (e.g. tests).
+    _from_file = from_file if isinstance(from_file, Path) else None
     result = asyncio.run(
         _replay_workflow(
             run_id=run_id,
             workflows_path=Path(workflows_path),
             tenant_id=tenant_id,
+            target=target,
+            from_file=_from_file,
+            verbose=verbose,
             suppress=as_json,
         )
     )
@@ -262,7 +301,7 @@ def replay(
         raise typer.Exit(code=0 if result["deterministic"] else 1)
     if result["deterministic"]:
         stdout.print(
-            f"[green]✓ replayed deterministically[/green] — "
+            "[green]✓ Replay matches — deterministic execution confirmed[/green] — "
             f"[bold]{result['workflow']}[/bold] run "
             f"[dim]{run_id}[/dim] reproduces identical decisions against its "
             f"recorded history."
@@ -285,13 +324,25 @@ async def _replay_workflow(
     run_id: str,
     workflows_path: Path,
     tenant_id: str,
+    target: str | None = None,
+    from_file: Path | None = None,
+    verbose: bool = False,
     suppress: bool,
 ) -> dict[str, Any]:
-    """Resolve → recompile → fetch history → replay. Returns a result dict.
+    """Resolve -> recompile -> fetch history -> replay. Returns a result dict.
 
     Exits cleanly (``typer.Exit``) on every operator-facing failure: an
     unknown run, a native/non-temporal run, a missing on-disk definition, or
     a missing ``[temporal]`` extra / connection. Never leaks a traceback.
+
+    ``from_file`` enables offline mode: replay from an exported event-history
+    JSON file instead of fetching from a live Temporal server. The [temporal]
+    extra is still required (the Replayer lives there), but no Temporal
+    connection is needed.
+
+    ``target`` selects the Temporal namespace when fetching history live.
+
+    ``verbose`` prints each activity replay step to stderr.
     """
     from movate.runtime.workflow_backend import (  # noqa: PLC0415
         WorkflowBackendError,
@@ -299,7 +350,7 @@ async def _replay_workflow(
         require_backend_available,
     )
 
-    # 1. Resolve the run from storage → recover the workflow name (D6: the
+    # 1. Resolve the run from storage -> recover the workflow name (D6: the
     #    workflow_run_id is both the storage key AND the Temporal workflow id).
     record = await _fetch_workflow_run(run_id=run_id, tenant_id=tenant_id)
     if record is None:
@@ -312,7 +363,7 @@ async def _replay_workflow(
 
     # 2. Recover the WorkflowGraph from the on-disk definition and confirm it
     #    is a runtime: temporal workflow. A native/langgraph run has no
-    #    Temporal history to replay — reject cleanly, never crash.
+    #    Temporal history to replay -- reject cleanly, never crash.
     graph = _load_workflow_graph(record.workflow, workflows_path)
     if graph is None:
         error(
@@ -331,13 +382,26 @@ async def _replay_workflow(
         raise typer.Exit(code=2)
 
     # 3. Recompile to the @workflow.defn class (the SAME path the worker uses)
-    #    and ensure the [temporal] extra + connection are available (fail loud,
-    #    ADR 054 D6 / ADR 055 D6).
-    try:
-        require_backend_available("temporal")
-    except WorkflowBackendError as exc:
-        error(str(exc), context="replay")
-        raise typer.Exit(code=2) from None
+    #    and ensure the [temporal] extra is available (fail loud,
+    #    ADR 054 D6 / ADR 055 D6). In offline mode (--from-file) we only need
+    #    the extra, not a live Temporal connection.
+    if from_file is not None:
+        # Offline mode: just need the [temporal] extra for the Replayer.
+        try:
+            import temporalio  # noqa: F401, PLC0415
+        except ImportError:
+            error(
+                "The [temporal] extra is not installed. "
+                "Install with: uv tool install --editable '.[temporal]' --force",
+                context="replay",
+            )
+            raise typer.Exit(code=2) from None
+    else:
+        try:
+            require_backend_available("temporal")
+        except WorkflowBackendError as exc:
+            error(str(exc), context="replay")
+            raise typer.Exit(code=2) from None
 
     from movate.core.workflow.compilers.temporal import TemporalCompiler  # noqa: PLC0415
 
@@ -353,10 +417,15 @@ async def _replay_workflow(
         error(f"could not recompile workflow {record.workflow!r}: {exc}", context="replay")
         raise typer.Exit(code=2) from None
 
-    # 4. Fetch history from Temporal by id (== run_id) and 5. replay it.
+    # 4. Fetch history (from file or Temporal) and 5. replay it.
     try:
         outcome = await _fetch_history_and_replay(
-            run_id=run_id, workflow_cls=workflow_cls, suppress=suppress
+            run_id=run_id,
+            workflow_cls=workflow_cls,
+            suppress=suppress,
+            from_file=from_file,
+            target=target,
+            verbose=verbose,
         )
     except WorkflowBackendError as exc:
         error(str(exc), context="replay")
@@ -398,12 +467,18 @@ def _load_workflow_graph(name: str, workflows_path: Path) -> Any:
 
 
 async def _fetch_history_and_replay(
-    *, run_id: str, workflow_cls: Any, suppress: bool
+    *,
+    run_id: str,
+    workflow_cls: Any,
+    suppress: bool,
+    from_file: Path | None = None,
+    target: str | None = None,
+    verbose: bool = False,
 ) -> tuple[bool, str | None]:
-    """Connect to Temporal, fetch the run's history, and replay it.
+    """Connect to Temporal (or read a file), fetch the run's history, and replay it.
 
     Returns ``(deterministic, divergence_message)``. ``temporalio`` is
-    imported lazily HERE (import isolation — ADR 054 D7 / ADR 055 Boundaries):
+    imported lazily HERE (import isolation -- ADR 054 D7 / ADR 055 Boundaries):
     nothing at this module's scope touches Temporal.
 
     Replay runs the workflow code against the durable event history WITHOUT
@@ -412,36 +487,73 @@ async def _fetch_history_and_replay(
     decisions. We pass ``raise_on_replay_failure=False`` and inspect
     ``WorkflowReplayResult.replay_failure`` so divergence is reported, not
     raised as a traceback.
+
+    ``from_file`` enables offline mode: load history from a JSON file exported
+    by ``mdk workflow history <run_id> --output <file>``.
+
+    ``target`` overrides the Temporal namespace for live connections.
+
+    ``verbose`` prints each event type in the history to stderr.
     """
     import contextlib  # noqa: PLC0415
     from pathlib import Path as _Path  # noqa: PLC0415
 
-    from temporalio.client import Client  # noqa: PLC0415
-    from temporalio.service import TLSConfig  # noqa: PLC0415
+    from temporalio.client import WorkflowHistory  # noqa: PLC0415
     from temporalio.worker import Replayer, UnsandboxedWorkflowRunner  # noqa: PLC0415
-
-    from movate.runtime.workflow_backend import _resolve_temporal_connection  # noqa: PLC0415
 
     def _spin(message: str) -> Any:
         # Suppress the stderr spinner under --json so the channel stays clean.
         return contextlib.nullcontext() if suppress else spinner(message)
 
-    conn = _resolve_temporal_connection()  # fail-loud if no TEMPORAL_HOST.
+    history: WorkflowHistory
+    if from_file is not None:
+        # Offline mode: load history from an exported JSON file.
+        if not from_file.is_file():
+            from movate.runtime.workflow_backend import WorkflowBackendError  # noqa: PLC0415
 
-    tls: Any = False
-    if conn.tls_cert_path:
-        tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
+            raise WorkflowBackendError(
+                f"history file not found: {from_file}. "
+                "Export with: mdk workflow history <run_id> --output history.json"
+            )
+        with _spin("loading history from file..."):
+            raw = json.loads(from_file.read_text(encoding="utf-8"))
+            history = WorkflowHistory.from_json(run_id, raw)
+    else:
+        from temporalio.client import Client  # noqa: PLC0415
+        from temporalio.service import TLSConfig  # noqa: PLC0415
 
-    with _spin("connecting to Temporal..."):
-        client = await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
+        from movate.runtime.workflow_backend import _resolve_temporal_connection  # noqa: PLC0415
 
-    with _spin("fetching workflow history..."):
-        handle = client.get_workflow_handle(run_id)
-        history = await handle.fetch_history()
+        conn = _resolve_temporal_connection()  # fail-loud if no TEMPORAL_HOST.
+        # --target overrides the namespace for this connection.
+        namespace = target if target else conn.namespace
+
+        tls: Any = False
+        if conn.tls_cert_path:
+            tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
+
+        with _spin("connecting to Temporal..."):
+            client = await Client.connect(conn.host, namespace=namespace, tls=tls)
+
+        with _spin("fetching workflow history..."):
+            handle = client.get_workflow_handle(run_id)
+            history = await handle.fetch_history()
+
+    # Verbose: print each event type in the history to stderr.
+    if verbose and not suppress:
+        event_count = len(history.events)
+        err.print(f"[dim]history contains {event_count} event(s):[/dim]")
+        for evt in history.events:
+            evt_type = evt.event_type
+            # The proto enum value name is human-readable (e.g.
+            # EVENT_TYPE_ACTIVITY_TASK_COMPLETED).
+            evt_cls = type(evt_type)
+            evt_name = evt_cls.Name(evt_type) if hasattr(evt_cls, "Name") else str(evt_type)
+            err.print(f"  [dim]{evt.event_id:>4}[/dim] {evt_name}")
 
     # Replay unsandboxed: the compiled workflow module is generated at runtime
     # (a source string, not an importable file the sandbox can re-load), and
-    # determinism is enforced at COMPILE time — the SAME reasoning the worker
+    # determinism is enforced at COMPILE time -- the SAME reasoning the worker
     # applies (workflow_backend._execute_on_temporal).
     replayer = Replayer(
         workflows=[workflow_cls],
@@ -454,6 +566,190 @@ async def _fetch_history_and_replay(
     if failure is None:
         return True, None
     return False, str(failure)
+
+
+# ---------------------------------------------------------------------------
+# History — fetch + export a Temporal run's full event history
+# (ADR 054 D6 / Phase 3). Companion to `mdk workflow replay --from-file`.
+# ---------------------------------------------------------------------------
+
+
+@workflow_app.command("history")
+def history(
+    run_id: str = typer.Argument(
+        ...,
+        help=(
+            "The workflow_run_id whose event history to fetch (== the Temporal "
+            "workflow id, ADR 054 D6)."
+        ),
+        metavar="RUN_ID",
+    ),
+    output: Path = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help=(
+            "Write the history as JSON to this file path. When omitted the "
+            "history is printed to stdout."
+        ),
+    ),
+    fmt: str = typer.Option(
+        None,
+        "--format",
+        "-f",
+        help=(
+            "Output format: 'json' (machine-readable) or 'table' (human-readable, "
+            "default for terminal). Defaults to 'json' when piped or --output is set."
+        ),
+    ),
+    target: str = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help="Temporal namespace / deployment target to connect to.",
+    ),
+) -> None:
+    """Fetch and display the full event history for a Temporal workflow run.
+
+    The event history is Temporal's durable record of every decision the
+    workflow made -- it is the input ``mdk workflow replay`` verifies against.
+
+    Use ``--output history.json`` to export the history to a file for offline
+    replay (``mdk workflow replay <run_id> --from-file history.json``).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Print a human-readable table of events[/dim]
+      $ mdk workflow history 1f3c...
+
+      [dim]# Export to a JSON file for offline replay[/dim]
+      $ mdk workflow history 1f3c... --output history.json
+
+      [dim]# Pipe JSON to jq[/dim]
+      $ mdk workflow history 1f3c... --format json | jq '.events | length'
+    """
+    import sys  # noqa: PLC0415
+
+    # Resolve format: explicit flag > auto-detect based on context.
+    if fmt is not None:
+        effective_fmt = fmt.lower()
+    elif output is not None or not sys.stdout.isatty():
+        effective_fmt = "json"
+    else:
+        effective_fmt = "table"
+
+    if effective_fmt not in ("json", "table"):
+        error(f"unknown --format {fmt!r}; expected 'json' or 'table'.", context="history")
+        raise typer.Exit(code=2)
+
+    suppress = effective_fmt == "json" and output is None
+    result = asyncio.run(
+        _fetch_history(
+            run_id=run_id,
+            target=target,
+            suppress=suppress,
+        )
+    )
+
+    if effective_fmt == "json":
+        json_str = json.dumps(result, indent=2)
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json_str, encoding="utf-8")
+            stdout.print(
+                f"[green]✓[/green] exported {len(result.get('events', []))} event(s) "
+                f"to [bold]{output}[/bold]"
+            )
+        else:
+            stdout.print(json_str, soft_wrap=True, highlight=False)
+        return
+
+    # Table format: one row per event.
+    events = result.get("events", [])
+    if not events:
+        hint("[dim]no events in this workflow's history[/dim]")
+        return
+    table = Table(title=f"workflow history for {run_id[:12]}... ({len(events)} events)")
+    table.add_column("id", style="dim", justify="right")
+    table.add_column("event_type")
+    table.add_column("timestamp", style="dim")
+    for evt in events:
+        evt_type = evt.get("eventType", evt.get("event_type", ""))
+        evt_id = str(evt.get("eventId", evt.get("event_id", "")))
+        timestamp = evt.get("eventTime", evt.get("event_time", ""))
+        # Truncate to YYYY-MM-DDTHH:MM:SS for table readability.
+        if isinstance(timestamp, str) and len(timestamp) > _TS_DISPLAY_LEN:
+            timestamp = timestamp[:_TS_DISPLAY_LEN]
+        table.add_row(evt_id, evt_type, timestamp)
+    stdout.print(table)
+    if output is not None:
+        json_str = json.dumps(result, indent=2)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json_str, encoding="utf-8")
+        stdout.print(f"[green]✓[/green] also exported to [bold]{output}[/bold]")
+
+
+async def _fetch_history(
+    *,
+    run_id: str,
+    target: str | None = None,
+    suppress: bool = False,
+) -> dict[str, Any]:
+    """Fetch the full event history for ``run_id`` from Temporal.
+
+    Returns the history as a JSON-serializable dict (the proto's JSON form).
+    """
+    import contextlib  # noqa: PLC0415
+    from pathlib import Path as _Path  # noqa: PLC0415
+
+    from movate.runtime.workflow_backend import (  # noqa: PLC0415
+        WorkflowBackendError,
+        _resolve_temporal_connection,
+    )
+
+    try:
+        import temporalio  # noqa: F401, PLC0415
+    except ImportError:
+        error(
+            "The [temporal] extra is not installed. "
+            "Install with: uv tool install --editable '.[temporal]' --force",
+            context="history",
+        )
+        raise typer.Exit(code=2) from None
+
+    from temporalio.client import Client  # noqa: PLC0415
+    from temporalio.service import TLSConfig  # noqa: PLC0415
+
+    try:
+        conn = _resolve_temporal_connection()
+    except WorkflowBackendError as exc:
+        error(str(exc), context="history")
+        raise typer.Exit(code=2) from None
+
+    namespace = target if target else conn.namespace
+
+    tls: Any = False
+    if conn.tls_cert_path:
+        tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
+
+    def _spin(message: str) -> Any:
+        return contextlib.nullcontext() if suppress else spinner(message)
+
+    with _spin("connecting to Temporal..."):
+        client = await Client.connect(conn.host, namespace=namespace, tls=tls)
+
+    with _spin("fetching workflow history..."):
+        handle = client.get_workflow_handle(run_id)
+        history = await handle.fetch_history()
+
+    # Serialize the WorkflowHistory to a JSON-compatible dict.
+    # WorkflowHistory.to_json() returns a JSON string; we parse it back
+    # to a dict so the caller can re-serialize with indent/output control.
+    # We wrap with the workflow_id so offline replay can reconstruct.
+    history_json_str = history.to_json()
+    history_dict: dict[str, Any] = json.loads(history_json_str)
+    history_dict["workflowId"] = run_id
+    return history_dict
 
 
 # ---------------------------------------------------------------------------

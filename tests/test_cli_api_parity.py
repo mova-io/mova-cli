@@ -19,6 +19,12 @@ exactly how two known gaps shipped unnoticed:
   ``WS`` ships; the REST one-shot parity and the ``say``/``transcribe``
   verbs were never built).
 
+The voice gap is now CLOSED: ``feat/voice-rest-oneshot`` built
+``POST /api/v1/agents/{name}/voice`` (ADR 050 D2) and the ``mdk voice say`` /
+``transcribe`` / ``ask`` verbs (ADR 050 D11), so those verbs are mapped in
+``REMOTE_VERB_ROUTES`` and the former voice ``xfail`` is removed. The ``replay``
+gap (ADR 045 D13) remains the one documented, unbuilt parity gap.
+
 This module closes that loop. It:
 
 1. **Enumerates remote-capable CLI verbs** by walking the Typer/Click
@@ -54,6 +60,7 @@ import inspect
 import click
 import pytest
 from fastapi.routing import APIRoute
+from starlette.routing import WebSocketRoute
 from typer.main import get_command
 
 from movate.cli.main import app as cli_app
@@ -97,6 +104,8 @@ REMOTE_VERB_ROUTES: dict[str, list[tuple[str, str]]] = {
     ],
     "jobs dead-letter purge": [("POST", "/api/v1/jobs/dead-letter/purge")],
     "runs show": [("GET", "/runs/{run_id}")],
+    # run replay / time-travel (ADR 045 D13) — remote via --target
+    "replay": [("POST", "/api/v1/runs/{run_id}/replay")],
     # batch inference
     "batch submit": [("POST", "/api/v1/agents/{name}/batch")],
     "batch status": [("GET", "/api/v1/batches/{batch_id}")],
@@ -163,6 +172,17 @@ REMOTE_VERB_ROUTES: dict[str, list[tuple[str, str]]] = {
     "contexts remote update": [("PUT", "/api/v1/contexts/{name}")],
     "contexts remote delete": [("DELETE", "/api/v1/contexts/{name}")],
     "contexts remote attach": [("POST", "/api/v1/agents/{name}/contexts")],
+    # voice (ADR 050 D11) — the streaming WS turn + its one-shot REST siblings.
+    # ``try`` drives the streaming WS transport; ``say``/``transcribe``/``ask``
+    # all drive the SAME one-shot POST (the WS's request/response sibling);
+    # ``providers list`` reads capability discovery. All now route through
+    # MovateClient-importing voice_cmd, so the gate enumerates + classifies them.
+    "voice try": [("WS", "/api/v1/agents/{name}/voice")],
+    "voice say": [("POST", "/api/v1/agents/{name}/voice")],
+    "voice transcribe": [("POST", "/api/v1/agents/{name}/voice")],
+    "voice ask": [("POST", "/api/v1/agents/{name}/voice")],
+    "voice call": [("POST", "/api/v1/agents/{name}/call/twilio")],
+    "voice providers list": [("GET", "/api/v1/capabilities")],
 }
 
 # ---------------------------------------------------------------------------
@@ -200,6 +220,12 @@ CONTROL_PLANE_ONLY: dict[str, str] = {
     # a local static check. It takes no ``--target`` so strict enumeration
     # already excludes it — documented here for the same belt-and-braces.
     "workflow lint": "local YAML compile/lint; no runtime HTTP call",
+    # ``workflow history`` and ``workflow replay`` (#697) query the Temporal
+    # workflow engine directly — they are control-plane ops tooling, not
+    # runtime API verbs.
+    "workflow history": "queries Temporal workflow history; control-plane only",
+    "workflow replay": "replays a Temporal workflow execution; control-plane only",
+    "voice bench": "local STT/TTS eval harness; no runtime HTTP call",
 }
 
 # ---------------------------------------------------------------------------
@@ -213,7 +239,6 @@ CONTROL_PLANE_ONLY: dict[str, str] = {
 
 # (method, path) the gap's CLI verb is *supposed* to call once built.
 GAP_REPLAY_ROUTE = ("POST", "/api/v1/runs/{run_id}/replay")  # ADR 045 D13
-GAP_VOICE_ROUTE = ("POST", "/api/v1/agents/{name}/voice")  # ADR 050 D2
 
 
 @pytest.fixture(scope="module")
@@ -227,20 +252,24 @@ def app():
 # ---------------------------------------------------------------------------
 
 
-def _route_index(app) -> dict[tuple[str, str], APIRoute]:
-    """Map ``(METHOD, served-path)`` -> APIRoute (HEAD/OPTIONS dropped).
+def _route_index(app) -> dict[tuple[str, str], object]:
+    """Map ``(METHOD, served-path)`` -> route (HEAD/OPTIONS dropped).
 
     Mirrors ``test_front_end_api_contract._route_index`` so both guards
-    read the route table the same way.
+    read the route table the same way, but ALSO indexes WebSocket routes
+    under the synthetic method ``"WS"`` — voice's streaming ``mdk voice try``
+    maps to the ``WS /api/v1/agents/{name}/voice`` transport (ADR 050 D11),
+    which is a ``WebSocketRoute``, not an ``APIRoute``.
     """
-    index: dict[tuple[str, str], APIRoute] = {}
+    index: dict[tuple[str, str], object] = {}
     for route in app.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        for method in route.methods:
-            if method in {"HEAD", "OPTIONS"}:
-                continue
-            index[(method, route.path)] = route
+        if isinstance(route, APIRoute):
+            for method in route.methods:
+                if method in {"HEAD", "OPTIONS"}:
+                    continue
+                index[(method, route.path)] = route
+        elif isinstance(route, WebSocketRoute):
+            index[("WS", route.path)] = route
     return index
 
 
@@ -405,50 +434,23 @@ def test_mapped_routes_exist_in_runtime(app) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "ADR 045 D13 designed POST /api/v1/runs/{id}/replay (run replay / "
-        "time-travel) but it was never built — `mdk replay` is local-only "
-        "today. When the endpoint ships, delete this xfail and add a "
-        "`replay` entry to REMOTE_VERB_ROUTES."
-    ),
-    strict=True,
-)
-def test_known_gap_replay_endpoint_built(app) -> None:
-    """ADR 045 D13 — ``POST /api/v1/runs/{id}/replay`` (designed, unbuilt)."""
+def test_replay_endpoint_built(app) -> None:
+    """ADR 045 D13 — ``POST /api/v1/runs/{run_id}/replay`` is now built.
+
+    (Was a strict-xfail "known gap" until the run-replay endpoint shipped; the
+    matching remote CLI verb + its REMOTE_VERB_ROUTES entry land alongside it.)
+    """
     index = _route_index(app)
     assert GAP_REPLAY_ROUTE in index
 
 
-@pytest.mark.xfail(
-    reason=(
-        "ADR 050 D2 designed POST /api/v1/agents/{name}/voice (REST one-shot "
-        "voice parity to the streaming WS) and ADR 050 D11 the `mdk voice "
-        "say` / `mdk voice transcribe` verbs — neither was built (only the "
-        "WS ships). When the endpoint ships, delete this xfail, add the "
-        "say/transcribe verbs, and map them in REMOTE_VERB_ROUTES."
-    ),
-    strict=True,
-)
-def test_known_gap_voice_rest_endpoint_built(app) -> None:
-    """ADR 050 D2 — ``POST /api/v1/agents/{name}/voice`` (designed, unbuilt)."""
-    index = _route_index(app)
-    assert GAP_VOICE_ROUTE in index
+def test_voice_rest_endpoint_built_and_mapped(app) -> None:
+    """ADR 050 D2 — ``POST /api/v1/agents/{name}/voice`` now ships (gap closed).
 
-
-def test_known_gap_voice_verbs_absent() -> None:
-    """Corollary to the voice gap: ``say`` / ``transcribe`` aren't wired yet.
-
-    This is NOT an xfail — it asserts today's reality (the verbs are
-    absent) so it stays green, and so the moment someone adds
-    ``mdk voice say`` it FAILS here, forcing them to also build the
-    endpoint + remove the paired ``test_known_gap_voice_rest_endpoint_built``
-    xfail. The two halves of the gap move together.
+    The former ``xfail`` gap: the REST one-shot voice endpoint is built (this
+    PR), so the route exists and the ``voice say``/``transcribe``/``ask`` verbs
+    are mapped in ``REMOTE_VERB_ROUTES``. This asserts the endpoint is real (the
+    parity proper for these verbs runs in ``test_mapped_routes_exist_in_runtime``).
     """
-    verb_paths = {path for path, _cmd in _iter_cli_commands()}
-    premature = sorted(v for v in ("voice say", "voice transcribe") if v in verb_paths)
-    assert not premature, (
-        f"voice verb(s) {premature} were added — build "
-        "POST /api/v1/agents/{name}/voice (ADR 050 D2), map them in "
-        "REMOTE_VERB_ROUTES, and remove the voice-gap xfail + this guard."
-    )
+    index = _route_index(app)
+    assert ("POST", "/api/v1/agents/{name}/voice") in index
