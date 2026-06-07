@@ -29,11 +29,12 @@ from movate.core.notifier import (
     notify_human_pause_safe,
     reset_notifier_cache,
 )
-from movate.core.notifier_sinks import GenericWebhookNotifier, TeamsNotifier
+from movate.core.notifier_sinks import GenericWebhookNotifier, SlackNotifier, TeamsNotifier
 
 _NOTIFIER_ENV = (
     "MOVATE_NOTIFIER",
     "MOVATE_NOTIFIER_TEAMS_WEBHOOK_URL",
+    "MOVATE_NOTIFIER_SLACK_WEBHOOK_URL",
     "MOVATE_NOTIFIER_WEBHOOK_URL",
     "MOVATE_NOTIFIER_WEBHOOK_SECRET",
     "MOVATE_RUNTIME_URL",
@@ -92,6 +93,19 @@ def test_build_notifier_webhook_with_url(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("MOVATE_NOTIFIER", "webhook")
     monkeypatch.setenv("MOVATE_NOTIFIER_WEBHOOK_URL", "https://hook.test/x")
     assert isinstance(build_notifier(), GenericWebhookNotifier)
+
+
+@pytest.mark.unit
+def test_build_notifier_slack_without_url_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOVATE_NOTIFIER", "slack")
+    assert isinstance(build_notifier(), NoOpNotifier)
+
+
+@pytest.mark.unit
+def test_build_notifier_slack_with_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOVATE_NOTIFIER", "slack")
+    monkeypatch.setenv("MOVATE_NOTIFIER_SLACK_WEBHOOK_URL", "https://hooks.slack.com/x")
+    assert isinstance(build_notifier(), SlackNotifier)
 
 
 @pytest.mark.unit
@@ -215,3 +229,28 @@ async def test_webhook_unsigned_without_secret(monkeypatch: pytest.MonkeyPatch) 
     await GenericWebhookNotifier(webhook_url="https://hook.test/x").notify_human_pause(_pause())
     assert cap.request is not None
     assert "X-MDK-Signature" not in cap.request.headers
+
+
+async def test_slack_payload_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    cap = _Capture()
+    _patched_client(monkeypatch, httpx.MockTransport(cap.handler))
+    ok = await SlackNotifier(webhook_url="https://hooks.slack.com/x").notify_human_pause(_pause())
+    assert ok is True
+    assert cap.request is not None
+    body = json.loads(cap.request.content)
+    # Plain-text fallback + Block Kit blocks.
+    assert "refund_approval" in body["text"]
+    assert isinstance(body["blocks"], list) and body["blocks"]
+    rendered = json.dumps(body["blocks"])
+    assert "wf-123" in rendered
+    assert "alice@acme.com" in rendered
+    assert "/api/v1/workflow-runs/wf-123/signal" in rendered
+
+
+async def test_slack_returns_false_on_transport_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("nope")
+
+    _patched_client(monkeypatch, httpx.MockTransport(boom))
+    sink = SlackNotifier(webhook_url="https://hooks.slack.com/x")
+    assert await sink.notify_human_pause(_pause()) is False

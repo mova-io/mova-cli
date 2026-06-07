@@ -22,6 +22,7 @@ Selection (``MOVATE_NOTIFIER``):
 * unset / ``none`` / ``console`` → :class:`NoOpNotifier` (logs only; the default,
   so the native + Temporal paths are byte-for-byte unchanged when unconfigured).
 * ``teams``   → POST a MessageCard to ``MOVATE_NOTIFIER_TEAMS_WEBHOOK_URL``.
+* ``slack``   → POST a Block Kit message to ``MOVATE_NOTIFIER_SLACK_WEBHOOK_URL``.
 * ``webhook`` → POST a JSON envelope to ``MOVATE_NOTIFIER_WEBHOOK_URL``
   (optionally HMAC-signed with ``MOVATE_NOTIFIER_WEBHOOK_SECRET``).
 
@@ -115,6 +116,17 @@ def build_notifier() -> NotifierProvider:
         from movate.core.notifier_sinks import TeamsNotifier  # noqa: PLC0415
 
         return TeamsNotifier(webhook_url=url)
+    if selector == "slack":
+        url = os.environ.get("MOVATE_NOTIFIER_SLACK_WEBHOOK_URL", "").strip()
+        if not url:
+            logger.warning(
+                "MOVATE_NOTIFIER=slack but MOVATE_NOTIFIER_SLACK_WEBHOOK_URL is unset "
+                "— HITL notifications disabled (no-op)."
+            )
+            return NoOpNotifier()
+        from movate.core.notifier_sinks import SlackNotifier  # noqa: PLC0415
+
+        return SlackNotifier(webhook_url=url)
     if selector == "webhook":
         url = os.environ.get("MOVATE_NOTIFIER_WEBHOOK_URL", "").strip()
         if not url:
@@ -129,7 +141,7 @@ def build_notifier() -> NotifierProvider:
         return GenericWebhookNotifier(webhook_url=url, secret=secret)
     logger.warning(
         "unknown MOVATE_NOTIFIER=%r — HITL notifications disabled (no-op). "
-        "Expected: teams | webhook | none.",
+        "Expected: teams | slack | webhook | none.",
         selector,
     )
     return NoOpNotifier()
