@@ -219,6 +219,13 @@ def test_every_emitted_metric_appears_on_some_dashboard() -> None:
         # the rest of the data-plane gauges are waiting on. Add a panel
         # alongside the DB-pool gauges when item #27 lands.
         "mdk.sse.connections_active": "ADR 035 D3, dashboard panel deferred to item #27",
+        # Voice turn latency (ADR 024/036/073) — newly bridged from the voice
+        # subsystem to OTel. A dedicated voice dashboard/workbook is the
+        # follow-up; the metrics ship first so data accrues before the panels.
+        "mdk.voice.responded_ms": "voice latency; voice dashboard is a follow-up",
+        "mdk.voice.stt_final_ms": "voice latency; voice dashboard is a follow-up",
+        "mdk.voice.tts_first_audio_ms": "voice latency; voice dashboard is a follow-up",
+        "mdk.voice.turns": "voice turn/barge-in counter; voice dashboard is a follow-up",
     }
 
     covered: set[str] = set()
