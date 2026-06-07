@@ -17218,7 +17218,7 @@ def build_app(  # noqa: PLR0912
         # MockProvider (hermetic, no keys); everything else → LiteLLM. Mirrors
         # the run/eval endpoints' choice.
         model_str = str(getattr(getattr(bundle.spec, "model", None), "provider", "") or "")
-        provider: BaseLLMProvider = (
+        provider: Any = (
             MockProvider()
             if model_str.startswith("mock") or "mock" in model_str.lower()
             else LiteLLMProvider()
