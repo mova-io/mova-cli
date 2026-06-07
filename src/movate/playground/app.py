@@ -441,6 +441,7 @@ def _capability_banner(caps: RuntimeCapabilities) -> str:
 
 _AGENT_LABEL_MAX_DESC = 60  # max description chars in the picker label
 _AGENT_LABEL_MAX_TAGS = 3  # max tags shown in the label
+_SCHEMA_HINT_MAX_FIELDS = 6  # max input-field names listed in the power-user hint
 
 
 def _agent_picker_label(agent: dict[str, Any]) -> str:
@@ -636,8 +637,8 @@ async def on_pick_agent(action: cl.Action) -> None:
     schema_hint = ""
     props = list((schema.get("properties") or {}).keys()) if isinstance(schema, dict) else []
     if props:
-        fields = ", ".join(f"`{p}`" for p in props[:6])
-        more = ", …" if len(props) > 6 else ""
+        fields = ", ".join(f"`{p}`" for p in props[:_SCHEMA_HINT_MAX_FIELDS])
+        more = ", …" if len(props) > _SCHEMA_HINT_MAX_FIELDS else ""
         schema_hint = (
             "\n\n*Power tip: paste a JSON object to set structured fields "
             f"({fields}{more}) — or just chat normally.*"
