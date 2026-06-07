@@ -114,6 +114,7 @@ def runs(
     table.add_column("workflow_run_id", style="dim")
     table.add_column("workflow", overflow="fold")
     table.add_column("status")
+    table.add_column("approvers", overflow="fold")
     table.add_column("gate prompt", overflow="fold")
     icon = {
         WorkflowStatus.SUCCESS: "[green]✓ success[/green]",
@@ -122,15 +123,23 @@ def runs(
     }
     for w in listing.workflow_runs:
         prompt = ""
+        approvers_cell = ""
         if w.human_task:
             prompt = str(w.human_task.get("prompt", ""))
             contract = w.human_task.get("output_contract") or []
             if contract:
                 prompt += f"  [dim](needs: {', '.join(str(k) for k in contract)})[/dim]"
+            approvers = w.human_task.get("approvers") or []
+            # Who can clear this gate (ADR 062/083). "anyone" when unrestricted,
+            # so an operator scanning the HITL queue knows whom to chase.
+            approvers_cell = (
+                ", ".join(str(a) for a in approvers) if approvers else "[dim]anyone[/dim]"
+            )
         table.add_row(
             w.workflow_run_id[:8] + "…",
             f"{w.workflow}@{w.workflow_version}",
             icon.get(w.status, w.status.value),
+            approvers_cell,
             prompt,
         )
     stdout.print(table)

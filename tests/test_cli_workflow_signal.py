@@ -74,7 +74,12 @@ async def cli_env(tmp_path: Path, monkeypatch):
     return _CliEnv(storage=storage, tenant_id=tenant_id)
 
 
-def _seed_paused_sync(storage: InMemoryStorage, tenant_id: str, rid: str = "wf-1") -> None:
+def _seed_paused_sync(
+    storage: InMemoryStorage,
+    tenant_id: str,
+    rid: str = "wf-1",
+    approvers: list[str] | None = None,
+) -> None:
     """Seed a PAUSED run via a one-shot asyncio.run so the test stays sync.
 
     Sync on purpose (see tests/test_client_and_remote_cli.py): ``runner.invoke``
@@ -95,7 +100,11 @@ def _seed_paused_sync(storage: InMemoryStorage, tenant_id: str, rid: str = "wf-1
                 final_state={"text": "seed", "step1": "done"},
                 paused_node_id="gate",
                 paused_state={"text": "seed", "step1": "done"},
-                human_task={"prompt": "Approve this refund?", "output_contract": ["decision"]},
+                human_task={
+                    "prompt": "Approve this refund?",
+                    "output_contract": ["decision"],
+                    **({"approvers": approvers} if approvers is not None else {}),
+                },
             )
         )
 
@@ -113,6 +122,20 @@ def test_cli_workflow_runs_paused_lists_gate_prompt(cli_env) -> None:
     row = payload["workflow_runs"][0]
     assert row["status"] == "paused"
     assert row["human_task"]["prompt"] == "Approve this refund?"
+
+
+@pytest.mark.unit
+def test_cli_workflow_runs_paused_table_shows_approvers(cli_env) -> None:
+    """The HITL queue table surfaces who can clear each gate — named approvers
+    when set, 'anyone' when the gate is unrestricted."""
+    _seed_paused_sync(cli_env.storage, cli_env.tenant_id, rid="wf-named", approvers=["lead@x.io"])
+    _seed_paused_sync(cli_env.storage, cli_env.tenant_id, rid="wf-open", approvers=[])
+
+    result = runner.invoke(cli_app, ["workflow", "runs", "--paused"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "approvers" in result.stdout  # the column header
+    assert "lead@x.io" in result.stdout  # named approver rendered
+    assert "anyone" in result.stdout  # unrestricted gate rendered
 
 
 @pytest.mark.unit
