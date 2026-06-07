@@ -57,6 +57,11 @@ class AgentTurnResult:
       event so the transport can correlate the turn. ``status`` is the
       implementation's own status string (the mdk Executor uses
       ``"success"`` / ``"error"``); a minimal adapter may just use ``"ok"``.
+    * ``trace_id`` — the observability trace id for this turn (the mdk Executor
+      passes its ``RunResponse.metrics.trace_id``), carried onto the terminal
+      ``done`` event so the transport can deep-link the turn to its trace (e.g.
+      the Langfuse trace URL). Framework-neutral — any id naming scheme works;
+      empty when the agent's tracing is off (the default for a bare adapter).
     * ``error`` — set (and ``status`` non-success) when the turn failed; the
       pipeline emits a ``stage="agent"`` error and synthesizes no audio.
     """
@@ -64,6 +69,7 @@ class AgentTurnResult:
     answer_text: str = ""
     run_id: str = ""
     status: str = "ok"
+    trace_id: str = ""
     error: AgentTurnError | None = None
 
 

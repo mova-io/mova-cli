@@ -254,6 +254,140 @@ async def test_send_voice_latency_omits_speculation_when_idle() -> None:
     assert "speculation" not in ws.sent[0]
 
 
+# ---------------------------------------------------------------------------
+# Voice-observability loop: correlate a voice turn with its trace (ADR 689
+# voice-runs-parity + ADR 024 tracing). The Executor's trace id rides the
+# AgentTurn seam onto the ``done`` event; the WS edge surfaces it on the
+# latency badge (with a Langfuse deep-link when configured) and it stays on
+# the persisted RunRecord's ``metrics.trace_id``.
+# ---------------------------------------------------------------------------
+
+
+async def test_executor_agent_turn_carries_trace_id() -> None:
+    """``ExecutorAgentTurn`` lifts the Executor's ``RunResponse.metrics.trace_id``
+    onto the ``AgentTurnResult`` so the pipeline can thread it to ``done``."""
+    import types  # noqa: PLC0415
+
+    from movate.core.models import Metrics, RunResponse  # noqa: PLC0415
+    from movate.runtime.voice_agent import ExecutorAgentTurn  # noqa: PLC0415
+
+    response = RunResponse(
+        status="success",
+        run_id="run-1",
+        human_readable="hello there",
+        trace_id="trace-abc123",
+        metrics=Metrics(trace_id="trace-abc123"),
+    )
+
+    class _FakeExecutor:
+        async def execute(self, bundle, request, *, on_token=None, tenant_id_override=None):
+            return response
+
+    bundle = types.SimpleNamespace(spec=types.SimpleNamespace(name="voice-demo"))
+    turn = ExecutorAgentTurn(executor=_FakeExecutor(), bundle=bundle)
+
+    result = await turn.run("hi")
+    assert result.status == "success"
+    assert result.run_id == "run-1"
+    assert result.trace_id == "trace-abc123"
+
+
+async def test_send_voice_latency_carries_trace_id_no_url_when_langfuse_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a trace id but Langfuse not configured: the badge carries ``trace_id``
+    (so an OTel/console consumer can correlate) but omits ``trace_url``."""
+    for var in ("LANGFUSE_HOST", "LANGFUSE_BASE_URL", "LANGFUSE_SECRET_KEY", "LANGFUSE_PROJECT_ID"):
+        monkeypatch.delenv(var, raising=False)
+    events = [
+        VoiceEvent(kind="transcript.final", text="hi", at_ms=100.0),
+        VoiceEvent(kind="agent.token", text="he", at_ms=300.0),
+    ]
+    ws = _FakeWS()
+    await _send_voice_latency(ws, events, trace_id="trace-xyz")
+
+    assert len(ws.sent) == 1
+    frame = ws.sent[0]
+    assert frame["trace_id"] == "trace-xyz"
+    assert "trace_url" not in frame
+
+
+async def test_send_voice_latency_carries_trace_url_when_langfuse_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With Langfuse configured, the badge carries a one-click ``trace_url`` to
+    the dashboard — the operator's jump from the live turn to the LLM trace."""
+    monkeypatch.setenv("LANGFUSE_HOST", "https://lf.example.com")
+    monkeypatch.setenv("LANGFUSE_PROJECT_ID", "proj-1")
+    events = [
+        VoiceEvent(kind="transcript.final", text="hi", at_ms=100.0),
+        VoiceEvent(kind="agent.token", text="he", at_ms=300.0),
+    ]
+    ws = _FakeWS()
+    await _send_voice_latency(ws, events, trace_id="trace-xyz")
+
+    assert len(ws.sent) == 1
+    frame = ws.sent[0]
+    assert frame["trace_id"] == "trace-xyz"
+    assert frame["trace_url"] == "https://lf.example.com/project/proj-1/traces/trace-xyz"
+
+
+async def test_send_voice_latency_omits_trace_fields_when_no_trace_id() -> None:
+    """No trace id (tracing off) → no ``trace_id`` / ``trace_url`` keys, so the
+    frame is byte-for-byte unchanged on the no-trace path (back-compat)."""
+    events = [
+        VoiceEvent(kind="transcript.final", text="hi", at_ms=100.0),
+        VoiceEvent(kind="agent.token", text="he", at_ms=300.0),
+    ]
+    ws = _FakeWS()
+    await _send_voice_latency(ws, events)
+
+    assert len(ws.sent) == 1
+    frame = ws.sent[0]
+    assert "trace_id" not in frame
+    assert "trace_url" not in frame
+
+
+async def test_voice_ws_turn_correlates_record_and_badge_to_executor_trace_id(
+    storage, agents_path, auth_setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: with tracing on, the voice turn's persisted RunRecord carries
+    the Executor's ``metrics.trace_id`` AND the latency badge surfaces the SAME
+    trace id — closing the loop from a voice run to its trace."""
+    # The stdout tracer mints a real per-run trace id (SilentTracer leaves it
+    # empty); MOVATE_TRACE_SINK would otherwise win, so clear it.
+    monkeypatch.delenv("MOVATE_TRACE_SINK", raising=False)
+    monkeypatch.setenv("MOVATE_TRACER", "stdout")
+
+    app = build_app(storage, agents_path=agents_path)
+    stt = FakeSTT("turn the lights on")
+    app.state.voice_stt_factory = lambda: stt
+    app.state.voice_tts_factory = FakeTTS
+    token, tenant_id = auth_setup
+    client = TestClient(app)
+    _create_agent(client, token)
+
+    with client.websocket_connect(f"/api/v1/agents/voice-demo/voice?token={token}") as ws:
+        ws.send_json({"type": "config", "mock": True})
+        ws.send_bytes(b"\x00\x01\x02\x03")
+        ws.send_json({"type": "end"})
+        frames = _drain_turn(ws)
+        ws.send_json({"type": "close"})
+
+    ctrl = [f for f in frames if isinstance(f, dict)]
+    done = next(c for c in ctrl if c["type"] == "done")
+    assert done["status"] == "success"
+
+    # The persisted record carries the Executor's trace id.
+    record = await storage.get_run(done["run_id"], tenant_id=tenant_id)
+    assert record is not None
+    assert record.metrics.trace_id  # non-empty (tracing was on)
+
+    # The latency badge surfaces the SAME trace id (the operator's jump-off).
+    latency = next(c for c in ctrl if c["type"] == "latency")
+    assert latency["trace_id"] == record.metrics.trace_id
+
+
 class _SlowTTS:
     """A TTS that yields several frames with an await between each, so an
     ``interrupt`` control frame has time to land mid-answer (barge-in test)."""

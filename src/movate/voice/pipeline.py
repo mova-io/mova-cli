@@ -75,7 +75,11 @@ class VoiceEvent:
     * ``agent.token`` → ``text`` (a streamed agent output delta, ADR 045 D11)
     * ``tts.audio`` → ``audio`` (a synthesized :class:`AudioChunk`)
     * ``error`` → ``message`` + ``code`` + ``stage`` (the degrade taken, D8)
-    * ``done`` → ``run_id`` + ``status`` (terminal; mirrors the SSE ``done``)
+    * ``done`` → ``run_id`` + ``status`` + ``trace_id`` (terminal; mirrors the
+      SSE ``done``). ``trace_id`` is the agent turn's observability trace id
+      (from :attr:`~movate.voice.agent_turn.AgentTurnResult.trace_id`), carried
+      so the transport can deep-link the turn to its trace. Empty when the
+      agent's tracing is off.
 
     ``at_ms`` is a monotonic wall-clock offset (milliseconds since the turn
     began, measured by :func:`run_voice_pipeline`) stamped on every event. It
@@ -94,6 +98,7 @@ class VoiceEvent:
     stage: str = ""
     run_id: str = ""
     status: str = ""
+    trace_id: str = ""
     at_ms: float = 0.0
 
 
@@ -531,6 +536,7 @@ async def run_voice_pipeline(
             stage=event.stage,
             run_id=event.run_id,
             status=event.status,
+            trace_id=event.trace_id,
             at_ms=(_now() - _t0) * 1000.0,
         )
 
@@ -653,6 +659,7 @@ async def run_voice_pipeline(
     answer_text = ""
     run_id = ""
     status = ""
+    trace_id = ""
     agent_failed = False
     try:
         while True:
@@ -666,6 +673,7 @@ async def run_voice_pipeline(
                 result = payload
                 run_id = result.run_id
                 status = result.status
+                trace_id = result.trace_id
                 if result.error is not None:
                     err = result.error
                     agent_failed = True
@@ -755,7 +763,7 @@ async def run_voice_pipeline(
     # the done status so the UI can label it ("interrupted") without treating it
     # as an error. A plain successful turn keeps its original run status.
     done_status = "interrupted" if interrupted else status
-    yield _stamp(VoiceEvent(kind="done", run_id=run_id, status=done_status))
+    yield _stamp(VoiceEvent(kind="done", run_id=run_id, status=done_status, trace_id=trace_id))
 
 
 # Sentinel marking both concurrent phases finished (drained from the event queue).
@@ -793,6 +801,7 @@ async def _run_streaming_turn(
     state: dict[str, Any] = {
         "run_id": "",
         "status": "",
+        "trace_id": "",
         "agent_failed": False,
         "interrupted": False,
     }
@@ -828,6 +837,7 @@ async def _run_streaming_turn(
                     res = payload
                     state["run_id"] = res.run_id
                     state["status"] = res.status
+                    state["trace_id"] = res.trace_id
                     if res.error is not None:
                         state["agent_failed"] = True
                         await event_q.put(
@@ -979,4 +989,11 @@ async def _run_streaming_turn(
 
     if not state["agent_failed"]:
         done_status = "interrupted" if state["interrupted"] else state["status"]
-        yield stamp(VoiceEvent(kind="done", run_id=state["run_id"], status=done_status))
+        yield stamp(
+            VoiceEvent(
+                kind="done",
+                run_id=state["run_id"],
+                status=done_status,
+                trace_id=state["trace_id"],
+            )
+        )
