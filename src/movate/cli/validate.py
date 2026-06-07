@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -375,6 +376,37 @@ def _validate_all(*, strict: bool, run_linter: bool, json_output: bool = False) 
         prompt_next_step(console=console, steps=steps)
 
 
+def _report_config_load_error(exc: ValidationError) -> None:
+    """Render a project-config :class:`ValidationError` as a clean diagnostic.
+
+    A malformed project file (``project.yaml`` / ``policy.yaml`` /
+    ``movate.yaml``) raises a raw pydantic ``ValidationError`` from
+    :func:`load_project_config`. This turns it into the same exit-2-shaped,
+    self-teaching message that an invalid ``agent.yaml`` gets — one line per
+    rejected key — instead of an uncaught stack trace. ``extra_forbidden``
+    errors (a typo'd or unknown project-level key) get an explicit
+    "unknown key … in project config" line; everything else falls back to
+    the raw pydantic message for that field.
+    """
+    console.print(
+        "[red]✗ project config failed to load[/red] "
+        "[dim](project.yaml / policy.yaml / movate.yaml)[/dim]:"
+    )
+    for err in exc.errors():
+        loc = ".".join(str(seg) for seg in err.get("loc", ())) or "(root)"
+        if err.get("type") == "extra_forbidden":
+            console.print(
+                f"  [red]·[/red] unknown key [bold]{loc}[/bold] in project config "
+                "— not part of the project schema (check for a typo)."
+            )
+        else:
+            console.print(f"  [red]·[/red] [bold]{loc}[/bold]: {err.get('msg', '')}")
+    console.print(
+        "[dim]  fix: correct the offending key in your project file, "
+        "or run [bold]mdk doctor[/bold] to inspect the merged config.[/dim]"
+    )
+
+
 def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     try:
         bundle = load_agent(path)
@@ -390,6 +422,17 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
                 "[dim]  hint: run [bold]mdk add skill <name>[/bold] "
                 "to scaffold the missing skill directory.[/dim]"
             )
+        raise typer.Exit(code=2) from None
+    except ValidationError as exc:
+        # The agent loader also reads the project config
+        # (``project.yaml`` / ``policy.yaml`` / ``movate.yaml``) to apply
+        # layered defaults. A malformed PROJECT file surfaces as a raw
+        # pydantic ``ValidationError`` here rather than an ``AgentLoadError``
+        # — left uncaught it became an ugly stack trace (the P1 demo-onboarding
+        # crash). Turn any config-load validation failure into the same clean,
+        # exit-2 diagnostic an invalid agent.yaml gets. Rule 10: self-teaching
+        # errors, never a traceback.
+        _report_config_load_error(exc)
         raise typer.Exit(code=2) from None
 
     spec = bundle.spec
@@ -420,7 +463,16 @@ def _validate_agent(path: Path, *, strict: bool, run_linter: bool) -> None:
     # this gate is "may this AGENT use this RUNTIME?" rather than "may this
     # model+budget combo run?". Default is permissive; setting
     # ``runtime.allowed: [litellm]`` in movate.yaml enforces 'A by default'.
-    project_cfg = load_project_config()
+    try:
+        project_cfg = load_project_config()
+    except ValidationError as exc:
+        # Defensive: the agent loader already loaded the project config
+        # above without error, so a failure here is unexpected — but a
+        # config file edited between the two reads (or a path-discovery
+        # difference) must still produce a clean diagnostic, not a stack
+        # trace.
+        _report_config_load_error(exc)
+        raise typer.Exit(code=2) from None
     runtime_violation = project_cfg.runtime.check_agent(spec)
     if runtime_violation is not None:
         console.print(f"[red]✗ runtime policy violation:[/red] {runtime_violation}")

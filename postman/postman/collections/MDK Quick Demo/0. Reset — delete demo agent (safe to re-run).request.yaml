@@ -1,0 +1,4 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/agents/{{agent_name}}"
+method: DELETE
+order: 1000

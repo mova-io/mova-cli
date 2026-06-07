@@ -43,10 +43,15 @@ import yaml
 from movate.tracing.metrics import METRIC_NAMES
 
 # Repo-root-relative dashboards directory (tests/ is one level under the root).
-_DASHBOARDS_DIR = Path(__file__).resolve().parent.parent / "dashboards"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DASHBOARDS_DIR = _REPO_ROOT / "dashboards"
 _GRAFANA = _DASHBOARDS_DIR / "grafana" / "mdk-golden-signals.json"
 _PROM_RULES = _DASHBOARDS_DIR / "prometheus" / "mdk-rules.yaml"
 _AZURE_WORKBOOK = _DASHBOARDS_DIR / "azure" / "mdk-golden-signals.workbook.json"
+# ADR 082 — the deployed Temporal operational workbook (loaded by
+# infra/azure/modules/monitor-workbooks.bicep via loadTextContent). Brought under
+# the same anti-drift guard so its mdk.* references can't go stale.
+_TEMPORAL_WORKBOOK = _REPO_ROOT / "infra" / "azure-monitor" / "workbooks" / "temporal.workbook.json"
 
 # Prometheus unit / aggregation suffixes the OTLP -> Prometheus convention
 # appends. Stripped (one layer per pass) before matching a Prometheus token
@@ -140,10 +145,15 @@ _POOL_METRICS = {
     "mdk.db.pool.max",
 }
 
+# ADR 082 — the Temporal operational workbook is built solely on the durable-
+# workflow completion counter (per-workflow timing lives in the Temporal Web UI).
+_TEMPORAL_METRICS = {"mdk.workflow.completed"}
+
 _CASES = [
     pytest.param(_GRAFANA, "json", _ALL_FIVE | _POOL_METRICS, id="grafana"),
     pytest.param(_PROM_RULES, "yaml", _ALL_FIVE, id="prometheus-rules"),
     pytest.param(_AZURE_WORKBOOK, "json", _ALL_FIVE, id="azure-workbook"),
+    pytest.param(_TEMPORAL_WORKBOOK, "json", _TEMPORAL_METRICS, id="temporal-workbook"),
 ]
 
 
