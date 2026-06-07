@@ -2614,6 +2614,32 @@ def _preflight_pgvector(plan: DeployPlan) -> None:
     raise typer.Exit(code=2)
 
 
+def _resolve_build_version() -> str:
+    """CalVer for the checkout being built (ADR 066), passed to the Docker build.
+
+    The version is git-derived, but ``az acr build .`` uploads the build context
+    WITHOUT ``.git`` — so we compute it here (where ``.git`` is present) and pass
+    it as the ``MOVATE_BUILD_VERSION`` build-arg, which the hatch metadata hook
+    honors. Computed via the in-repo ``scripts/calver_version.py`` (the canonical
+    computor); falls back to the installed ``movate.__version__`` if that script
+    isn't reachable (e.g. deploying from outside a checkout).
+    """
+    script = Path("scripts/calver_version.py")
+    if script.is_file():
+        try:
+            out = subprocess.run(
+                [sys.executable, str(script)],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            if out:
+                return out
+        except Exception:
+            pass
+    return movate.__version__
+
+
 def _run_acr_build(plan: DeployPlan, *, verbose: bool = False) -> None:
     """``az acr build`` — builds the image inside ACR (no local Docker).
 
@@ -2628,6 +2654,8 @@ def _run_acr_build(plan: DeployPlan, *, verbose: bool = False) -> None:
     timing aren't useful at deploy time. On failure the captured tail is
     surfaced regardless.
     """
+    # ADR 066 — inject the git-derived version (the build context excludes .git).
+    build_version = _resolve_build_version()
     cmd = [
         "az",
         "acr",
@@ -2642,6 +2670,8 @@ def _run_acr_build(plan: DeployPlan, *, verbose: bool = False) -> None:
         "Dockerfile",
         "--target",
         "runtime",
+        "--build-arg",
+        f"MOVATE_BUILD_VERSION={build_version}",
         ".",
     ]
     with live_step(f"building {plan.image_tag} in ACR…") as step:

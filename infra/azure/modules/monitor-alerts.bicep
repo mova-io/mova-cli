@@ -15,8 +15,10 @@
 //                                        "mdk.jobs.completed" — dot-names are
 //                                        preserved verbatim by the exporter)
 //     - requests   → AppRequests       (HTTP server spans, e.g. /healthz, /api/v1)
-//   so all four rules are LOG-SEARCH alerts (scheduledQueryRules v2) scoped to
-//   the WORKSPACE, where the App* tables live.
+//   so all rules are LOG-SEARCH alerts (scheduledQueryRules v2) scoped to
+//   the WORKSPACE, where the App* tables live. Six rules: the four golden-signal
+//   alerts (dead-letter / error-rate / latency / availability) plus DB-pool
+//   exhaustion (ADR 034 D3) and SSE saturation (ADR 035 D3).
 //
 // DEFAULT-OFF: invoked from main.bicep only when (enableAlerts && enableAppInsights).
 // When enableAlerts=false, main.bicep does not instantiate this module at all,
@@ -86,6 +88,22 @@ param latencySeverity int = 2
 @maxValue(4)
 param availabilitySeverity int = 1
 
+@description('DB pool exhaustion: alert when the avg of mdk.db.pool.waiting (callers blocked acquiring a Postgres connection, ADR 034 D3) over the window exceeds this. Default 0 — any SUSTAINED non-zero waiting (2 consecutive periods) is the early-warning signal that N_pods x pool.max is overrunning Postgres max_connections.')
+param poolWaitingThreshold int = 0
+
+@description('Severity for the DB-pool-exhaustion alert.')
+@minValue(0)
+@maxValue(4)
+param poolSeverity int = 1
+
+@description('SSE saturation: alert when the max of mdk.sse.connections_active (ADR 035 D3) over the window exceeds this. Default 100 — a single runaway subscriber owning a large slice of the per-pod polling budget. Tune to your per-tenant cap.')
+param sseConnectionsThreshold int = 100
+
+@description('Severity for the SSE-saturation alert.')
+@minValue(0)
+@maxValue(4)
+param sseSeverity int = 2
+
 // Stamp the monitored component's resource id onto each rule's tags so an
 // on-call engineer can pivot from a fired alert to the App Insights component
 // (and the rules carry a stable back-reference even though the KQL targets the
@@ -128,7 +146,7 @@ resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
 // api-version 2023-03-15-preview is the stable v2 shape `az bicep build`
 // accepts; it carries the `criteria.allOf[].{query,timeAggregation,
 // metricMeasureColumn,operator,threshold,failingPeriods}` schema + the
-// `scopes`/`actions` wiring used below. All four are scoped to the WORKSPACE
+// `scopes`/`actions` wiring used below. All are scoped to the WORKSPACE
 // (App* tables live there for workspace-based App Insights).
 // ---------------------------------------------------------------------------
 
@@ -309,8 +327,98 @@ resource availabilityRule 'Microsoft.Insights/scheduledQueryRules@2023-03-15-pre
   }
 }
 
+// (5) DB POOL EXHAUSTION — AppMetrics, the mdk.db.pool.waiting observable gauge
+// (ADR 034 D3). A sustained non-zero "waiting" means callers are blocking to
+// acquire a Postgres connection — the early-warning that under KEDA autoscale
+// N_pods x pool.max_size is overrunning Azure Postgres max_connections (invisible
+// until it tips into refusals). Requires 2 consecutive periods so a transient
+// blip doesn't page. ASSUMPTION (🔒): the gauge lands in AppMetrics with the
+// per-export value in the `Sum` column (confirm against live AppMetrics; the
+// Grafana pool panels query the same instrument).
+resource poolExhaustionRule 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: '${appInsightsName}-db-pool-exhaustion'
+  location: location
+  tags: ruleTags
+  properties: {
+    displayName: 'movate: DB connection-pool exhaustion'
+    description: 'mdk.db.pool.waiting (callers blocked acquiring a Postgres connection, ADR 034 D3) averaged over ${windowSize} exceeded ${poolWaitingThreshold} for 2 consecutive periods. Source: ${appInsightsName}.'
+    severity: poolSeverity
+    enabled: true
+    scopes: [workspaceResourceId]
+    windowSize: windowSize
+    evaluationFrequency: evaluationFrequency
+    criteria: {
+      allOf: [
+        {
+          query: '''AppMetrics
+| where Name == "mdk.db.pool.waiting"
+| summarize Waiting = avg(Sum)'''
+          timeAggregation: 'Average'
+          metricMeasureColumn: 'Waiting'
+          operator: 'GreaterThan'
+          threshold: poolWaitingThreshold
+          failingPeriods: {
+            numberOfEvaluationPeriods: 2
+            minFailingPeriodsToAlert: 2
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [actionGroup.id]
+    }
+  }
+}
+
+// (6) SSE SATURATION — AppMetrics, the mdk.sse.connections_active up-down counter
+// (ADR 035 D3). A single runaway client holding open many event-stream
+// connections owns a disproportionate slice of the per-pod polling budget. Fires
+// on the peak (max) over the window crossing the configured ceiling.
+resource sseSaturationRule 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' = {
+  name: '${appInsightsName}-sse-saturation'
+  location: location
+  tags: ruleTags
+  properties: {
+    displayName: 'movate: SSE subscriber saturation'
+    description: 'mdk.sse.connections_active (open GET /api/v1/events/stream subscribers, ADR 035 D3) peaked above ${sseConnectionsThreshold} over ${windowSize}. Source: ${appInsightsName}.'
+    severity: sseSeverity
+    enabled: true
+    scopes: [workspaceResourceId]
+    windowSize: windowSize
+    evaluationFrequency: evaluationFrequency
+    criteria: {
+      allOf: [
+        {
+          query: '''AppMetrics
+| where Name == "mdk.sse.connections_active"
+| summarize Conns = max(Sum)'''
+          timeAggregation: 'Maximum'
+          metricMeasureColumn: 'Conns'
+          operator: 'GreaterThan'
+          threshold: sseConnectionsThreshold
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    autoMitigate: true
+    actions: {
+      actionGroups: [actionGroup.id]
+    }
+  }
+}
+
 @description('Resource id of the Action Group all rules notify. Surfaced so main.bicep can echo it as a deployment output.')
 output actionGroupId string = actionGroup.id
 
 @description('Action Group name.')
 output actionGroupName string = actionGroup.name
+
+@description('Resource id of the DB-pool-exhaustion alert rule (ADR 034 D3).')
+output poolExhaustionRuleId string = poolExhaustionRule.id
+
+@description('Resource id of the SSE-saturation alert rule (ADR 035 D3).')
+output sseSaturationRuleId string = sseSaturationRule.id

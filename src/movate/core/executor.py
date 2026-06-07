@@ -14,6 +14,7 @@ Workflow orchestration lives in ``movate.core.workflow``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -1214,6 +1215,12 @@ class Executor:
         from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
         from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
+
+        # LangChain backend — optional; only registers if mdk[langchain] is
+        # installed. Missing extra is fine — skills with kind=langchain will
+        # get a clear "no backend registered" error at dispatch time.
+        with contextlib.suppress(ImportError):
+            from movate.core.skill_backend import langchain as _lc_backend  # noqa: F401, PLC0415
 
         # Build a name → SkillBundle map for quick lookup inside the loop.
         skill_index: dict[str, Any] = {s.spec.name: s for s in bundle.skills}

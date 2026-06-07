@@ -174,6 +174,10 @@ main { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:16px; padding:16px;
 .events .e.err { color:var(--err); }
 .events .e.final { color:var(--text); }
 .events .e.warn { color:var(--warn); }
+#events-details summary { list-style:none; }
+#events-details summary::-webkit-details-marker { display:none; }
+#events-details summary h2::before { content:'▸ '; font-size:12px; }
+#events-details[open] summary h2::before { content:'▾ '; }
 .controls { padding:18px 24px; border-top:1px solid var(--border); }
 .controls-row { display:flex; gap:12px; justify-content:center; align-items:center; flex-wrap:wrap; }
 button { font-size:13px; font-weight:500; padding:8px 14px; border:0; border-radius:6px;
@@ -216,6 +220,10 @@ button.active { background:var(--accent); color:white; }
     Click to enable microphone and audio playback in this browser.
   </div>
   <button class="start" id="gate-start">▶ Start</button>
+  <div id="deploy-info" class="muted" style="font-size:11px;opacity:0.6;margin-top:4px;
+       font-variant-numeric:tabular-nums;font-family:var(--mono);">
+    loading deploy info…
+  </div>
 </div>
 
 <header>
@@ -229,6 +237,9 @@ button.active { background:var(--accent); color:white; }
   <span id="status" class="dot"></span>
   <h1>Mova-iO Voice Playground</h1>
   <span id="status-text" class="muted" style="font-size:12px;"></span>
+  <span id="deploy-badge" class="muted" style="font-size:10px;opacity:0.5;
+        font-variant-numeric:tabular-nums;font-family:var(--mono);margin-left:auto;
+        white-space:nowrap;"></span>
   <!-- View tabs — Simple (curated minimal UI for a demo audience) vs
        Detailed (full engineering view). Persists in localStorage. -->
   <div class="view-tabs" id="view-tabs">
@@ -261,8 +272,8 @@ button.active { background:var(--accent); color:white; }
   <!-- 📞 Sync-to-phone button — pushes the playground's current settings
        (agent tier, Mova-iO agent_id, TTS tier, voice, hedge, budget) to the
        module-level config the next inbound Twilio call will use. -->
-  <button id="twilio-sync" class="badge detailed-only"
-          title="Copy current playground settings to the Twilio phone number — the NEXT call to this number will use these"
+  <button id="twilio-sync" class="badge"
+          title="Sync the selected agent to the Twilio phone number — the NEXT call to this number will use this agent"
           style="cursor:pointer;color:var(--text);padding:2px 8px;border:0;">📞 Sync to phone</button>
   <!-- BYOK header badge — click to paste your own Mova-iO API key.
        Shows "Lyzr: demo key" by default, "Lyzr: your key" when BYOK active. -->
@@ -319,6 +330,15 @@ button.active { background:var(--accent); color:white; }
     Tip: once your key is applied, the Mova-iO agent dropdown reloads with
     <em>your</em> account's agents.
   </p>
+
+  <!-- Phone Sync moved to the unified 📞 Sync button next to the agent
+       dropdown (controls row). Hidden DOM kept for backward-compat JS refs. -->
+  <div id="phone-sync-panel" style="display:none !important;">
+    <strong id="phone-sync-number"></strong>
+    <select id="phone-agent-select"><option value=""></option></select>
+    <button id="phone-sync-btn"></button>
+    <div id="phone-sync-status" style="display:none;"></div>
+  </div>
 </div>
 
 <!-- L2: "Currently voicing" — Mova-iO agent metadata panel. Shows when an agent
@@ -463,7 +483,7 @@ button.active { background:var(--accent); color:white; }
       <span class="lg"><span class="sw" style="background:var(--c2);"></span>● transcript</span>
       <span class="lg"><span class="sw" style="background:var(--c3);"></span>● agent token</span>
       <span class="lg"><span class="sw" style="background:var(--accent);"></span>● TTS frame</span>
-      <span style="margin-left:auto;color:var(--muted);" id="monitor-now">—</span>
+      <span style="margin-left:auto;color:var(--muted);font-family:'SF Mono',Menlo,monospace;font-variant-numeric:tabular-nums;min-width:12em;text-align:right;" id="monitor-now">—</span>
     </div>
   </section>
 
@@ -498,9 +518,11 @@ button.active { background:var(--accent); color:white; }
     </div>
   </section>
 
-  <section class="panel detailed-only" style="grid-column: 1 / -1;">
-    <h2>Event stream (raw)</h2>
-    <div class="events" id="events"></div>
+  <section class="panel" style="grid-column: 1 / -1;">
+    <details id="events-details">
+      <summary style="cursor:pointer;user-select:none;"><h2 style="display:inline;">Event stream (raw)</h2></summary>
+      <div class="events" id="events"></div>
+    </details>
   </section>
 </main>
 
@@ -520,6 +542,8 @@ button.active { background:var(--accent); color:white; }
            (full answer at once) but uses the SDK's full pipeline. -->
       <button data-tier="lyzr_sdk" id="agent-lyzr-sdk" class="tier-mova"
               title="Mova-iO via the SDK binding — full answer at once, deeper SDK lifecycle (memory/RAI)">Standard</button>
+      <button data-tier="deep_agent" class="detailed-only"
+              title="LangChain Deep Agent with planning, subagents, and memory">Deep Agent</button>
       <!-- B1: full-duplex realtime mode (OpenAI Realtime). Detailed only. -->
       <button data-tier="realtime" id="agent-realtime" class="detailed-only"
               title="Full-duplex realtime — sub-second turns; OpenAI Realtime owns STT+LLM+TTS server-side">Realtime</button>
@@ -533,6 +557,18 @@ button.active { background:var(--accent); color:white; }
             min-width:240px;max-width:320px;">
       <option value="">loading…</option>
     </select>
+    <!-- Unified phone sync — right next to the agent picker. Uses whichever
+         agent is currently selected (no duplicate dropdown). Hidden until
+         Twilio number is known + agents are loaded. -->
+    <button id="quick-sync" style="display:none;font-size:11px;padding:5px 10px;
+            border-radius:6px;border:1px solid var(--border);background:var(--surface);
+            color:var(--muted);cursor:pointer;white-space:nowrap;"
+            title="Sync this agent to the phone line">📞 Sync</button>
+    <!-- Synced-agent pill — colorful indicator of which agent answers the phone.
+         Independent of the browser agent (user can switch agents freely). -->
+    <span id="synced-pill" style="display:none;font-size:11px;padding:4px 10px;
+          border-radius:12px;background:rgba(52,208,88,0.15);color:var(--ok);
+          white-space:nowrap;font-weight:500;"></span>
     <!-- Manual refresh — force a re-fetch of the agent list (e.g. after
          creating a new agent in Mova-iO Studio, or after pasting a different
          BYOK key if the auto-refresh missed). Bypasses the server-side cache. -->
@@ -556,6 +592,33 @@ button.active { background:var(--accent); color:white; }
     <div class="toggle-group detailed-only" id="tts-toggle">
       <button data-tier="cartesia" class="active">Cartesia (fast)</button>
       <button data-tier="openai">OpenAI</button>
+    </div>
+    <!-- Language picker — multi-language voice support. Selecting a language
+         auto-switches the STT language hint, agent prompt, and TTS voice. -->
+    <span class="muted" style="font-size:11px;margin-left:8px;">Language</span>
+    <select id="language-select"
+            title="Select language — STT, agent, and TTS voice adapt automatically"
+            style="background:var(--surface);color:var(--text);border:1px solid var(--border);
+                   border-radius:6px;padding:6px 8px;font-size:11px;min-width:140px;">
+      <option value="">🇺🇸 English (default)</option>
+      <option value="es">🇪🇸 Spanish</option>
+      <option value="fr">🇫🇷 French</option>
+      <option value="fr-CA">🇨🇦 French (Canadian)</option>
+      <option value="de">🇩🇪 German</option>
+      <option value="pt">🇧🇷 Portuguese</option>
+      <option value="hi">🇮🇳 Hindi</option>
+      <option value="ja">🇯🇵 Japanese</option>
+      <option value="zh">🇨🇳 Chinese</option>
+      <option value="ko">🇰🇷 Korean</option>
+      <option value="auto">🌐 Auto-detect</option>
+    </select>
+    <!-- Transport toggle — WebSocket (default) or LiveKit WebRTC. LiveKit
+         gives 16kHz Opus (vs 8kHz WS PCM), sub-50ms P2P, built-in echo
+         cancellation. Hidden when LiveKit is not configured on the server. -->
+    <span class="muted detailed-only" id="transport-label" style="font-size:11px;margin-left:8px;display:none;">Transport</span>
+    <div class="toggle-group detailed-only" id="transport-toggle" style="display:none;">
+      <button data-transport="ws" class="active" title="WebSocket (PCM16 binary frames, default)">WebSocket</button>
+      <button data-transport="livekit" title="LiveKit WebRTC (Opus, P2P, echo cancellation)">LiveKit</button>
     </div>
     <!-- Voice picker — kept visible in BOTH views so users can pick a voice
          that matches their use case in either mode. -->
@@ -643,6 +706,14 @@ button.active { background:var(--accent); color:white; }
   </div>
   <div class="controls-row">
     <button id="talk" class="primary" disabled>🎙️ Talk</button>
+    <!-- Subtle LiveKit toggle next to Talk — visible in Simple + Detailed.
+         Hidden until /livekit/status confirms it's available. Clicking swaps
+         transport between WebSocket and LiveKit WebRTC. -->
+    <button id="lk-toggle" style="display:none;font-size:11px;padding:6px 12px;
+            border-radius:16px;border:1px solid var(--border);background:var(--surface);
+            color:var(--muted);cursor:pointer;transition:all .15s;margin-left:8px;"
+            title="Switch to LiveKit WebRTC (16 kHz Opus, P2P, lower latency)">📡 WebRTC</button>
+    <span id="livekit-status-badge" class="badge" style="display:none;"></span>
   </div>
   <div class="hint" id="hint">click Talk · auto-endpoints on silence · or hold space (push-to-talk mode)</div>
   <div class="error" id="err"></div>
@@ -689,14 +760,168 @@ $('gate-start').addEventListener('click', async () => {
 // same UI events (transcript.*, tts.audio, done, error) so the rendering code
 // doesn't need a parallel branch.
 let connectionMode = 'pipeline';
+let transportMode = 'ws';       // 'ws' (WebSocket) or 'livekit' (WebRTC)
+let lkRoom = null;               // LiveKit Room instance when connected
+let lkConnected = false;
+let lkAvailable = false;         // persists across WS reconnects
+
+// ─── LiveKit availability check ────────────────────────────────────────────
+// On load, probe /livekit/status. If configured, show the transport toggle.
+// Also called from the 'ready' handler to re-assert visibility after reconnects.
+function showLiveKitToggle() {
+  if (!lkAvailable) return;
+  $('transport-label').style.display = '';
+  $('transport-toggle').style.display = '';
+  $('lk-toggle').style.display = '';
+}
+(async function checkLiveKit() {
+  try {
+    const r = await fetch('/livekit/status');
+    const d = await r.json();
+    if (d.ok && d.configured) {
+      lkAvailable = true;
+      showLiveKitToggle();
+      logEvent('LiveKit available — transport toggle enabled');
+    }
+  } catch { /* LiveKit not available — toggle stays hidden */ }
+})();
+
+// ─── LiveKit connect / disconnect ──────────────────────────────────────────
+async function connectLiveKit() {
+  if (lkConnected) return;
+  if (typeof LivekitClient === 'undefined') {
+    status('LiveKit SDK not loaded', 'err');
+    return;
+  }
+  try {
+    status('connecting (LiveKit)…', '');
+    $('talk').disabled = true;
+
+    // 1. Get token from server.
+    const roomName = 'playground-' + Date.now();
+    const tokResp = await fetch('/livekit/token', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({room_name: roomName, participant_name: 'browser'})
+    });
+    const tokData = await tokResp.json();
+    if (!tokData.ok) throw new Error(tokData.error || 'Token request failed');
+
+    // 2. Tell server agent to join the room (with current session config).
+    const joinResp = await fetch('/livekit/join', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        room_name: roomName,
+        agent_tier: agentTier,
+        language: $('language-select').value || '',
+        voice_id: $('voice-select').value || '',
+        lyzr_agent_id: currentLyzrAgentId || $('lyzr-agent-select').value || $('lyzr-id').value || '',
+        tts_tier: ttsTier || 'cartesia',
+        user_lyzr_key: $('byok-lyzr').value || '',
+      })
+    });
+    const joinData = await joinResp.json();
+    if (!joinData.ok) throw new Error(joinData.error || 'Join failed');
+
+    // 3. Connect browser to the LiveKit room.
+    lkRoom = new LivekitClient.Room();
+    var RE = LivekitClient.RoomEvent;
+
+    lkRoom.on(RE.Connected, function() {
+      lkConnected = true;
+      status('connected (LiveKit WebRTC)', 'ok');
+      $('talk').disabled = true;  // No Talk button needed — VAD is automatic
+      $('hint').textContent = 'LiveKit connected — just speak, VAD handles turns automatically';
+      $('livekit-status-badge').textContent = '🟢 WebRTC';
+      $('livekit-status-badge').style.display = '';
+      $('livekit-status-badge').style.color = 'var(--ok)';
+      // Show listening state so user knows they can speak.
+      $('transcript').textContent = '…listening (LiveKit)';
+      $('answer').innerHTML = '<span class="muted">—</span>';
+      logEvent('LiveKit room connected — WebRTC audio active', 'final');
+    });
+
+    lkRoom.on(RE.Disconnected, function() {
+      lkConnected = false;
+      status('disconnected (LiveKit)', 'err');
+      $('livekit-status-badge').textContent = '🔴 reconnecting…';
+      $('livekit-status-badge').style.color = 'var(--warn)';
+      $('hint').textContent = 'LiveKit disconnected — reconnecting…';
+      logEvent('LiveKit room disconnected — will reconnect in 3s', 'err');
+      // Auto-reconnect after a brief delay.
+      if (transportMode === 'livekit') {
+        lkRoom = null;
+        setTimeout(() => { if (transportMode === 'livekit') connectLiveKit(); }, 3000);
+      }
+    });
+
+    // Receive agent's TTS audio — auto-play via DOM element.
+    lkRoom.on(RE.TrackSubscribed, function(track, pub, participant) {
+      if (track.kind === 'audio') {
+        var el = track.attach();
+        el.id = 'lk-agent-audio';
+        el.style.display = 'none';
+        document.body.appendChild(el);
+        logEvent('Receiving agent audio via WebRTC');
+      }
+    });
+    lkRoom.on(RE.TrackUnsubscribed, function(track) {
+      track.detach().forEach(function(el) { el.remove(); });
+    });
+
+    // Receive pipeline events over DataChannel → reuse existing handleJson.
+    lkRoom.on(RE.DataReceived, function(payload) {
+      try {
+        var text = new TextDecoder().decode(payload);
+        handleJson(text);
+      } catch(e) {
+        logEvent('DataChannel parse error: ' + e.message, 'err');
+      }
+    });
+
+    await lkRoom.connect(tokData.url, tokData.token);
+
+    // 4. Publish mic to the room — the bridge's VAD handles endpointing.
+    await lkRoom.localParticipant.setMicrophoneEnabled(true);
+    logEvent('Microphone published to LiveKit room');
+
+  } catch(err) {
+    status('LiveKit error: ' + err.message, 'err');
+    logEvent('LiveKit connect failed: ' + err.message, 'err');
+    lkConnected = false;
+    // Stay in LiveKit mode — don't auto-fallback to WS (that causes
+    // a reconnect loop). User can manually click WebRTC OFF to go back.
+    $('livekit-status-badge').textContent = '🔴 error';
+    $('livekit-status-badge').style.display = '';
+    $('livekit-status-badge').style.color = 'var(--err)';
+  }
+}
+
+async function disconnectLiveKit() {
+  if (lkRoom) {
+    try { await lkRoom.disconnect(); } catch {}
+    lkRoom = null;
+  }
+  lkConnected = false;
+  var el = document.getElementById('lk-agent-audio');
+  if (el) el.remove();
+  $('livekit-status-badge').style.display = 'none';
+}
 
 function connect() {
+  // LiveKit transport — no WebSocket needed.
+  if (transportMode === 'livekit') {
+    connectLiveKit();
+    return;
+  }
+  // Default: WebSocket transport.
   const path = connectionMode === 'realtime' ? '/ws/voice/realtime' : '/ws/voice';
   const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + path;
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { status(`connected (${connectionMode})`, 'ok'); $('talk').disabled = false; };
-  ws.onclose = () => { status('disconnected', 'err'); $('talk').disabled = true; if (audioUnlocked) setTimeout(connect, 2000); };
+  ws.onclose = () => { status('disconnected', 'err'); $('talk').disabled = true; if (audioUnlocked && transportMode === 'ws') setTimeout(connect, 2000); };
   ws.onerror = () => status('connection error', 'err');
   ws.onmessage = (e) => (typeof e.data === 'string') ? handleJson(e.data) : handleAudio(e.data);
 }
@@ -776,6 +1001,8 @@ function handleJson(s) {
         dialBtn.style.display = 'none';
       }
     }
+    // Show the quick-sync button if Twilio is configured + agents are loaded.
+    _showQuickSync();
     // BYOK badge — reflect whatever the server reports at session start.
     // We only surface Lyzr (USER_KEY_PROVIDERS narrowed to "lyzr").
     if (m.user_keys_active && m.user_keys_active.lyzr) {
@@ -796,6 +1023,8 @@ function handleJson(s) {
     // Pre-populate the agent_id input from whatever the server loaded.
     $('lyzr-id').value = m.lyzr_agent_id || '';
     showLyzrIdInput((agentTier === 'lyzr' || agentTier === 'lyzr_sdk'));
+    // Re-assert LiveKit toggle visibility — may have been lost on reconnect.
+    showLiveKitToggle();
     return;
   }
   if (ev === 'lyzr_agent_id') {
@@ -888,6 +1117,16 @@ function handleJson(s) {
     }
     return;
   }
+  if (ev === 'language') {
+    // Server confirmed language change — sync both dropdowns.
+    if ($('language-select').value !== (m.language || '')) {
+      $('language-select').value = m.language || '';
+    }
+    if (m.voice_id && $('voice-select').value !== m.voice_id) {
+      $('voice-select').value = m.voice_id;
+    }
+    return;
+  }
   if (ev === 'trail') {
     // A1: live failover-router trail — every selection, failover, breaker
     // trip, cache hit, or hedge surfaces here. Compact, color-coded so a
@@ -966,9 +1205,14 @@ function handleJson(s) {
     } else if (k === 'agent.token') {
       // Stream tokens into a per-turn rolling buffer; too noisy to log each.
     } else if (k === 'done') {
+      if (m.answer) logEvent(`📞 ${t}agent: ${m.answer}`, 'final');
       logEvent(`📞 ${t}done · ${m.badge || ''}`, 'final');
     } else if (k === 'error') {
       logEvent(`📞 ${t}error · ${m.stage || ''}: ${m.message || ''}`, 'err');
+    } else if (k === 'call_count') {
+      logEvent(`📞 ${m.active}/${m.max} phone lines active`, 'final');
+    } else if (k === 'call_rejected') {
+      logEvent(`📞 ⚠ call rejected — at capacity (${m.active}/${m.max})`, 'err');
     }
     return;
   }
@@ -1104,6 +1348,21 @@ function handleJson(s) {
     return;
   }
   if (ev === 'done') {
+    // LiveKit bridge sends a minimal done (no latency/cost/metrics).
+    // Just reset the UI for the next turn and log it.
+    if (transportMode === 'livekit') {
+      speaking = false;
+      $('interrupt').style.display = 'none';
+      logEvent('turn complete (LiveKit)', 'final');
+      // Prep the UI for the next turn — show "listening" state.
+      setTimeout(() => {
+        if (transportMode === 'livekit' && lkConnected) {
+          $('transcript').textContent = '…listening (LiveKit)';
+          $('answer').innerHTML = '<span class="muted">—</span>';
+        }
+      }, 1500);
+      return;
+    }
     $('badge').textContent = m.badge || '';
     $('tts-badge').textContent = `served by ${m.tts_tier}`;
     $('cost-badge').textContent = m.cost_usd != null ? `$${m.cost_usd.toFixed(5)}` : '';
@@ -1536,6 +1795,10 @@ async function loadLyzrAgents(force = false) {
     // If a currentLyzrAgentId was already set (server-side default), select it.
     if (currentLyzrAgentId) sel.value = currentLyzrAgentId;
     lyzrAgentsLoaded = true;
+    // In Simple view the agent picker should always be visible once loaded.
+    if (document.documentElement.getAttribute('data-view') === 'simple') {
+      showLyzrIdInput(true);
+    }
   } catch (e) {
     sel.innerHTML = `<option value="">err: ${String(e)}</option>`;
   }
@@ -1861,17 +2124,40 @@ function tickMonitor(now) {
   monMic[monIdx] = sampleMicLevel();
   monAgent[monIdx] = decayAgentLevel();
   monIdx = (monIdx + 1) % MON_N;
+  // Update elapsed text BEFORE draw so the layout invalidation settles
+  // before we read cached canvas dimensions (avoids read-after-write thrash).
+  const elapsedSec = Math.floor((now - monStartTime) / 1000);
+  const monNow = $('monitor-now');
+  if (monNow && monNow.dataset.lastSec !== String(elapsedSec)) {
+    monNow.dataset.lastSec = String(elapsedSec);
+    monNow.textContent = `elapsed ${elapsedSec}s · samples ${MON_FPS}/s`;
+  }
   drawMonitor();
 }
+
+// Cached canvas dimensions — updated by ResizeObserver instead of
+// per-frame clientWidth reads (which force synchronous layout flushes
+// and caused a visible ~1-second "shudder" whenever the elapsed-time
+// DOM text changed width).
+let monCssW = 800, monCssH = 140;
+const _monResizeObs = new ResizeObserver(entries => {
+  for (const e of entries) {
+    monCssW = e.contentRect.width || 800;
+    monCssH = e.contentRect.height || 140;
+  }
+});
+// Attach observer as soon as the canvas exists (load-time or first draw).
+let _monObsAttached = false;
 
 function drawMonitor() {
   const c = $('monitor-canvas');
   if (!c) return;
+  if (!_monObsAttached) { _monResizeObs.observe(c); _monObsAttached = true; monCssW = c.clientWidth || 800; monCssH = c.clientHeight || 140; }
   const dpr = window.devicePixelRatio || 1;
-  const cssW = c.clientWidth || 800;
-  const cssH = c.clientHeight || 140;
-  if (c.width !== cssW * dpr || c.height !== cssH * dpr) {
-    c.width = cssW * dpr; c.height = cssH * dpr;
+  const cssW = monCssW;
+  const cssH = monCssH;
+  if (c.width !== Math.round(cssW * dpr) || c.height !== Math.round(cssH * dpr)) {
+    c.width = Math.round(cssW * dpr); c.height = Math.round(cssH * dpr);
   }
   const ctx = c.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1941,17 +2227,9 @@ function drawMonitor() {
   ctx.strokeStyle = colMid; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(cssW - 1, 0); ctx.lineTo(cssW - 1, cssH);
   ctx.stroke();
-
-  // Update the "elapsed" footer text — integer seconds only (the chart
-  // redraws ~30× per second; a tenths-of-a-second counter looked jittery).
-  // Only mutate the DOM when the integer actually changes to avoid layout
-  // shifts from variable-width digits in the right-aligned "samples" suffix.
-  const elapsedSec = Math.floor((performance.now() - monStartTime) / 1000);
-  const monNow = $('monitor-now');
-  if (monNow && monNow.dataset.lastSec !== String(elapsedSec)) {
-    monNow.dataset.lastSec = String(elapsedSec);
-    monNow.textContent = `elapsed ${elapsedSec}s · samples ${MON_FPS}/s`;
-  }
+  // Elapsed-time DOM update moved to tickMonitor() — writing DOM inside
+  // drawMonitor caused a read-after-write layout thrash on the next frame
+  // (clientWidth forced a sync layout flush every time the text changed).
 }
 
 function startMonitor() {
@@ -2032,6 +2310,8 @@ function stopMic() {
 
 // ─── Talk control (click = VAD, hold space = push-to-talk) ────────────────
 async function beginTurn() {
+  // LiveKit mode: turns are automatic (bridge VAD handles it). Skip.
+  if (transportMode === 'livekit') return;
   // A pending PTT tail-capture close from the previous press? Cancel it —
   // the user is starting a new turn (or extending the current one). The
   // mic / talking flag is still in the post-release tail window.
@@ -2081,6 +2361,7 @@ function endTurn(sendStop = true, delayMs = 0) {
 }
 function _endTurnNow(sendStop) {
   if (!talking) return;
+  if (transportMode === 'livekit') return;  // LiveKit VAD handles endpointing
   talking = false;
   $('talk').classList.remove('live');
   stopMic();
@@ -2110,16 +2391,69 @@ talkBtn.addEventListener('click', (e) => {
 talkBtn.addEventListener('mousedown', (e) => { if (!vad) beginTurn(); });
 // PTT release / leave / spacebar-up: end with a 1-second tail-capture window
 // so the trailing syllable reaches STT before the mic closes.
-talkBtn.addEventListener('mouseup',   (e) => { if (!vad) { endTurn(true, 2000); e.currentTarget.blur(); } });
-talkBtn.addEventListener('mouseleave',(e) => { if (!vad) endTurn(true, 2000); });
+talkBtn.addEventListener('mouseup',   (e) => { if (!vad) { endTurn(true, 1000); e.currentTarget.blur(); } });
+talkBtn.addEventListener('mouseleave',(e) => { if (!vad) endTurn(true, 1000); });
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && !e.repeat && !vad) { e.preventDefault(); beginTurn(); }
 });
 document.addEventListener('keyup',   (e) => {
-  if (e.code === 'Space' && !vad) { e.preventDefault(); endTurn(true, 2000); }
+  if (e.code === 'Space' && !vad) { e.preventDefault(); endTurn(true, 1000); }
 });
 
 // ─── Toggle wiring ────────────────────────────────────────────────────────
+// Transport toggle — switch between WebSocket and LiveKit WebRTC.
+document.querySelectorAll('#transport-toggle button').forEach(b => {
+  b.addEventListener('click', async () => {
+    const mode = b.dataset.transport;
+    if (mode === transportMode) return;
+    transportMode = mode;
+    updateToggle('transport-toggle', 'transport', mode);
+    logEvent(`transport → ${mode}`, mode === 'livekit' ? 'final' : '');
+
+    // Keep the simple-view chip in sync.
+    const chip = $('lk-toggle');
+    if (mode === 'livekit') {
+      chip.textContent = '📡 WebRTC ON';
+      chip.style.background = 'var(--accent)'; chip.style.color = '#fff'; chip.style.borderColor = 'var(--accent)';
+      try { ws.close(); } catch {}
+      await connectLiveKit();
+    } else {
+      chip.textContent = '📡 WebRTC';
+      chip.style.background = 'var(--surface)'; chip.style.color = 'var(--muted)'; chip.style.borderColor = 'var(--border)';
+      await disconnectLiveKit();
+      $('talk').disabled = false;
+      $('hint').textContent = 'click Talk · auto-endpoints on silence · or hold space (push-to-talk mode)';
+      connect();
+    }
+  });
+});
+// Simple-view LiveKit chip — single toggle button next to Talk.
+$('lk-toggle').addEventListener('click', async () => {
+  const btn = $('lk-toggle');
+  if (transportMode === 'ws') {
+    transportMode = 'livekit';
+    btn.textContent = '📡 WebRTC ON';
+    btn.style.background = 'var(--accent)';
+    btn.style.color = '#fff';
+    btn.style.borderColor = 'var(--accent)';
+    updateToggle('transport-toggle', 'transport', 'livekit');
+    logEvent('transport → livekit (WebRTC)', 'final');
+    try { ws.close(); } catch {}
+    await connectLiveKit();
+  } else {
+    transportMode = 'ws';
+    btn.textContent = '📡 WebRTC';
+    btn.style.background = 'var(--surface)';
+    btn.style.color = 'var(--muted)';
+    btn.style.borderColor = 'var(--border)';
+    updateToggle('transport-toggle', 'transport', 'ws');
+    logEvent('transport → ws (WebSocket)');
+    await disconnectLiveKit();
+    $('talk').disabled = false;
+    $('hint').textContent = 'click Talk · auto-endpoints on silence · or hold space (push-to-talk mode)';
+    connect();
+  }
+});
 document.querySelectorAll('#tts-toggle button').forEach(b => {
   b.addEventListener('click', () => ws.send(JSON.stringify({ event: 'set_tts_tier', tier: b.dataset.tier })));
 });
@@ -2127,6 +2461,14 @@ document.querySelectorAll('#agent-toggle button').forEach(b => {
   b.addEventListener('click', () => {
     if (b.disabled) return;
     const tier = b.dataset.tier;
+    // LiveKit mode: realtime toggle doesn't apply (LiveKit IS the realtime transport).
+    if (transportMode === 'livekit') {
+      if (tier === 'realtime') return;  // N/A in LiveKit mode
+      agentTier = tier;
+      updateToggle('agent-toggle', 'tier', tier);
+      logEvent(`agent → ${tier} (LiveKit — takes effect next room)`);
+      return;
+    }
     if (tier === 'realtime') {
       // B1: realtime owns transport — reconnect to /ws/voice/realtime.
       switchMode('realtime');
@@ -2256,6 +2598,123 @@ $('twilio-sync').addEventListener('click', () => {
   $('twilio-sync').textContent = '📞 Syncing…';
   setTimeout(() => { $('twilio-sync').textContent = '📞 Sync to phone'; }, 1500);
 });
+
+// ─── Phone Sync panel (Simple tab) ───────────────────────────────────────
+// Shows once the Mova-iO agent dropdown has loaded (i.e. user has a key).
+// Mirrors the agent list from #lyzr-agent-select into #phone-agent-select
+// and sends push_to_twilio via WS to attach the chosen agent to the phone line.
+function _phoneSyncPopulate() {
+  const src = $('lyzr-agent-select');
+  const dst = $('phone-agent-select');
+  if (!src || !dst) return;
+  // Copy options from the Mova-iO agent picker.
+  dst.innerHTML = '<option value="">— select agent —</option>';
+  for (const opt of src.options) {
+    if (!opt.value) continue;
+    const o = document.createElement('option');
+    o.value = opt.value;
+    o.textContent = opt.textContent;
+    dst.appendChild(o);
+  }
+  // Phone sync moved to the unified quick-sync button in the controls row.
+  // Just update the hidden phone-sync-number for backward compat.
+  const num = $('twilio-dial')?.dataset?.number;
+  if (num) $('phone-sync-number').textContent = formatPhone(num);
+}
+// Re-populate whenever the Mova-iO dropdown changes (after BYOK apply, refresh, etc.)
+const _lyzrSelObs = new MutationObserver(_phoneSyncPopulate);
+if ($('lyzr-agent-select')) {
+  _lyzrSelObs.observe($('lyzr-agent-select'), { childList: true });
+}
+
+$('phone-sync-btn').addEventListener('click', async () => {
+  const agent = $('phone-agent-select').value;
+  const status = $('phone-sync-status');
+  if (!agent) {
+    status.style.display = '';
+    status.style.background = 'rgba(239,68,68,0.12)';
+    status.style.color = 'var(--err)';
+    status.textContent = 'Please select an agent first.';
+    return;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    status.style.display = '';
+    status.style.background = 'rgba(239,68,68,0.12)';
+    status.style.color = 'var(--err)';
+    status.textContent = 'Not connected — click Start first.';
+    return;
+  }
+  $('phone-sync-btn').disabled = true;
+  $('phone-sync-btn').textContent = '📞 Syncing…';
+  status.style.display = 'none';
+
+  try {
+    // First, tell the WS session which Lyzr agent to use, then push the
+    // full session config to the Twilio defaults — same mechanism as the
+    // Detailed-tab "Sync to phone" button (push_to_twilio WS event).
+    ws.send(JSON.stringify({ event: 'set_lyzr_agent_id', agent_id: agent }));
+    ws.send(JSON.stringify({ event: 'push_to_twilio' }));
+    const agentLabel = $('phone-agent-select').selectedOptions[0]?.textContent || agent;
+    status.style.display = '';
+    status.style.background = 'rgba(52,208,88,0.12)';
+    status.style.color = 'var(--ok)';
+    status.textContent = '✓ Synced! Calls to ' + ($('phone-sync-number')?.textContent || 'the number') + ' now reach ' + agentLabel;
+  } catch (e) {
+    status.style.display = '';
+    status.style.background = 'rgba(239,68,68,0.12)';
+    status.style.color = 'var(--err)';
+    status.textContent = 'Error: ' + e.message;
+  }
+  $('phone-sync-btn').disabled = false;
+  $('phone-sync-btn').textContent = '📞 Sync to Phone';
+});
+
+// ─── Unified quick-sync (controls-row button) ────────────────────────────
+// Uses the current agent from #lyzr-agent-select (no duplicate dropdown).
+// Shows the synced-agent pill after a successful sync.
+let _syncedAgentLabel = '';
+let _syncedPhoneNumber = '';
+
+function _showQuickSync() {
+  // Show the quick-sync button if we have agents + a phone number.
+  const num = $('twilio-dial')?.dataset?.number;
+  const sel = $('lyzr-agent-select');
+  if (num && sel && sel.options.length > 1) {
+    $('quick-sync').style.display = '';
+    _syncedPhoneNumber = formatPhone(num);
+  }
+}
+// Re-check whenever the agent dropdown reloads.
+const _qsObs = new MutationObserver(_showQuickSync);
+if ($('lyzr-agent-select')) _qsObs.observe($('lyzr-agent-select'), { childList: true });
+
+$('quick-sync').addEventListener('click', async () => {
+  const sel = $('lyzr-agent-select');
+  const agent = sel?.value;
+  if (!agent) {
+    logEvent('Select an agent first, then click Sync', 'err');
+    return;
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    logEvent('Not connected — cannot sync to phone', 'err');
+    return;
+  }
+  const btn = $('quick-sync');
+  btn.disabled = true; btn.textContent = '📞 Syncing…';
+  try {
+    ws.send(JSON.stringify({ event: 'set_lyzr_agent_id', agent_id: agent }));
+    ws.send(JSON.stringify({ event: 'push_to_twilio' }));
+    _syncedAgentLabel = sel.selectedOptions[0]?.textContent || agent.slice(0, 12);
+    const pill = $('synced-pill');
+    pill.textContent = '🟢 ' + _syncedAgentLabel + ' → ' + _syncedPhoneNumber;
+    pill.style.display = '';
+    logEvent('📞 synced ' + _syncedAgentLabel + ' → ' + _syncedPhoneNumber, 'final');
+  } catch (e) {
+    logEvent('Sync error: ' + e.message, 'err');
+  }
+  btn.disabled = false; btn.textContent = '📞 Sync';
+});
+
 // BYOK: panel toggle + apply/clear/show controls. Keys are kept in DOM only
 // (no localStorage by default — opt-in could be a future enhancement) and
 // sent to the server inside one set_user_keys WS message.
@@ -2277,12 +2736,8 @@ $('byok-apply').addEventListener('click', () => {
   currentLyzrAgentId = '';  // force re-select on the new account
   logEvent('🔄 reloading agent list with your key…', 'final');
   loadLyzrAgents(true);  // force = cache-bust
-  // Auto-collapse the modal once a real key was entered — the user is done
-  // with this panel and the dropdown / Talk button below it become the focus.
-  // We still keep it open for empty submissions so the user sees feedback.
-  if (keyEntered) {
-    $('byok-panel').style.display = 'none';
-  }
+  // Keep the panel open after applying so the user sees the phone-sync
+  // controls once the agent dropdown reloads (phone sync lives inside BYOK).
 });
 $('byok-clear').addEventListener('click', () => {
   $('byok-lyzr').value = '';
@@ -2304,6 +2759,16 @@ $('interrupt').addEventListener('click', () => {
 });
 
 status('click ▶ to start');
+
+// ── Language picker ──────────────────────────────────────────────────────────
+$('language-select').addEventListener('change', () => {
+  const lang = $('language-select').value;
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ event: 'set_language', language: lang }));
+  }
+  const label = $('language-select').options[$('language-select').selectedIndex].text;
+  logEvent(`🌐 language → ${label}`, 'final');
+});
 
 // ── Voice picker (TTS voice selection) ─────────────────────────────────────
 // Voices are tier-specific: switching the TTS primary repopulates the dropdown
@@ -2401,11 +2866,23 @@ function applyView(view) {
     };
     if (ws && ws.readyState === 1) enforceSimpleDefaults();
     else setTimeout(enforceSimpleDefaults, 800);
+    // Simple view always uses Lyzr — show the agent picker so the user
+    // can select which agent to speak with (same dropdown as Detailed).
+    showLyzrIdInput(true);
     // Also auto-open the BYOK panel if no Mova-iO key is set yet — Simple view
     // calls out that "the user needs to add a Mova-iO API key, no other keys".
     if (!($('byok-lyzr').value || '').trim()) {
       $('byok-panel').style.display = '';
     }
+  } else {
+    // Detailed view: re-sync picker visibility with the current tier.
+    showLyzrIdInput((agentTier === 'lyzr' || agentTier === 'lyzr_sdk'));
+  }
+  // Event stream: always open in Detailed, collapsed by default in Simple.
+  const evDetails = $('events-details');
+  if (evDetails) {
+    if (view === 'detailed') evDetails.open = true;
+    // Don't force-close in Simple — respect the user's toggle if they opened it.
   }
   // Re-render the live activity chart after layout shifts (canvas dims change).
   if (typeof drawMonitor === 'function') setTimeout(drawMonitor, 50);
@@ -2469,6 +2946,48 @@ try {
     badge.style.display = 'inline-block';
   }
 })();
+
+// ── Deploy info — fetches /health on load, shows deploy time + live elapsed ──
+(async () => {
+  const gateEl = $('deploy-info');
+  const badgeEl = $('deploy-badge');
+  try {
+    const r = await fetch('/health');
+    if (!r.ok) throw new Error(`${r.status}`);
+    const h = await r.json();
+    const iso = h.started_at;                // "2026-06-04T12:34:56Z"
+    if (!iso) { gateEl.textContent = ''; return; }
+    const bootDate = new Date(iso);
+
+    function fmtDate(d) {
+      return d.toLocaleString('en-US', {
+        month: 'short', day: 'numeric', year: 'numeric',
+        hour: 'numeric', minute: '2-digit', hour12: true, timeZoneName: 'short',
+      });
+    }
+    function fmtElapsed(sec) {
+      if (sec < 60)   return `${sec}s`;
+      if (sec < 3600) return `${Math.floor(sec / 60)}m ${sec % 60}s`;
+      const hr = Math.floor(sec / 3600);
+      const mn = Math.floor((sec % 3600) / 60);
+      return `${hr}h ${mn}m`;
+    }
+
+    function tick() {
+      const elapsed = Math.floor((Date.now() - bootDate.getTime()) / 1000);
+      const ago = fmtElapsed(elapsed);
+      gateEl.textContent  = `Deployed ${fmtDate(bootDate)} · ${ago} ago`;
+      badgeEl.textContent = `deployed ${ago} ago`;
+    }
+    tick();
+    setInterval(tick, 1000);
+  } catch {
+    gateEl.textContent = '';
+    badgeEl.textContent = '';
+  }
+})();
 </script>
+<!-- LiveKit JS SDK — loaded lazily; only used when the transport toggle is set to LiveKit. -->
+<script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.js"></script>
 </body>
 </html>

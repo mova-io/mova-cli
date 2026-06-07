@@ -136,6 +136,20 @@ class CartesiaTTS:
         if not utterance.strip():
             return  # nothing to say → no audio frames
 
+        # Guard: Cartesia voice IDs are UUIDs. If the failover chain passes a
+        # foreign voice name (e.g. OpenAI's "alloy"), ignore it — use our
+        # default rather than 400-ing (ADR 049 provider portability).
+        import re  # noqa: PLC0415
+
+        _is_uuid = bool(
+            voice_id
+            and re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                voice_id.lower(),
+            )
+        )
+        resolved_voice = voice_id if _is_uuid else self._default_voice
+
         client = self._resolve_client(api_key)
         # Use SSE (streaming) not bytes (buffered REST) — bytes waits for the
         # whole utterance server-side, killing Cartesia's first-byte advantage.
@@ -147,7 +161,7 @@ class CartesiaTTS:
             stream = streamer(
                 model_id=self._model,
                 transcript=utterance,
-                voice={"mode": "id", "id": voice_id or self._default_voice},
+                voice={"mode": "id", "id": resolved_voice},
                 output_format={
                     "container": _CARTESIA_CONTAINER,
                     "encoding": _CARTESIA_ENCODING,
@@ -158,7 +172,7 @@ class CartesiaTTS:
             stream = client.tts.bytes(
                 model_id=self._model,
                 transcript=utterance,
-                voice={"mode": "id", "id": voice_id or self._default_voice},
+                voice={"mode": "id", "id": resolved_voice},
                 output_format={
                     "container": _CARTESIA_CONTAINER,
                     "encoding": _CARTESIA_ENCODING,

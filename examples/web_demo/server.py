@@ -36,6 +36,8 @@ from fastapi.staticfiles import StaticFiles
 
 from movate.voice import (
     AdaptiveEndpointing,
+    AgentTurnError,
+    AgentTurnResult,
     AudioChunk,
     CartesiaTTS,
     DeepgramSTT,
@@ -268,6 +270,43 @@ TTS_VOICES: dict[str, list[dict[str, str]]] = {
 }
 
 
+# ── Multi-language voice mapping ─────────────────────────────────────────
+# Maps ISO 639-1 language codes to recommended TTS voices per provider.
+# Cartesia has multilingual voices (Sonic Multilingual model); OpenAI TTS
+# auto-adapts to the text language (alloy/nova/etc. work for any language).
+# When the user selects a language, we auto-select the matching Cartesia
+# voice so pronunciation is native. Deepgram STT just needs the language=
+# hint (e.g. "es", "fr") which is passed separately.
+SUPPORTED_LANGUAGES: list[dict[str, str]] = [
+    {"code": "", "label": "English (default)", "flag": "🇺🇸"},
+    {"code": "es", "label": "Spanish", "flag": "🇪🇸"},
+    {"code": "fr", "label": "French", "flag": "🇫🇷"},
+    {"code": "fr-CA", "label": "French (Canadian)", "flag": "🇨🇦"},
+    {"code": "de", "label": "German", "flag": "🇩🇪"},
+    {"code": "pt", "label": "Portuguese", "flag": "🇧🇷"},
+    {"code": "hi", "label": "Hindi", "flag": "🇮🇳"},
+    {"code": "ja", "label": "Japanese", "flag": "🇯🇵"},
+    {"code": "zh", "label": "Chinese (Mandarin)", "flag": "🇨🇳"},
+    {"code": "ko", "label": "Korean", "flag": "🇰🇷"},
+    {"code": "auto", "label": "Auto-detect", "flag": "🌐"},
+]
+LANGUAGE_VOICES: dict[str, dict[str, str]] = {
+    # Cartesia Sonic Multilingual voices — curated for natural accent.
+    # OpenAI TTS voices are language-agnostic (auto-adapt), so no mapping needed.
+    # These Cartesia voice IDs may change — the TTS failover guard in
+    # openai_speech.py / cartesia.py handles unrecognized IDs gracefully.
+    "es": {"cartesia": "846d6cb0-2301-48b6-9683-48f5618ea2f6", "label": "Spanish (Sophia)"},
+    "fr": {"cartesia": "a8a1eb38-5f15-4c1d-8722-7ac0f329f8f3", "label": "French (Marie)"},
+    "fr-CA": {"cartesia": "a8a1eb38-5f15-4c1d-8722-7ac0f329f8f3", "label": "French-Canadian (Marie)"},
+    "de": {"cartesia": "3f6e78a8-5283-42aa-b236-e00b39dbb3d3", "label": "German (Hans)"},
+    "pt": {"cartesia": "700d1ee3-a641-4018-ba6e-899dcadc9e2b", "label": "Portuguese (Ana)"},
+    "hi": {"cartesia": "95856005-0332-41b0-935f-352e296aa0df", "label": "Hindi (Priya)"},
+    "ja": {"cartesia": "2b568345-1d48-4047-b25f-7baccf842eb0", "label": "Japanese (Yuki)"},
+    "zh": {"cartesia": "e90c6678-f0d3-4767-9883-5d0ecf5894a8", "label": "Chinese (Li Wei)"},
+    "ko": {"cartesia": "663afeec-d082-4ab5-827e-2e41bf73fa9c", "label": "Korean (Soo-Jin)"},
+}
+
+
 # Cartesia voice catalog cache. Voices rarely change but the catalog is 700+
 # entries so we don't want to re-fetch + filter on every page load. Per-key
 # (so a BYOK user's catalog and the server's stay isolated, even though they
@@ -493,14 +532,15 @@ class _KeyedTTS:
 
 AGENT_TIERS = {
     "openai": "OpenAI Chat (GPT-4o-mini)",
-    "lyzr": "Lyzr ADK (/v4 streaming)",
+    "lyzr": "Mova-iO Streaming (/v3 native)",
     # L6: alternative Lyzr integration path — wraps Lyzr's /v3/inference/chat/
     # (the SDK's historical endpoint) inside movate.voice.LyzrAgentTurn. Slower
-    # than /v4 (buffered, no token streaming) but demonstrates the
+    # than streaming (buffered, no token streaming) but demonstrates the
     # SDK-wrapping binding shipped in mdk-voice. The architectural point: the
-    # same voice pipeline handles BOTH a streaming-token agent (via /v4) AND a
-    # non-streaming SDK-shaped agent (via LyzrAgentTurn) without changing.
-    "lyzr_sdk": "Lyzr (SDK binding)",
+    # same voice pipeline handles BOTH a streaming agent AND a non-streaming
+    # SDK-shaped agent (via LyzrAgentTurn) without changing.
+    "lyzr_sdk": "Mova-iO SDK (buffered)",
+    "deep_agent": "Deep Agent (LangChain planning + subagents)",
 }
 
 
@@ -539,6 +579,180 @@ class _LyzrV3HTTPAgent:
         return {"response": body.get("response", "")}
 
 
+class LyzrV3StreamAgent:
+    """Streaming agent using Lyzr's native ``/v3/inference/stream/`` endpoint.
+
+    Uses ``x-api-key`` header auth (the standard Lyzr auth) instead of
+    ``Authorization: Bearer`` (the OpenAI-compat ``/v4`` path). This matters
+    because some agents are only accessible via the ``/v3`` auth — the ``/v4``
+    OpenAI-compat shim can return 403 for the same key + agent_id that works
+    fine on ``/v3``.
+
+    Streams the response using ``httpx.AsyncClient.stream()`` and fires
+    ``on_token`` per chunk so the voice pipeline can overlap TTS synthesis
+    with agent generation — same latency benefit as the OpenAI SSE path.
+
+    Implements the AgentTurn protocol: ``async run(text, *, on_token, ...)``
+    returning an ``AgentTurnResult``.
+    """
+
+    name = "lyzr-v3-stream"
+    version = "1"
+    speculatable = True  # stateless per-call; safe to discard
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        api_key: str,
+        voice_hint: str | None = None,
+        on_tool_call: Callable[[dict[str, Any]], None] | None = None,
+        on_extras: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        import httpx  # noqa: PLC0415
+
+        self._agent_id = agent_id
+        self._api_key = api_key
+        self._voice_hint = (voice_hint or "").strip() or None
+        self.on_tool_call = on_tool_call
+        self.on_extras = on_extras
+        self._session_id = f"mdk-voice-{id(self):x}"
+        # Reuse a single httpx client across turns — avoids a TCP+TLS
+        # handshake (~100–300 ms) on every call. The client's connection
+        # pool keeps the HTTPS connection warm between turns.
+        self._http = httpx.AsyncClient(
+            timeout=30,
+            headers={
+                "x-api-key": self._api_key,
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream, application/x-ndjson, application/json",
+            },
+        )
+
+    def reset(self) -> None:
+        """Clear server-side session by rotating the session_id."""
+        self._session_id = f"mdk-voice-{id(self):x}-{__import__('time').monotonic_ns()}"
+
+    async def run(
+        self,
+        text: str,
+        *,
+        on_token: Callable[[str], None] | None = None,
+        language: str | None = None,
+        session_id: str | None = None,
+    ) -> AgentTurnResult:
+        user_content = text
+        if self._voice_hint:
+            user_content = f"{text}\n\n[Voice channel — {self._voice_hint}]"
+
+        payload = {
+            "user_id": "mdk-voice-demo",
+            "agent_id": self._agent_id,
+            "session_id": session_id or self._session_id,
+            "message": user_content,
+        }
+
+        try:
+            async with self._http.stream(
+                "POST",
+                "https://agent-prod.studio.lyzr.ai/v3/inference/stream/",
+                json=payload,
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode(errors="replace")
+                    return AgentTurnResult(
+                        status="error",
+                        error=AgentTurnError(message=f"{resp.status_code}: {body[:500]}"),
+                    )
+
+                collected: list[str] = []
+                # Auto-detect the streaming format by inspecting chunks.
+                # Lyzr may use SSE ("data: ..."), newline-delimited JSON,
+                # or plain text streaming. We handle all three.
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    text_chunk = ""
+
+                    # SSE format: "data: ..." lines
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data)
+                            # OpenAI-compat SSE shape
+                            if "choices" in obj:
+                                delta = obj["choices"][0].get("delta", {})
+                                text_chunk = delta.get("content", "")
+                            # Lyzr native shape
+                            elif "response" in obj:
+                                text_chunk = obj["response"]
+                            elif "content" in obj:
+                                text_chunk = obj["content"]
+                            elif "chunk" in obj:
+                                text_chunk = obj["chunk"]
+                            # Surface extras if present
+                            if self.on_extras is not None:
+                                extras: dict[str, Any] = {}
+                                for f in ("citations", "sources", "metadata"):
+                                    if f in obj and obj[f]:
+                                        extras[f] = obj[f]
+                                if extras:
+                                    try:
+                                        self.on_extras(extras)
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                        except json.JSONDecodeError:
+                            # Plain text after "data: " prefix
+                            text_chunk = data
+
+                    # Newline-delimited JSON (no "data:" prefix)
+                    elif line.startswith("{"):
+                        try:
+                            obj = json.loads(line)
+                            text_chunk = (
+                                obj.get("response", "")
+                                or obj.get("content", "")
+                                or obj.get("chunk", "")
+                                or obj.get("text", "")
+                            )
+                            # Check for done signal
+                            if obj.get("done") is True and not text_chunk:
+                                break
+                        except json.JSONDecodeError:
+                            text_chunk = line
+
+                    # Plain text streaming — each line IS a chunk
+                    else:
+                        text_chunk = line
+
+                    if text_chunk:
+                        collected.append(text_chunk)
+                        if on_token is not None:
+                            on_token(text_chunk)
+
+                answer = "".join(collected).strip()
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return AgentTurnResult(
+                status="error",
+                error=AgentTurnError(message=str(exc) or exc.__class__.__name__),
+            )
+
+        if not answer:
+            return AgentTurnResult(
+                status="error",
+                error=AgentTurnError(message="Empty response from Lyzr streaming endpoint"),
+            )
+
+        return AgentTurnResult(status="ok", answer_text=answer)
+
+
 def _lyzr_agent_id() -> str | None:
     """Read the Lyzr agent_id from env or ~/.mdk_lyzr_agent_id."""
     aid = os.environ.get("LYZR_AGENT_ID")
@@ -561,21 +775,21 @@ def _build_agent(
 ) -> object:
     """Build an AgentTurn for the chosen tier.
 
-    Lyzr exposes an OpenAI-compatible streaming endpoint at
-    ``/v4/chat/completions`` (Bearer auth, SSE deltas, ``model=agent_id``), so
-    we point :class:`OpenAIChatAgent` at it. That gets us **token streaming +
-    sentence-by-sentence TTS** for the Lyzr tier instead of the buffered
-    ``/v3/inference/chat/`` (which made the live phone call feel slow). Same
-    code path, two backends — that is the framework-neutral seam paying off.
+    The ``lyzr`` tier uses Lyzr's native ``/v3/inference/stream/`` endpoint
+    with ``x-api-key`` header auth. This is the officially documented Lyzr
+    streaming API and avoids the 403 permission issues that the OpenAI-compat
+    ``/v4/chat/completions`` shim (Bearer auth) sometimes returns for BYOK
+    agents. Token streaming feeds the sentence-by-sentence TTS pipeline just
+    like the OpenAI Chat path — same latency benefit.
 
-    The agent's own system prompt is configured in Lyzr Studio, so we don't
-    send ours when talking to Lyzr (``send_system=False``).
+    The agent's own system prompt is configured in Lyzr Studio, so we append
+    a voice-context cue to the user message instead of overriding it.
     """
     # Lyzr agents in Studio are typically configured to produce structured,
     # multi-section chat output (headers, bullet lists, citations). That reads
     # terribly aloud. We don't touch the operator's system prompt — we just
     # append a voice-context cue to the user turn so the model knows to
-    # reshape the answer for spoken delivery. Same hint used for both /v4 and
+    # reshape the answer for spoken delivery. Same hint used for streaming and
     # the SDK paths. Adjust to taste; leave empty to disable.
     _LYZR_VOICE_HINT = (
         "please respond conversationally in 1-3 short sentences suitable for "
@@ -587,19 +801,23 @@ def _build_agent(
         # BYOK: prefer the user-supplied lyzr_api_key; else env.
         key = lyzr_api_key or os.environ.get("LYZR_API_KEY")
         agent_id = (lyzr_agent_id or _lyzr_agent_id() or "").strip()
+        log.info(
+            "build_agent(lyzr): agent_id=%s key_source=%s key_len=%d",
+            (agent_id or "—")[:8],
+            "byok" if lyzr_api_key else ("env" if key else "none"),
+            len(key) if key else 0,
+        )
         if key and agent_id:
             try:
-                return OpenAIChatAgent(
-                    model=agent_id,
-                    base_url="https://agent-prod.studio.lyzr.ai/v4",
+                return LyzrV3StreamAgent(
+                    agent_id=agent_id,
                     api_key=key,
-                    send_system=False,
+                    voice_hint=_LYZR_VOICE_HINT,
                     on_tool_call=on_tool_call,
                     on_extras=on_extras,
-                    voice_hint=_LYZR_VOICE_HINT,
                 )
             except Exception as exc:  # noqa: BLE001 - any Lyzr setup failure → fallback
-                log.warning("Lyzr unavailable, falling back to OpenAI Chat: %s", exc)
+                log.warning("Lyzr streaming unavailable, falling back to OpenAI Chat: %s", exc)
         else:
             log.warning(
                 "Lyzr selected but %s missing — falling back to OpenAI Chat",
@@ -621,6 +839,21 @@ def _build_agent(
                 log.warning("Lyzr SDK path unavailable, falling back: %s", exc)
         else:
             log.warning("Lyzr SDK selected but key/agent_id missing — falling back")
+    if tier == "deep_agent":
+        try:
+            from movate.integrations.deep_agents import DeepAgentTurn  # noqa: PLC0415
+
+            return DeepAgentTurn(
+                model="openai:gpt-4o-mini",
+                system_prompt=(
+                    "You are Deva, a helpful voice assistant at Movate. "
+                    "Reply concisely in 1-3 sentences. You have planning "
+                    "capabilities — for complex questions, break them into "
+                    "steps. You are being read aloud via text-to-speech."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Deep Agent unavailable, falling back to OpenAI Chat: %s", exc)
     return OpenAIChatAgent(
         on_tool_call=on_tool_call,
         on_extras=on_extras,
@@ -765,12 +998,13 @@ class Session:
         self.hedge_stt: bool = False
         self.hedge_tts: bool = False
         # ADR 070: speculative agent kickoff — start the agent on a stable interim
-        # to recover the ~1.5s endpointing wait. Off by default (opt-in, changes
-        # the cost profile); only fires when the active agent is cancel-safe
-        # (OpenAIChatAgent yes, LyzrAgentTurn SDK no). Toggled live via the
+        # to recover the ~1.5s endpointing wait. ON by default — the pipeline
+        # auto-guards on agent.speculatable so non-streaming agents (LyzrAgentTurn
+        # SDK) are skipped. Streaming agents (OpenAIChatAgent, LyzrV3StreamAgent)
+        # benefit from ~500–1000 ms latency savings. Toggled live via the
         # set_speculative WS event so the demo can A/B it and the dashboard can
         # watch the real commit/cancel ratio (speculation_* events → metrics).
-        self.speculative: bool = False
+        self.speculative: bool = True
         # ADR 071 D4 / ADR 073 D3 — per-session voice tuning, editable live from
         # the UI so the audience can A/B it. Keyterms default to the curated demo
         # list (merged, de-duped, with the DeepgramSTT constructor list);
@@ -799,6 +1033,9 @@ class Session:
         # voice for this tier" (alloy for OpenAI, the Cartesia adapter's
         # default UUID for Cartesia). Updated via the set_voice_id WS message.
         self.voice_id: str = ""
+        # Multi-language support — STT language hint + agent prompt language.
+        # Default "" = English (auto-detect). Set via set_language WS event.
+        self.language: str = ""
         self.tts = self._build_tts()
         self.turns = 0
         # A4: cost-bounded routing. Per-session budget; once cumulative spent
@@ -845,6 +1082,23 @@ class Session:
         """Pick a specific TTS voice for the next turn ("" = adapter default)."""
         self.voice_id = (voice_id or "").strip()
         return self.voice_id
+
+    def set_language(self, language: str) -> dict[str, str]:
+        """Set the session language for STT + agent prompt.
+
+        Returns ``{language, voice_id}`` — when switching languages, the
+        TTS voice is auto-selected from LANGUAGE_VOICES so the accent
+        matches. Pass "" to revert to English/auto-detect.
+        """
+        self.language = (language or "").strip().lower()
+        # Auto-select a matching TTS voice when switching languages.
+        voice = LANGUAGE_VOICES.get(self.language, {}).get("cartesia", "")
+        if voice:
+            self.voice_id = voice
+        elif not self.language or self.language == "en":
+            # Revert to default English voice.
+            self.voice_id = ""
+        return {"language": self.language, "voice_id": self.voice_id}
 
     def set_hedge(self, stt: bool | None = None, tts: bool | None = None) -> dict[str, bool]:
         """B2: toggle latency hedging for STT and/or TTS; rebuild affected chains.
@@ -1203,12 +1457,36 @@ async def index() -> FileResponse:
     return FileResponse(DEMO_DIR / "index.html")
 
 
+@app.get("/livekit")
+async def livekit_page() -> FileResponse:
+    """Standalone LiveKit browser demo — WebRTC voice to the mdk agent."""
+    return FileResponse(str(Path(__file__).parent / "static" / "livekit.html"))
+
+
 # Service-wide telemetry the /health endpoint exposes (C3). Bumped from
 # `_active_sessions` whenever a /ws/voice or /ws/voice/realtime handler enters
 # and decremented in its finally. Lets ops see "is anyone using the demo right
 # now?" without scraping logs.
 _active_sessions: int = 0
 _started_at_monotonic: float = 0.0  # set in main(); 0 means "not yet started"
+
+# Phone-call concurrency. `_active_phone_calls` is bumped on WS accept and
+# decremented in the finally of the /ws/twilio handler. The TwiML endpoint
+# checks it against `MAX_CONCURRENT_CALLS` and returns a polite <Say> rejection
+# when full — callers hear "all agents are busy" instead of degrading active
+# calls. Configurable via env so ops can tune without a redeploy.
+MAX_CONCURRENT_CALLS: int = int(os.environ.get("MAX_CONCURRENT_CALLS", "3"))
+_active_phone_calls: int = 0
+
+
+def _phone_call_entered() -> None:
+    """Bump the active-phone-call count."""
+    globals()["_active_phone_calls"] = globals()["_active_phone_calls"] + 1
+
+
+def _phone_call_exited() -> None:
+    """Decrement the active-phone-call count, floor at zero."""
+    globals()["_active_phone_calls"] = max(0, globals()["_active_phone_calls"] - 1)
 
 
 def _session_entered() -> None:
@@ -1302,12 +1580,20 @@ async def health() -> dict[str, object]:
         ),
         "started_at": _started_at_wall_iso,
         "active_sessions": _active_sessions,
+        "active_phone_calls": _active_phone_calls,
+        "max_phone_calls": MAX_CONCURRENT_CALLS,
         "adapters": adapters,
+        "livekit": {
+            "configured": _livekit_config() is not None,
+            "url": (_livekit_config() or {}).get("url", ""),
+        },
         "endpoints": {
             "browser_ws": "/ws/voice",
             "realtime_ws": "/ws/voice/realtime",
             "twilio_ws": "/ws/twilio",
             "twilio_twiml": "/twiml/voice",
+            "livekit_token": "/livekit/token",
+            "livekit_status": "/livekit/status",
             "parity": "/parity",
         },
         "tip": "drop missing keys at ~/.mdk_<name>_key (chmod 600) or set them via env",
@@ -1483,6 +1769,81 @@ async def tts_voices() -> dict[str, object]:
     return {"ok": True, "voices": out, "cartesia_live": bool(cart_voices)}
 
 
+@app.get("/languages")
+async def languages() -> dict[str, object]:
+    """Supported languages for multi-language voice."""
+    return {
+        "ok": True,
+        "languages": SUPPORTED_LANGUAGES,
+        "voices": LANGUAGE_VOICES,
+    }
+
+
+# ── LiveKit endpoints ────────────────────────────────────────────────────
+
+@app.get("/livekit/status")
+async def livekit_status() -> dict[str, object]:
+    """Check if LiveKit is configured and reachable."""
+    cfg = _livekit_config()
+    return {
+        "ok": cfg is not None,
+        "configured": cfg is not None,
+        "url": cfg["url"] if cfg else None,
+    }
+
+
+@app.post("/livekit/token")
+async def livekit_token(request: Request) -> dict[str, object]:
+    """Generate a LiveKit access token for a browser participant.
+
+    The browser calls this to get a token, then connects directly to the
+    LiveKit room via WebRTC. The mdk agent joins the same room via the
+    LiveKitTransport and runs the voice pipeline.
+
+    Body: {"room_name": "call-123", "participant_name": "browser-user"}
+    """
+    cfg = _livekit_config()
+    if not cfg:
+        return {"ok": False, "error": "LiveKit not configured"}
+
+    try:
+        from livekit.api import AccessToken, VideoGrants  # noqa: PLC0415
+    except ImportError:
+        return {"ok": False, "error": "livekit SDK not installed"}
+
+    body = await request.json()
+    room_name = body.get("room_name", f"mdk-voice-{__import__('time').monotonic_ns()}")
+    participant_name = body.get("participant_name", "browser-user")
+
+    token = AccessToken(
+        api_key=cfg["api_key"],
+        api_secret=cfg["api_secret"],
+    )
+    token.identity = participant_name
+    token.name = participant_name
+    grant = VideoGrants(
+        room_create=True,
+        room_join=True,
+        room=room_name,
+    )
+    token.with_grants(grant)
+
+    jwt_token = token.to_jwt()
+
+    log.info(
+        "livekit: issued token for room=%s participant=%s",
+        room_name,
+        participant_name,
+    )
+
+    return {
+        "ok": True,
+        "token": jwt_token,
+        "url": cfg["url"],
+        "room_name": room_name,
+    }
+
+
 @app.get("/parity")
 async def parity() -> dict[str, object]:
     """Live Lyzr provider-parity report — "we cover N/M of your voice menu".
@@ -1567,7 +1928,13 @@ async def recording_url(session_id: str) -> dict[str, object]:
 
 
 def _twilio_creds() -> tuple[str, str, str] | None:
-    """Load Twilio (SID, auth_token, phone_number) from ~/.mdk_twilio_* files."""
+    """Load Twilio (SID, auth_token, phone_number).
+
+    Resolution order:
+    1. ``~/.mdk_twilio_{sid,token,number}`` files (laptop dev).
+    2. ``TWILIO_ACCOUNT_SID`` / ``TWILIO_AUTH_TOKEN`` / ``TWILIO_NUMBER`` env
+       vars (Azure Container Apps injects these as container secrets).
+    """
     home = Path.home()
     try:
         return (
@@ -1576,7 +1943,37 @@ def _twilio_creds() -> tuple[str, str, str] | None:
             (home / ".mdk_twilio_number").read_text().strip(),
         )
     except OSError:
-        return None
+        pass
+    # Fallback: env vars (ACA container secrets path).
+    sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    number = os.environ.get("TWILIO_NUMBER", "").strip()
+    if sid and token and number:
+        return (sid, token, number)
+    return None
+
+
+# ── LiveKit credentials ──────────────────────────────────────────────────
+# Loaded from env vars (LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+# or ~/.mdk_livekit_* files (same pattern as Twilio).
+
+def _livekit_config() -> dict[str, str] | None:
+    """Load LiveKit credentials. Returns {url, api_key, api_secret} or None."""
+    home = Path.home()
+    try:
+        return {
+            "url": (home / ".mdk_livekit_url").read_text().strip(),
+            "api_key": (home / ".mdk_livekit_key").read_text().strip(),
+            "api_secret": (home / ".mdk_livekit_secret").read_text().strip(),
+        }
+    except OSError:
+        pass
+    url = os.environ.get("LIVEKIT_URL", "").strip().strip('"').strip("'")
+    key = os.environ.get("LIVEKIT_API_KEY", "").strip().strip('"').strip("'")
+    secret = os.environ.get("LIVEKIT_API_SECRET", "").strip().strip('"').strip("'")
+    if url and key and secret:
+        return {"url": url, "api_key": key, "api_secret": secret}
+    return None
 
 
 def _twilio_number() -> str:
@@ -1663,7 +2060,13 @@ def _public_base_url(request: Any) -> str | None:
 @app.get("/twiml/voice")
 @app.post("/twiml/voice")
 async def twiml_voice(request: Request) -> Any:
-    """Return a TwiML <Connect><Stream/> that points Twilio at our /ws/twilio."""
+    """Return a TwiML <Connect><Stream/> that points Twilio at our /ws/twilio.
+
+    Admission gate: if ``_active_phone_calls >= MAX_CONCURRENT_CALLS``, return
+    a polite TwiML ``<Say>`` rejection instead of handing off the stream. The
+    caller hears "all agents are busy" and hangs up — active calls are not
+    degraded. The browser event stream gets a ``call_rejected`` notification.
+    """
     from fastapi import Response  # noqa: PLC0415
     from twilio_bridge import twiml_for_stream  # noqa: PLC0415
 
@@ -1678,6 +2081,34 @@ async def twiml_voice(request: Request) -> Any:
                 "or deploy behind a public ingress.</Say></Response>"
             ),
         )
+
+    # Admission gate — reject before opening the WS so active calls keep
+    # their full CPU/bandwidth budget.
+    if _active_phone_calls >= MAX_CONCURRENT_CALLS:
+        log.warning(
+            "twilio: rejecting call — at capacity (%d/%d)",
+            _active_phone_calls,
+            MAX_CONCURRENT_CALLS,
+        )
+        # Best-effort broadcast to browsers watching the event stream.
+        asyncio.ensure_future(
+            _broadcast_twilio(
+                kind="call_rejected",
+                reason="at_capacity",
+                active=_active_phone_calls,
+                max=MAX_CONCURRENT_CALLS,
+            )
+        )
+        return Response(
+            media_type="application/xml",
+            content=(
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                "<Response><Say voice=\"Polly.Joanna\">"
+                "All agents are currently busy. Please try again shortly."
+                "</Say></Response>"
+            ),
+        )
+
     wss = public.replace("https://", "wss://").replace("http://", "ws://") + "/ws/twilio"
     return Response(media_type="application/xml", content=twiml_for_stream(wss))
 
@@ -1775,8 +2206,9 @@ _twilio_config: dict[str, Any] = {
     "voice_id": "",
     "hedge_stt": False,
     "hedge_tts": False,
-    "speculative": False,
+    "speculative": True,
     "budget_usd": None,
+    "lyzr_api_key": None,  # BYOK key from the browser session (if any)
     "updated_by": None,  # browser session_id that last pushed, for telemetry
 }
 
@@ -1784,6 +2216,10 @@ _twilio_config: dict[str, Any] = {
 def _apply_twilio_config(session: Session) -> Session:
     """Apply the playground's last-pushed Twilio config to a fresh Session."""
     cfg = _twilio_config
+    # BYOK: if the browser pushed a Lyzr key, inject it so the phone call
+    # can access the same agents the browser user selected.
+    if cfg.get("lyzr_api_key"):
+        session.set_user_keys({"lyzr": cfg["lyzr_api_key"]})
     if cfg.get("lyzr_agent_id"):
         session.set_lyzr_agent_id(cfg["lyzr_agent_id"])
     if cfg.get("agent_tier") and cfg["agent_tier"] != session.agent_tier:
@@ -1838,6 +2274,20 @@ async def twilio_voice(ws: WebSocket) -> None:
         await ws.close()
         return
 
+    # Track the active call count for the admission gate + /health.
+    _phone_call_entered()
+    log.info(
+        "twilio: call accepted (%d/%d active)",
+        _active_phone_calls,
+        MAX_CONCURRENT_CALLS,
+    )
+    # Notify browsers so the event stream can show "📞 2/3 lines active".
+    await _broadcast_twilio(
+        kind="call_count",
+        active=_active_phone_calls,
+        max=MAX_CONCURRENT_CALLS,
+    )
+
     _prune_stale_twilio_sessions()
     # B5: session_holder is a 1-slot mutable container so on_call_sid can swap
     # in a resumed Session BEFORE build_kwargs is read for turn 1. The eager
@@ -1845,12 +2295,14 @@ async def twilio_voice(ws: WebSocket) -> None:
     # Apply the playground's last-pushed config so the phone uses the same
     # agent / voice / hedge / budget the browser demo is currently set to.
     session_holder: list[Session] = [_apply_twilio_config(Session())]
+    _s = session_holder[0]
     log.info(
-        "twilio: new session agent=%s/%s tts=%s voice=%s",
-        session_holder[0].agent_tier,
-        (session_holder[0].lyzr_agent_id or "—")[:8],
-        session_holder[0].tts_tier,
-        (session_holder[0].voice_id or "default")[:24],
+        "twilio: new session agent=%s/%s tts=%s voice=%s byok_lyzr=%s",
+        _s.agent_tier,
+        (_s.lyzr_agent_id or "—")[:8],
+        _s.tts_tier,
+        (_s.voice_id or "default")[:24],
+        bool(_s.user_keys.get("lyzr")),
     )
     resumed_call_sid: list[str | None] = [None]
 
@@ -1884,11 +2336,18 @@ async def twilio_voice(ws: WebSocket) -> None:
     def on_done(events: list[object]) -> None:
         lat = compute_turn_latency(events)  # type: ignore[arg-type]
         log.info("twilio turn done: %s", format_latency_badge(lat) or "(no audio)")
+        # Accumulate the full agent answer from token events so the browser
+        # mirror can display the complete response (not just latency badges).
+        answer = "".join(
+            getattr(e, "text", "") for e in events
+            if getattr(e, "kind", "") == "agent.token"
+        )
         # Also tell the live mirror so browser shows per-turn summary.
         asyncio.create_task(
             _broadcast_twilio(
                 kind="done",
                 badge=format_latency_badge(lat) or "",
+                answer=answer,
                 stt_final_ms=getattr(lat, "stt_final_ms", None),
                 agent_first_token_ms=getattr(lat, "agent_first_token_ms", None),
                 tts_first_audio_ms=getattr(lat, "tts_first_audio_ms", None),
@@ -1922,9 +2381,131 @@ async def twilio_voice(ws: WebSocket) -> None:
         cs = resumed_call_sid[0]
         if cs:
             _twilio_sessions[cs] = (session_holder[0], _time.monotonic())
+        # Release the call slot and notify browsers.
+        _phone_call_exited()
+        log.info(
+            "twilio: call ended (%d/%d active)",
+            _active_phone_calls,
+            MAX_CONCURRENT_CALLS,
+        )
+        asyncio.ensure_future(
+            _broadcast_twilio(
+                kind="call_count",
+                active=_active_phone_calls,
+                max=MAX_CONCURRENT_CALLS,
+            )
+        )
 
 
 # ── End Twilio bridge ─────────────────────────────────────────────────────────
+
+
+# ── LiveKit room-based voice ─────────────────────────────────────────────────
+
+@app.post("/livekit/join")
+async def livekit_join(request: Request) -> dict[str, object]:
+    """Start a LiveKit voice session.
+
+    The browser:
+    1. Calls POST /livekit/token to get a participant token + room name
+    2. Connects to the LiveKit room via the JS SDK (WebRTC)
+    3. Calls POST /livekit/join with the room_name to tell the server
+       to join as the agent
+
+    The server joins the same room via the LiveKit bridge, subscribes to
+    the participant's audio, runs the voice pipeline, and publishes TTS
+    audio back. The browser hears the agent via WebRTC.
+    """
+    cfg = _livekit_config()
+    if not cfg:
+        return {"ok": False, "error": "LiveKit not configured"}
+
+    body = await request.json()
+    room_name = body.get("room_name", "")
+    if not room_name:
+        return {"ok": False, "error": "room_name required"}
+
+    # Generate an agent token for this room.
+    try:
+        from livekit.api import AccessToken, VideoGrants  # noqa: PLC0415
+    except ImportError:
+        return {"ok": False, "error": "livekit SDK not installed"}
+
+    log.info(
+        "livekit: generating agent token with key=%s secret_len=%d url=%s room=%s",
+        cfg["api_key"],
+        len(cfg["api_secret"]),
+        cfg["url"],
+        room_name,
+    )
+    agent_token = AccessToken(
+        api_key=cfg["api_key"],
+        api_secret=cfg["api_secret"],
+    )
+    agent_token.identity = "mdk-agent"
+    agent_token.name = "Deva (AI Agent)"
+    agent_token.with_grants(VideoGrants(room_create=True, room_join=True, room=room_name))
+    agent_jwt = agent_token.to_jwt()
+
+    # Launch the bridge in the background.
+    from livekit_bridge import handle_livekit_room  # noqa: PLC0415
+
+    session = Session()
+
+    # Accept optional session config from the main playground.
+    # BYOK: if the user pasted their own Lyzr key in the browser, apply it
+    # to this session so the LiveKit bridge authenticates with their account.
+    user_lyzr_key = body.get("user_lyzr_key", "")
+    if user_lyzr_key:
+        session.user_keys["lyzr"] = user_lyzr_key
+    # Set lyzr_agent_id BEFORE agent_tier — set_agent_tier rebuilds the
+    # agent object using self.lyzr_agent_id, so it needs to be current.
+    lyzr_agent_id = body.get("lyzr_agent_id", "")
+    if lyzr_agent_id:
+        session.lyzr_agent_id = lyzr_agent_id
+    agent_tier = body.get("agent_tier", "")
+    if agent_tier and agent_tier != session.agent_tier:
+        session.set_agent_tier(agent_tier)
+    # If agent_tier was already correct but agent_id changed, rebuild.
+    elif lyzr_agent_id:
+        session.set_lyzr_agent_id(lyzr_agent_id)
+    language = body.get("language", "")
+    if language:
+        session.set_language(language)
+    voice_id = body.get("voice_id", "")
+    if voice_id:
+        session.voice_id = voice_id
+    tts_tier = body.get("tts_tier", "")
+    if tts_tier:
+        session.set_tts_tier(tts_tier)
+
+    def build_kwargs(turn: int) -> dict[str, Any]:
+        return {
+            "stt": session.stt,
+            "agent": session.agent,
+            "tts": session.tts,
+            "tts_streaming": True,
+            "text_filter": speakify,
+            "pii_redactor": redact_pii,
+            "agent_timeout": 15.0,
+            "voice_id": session.voice_id,
+        }
+
+    asyncio.create_task(
+        handle_livekit_room(
+            livekit_url=cfg["url"],
+            token=agent_jwt,
+            room_name=room_name,
+            build_pipeline_kwargs=build_kwargs,
+            publish_events=True,
+        )
+    )
+
+    log.info("livekit: agent joining room=%s", room_name)
+    return {"ok": True, "room_name": room_name, "agent_identity": "mdk-agent"}
+
+
+# ── End LiveKit bridge ────────────────────────────────────────────────────────
 
 
 @app.websocket("/ws/voice")
@@ -2107,9 +2688,8 @@ async def voice(ws: WebSocket) -> None:
             if ev_name == "push_to_twilio":
                 # Snapshot the browser session's current settings into the
                 # module-level Twilio default. The NEXT inbound phone call
-                # will use these. Lyzr key is NOT pushed (per-session BYOK
-                # stays per-session); env-level Lyzr key is what the phone
-                # call will authenticate with.
+                # will use these — including the BYOK Lyzr key so the phone
+                # can access the same agents the browser user selected.
                 _twilio_config["agent_tier"] = session.agent_tier
                 _twilio_config["lyzr_agent_id"] = session.lyzr_agent_id
                 _twilio_config["tts_tier"] = session.tts_tier
@@ -2118,6 +2698,7 @@ async def voice(ws: WebSocket) -> None:
                 _twilio_config["hedge_tts"] = session.hedge_tts
                 _twilio_config["speculative"] = session.speculative
                 _twilio_config["budget_usd"] = session.budget_usd
+                _twilio_config["lyzr_api_key"] = session.user_keys.get("lyzr")
                 _twilio_config["updated_by"] = session.session_id
                 log.info(
                     "twilio config pushed: tier=%s tts=%s voice=%s lyzr=%s",
@@ -2131,6 +2712,13 @@ async def voice(ws: WebSocket) -> None:
             if ev_name == "set_voice_id":
                 applied = session.set_voice_id(str(data.get("voice_id", "")))
                 await _send_event(ws, event="voice_id", voice_id=applied)
+                continue
+            if ev_name == "set_language":
+                result = session.set_language(str(data.get("language", "")))
+                await _send_event(
+                    ws, event="language", language=result["language"],
+                    voice_id=result["voice_id"],
+                )
                 continue
             if ev_name == "set_hedge":
                 # B2: latency hedging — fire 2 STTs/TTSs in parallel, take first.
@@ -2292,6 +2880,7 @@ async def voice(ws: WebSocket) -> None:
                     cancel=cancel,
                     agent_timeout=15.0,
                     voice_id=session.voice_id,
+                    language=session.language or None,
                     # ADR 070: opt-in speculative kickoff + observer so the
                     # speculation_started/committed/cancelled events flow to the
                     # metrics + trail (the live cancel-ratio the dashboard shows).

@@ -51,7 +51,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import movate
 from movate.core.auth import (
@@ -4780,7 +4780,7 @@ def _load_sample_cases(bundle: AgentBundle, *, limit: int = 3) -> list[dict[str,
     return rows
 
 
-def build_app(
+def build_app(  # noqa: PLR0912
     storage: StorageProvider,
     *,
     agents: list[AgentBundle] | None = None,
@@ -15693,6 +15693,92 @@ def build_app(
             return
 
     # ------------------------------------------------------------------
+    # Twilio phone routing — configurable active agent
+    #
+    # One fixed webhook URL for Twilio: POST /api/v1/call/twilio
+    # The runtime keeps an in-memory "active voice agent" name (defaults
+    # to MDK_TWILIO_AGENT env or the first loaded agent).  A config
+    # endpoint lets callers switch it without touching Twilio console.
+    #
+    # GET  /api/v1/call/twilio/config  — read current active agent
+    # PUT  /api/v1/call/twilio/config  — set active agent {"agent":"name"}
+    # POST /api/v1/call/twilio         — Twilio webhook (routes to active)
+    # ------------------------------------------------------------------
+
+    # Initialise on first request (app.state is set after startup).
+    _twilio_active_agent_name: str | None = os.environ.get("MDK_TWILIO_AGENT")
+
+    @v1.get("/call/twilio/config", tags=["voice-v1"])
+    async def v1_call_twilio_config_get(request: Request) -> dict[str, Any]:
+        """Return the currently active voice agent for Twilio calls."""
+        nonlocal _twilio_active_agent_name
+        if _twilio_active_agent_name is None:
+            # Default to first loaded agent.
+            agents_reg: list[AgentBundle] = request.app.state.agents
+            _twilio_active_agent_name = agents_reg[0].spec.name if agents_reg else ""
+        return {"agent": _twilio_active_agent_name}
+
+    @v1.put("/call/twilio/config", tags=["voice-v1"])
+    async def v1_call_twilio_config_put(
+        request: Request,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Set the active voice agent for Twilio calls.
+
+        Body: ``{"agent": "voice-receptionist"}``
+        """
+        nonlocal _twilio_active_agent_name
+        agent_name = body.get("agent", "").strip()
+        if not agent_name:
+            raise HTTPException(status_code=400, detail="'agent' field required")
+
+        # Verify the agent exists.
+        store: StorageProvider = request.app.state.storage
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        bundle = await resolve_agent_bundle(
+            store, agent_name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            raise HTTPException(status_code=404, detail=f"Agent {agent_name!r} not found")
+
+        _twilio_active_agent_name = agent_name
+        return {"agent": _twilio_active_agent_name, "status": "active"}
+
+    @v1.post("/call/twilio", tags=["voice-v1"], response_class=Response)
+    async def v1_call_twilio_generic(request: Request) -> Response:
+        """Generic Twilio webhook — routes to the currently active agent.
+
+        Set once in Twilio console, then switch agents via
+        PUT /api/v1/call/twilio/config.
+        """
+        nonlocal _twilio_active_agent_name
+        if _twilio_active_agent_name is None:
+            agents_reg: list[AgentBundle] = request.app.state.agents
+            _twilio_active_agent_name = agents_reg[0].spec.name if agents_reg else ""
+        if not _twilio_active_agent_name:
+            return Response(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured.</Say></Response>',  # noqa: E501
+                media_type="application/xml",
+            )
+        # Redirect to the per-agent TwiML endpoint.
+        name = _twilio_active_agent_name
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        scheme = "wss" if proto == "https" else "ws"
+        stream_url = f"{scheme}://{host}/api/v1/agents/{name}/call/twilio/stream"
+
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Connect>"
+            f'<Stream url="{stream_url}" />'
+            "</Connect>"
+            "</Response>"
+        )
+        return Response(content=twiml, media_type="application/xml")
+
+    # ------------------------------------------------------------------
     # POST /api/v1/agents/{name}/call/twilio — TwiML webhook (ADR 074 D3/D4)
     #
     # Twilio hits this webhook when a call arrives on a configured number.
@@ -15723,7 +15809,12 @@ def build_app(
         # Derive the WS URL from the incoming request's host.
         host = request.headers.get("host", request.url.hostname or "localhost")
         # Use wss:// if the request came over HTTPS, ws:// otherwise.
-        scheme = "wss" if request.url.scheme == "https" else "ws"
+        # Behind a reverse proxy (Azure Container Apps, nginx, etc.) the
+        # proxy terminates TLS and forwards plain HTTP internally, so
+        # request.url.scheme is "http" even though the client connected
+        # over HTTPS.  X-Forwarded-Proto carries the original scheme.
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        scheme = "wss" if proto == "https" else "ws"
         stream_url = f"{scheme}://{host}/api/v1/agents/{name}/call/twilio/stream"
 
         twiml = (
@@ -15735,6 +15826,92 @@ def build_app(
             "</Response>"
         )
         return Response(content=twiml, media_type="application/xml")
+
+    # ------------------------------------------------------------------
+    # POST /api/v1/agents/{name}/call/twilio/sync — Sync phone number
+    #
+    # Updates the Twilio phone number's Voice webhook to point at this
+    # agent's /call/twilio endpoint.  Requires TWILIO_ACCOUNT_SID,
+    # TWILIO_AUTH_TOKEN, and TWILIO_NUMBER env vars.
+    # ------------------------------------------------------------------
+    @v1.post(
+        "/agents/{name}/call/twilio/sync",
+        tags=["agents-v1"],
+    )
+    async def v1_agent_call_twilio_sync(
+        name: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Sync a Twilio phone number to route calls to this agent.
+
+        Updates the Twilio Incoming Phone Number's VoiceUrl to
+        ``https://<host>/api/v1/agents/{name}/call/twilio`` so incoming
+        calls are handled by the named agent's voice pipeline.
+        """
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+        auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+        phone_number = os.environ.get("TWILIO_NUMBER", "").strip()
+
+        if not account_sid or not auth_token or not phone_number:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_NUMBER "
+                    "must all be set as environment variables."
+                ),
+            )
+
+        # Verify the agent exists.
+        agents_reg: list[AgentBundle] = request.app.state.agents
+        store: StorageProvider = request.app.state.storage
+        default_tenant = os.environ.get("MOVATE_DEFAULT_TENANT", "default")
+        bundle = await resolve_agent_bundle(
+            store, name, tenant_id=default_tenant, version=None, fallback=agents_reg
+        )
+        if bundle is None:
+            raise HTTPException(status_code=404, detail=f"Agent {name!r} not found")
+
+        # Build the webhook URL for this agent.
+        host = request.headers.get("host", request.url.hostname or "localhost")
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        webhook_url = f"{proto}://{host}/api/v1/agents/{name}/call/twilio"
+
+        # Use the Twilio REST API to find the phone number SID and update it.
+        try:
+            from twilio.rest import Client as TwilioClient  # noqa: PLC0415
+        except ImportError:
+            raise HTTPException(  # noqa: B904
+                status_code=501,
+                detail="twilio SDK not installed; add mdk[telephony]",
+            )
+
+        try:
+            client = TwilioClient(account_sid, auth_token)
+            # Look up the phone number SID.
+            numbers = client.incoming_phone_numbers.list(phone_number=phone_number)
+            if not numbers:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No Twilio number matching {phone_number}",
+                )
+            pn = numbers[0]
+            # Update the voice webhook URL.
+            pn.update(voice_url=webhook_url, voice_method="POST")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(  # noqa: B904
+                status_code=502,
+                detail=f"Twilio API error: {exc}",
+            )
+
+        return {
+            "status": "synced",
+            "agent": name,
+            "phone_number": phone_number,
+            "webhook_url": webhook_url,
+            "phone_number_sid": pn.sid,
+        }
 
     # ------------------------------------------------------------------
     # WS /api/v1/agents/{name}/call/twilio/stream — Twilio Media Stream
@@ -15820,11 +15997,22 @@ def build_app(
         config = _VoiceTurnConfig()
         _seed_voice_turn_config(config, bundle)
 
+        # Voice-context cue: nudge the agent to respond conversationally
+        # (short sentences, no markdown) so TTS sounds natural. Same hint
+        # used by the standalone demo server (server.py _LYZR_VOICE_HINT).
+        _VOICE_HINT = (  # noqa: N806
+            "please respond conversationally in 1-3 short sentences suitable "
+            "for text-to-speech playback. Do not use markdown, headers, bullet "
+            "lists, numbered steps, or section labels. Summarize key info "
+            "inline. If a long procedure is needed, offer to send detailed "
+            "steps separately."
+        )
         agent = ExecutorAgentTurn(
             executor=executor,
             bundle=bundle,
             tenant_id=default_tenant,
             input_key=config.input_key,
+            voice_hint=_VOICE_HINT,
         )
 
         try:
@@ -16268,6 +16456,319 @@ def build_app(
         return {"deleted": True}
 
     app.include_router(v1)
+
+    # ------------------------------------------------------------------
+    # GET /lyzr/agents — List agents from the user's Lyzr account.
+    # Drives the Mova-iO agent picker dropdown in the voice demo UI.
+    # Honors BYOK via X-Lyzr-Api-Key header; falls back to LYZR_API_KEY env.
+    # ------------------------------------------------------------------
+    import time as _time_mod  # noqa: PLC0415
+
+    _lyzr_agents_cache: dict[str, tuple[float, dict[str, object]]] = {}
+    _LYZR_AGENTS_TTL_S = 60.0  # noqa: N806
+
+    def _resolve_lyzr_key(request: Request) -> str:
+        header_key = (request.headers.get("x-lyzr-api-key") or "").strip()
+        return header_key or os.environ.get("LYZR_API_KEY", "").strip()
+
+    @app.get("/lyzr/agents", tags=["voice"], include_in_schema=False)
+    async def _lyzr_agents(request: Request) -> dict[str, object]:
+        """List agents from the caller's Lyzr account for the agent picker."""
+        key = _resolve_lyzr_key(request)
+        if not key:
+            return {
+                "ok": False,
+                "error": "LYZR_API_KEY not set",
+                "tip": "Paste a Mova-iO API key in the key panel, or set LYZR_API_KEY env",
+            }
+        now = _time_mod.monotonic()
+        cached = _lyzr_agents_cache.get(key)
+        if cached and now - cached[0] < _LYZR_AGENTS_TTL_S:
+            return cached[1]
+        try:
+            import httpx  # noqa: PLC0415
+
+            r = httpx.get(
+                "https://agent-prod.studio.lyzr.ai/v3/agents/",
+                headers={"x-api-key": key},
+                timeout=5.0,
+            )
+            r.raise_for_status()
+            raw = r.json() or []
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        def _summary(a: dict[str, object]) -> dict[str, object]:
+            tools = a.get("tools") or []
+            tool_names = [t.get("name") for t in tools if isinstance(t, dict)]  # type: ignore[attr-defined]
+            instructions = str(a.get("agent_instructions") or "")
+            return {
+                "id": a.get("_id"),
+                "name": a.get("name") or "(unnamed)",
+                "description": (str(a.get("description") or ""))[:200],
+                "role": a.get("agent_role") or "",
+                "instructions_snippet": instructions[:280]
+                + ("..." if len(instructions) > 280 else ""),  # noqa: PLR2004
+                "tools": tool_names,
+                "features": a.get("features") or [],
+            }
+
+        agents = sorted(
+            (_summary(a) for a in raw if isinstance(a, dict) and a.get("_id")),
+            key=lambda x: str(x.get("name") or "").lower(),
+        )
+        payload: dict[str, object] = {"ok": True, "agents": agents, "count": len(agents)}
+        _lyzr_agents_cache[key] = (now, payload)
+        return payload
+
+    @app.get("/lyzr/agents/{agent_id}", tags=["voice"], include_in_schema=False)
+    async def _lyzr_agent_detail(agent_id: str, request: Request) -> dict[str, object]:
+        """Validate + fetch metadata for a single Lyzr agent (L5 badge)."""
+        key = _resolve_lyzr_key(request)
+        if not key:
+            return {"ok": False, "error": "no key"}
+        try:
+            import httpx  # noqa: PLC0415
+
+            r = httpx.get(
+                f"https://agent-prod.studio.lyzr.ai/v3/agents/{agent_id}",
+                headers={"x-api-key": key},
+                timeout=5.0,
+            )
+            r.raise_for_status()
+            a = r.json()
+            return {
+                "ok": True,
+                "agent": {
+                    "id": a.get("_id"),
+                    "name": a.get("name"),
+                    "description": (str(a.get("description") or ""))[:200],
+                    "role": a.get("agent_role") or "",
+                    "instructions_snippet": (str(a.get("agent_instructions") or ""))[:280],
+                    "tools": [t.get("name") for t in (a.get("tools") or []) if isinstance(t, dict)],
+                    "features": a.get("features") or [],
+                },
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # GET /tts/voices — Voice catalog for the demo UI's voice picker.
+    # Fetches live from Cartesia's /voices API (cached 1h), falls back
+    # to a single default voice if the API is unreachable.
+    # ------------------------------------------------------------------
+    _OPENAI_VOICES = [  # noqa: N806
+        {
+            "id": "alloy",
+            "label": "Alloy",
+            "description": "neutral, balanced",
+            "use_case": "general support, default",
+        },
+        {
+            "id": "echo",
+            "label": "Echo",
+            "description": "calm, measured male",
+            "use_case": "customer service, IVR",
+        },
+        {
+            "id": "fable",
+            "label": "Fable",
+            "description": "warm British accent",
+            "use_case": "storytelling, training",
+        },
+        {
+            "id": "onyx",
+            "label": "Onyx",
+            "description": "deep, authoritative male",
+            "use_case": "announcements, alerts",
+        },
+        {
+            "id": "nova",
+            "label": "Nova",
+            "description": "bright, friendly female",
+            "use_case": "help desk, assistant",
+        },
+        {
+            "id": "shimmer",
+            "label": "Shimmer",
+            "description": "soft, expressive female",
+            "use_case": "wellness, calm settings",
+        },
+    ]
+    _cartesia_cache: tuple[float, list[dict[str, str]]] | None = None
+    _CARTESIA_TTL = 3600.0  # noqa: N806
+
+    def _classify_use_case(desc: str) -> str:
+        d = desc.lower()
+        for kws, label in [
+            (("support", "service", "customer", "help"), "customer service"),
+            (("professional", "business", "enterprise"), "enterprise voice"),
+            (("calm", "soothing", "meditat"), "wellness, calm settings"),
+            (("instruct", "training", "guide", "explainer"), "training, walkthrough"),
+            (("news", "anchor", "broadcast"), "news, announcements"),
+            (("bright", "upbeat", "energetic", "friendly"), "casual, help desk"),
+        ]:
+            if any(k in d for k in kws):
+                return label
+        return "general use"
+
+    def _fetch_cartesia_voices() -> list[dict[str, str]]:
+        key = os.environ.get("CARTESIA_API_KEY", "").strip()
+        if not key:
+            return []
+        try:
+            import httpx  # noqa: PLC0415
+
+            r = httpx.get(
+                "https://api.cartesia.ai/voices/",
+                headers={"X-API-Key": key, "Cartesia-Version": "2024-06-10"},
+                timeout=8.0,
+            )
+            r.raise_for_status()
+            voices = r.json() or []
+        except Exception:
+            return []
+        SKIP = ("fairy", "gaming", "pikachu", "robot", "elf", "demon", "ghost", "alien")  # noqa: N806
+        PREFERRED = (  # noqa: N806
+            "support",
+            "professional",
+            "natural",
+            "conversational",
+            "assistant",
+            "warm",
+            "friendly",
+            "customer",
+            "guide",
+            "explainer",
+        )
+        en = [
+            v
+            for v in voices
+            if isinstance(v, dict)
+            and v.get("language") == "en"
+            and v.get("is_public")
+            and v.get("id")
+            and v.get("name")
+            and not any(s in (v.get("description") or "").lower() for s in SKIP)
+            and not any(s in (v.get("name") or "").lower() for s in SKIP)
+        ]
+
+        def score(v: dict) -> int:  # type: ignore[type-arg]
+            d = str(v.get("description") or "").lower()
+            return sum(1 for k in PREFERRED if k in d)
+
+        en.sort(key=lambda v: (-score(v), str(v.get("name") or "")))
+        by_gender: dict[str, list] = {"f": [], "m": []}  # type: ignore[type-arg]
+        seen: set[str] = set()
+        for v in en:
+            nm = str(v.get("name") or "").split(" - ")[0].strip().lower()
+            if not nm or nm in seen:
+                continue
+            seen.add(nm)
+            g = "f" if str(v.get("gender") or "").lower().startswith("fem") else "m"
+            if len(by_gender[g]) < 8:  # noqa: PLR2004
+                by_gender[g].append(v)
+        picked = by_gender["f"] + by_gender["m"]
+
+        def norm(v: dict) -> dict[str, str]:  # type: ignore[type-arg]
+            name = str(v.get("name") or "").split(" - ")[0].strip()
+            gs = "F" if str(v.get("gender") or "").lower().startswith("fem") else "M"
+            desc = str(v.get("description") or "").strip().rstrip(".")
+            if len(desc) > 80:  # noqa: PLR2004
+                desc = desc[:77] + "..."
+            return {
+                "id": str(v["id"]),
+                "label": f"{name} ({gs})",
+                "description": desc or f"{gs} voice",
+                "use_case": _classify_use_case(desc),
+            }
+
+        return [norm(v) for v in picked]
+
+    @app.get("/tts/voices", tags=["voice"], include_in_schema=False)
+    async def _tts_voices() -> dict[str, Any]:
+        nonlocal _cartesia_cache
+        import asyncio  # noqa: PLC0415
+
+        cart_voices: list[dict[str, str]] = []
+        now = _time_mod.monotonic()
+        if _cartesia_cache and now - _cartesia_cache[0] < _CARTESIA_TTL:
+            cart_voices = _cartesia_cache[1]
+        else:
+            cart_voices = await asyncio.to_thread(_fetch_cartesia_voices)
+            if cart_voices:
+                _cartesia_cache = (now, cart_voices)
+        if not cart_voices:
+            cart_voices = [
+                {
+                    "id": "a0e99841-438c-4a64-b679-ae501e7d6091",
+                    "label": "Clara (F)",
+                    "description": "Adapter default voice",
+                    "use_case": "general use",
+                }
+            ]
+        return {
+            "ok": True,
+            "voices": {"openai": _OPENAI_VOICES, "cartesia": cart_voices},
+            "cartesia_live": bool(_cartesia_cache),
+        }
+
+    # ------------------------------------------------------------------
+    # GET / — Serve the voice demo app (examples/web_demo/index.html).
+    # The file is baked into the image at /app/web_demo/index.html by the
+    # Dockerfile.  Falls back to a project-root lookup for local dev.
+    # ------------------------------------------------------------------
+    # Eagerly load the voice demo HTML at startup so the GET / route
+    # never hits a file-not-found at request time.
+    _demo_html: str = ""
+    _demo_candidates = [
+        "/app/web_demo/index.html",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "examples",
+            "web_demo",
+            "index.html",
+        ),
+        os.path.join(
+            os.environ.get("MOVATE_AGENTS_PATH", "/app/agents"), "..", "web_demo", "index.html"
+        ),
+    ]
+    for _p in _demo_candidates:
+        _p = os.path.normpath(_p)
+        if os.path.isfile(_p):
+            with open(_p) as _f:
+                _demo_html = _f.read()
+            logger.info("Voice demo HTML loaded from %s (%d bytes)", _p, len(_demo_html))
+            break
+    else:
+        logger.warning("Voice demo HTML not found; checked: %s", _demo_candidates)
+
+    # Mount /static for voice demo assets (logos, etc.).
+    _static_candidates = [
+        "/app/web_demo/static",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "static"
+        ),
+    ]
+    for _sp in _static_candidates:
+        _sp = os.path.normpath(_sp)
+        if os.path.isdir(_sp):
+            from starlette.staticfiles import StaticFiles  # noqa: PLC0415
+
+            app.mount("/static", StaticFiles(directory=_sp), name="demo-static")
+            logger.info("Mounted /static from %s", _sp)
+            break
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def _voice_demo() -> HTMLResponse:
+        if not _demo_html:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice demo HTML not found. Checked: {_demo_candidates}",
+            )
+        return HTMLResponse(_demo_html)
 
     # ------------------------------------------------------------------
     # Typed exception → HTTP code translator. AgentCreationError carries

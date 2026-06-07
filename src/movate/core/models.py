@@ -480,6 +480,13 @@ class SkillImplementationKind(StrEnum):
     MCP server or an HTTP service. Sandboxed: configurable timeout,
     resource limits."""
 
+    LANGCHAIN = "langchain"
+    """Wrap a LangChain ``BaseTool`` as an MDK skill. The ``entry`` field
+    is a dotted import path to a LangChain tool class or factory function
+    (e.g. ``langchain_community.tools.wikipedia:WikipediaQueryRun``).
+    The tool is instantiated once on first call and reused. Requires the
+    ``mdk[langchain]`` extra (imported lazily)."""
+
 
 class SkillImplementation(BaseModel):
     """Backend declaration for a skill.

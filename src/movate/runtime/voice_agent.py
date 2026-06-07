@@ -60,11 +60,13 @@ class ExecutorAgentTurn(AgentTurn):
         bundle: Any,
         tenant_id: str | None = None,
         input_key: str = "text",
+        voice_hint: str = "",
     ) -> None:
         self._executor = executor
         self._bundle = bundle
         self._tenant_id = tenant_id
         self._input_key = input_key
+        self._voice_hint = voice_hint
 
     async def run(
         self,
@@ -79,9 +81,14 @@ class ExecutorAgentTurn(AgentTurn):
         # lazy-import posture in the voice package).
         from movate.core.models import RunRequest  # noqa: PLC0415
 
+        # Append a voice-context cue so the agent responds conversationally
+        # (short sentences, no markdown) instead of its default chat format.
+        effective_text = text
+        if self._voice_hint:
+            effective_text = f"{text}\n\n[Voice channel — {self._voice_hint}]"
         request = RunRequest(
             agent=self._bundle.spec.name,
-            input={self._input_key: text},
+            input={self._input_key: effective_text},
         )
         try:
             response = await self._executor.execute(

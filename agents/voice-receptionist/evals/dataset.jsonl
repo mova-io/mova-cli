@@ -1,0 +1,4 @@
+{"input": {"question": "Hi, what does Movate do?"}, "expected": {"answer": "Movate is an AI-first technology services company that helps enterprises build, deploy, and operate AI agents on the mdk platform."}}
+{"input": {"question": "How can I reach your sales team?"}, "expected": {"answer": "Sure! You can reach our sales team at sales@movate.com."}}
+{"input": {"question": "Where do I go for support?"}, "expected": {"answer": "For support, you can visit support.movate.com."}}
+{"input": {"question": "What can the mdk platform do?"}, "expected": {"answer": "The mdk platform supports voice agents, knowledge graphs, workflows, and enterprise connectors."}}

@@ -14,12 +14,77 @@ is not on ``$PATH`` (see ``conftest.py``).
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+# temporalio is an opt-in extra. Import it at module scope (guarded) so the
+# workflow classes below can be defined at MODULE level — temporalio's
+# ``@workflow.run`` rejects classes defined inside a function (``<locals>`` in
+# ``__qualname__``) as of temporalio 1.27. The ``temporal_client`` fixture
+# still skips the individual tests when the ``temporal`` CLI binary is absent
+# (e.g. on CI), so this only adds a clean collection-time skip when the Python
+# SDK itself isn't installed.
+pytest.importorskip("temporalio")
+
+from temporalio import activity, workflow
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
+
 pytestmark = pytest.mark.temporal
+
+
+# -- A trivial activity that stands in for call_agent_activity --------------
+
+
+@activity.defn(name="test_agent_activity")
+async def _trivial_agent_activity(
+    node_id: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """A trivial activity that returns a fixed result."""
+    return {"agent_output": f"hello from {node_id}", "input_echo": state.get("user_input", "")}
+
+
+# -- A trivial single-node workflow that calls the activity -----------------
+
+
+@workflow.defn
+class TrivialTestWorkflow:
+    """A single-node workflow: call the activity, merge result, return."""
+
+    @workflow.run
+    async def run(self, initial_state: dict[str, Any]) -> dict[str, Any]:
+        state = dict(initial_state)
+        result = await workflow.execute_activity(
+            _trivial_agent_activity,
+            args=["agent-node-1", state],
+            schedule_to_close_timeout=timedelta(seconds=30),
+        )
+        state.update(result)
+        return state
+
+
+# -- A workflow that drives the real mdk ``call_agent_activity`` ------------
+
+
+@workflow.defn
+class MdkActivityTestWorkflow:
+    @workflow.run
+    async def run(self, initial_state: dict[str, Any]) -> dict[str, Any]:
+        with workflow.unsafe.imports_passed_through():
+            from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
+                call_agent_activity as _activity,
+            )
+        state = dict(initial_state)
+        result = await workflow.execute_activity(
+            _activity,
+            args=["test-node", "fake-agent-ref", state, "test-run-id"],
+            schedule_to_close_timeout=timedelta(seconds=30),
+        )
+        state.update(result)
+        return state
 
 
 @pytest.mark.timeout(60)
@@ -27,40 +92,9 @@ async def test_trivial_workflow_via_startdev(temporal_client: Any) -> None:
     """Submit a trivial workflow, wait for completion, assert result.
 
     The workflow is a single ``@workflow.defn`` class whose ``run`` method
-    calls ``call_agent_activity`` once and returns the result merged into
-    state. The agent activity is patched to return a fixed dict (no real
-    LLM call, no real agent bundle).
+    calls the activity once and returns the result merged into state. The
+    activity returns a fixed dict (no real LLM call, no real agent bundle).
     """
-    from temporalio import activity, workflow  # noqa: PLC0415
-    from temporalio.worker import UnsandboxedWorkflowRunner, Worker  # noqa: PLC0415
-
-    # -- Define a trivial activity that stands in for call_agent_activity ---
-
-    @activity.defn(name="test_agent_activity")
-    async def test_agent_activity(
-        node_id: str,
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        """A trivial activity that returns a fixed result."""
-        return {"agent_output": f"hello from {node_id}", "input_echo": state.get("user_input", "")}
-
-    # -- Define a trivial workflow that calls the activity ------------------
-
-    @workflow.defn
-    class TrivialTestWorkflow:
-        """A single-node workflow: call the activity, merge result, return."""
-
-        @workflow.run
-        async def run(self, initial_state: dict[str, Any]) -> dict[str, Any]:
-            state = dict(initial_state)
-            result = await workflow.execute_activity(
-                test_agent_activity,
-                args=["agent-node-1", state],
-                schedule_to_close_timeout=workflow.unsafe.timedelta(seconds=30),
-            )
-            state.update(result)
-            return state
-
     # -- Run the workflow on the dev server ---------------------------------
 
     task_queue = "test-temporal-startdev"
@@ -69,7 +103,7 @@ async def test_trivial_workflow_via_startdev(temporal_client: Any) -> None:
         temporal_client,
         task_queue=task_queue,
         workflows=[TrivialTestWorkflow],
-        activities=[test_agent_activity],
+        activities=[_trivial_agent_activity],
         workflow_runner=UnsandboxedWorkflowRunner(),
     ):
         result = await temporal_client.execute_workflow(
@@ -96,9 +130,6 @@ async def test_mdk_activity_wiring_via_startdev(temporal_client: Any) -> None:
     server. The Executor and agent loader are mocked so no LLM call or
     real agent bundle is needed.
     """
-    from temporalio import workflow  # noqa: PLC0415
-    from temporalio.worker import UnsandboxedWorkflowRunner, Worker  # noqa: PLC0415
-
     from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
         call_agent_activity,
         configure_activities,
@@ -120,25 +151,6 @@ async def test_mdk_activity_wiring_via_startdev(temporal_client: Any) -> None:
         tenant_id="test-tenant",
     )
 
-    # -- Define a workflow that calls the real call_agent_activity ----------
-
-    @workflow.defn
-    class MdkActivityTestWorkflow:
-        @workflow.run
-        async def run(self, initial_state: dict[str, Any]) -> dict[str, Any]:
-            with workflow.unsafe.imports_passed_through():
-                from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
-                    call_agent_activity as _activity,
-                )
-            state = dict(initial_state)
-            result = await workflow.execute_activity(
-                _activity,
-                args=["test-node", "fake-agent-ref", state, "test-run-id"],
-                schedule_to_close_timeout=workflow.unsafe.timedelta(seconds=30),
-            )
-            state.update(result)
-            return state
-
     # -- Mock the agent loader and executor --------------------------------
 
     mock_bundle = AsyncMock()
@@ -156,8 +168,11 @@ async def test_mdk_activity_wiring_via_startdev(temporal_client: Any) -> None:
     task_queue = "test-mdk-activity-startdev"
 
     with (
+        # ``load_agent`` is imported lazily inside ``call_agent_activity``
+        # (``from movate.core.loader import load_agent``), so patch it at its
+        # source module, not on ``temporal_activities``.
         patch(
-            "movate.core.workflow.temporal_activities.load_agent",
+            "movate.core.loader.load_agent",
             return_value=mock_bundle,
         ),
         patch(

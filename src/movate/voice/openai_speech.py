@@ -161,6 +161,14 @@ class OpenAIWhisperSTT:
         yield TranscriptChunk(text=text, is_final=True)
 
 
+# OpenAI's supported voice names (as of 2024-12). Any voice_id not in this
+# set is silently mapped to the adapter's default — this prevents a Cartesia
+# UUID or ElevenLabs voice_id from 400-ing on failover (ADR 049 portability).
+_OPENAI_VOICES: frozenset[str] = frozenset(
+    {"alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"}
+)
+
+
 class OpenAITTS:
     """OpenAI :class:`~movate.voice.base.TextToSpeechProvider`.
 
@@ -209,6 +217,14 @@ class OpenAITTS:
         if not utterance.strip():
             return  # nothing to say → no audio frames
 
+        # Guard: if the voice_id was set for a different provider (e.g. a
+        # Cartesia UUID on failover), ignore it and use our default. Passing a
+        # foreign voice_id to OpenAI yields a 400 — silent fallback is safer
+        # than a hard error on a failover path (ADR 049 portability).
+        resolved_voice = (
+            voice_id if voice_id and voice_id.lower() in _OPENAI_VOICES else self._default_voice
+        )
+
         client = self._resolve_client(api_key)
         # Request raw PCM (no container at the edge). Prefer the SDK's
         # streaming-response context manager so the FIRST audio bytes arrive
@@ -221,7 +237,7 @@ class OpenAITTS:
         if streamer is not None:
             async with streamer(
                 model=self._model,
-                voice=voice_id or self._default_voice,
+                voice=resolved_voice,
                 input=utterance,
                 response_format="pcm",
             ) as resp:
@@ -231,7 +247,7 @@ class OpenAITTS:
 
         resp = await client.audio.speech.create(
             model=self._model,
-            voice=voice_id or self._default_voice,
+            voice=resolved_voice,
             input=utterance,
             response_format="pcm",
         )

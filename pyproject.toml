@@ -4,7 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.6.4.2"
+# Version is DERIVED FROM GIT at build time (ADR 066), never committed here — so
+# PRs never conflict on a version line. See hatch_build.py + scripts/calver_version.py.
+dynamic = ["version"]
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -269,9 +271,35 @@ telephony = [
     # SDKs only) so operators who need web-WS voice but not phone calls pay
     # nothing for the Twilio SDK.
     "twilio>=9.0,<10",
+    # LiveKit telephony transport (ADR 074 D2). WebRTC-native path: 16 kHz
+    # Opus (vs Twilio's 8 kHz mu-law), built-in SIP gateway, sub-200ms
+    # transport latency. The livekit + livekit-agents SDKs are Apache-2.0
+    # (permissive). Imported LAZILY inside movate.voice.transports.livekit.
+    "livekit>=0.14,<1",
+    "livekit-agents>=0.11,<1",
 ]
 langchain = [
-    "langchain-core>=0.3,<1",
+    # LangChain core — supports both v0.3 (legacy) and v1.x (Deep Agents).
+    # The >=0.3 floor lets existing langchain-community tools work; the
+    # absence of an upper bound lets deepagents pull v1.x when both extras
+    # are installed together.
+    "langchain-core>=0.3",
+    "langsmith>=0.1.147,<1",
+]
+langgraph = [
+    # LangGraph execution backend (ADR 030 D1). Enables `mdk run --runtime
+    # langgraph` for graph-based workflows with conditionals, cycles, and
+    # parallel fan-out. Imported LAZILY inside `movate.runtime.langgraph_backend`
+    # — a runtime without this extra never loads it. langgraph is MIT-licensed
+    # (permissive; passes scripts/check_licenses.py --strict).
+    "langgraph>=0.4",
+]
+deepagents = [
+    # LangChain Deep Agents — production agent harness with task planning,
+    # subagent spawning, memory, MCP tools, and virtual filesystem. Built
+    # on LangGraph. Requires a provider-specific langchain package.
+    "deepagents>=0.1",
+    "langchain-openai>=0.3",
 ]
 teams = [
     # The Teams bot is a FastAPI app, so it leans on the same web deps
@@ -408,6 +436,11 @@ dev = [
 # cycle — until then both are first-class.
 movate = "movate.cli.main:app"
 mdk = "movate.cli.main:app"
+
+# ADR 066 — the version is a dynamic field populated by the custom metadata hook
+# (hatch_build.py), which computes CalVer from git history at build time.
+[tool.hatch.metadata.hooks.custom]
+path = "hatch_build.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/movate"]
@@ -575,6 +608,13 @@ module = [
     # Temporal compiler / worker glue (Phase 1 Track B/C), so a base install
     # is unaffected.
     "temporalio.*",
+    # LangGraph SDK — optional [langgraph] extra (ADR 030 D1). Imported
+    # LAZILY inside movate.runtime.langgraph_backend; base install unaffected.
+    "langgraph.*",
+    # LiveKit SDK — optional [telephony] extra (ADR 074 D2). Imported
+    # LAZILY inside movate.voice.transports.livekit; base install unaffected.
+    "livekit.*",
+    "livekit_agents.*",
 ]
 ignore_missing_imports = true
 

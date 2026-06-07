@@ -53,10 +53,17 @@ RUN uv sync --all-extras --no-extra airflow --no-dev --frozen --no-install-proje
 # ---------------------------------------------------------------------------
 FROM deps AS app
 
+# ADR 066 — the version is git-derived, but the Docker context excludes .git, so
+# the host passes the computed CalVer as a build-arg; the hatch metadata hook
+# reads it via MOVATE_BUILD_VERSION. hatch_build.py + scripts/calver_version.py
+# must be present for the build backend to resolve the dynamic version.
+ARG MOVATE_BUILD_VERSION=""
 COPY src/ ./src/
 COPY README.md ./
-COPY pyproject.toml uv.lock ./
-RUN uv sync --all-extras --no-extra airflow --no-dev --frozen
+COPY pyproject.toml uv.lock hatch_build.py ./
+COPY scripts/calver_version.py ./scripts/
+RUN MOVATE_BUILD_VERSION="${MOVATE_BUILD_VERSION}" \
+    uv sync --all-extras --no-extra airflow --no-dev --frozen
 
 # Bake the default templates so `movate init` works inside the
 # container if an operator shells in. Production runs ignore this.
@@ -75,6 +82,11 @@ COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate
 # pattern), add an empty `agents/.keep` file.
 COPY agents/ /app/agents/
 ENV MOVATE_AGENTS_PATH=/app/agents
+
+# Voice demo web app — the standalone demo server (server.py) serves
+# the full browser voice experience: /ws/voice WebSocket, /tts/voices,
+# /lyzr/agents, Talk button, live activity chart, etc.
+COPY examples/web_demo/ /app/web_demo/
 
 # Default tracer goes to stdout — Container Apps captures stdout to
 # Log Analytics. Operators flip MOVATE_TRACER=otel via env to switch
@@ -132,10 +144,15 @@ RUN uv sync --all-extras --no-extra airflow --no-dev --frozen --no-install-proje
 
 FROM playground-deps AS playground
 
+# ADR 066 — see the `app` stage: git-derived version via MOVATE_BUILD_VERSION
+# build-arg + the hatch hook files (the build context excludes .git).
+ARG MOVATE_BUILD_VERSION=""
 COPY src/ ./src/
 COPY README.md ./
-COPY pyproject.toml uv.lock ./
-RUN uv sync --all-extras --no-extra airflow --no-dev --frozen
+COPY pyproject.toml uv.lock hatch_build.py ./
+COPY scripts/calver_version.py ./scripts/
+RUN MOVATE_BUILD_VERSION="${MOVATE_BUILD_VERSION}" \
+    uv sync --all-extras --no-extra airflow --no-dev --frozen
 
 # Bake the default templates so `movate init` works if an operator shells in.
 COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate/templates/
@@ -146,6 +163,11 @@ COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate
 # path don't trip; the playground command never reads it.
 COPY agents/ /app/agents/
 ENV MOVATE_AGENTS_PATH=/app/agents
+
+# Voice demo web app (same COPY as the runtime/app stage — the default
+# build target is this playground stage, and ACA overrides CMD to
+# `mdk serve`, so the runtime serves this HTML at GET /).
+COPY examples/web_demo/ /app/web_demo/
 
 # Non-root user (defense in depth — matches the runtime/worker stages).
 RUN useradd --create-home --home-dir /home/movate --shell /bin/bash movate \

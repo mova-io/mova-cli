@@ -84,12 +84,8 @@ def require_backend_available(effective_runtime: str) -> None:
     if effective_runtime == "native":
         return
     if effective_runtime == "langgraph":
-        raise WorkflowBackendError(
-            "LangGraph backend execution is not yet wired (ADR 055 step 3); "
-            "use runtime 'native' or 'temporal'. (The LangGraph compiler exists "
-            "for `mdk export langgraph`, but selecting it for execution is "
-            "deliberately rejected rather than silently downgraded.)"
-        )
+        _require_langgraph_extra()
+        return
     if effective_runtime == "temporal":
         _require_temporal_extra()
         _resolve_temporal_connection()  # raises if no TEMPORAL_HOST configured.
@@ -106,6 +102,17 @@ def _require_temporal_extra() -> None:
         raise WorkflowBackendError(
             "The [temporal] extra is not installed. "
             "Install with: uv tool install --editable '.[temporal]' --force"
+        ) from exc
+
+
+def _require_langgraph_extra() -> None:
+    """Raise the install hint if the ``[langgraph]`` extra is absent (D6)."""
+    try:
+        import langgraph  # noqa: F401, PLC0415 — availability probe only.
+    except ImportError as exc:
+        raise WorkflowBackendError(
+            "The [langgraph] extra is not installed. "
+            "Install with: uv tool install --editable '.[langgraph]' --force"
         ) from exc
 
 
