@@ -56,6 +56,17 @@ leaves the Container App with no `identity` block at all.
 ''')
 param userAssignedIdentityId string = ''
 
+@description('''
+Prometheus remote-write endpoint (ADR 087). When non-empty, the collector adds a
+`prometheusremotewrite` exporter to the METRICS pipeline (alongside azuremonitor)
+and pushes metrics here, e.g.
+https://movate-dev-prometheus.internal.<domain>/api/v1/write. Empty (default) →
+no Prometheus exporter; the compiled config is byte-for-byte the
+App-Insights-only original. Read at runtime via
+${env:PROMETHEUS_REMOTE_WRITE_ENDPOINT}.
+''')
+param prometheusRemoteWriteEndpoint string = ''
+
 @description('Min replicas. One collector replica is plenty for a single-team trace volume.')
 @minValue(0)
 @maxValue(5)
@@ -97,7 +108,8 @@ var otlpHttpPort = 4318
 //   characters `${'$'}` into the deployed value. Confirmed: the compiled ARM
 //   carries the literal `${env:APPLICATIONINSIGHTS_CONNECTION_STRING}`, which
 //   the collector's env: config provider then expands at runtime.
-var otelCollectorConfig = '''
+// App-Insights-only config (the original, unchanged when Prometheus is off).
+var otelConfigBase = '''
 receivers:
   otlp:
     protocols:
@@ -120,6 +132,40 @@ service:
       receivers: [otlp]
       exporters: [azuremonitor]
 '''
+
+// ADR 087 — fan metrics out to Prometheus as WELL as App Insights. Only the
+// metrics pipeline gains the second exporter; traces/logs stay App-Insights-only.
+// The endpoint is read at runtime from ${env:PROMETHEUS_REMOTE_WRITE_ENDPOINT}.
+var otelConfigWithProm = '''
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  azuremonitor:
+    connection_string: ${env:APPLICATIONINSIGHTS_CONNECTION_STRING}
+  prometheusremotewrite:
+    endpoint: ${env:PROMETHEUS_REMOTE_WRITE_ENDPOINT}
+    resource_to_telemetry_conversion:
+      enabled: true
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [azuremonitor]
+    metrics:
+      receivers: [otlp]
+      exporters: [azuremonitor, prometheusremotewrite]
+    logs:
+      receivers: [otlp]
+      exporters: [azuremonitor]
+'''
+
+// Gate (ADR 087 D3): default-off → byte-for-byte the original config.
+var otelCollectorConfig = empty(prometheusRemoteWriteEndpoint) ? otelConfigBase : otelConfigWithProm
 
 resource collector 'Microsoft.App/containerApps@2024-03-01' = {
   name: name
@@ -187,6 +233,14 @@ resource collector 'Microsoft.App/containerApps@2024-03-01' = {
               // doc for why it is intentionally not a @secure() / KV secretRef.
               name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
               value: appInsightsConnectionString
+            }
+            {
+              // ADR 087 — target for the prometheusremotewrite exporter. Empty
+              // when Prometheus is disabled (the exporter isn't in the config
+              // then, so the value is unread); set to the Prometheus internal
+              // remote-write URL when enablePrometheus flips on.
+              name: 'PROMETHEUS_REMOTE_WRITE_ENDPOINT'
+              value: prometheusRemoteWriteEndpoint
             }
           ]
         }

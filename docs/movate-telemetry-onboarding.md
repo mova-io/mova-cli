@@ -241,3 +241,57 @@ separate ADR (likely ADR 04x), once Phase 1 metrics demonstrate that
 cross-tenant KQL fan-out is the real scale bottleneck. **Do not** add
 `MDK_TELEMETRY_*` envs to `src/` until that ADR lands. This onboarding
 runbook will get a Phase 2 section at that time.
+
+---
+
+## Prometheus augmentation (ADR 087) — optional, real-time metrics
+
+App Insights (above) is the source of truth for traces / logs / audit. For
+**real-time operational metrics + PromQL dashboards**, deploy the optional
+self-hosted Prometheus backend (ADR 087). It is gated behind `enablePrometheus`
+and is **additive** — App Insights is untouched.
+
+### 1. Deploy
+Set the bicep param and redeploy (requires `enableAppInsights` + a connection
+string — Prometheus is fed by the collector's remote-write):
+
+```bash
+# in main.dev.bicepparam (or --parameters)
+param enablePrometheus = true
+```
+
+This creates `movate-<env>-prometheus` (internal, single replica, ephemeral TSDB
+in dev) and adds a `prometheusremotewrite` exporter to the collector's metrics
+pipeline → metrics now flow to BOTH App Insights and Prometheus.
+
+### 2. Wire the Grafana datasource (out-of-band, like the dashboards)
+Grafana is not yet bicep-managed, so add the Prometheus datasource once via the
+Grafana API (admin creds):
+
+```bash
+G="https://movate-<env>-grafana-oss.<domain>"
+curl -u admin:"$GF_ADMIN_PW" -H 'Content-Type: application/json' -d '{
+  "name":"Prometheus","type":"prometheus","access":"proxy",
+  "url":"https://movate-<env>-prometheus.internal.<domain>","isDefault":false,
+  "uid":"prometheus"
+}' "$G/api/datasources"
+```
+
+### 3. Import the PromQL dashboards
+The in-repo PromQL dashboards (`dashboards/grafana/*.json`) and rules
+(`dashboards/prometheus/mdk-rules.yaml`) now have a backend. Import each (they
+reference `${DS_PROMETHEUS}` / a `prometheus` datasource):
+
+```bash
+for f in dashboards/grafana/mdk-*.json; do
+  curl -u admin:"$GF_ADMIN_PW" -H 'Content-Type: application/json' \
+    -d "{\"dashboard\": $(cat "$f"), \"overwrite\": true, \"inputs\": [{\"name\":\"DS_PROMETHEUS\",\"type\":\"datasource\",\"pluginId\":\"prometheus\",\"value\":\"prometheus\"}]}" \
+    "$G/api/dashboards/import"
+done
+```
+
+### Production note
+Dev runs a single-replica, ephemeral-TSDB Prometheus on Container Apps. **Before
+any customer/production use**, migrate to **Azure Monitor Managed Prometheus**
+(Azure Monitor Workspace) — the collector's `prometheusremotewrite` exporter is
+the seam (re-point + add AAD auth). That migration is a follow-up ADR.

@@ -395,6 +395,17 @@ scheduler keeps its existing trace behavior).
 param enableAppInsights bool = false
 
 @description('''
+Deploy a self-hosted Prometheus Container App and fan the OTel Collector's
+METRICS pipeline to it via remote-write (ADR 087) — high-resolution operational
+metrics + PromQL dashboards alongside App Insights. Requires the collector
+(enableAppInsights + a connection string); off by default and purely additive —
+when false, no Prometheus app is created and the collector config is byte-for-byte
+the App-Insights-only original. Dev posture: single replica, ephemeral TSDB —
+NOT for production (→ Azure Monitor Managed Prometheus, a follow-up ADR).
+''')
+param enablePrometheus bool = false
+
+@description('''
 Application Insights connection string the OTel Collector's azuremonitor
 exporter ships telemetry to. PLAIN (not @secure()) on purpose: ARM omits
 @secure() params during preflight (exactly when the value must be present),
@@ -607,6 +618,11 @@ var otelCollectorName = 'movate-${env}-otelcol'
 // pass 2 supplies the connStr and the collector + endpoint come up. Used by
 // the otelCollector module condition and the api/worker trace wiring below.
 var appInsightsExportEnabled = enableAppInsights && !empty(appInsightsConnectionString)
+
+// ADR 087 — Prometheus augmentation. Requires the collector (it's the collector
+// that remote-writes to Prometheus), so gate on appInsightsExportEnabled too.
+var prometheusEnabled = enablePrometheus && appInsightsExportEnabled
+var prometheusName = 'movate-${env}-prometheus'
 
 // ---------------------------------------------------------------------------
 // Modules
@@ -1049,6 +1065,17 @@ module temporalUi 'modules/containerapp-temporal-ui.bicep' = if (enableTemporalU
 // comes up. No UAI / role assignments needed: it runs the public contrib image
 // (no ACR pull) and the connection string arrives as a plain param (no KV).
 // ---------------------------------------------------------------------------
+// ADR 087 — self-hosted Prometheus (dev), fed by the collector's remote-write.
+module prometheus 'modules/containerapp-prometheus.bicep' = if (prometheusEnabled) {
+  name: 'prometheus-${env}'
+  params: {
+    name: prometheusName
+    location: location
+    environmentId: cae.outputs.envId
+    tags: tags
+  }
+}
+
 module otelCollector 'modules/containerapp-otel-collector.bicep' = if (appInsightsExportEnabled) {
   name: 'otelcol-${env}'
   params: {
@@ -1056,6 +1083,9 @@ module otelCollector 'modules/containerapp-otel-collector.bicep' = if (appInsigh
     location: location
     environmentId: cae.outputs.envId
     appInsightsConnectionString: appInsightsConnectionString
+    // ADR 087 — when Prometheus is on, push metrics to its internal remote-write
+    // endpoint as well; empty otherwise (App-Insights-only config).
+    prometheusRemoteWriteEndpoint: prometheusEnabled ? 'https://${prometheus!.outputs.fqdn}/api/v1/write' : ''
     tags: tags
   }
 }
