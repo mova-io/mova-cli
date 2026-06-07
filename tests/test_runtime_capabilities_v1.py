@@ -91,9 +91,8 @@ def test_full_view_shape(client: TestClient, read_auth) -> None:
 
 def test_full_view_resources_reflect_route_table(client: TestClient, read_auth) -> None:
     """The ``resources`` block enumerates the manageable surface, derived from
-    the live route table — agents/projects/kb are fully managed, skills is
-    create-only (``managed: false``), and contexts is absent until its API
-    ships (ADR 060)."""
+    the live route table — agents/projects/kb are fully managed, and skills +
+    contexts are now first-class managed CRUD resources (ADR 060)."""
     header, _ = read_auth
     body = client.get("/api/v1/capabilities", headers=header).json()
 
@@ -108,13 +107,13 @@ def test_full_view_resources_reflect_route_table(client: TestClient, read_auth) 
         assert by_name[name]["path"].startswith("/api/v1/")
         assert by_name[name]["operations"]  # non-empty
 
-    # Skills exists but is create-only on this build → managed=false, and the
-    # honest operation list reflects exactly that.
-    assert by_name["skills"]["operations"] == ["create"]
-    assert by_name["skills"]["managed"] is False
-
-    # Contexts has no API on this build → omitted entirely (not promised).
-    assert "contexts" not in by_name
+    # Skills + contexts are now first-class managed resources with full CRUD
+    # (ADR 060 steps 1-2) — both managed=true, both serving /api/v1/<name>.
+    for name in ("skills", "contexts"):
+        assert name in by_name, f"{name} missing from resources"
+        assert by_name[name]["managed"] is True
+        assert by_name[name]["path"] == f"/api/v1/{name}"
+        assert {"create", "list", "get", "update", "delete"} <= set(by_name[name]["operations"])
 
 
 def test_minimal_view_omits_resources(client: TestClient) -> None:
