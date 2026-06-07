@@ -40,6 +40,7 @@
       "type": "stat",
       "id": 2,
       "title": "Workflows completed (24h)",
+      "description": "**Traffic** (golden signal). Durable workflow executions that reached a terminal state in the last 24h. The throughput headline for the Temporal backend.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -94,6 +95,7 @@
       "type": "stat",
       "id": 3,
       "title": "Success rate % (24h)",
+      "description": "**Errors** (golden signal, inverted). Share of workflows that ended `success` vs failed/terminated over 24h. Red <90%, amber <99%, green \u226599% \u2014 the reliability headline.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -109,9 +111,32 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
           },
-          "unit": "percent"
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 90
+              },
+              {
+                "color": "green",
+                "value": 99
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
         },
         "overrides": []
       },
@@ -149,6 +174,7 @@
       "type": "timeseries",
       "id": 4,
       "title": "Completed / 15m by status",
+      "description": "Completion rate per 15m split by terminal status. A `failed` or `terminated` series appearing is the earliest trend signal that something regressed.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -171,8 +197,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -201,6 +232,7 @@
       "type": "table",
       "id": 5,
       "title": "Completed by workflow + status",
+      "description": "Per-workflow completion counts broken out by status \u2014 the drill-down that tells you *which* workflow definition is driving failures, not just that failures exist.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -247,6 +279,7 @@
       "type": "timeseries",
       "id": 6,
       "title": "Completions / 15m by workflow",
+      "description": "Throughput per 15m split by workflow definition \u2014 shows which workflows carry the load and when each is active.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -269,8 +302,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -299,6 +337,7 @@
       "type": "timeseries",
       "id": 7,
       "title": "Workflow duration (mean ms by workflow)",
+      "description": "**Latency** (golden signal). Mean wall-clock duration per workflow (histogram sum/count). NOTE: this is true wall-clock \u2014 a HUMAN-paused (HITL) workflow's duration *includes* the time spent waiting for the human, by design.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -322,8 +361,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -352,6 +396,7 @@
       "type": "timeseries",
       "id": 8,
       "title": "Workflow duration (mean ms by status)",
+      "description": "**Latency** (golden signal). Mean duration split by terminal status \u2014 failed runs that die fast vs slow tell different stories (fast fail = validation; slow fail = timeout/retry exhaustion).",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -375,8 +420,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -418,6 +468,7 @@
       "type": "timeseries",
       "id": 10,
       "title": "Workflow task schedule-to-start latency (avg ms)",
+      "description": "**Saturation** (golden signal). Time a workflow task waited in the queue before a worker picked it up. Rising latency = not enough worker capacity for the task-queue depth; scale workers.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -441,8 +492,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -471,6 +527,7 @@
       "type": "timeseries",
       "id": 11,
       "title": "Worker task slots available",
+      "description": "**Saturation** (golden signal). Free executor slots on the worker pool. Slots hitting zero while schedule-to-start latency climbs confirms the worker is the bottleneck.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -493,8 +550,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -523,6 +585,7 @@
       "type": "timeseries",
       "id": 12,
       "title": "Temporal RPC failures / 5m",
+      "description": "**Errors** (golden signal). Failed gRPC calls from the worker to the Temporal frontend. Any sustained non-zero value points at a connectivity/TLS/namespace problem between worker and server. Amber \u22651, red \u226510 per 5m.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -538,15 +601,43 @@
           "custom": {
             "drawStyle": "line",
             "fillOpacity": 10,
-            "showPoints": "never"
+            "showPoints": "never",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
           }
         },
         "overrides": []
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"
@@ -575,6 +666,7 @@
       "type": "timeseries",
       "id": 13,
       "title": "Sticky cache hit vs miss / 5m",
+      "description": "Sticky-execution cache hits vs misses. A high miss ratio means workers keep replaying history from scratch (cache evictions / worker churn) \u2014 extra CPU and latency per task.",
       "datasource": {
         "type": "grafana-azure-monitor-datasource",
         "uid": "ffnrfwjnew5xcc"
@@ -597,8 +689,13 @@
       },
       "options": {
         "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max",
+            "mean"
+          ]
         },
         "tooltip": {
           "mode": "multi"

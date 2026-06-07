@@ -66,8 +66,14 @@ def _next_id() -> int:
 
 
 def _opts() -> dict:
+    # Golden-signals legend: a TABLE legend surfacing last / max / mean per series
+    # so an operator reads the current value AND the recent peak without hovering.
     return {
-        "legend": {"displayMode": "list", "placement": "bottom"},
+        "legend": {
+            "displayMode": "table",
+            "placement": "bottom",
+            "calcs": ["lastNotNull", "max", "mean"],
+        },
         "tooltip": {"mode": "multi"},
     }
 
@@ -87,10 +93,27 @@ def row(title: str, y: int) -> dict:
     }
 
 
-def _fieldcfg(unit: str | None) -> dict:
-    defaults: dict = {"custom": {"drawStyle": "line", "fillOpacity": 10, "showPoints": "never"}}
+def _thresholds(steps: list[tuple[str, float | None]]) -> dict:
+    """Build a Grafana absolute-threshold config from (color, value) steps.
+
+    The first step's value must be ``None`` (the base band). Colours
+    saturation / error panels green→amber→red so a scan flags a panel that has
+    crossed an operational limit (golden-signals: errors + saturation loud)."""
+    return {
+        "mode": "absolute",
+        "steps": [{"color": c, "value": v} for c, v in steps],
+    }
+
+
+def _fieldcfg(unit: str | None, thresholds: dict | None = None) -> dict:
+    custom: dict = {"drawStyle": "line", "fillOpacity": 10, "showPoints": "never"}
+    defaults: dict = {"custom": custom}
     if unit:
         defaults["unit"] = unit
+    if thresholds is not None:
+        defaults["thresholds"] = thresholds
+        defaults["color"] = {"mode": "thresholds"}
+        custom["thresholdsStyle"] = {"mode": "dashed"}
     return {"defaults": defaults, "overrides": []}
 
 
@@ -105,14 +128,17 @@ def kql_panel(
     unit: str | None = None,
     viz: str = "timeseries",
     result: str = "time_series",
+    description: str = "",
+    thresholds: dict | None = None,
 ) -> dict:
     panel = {
         "type": viz,
         "id": _next_id(),
         "title": title,
+        "description": description,
         "datasource": DS,
         "gridPos": _grid(x, y, w, h),
-        "fieldConfig": _fieldcfg(unit),
+        "fieldConfig": _fieldcfg(unit, thresholds),
         "options": _opts(),
         "targets": [
             {
@@ -152,6 +178,9 @@ panels += [
         h=6,
         viz="stat",
         result="table",
+        description="**Traffic** (golden signal). Durable workflow executions that "
+        "reached a terminal state in the last 24h. The throughput headline for the "
+        "Temporal backend.",
     ),
     kql_panel(
         "Success rate % (24h)",
@@ -168,6 +197,10 @@ panels += [
         unit="percent",
         viz="stat",
         result="table",
+        description="**Errors** (golden signal, inverted). Share of workflows that "
+        "ended `success` vs failed/terminated over 24h. Red <90%, amber <99%, "
+        "green ≥99% — the reliability headline.",
+        thresholds=_thresholds([("red", None), ("yellow", 90), ("green", 99)]),
     ),
     kql_panel(
         "Completed / 15m by status",
@@ -179,6 +212,9 @@ panels += [
         y=y,
         w=12,
         h=6,
+        description="Completion rate per 15m split by terminal status. A `failed` "
+        "or `terminated` series appearing is the earliest trend signal that "
+        "something regressed.",
     ),
 ]
 y += 6
@@ -194,6 +230,9 @@ panels += [
         w=12,
         viz="table",
         result="table",
+        description="Per-workflow completion counts broken out by status — the "
+        "drill-down that tells you *which* workflow definition is driving "
+        "failures, not just that failures exist.",
     ),
     kql_panel(
         "Completions / 15m by workflow",
@@ -204,6 +243,8 @@ panels += [
         x=12,
         y=y,
         w=12,
+        description="Throughput per 15m split by workflow definition — shows which "
+        "workflows carry the load and when each is active.",
     ),
 ]
 y += 8
@@ -225,6 +266,10 @@ panels += [
         y=y,
         w=12,
         unit="ms",
+        description="**Latency** (golden signal). Mean wall-clock duration per "
+        "workflow (histogram sum/count). NOTE: this is true wall-clock — a "
+        "HUMAN-paused (HITL) workflow's duration *includes* the time spent waiting "
+        "for the human, by design.",
     ),
     kql_panel(
         "Workflow duration (mean ms by status)",
@@ -238,6 +283,9 @@ panels += [
         y=y,
         w=12,
         unit="ms",
+        description="**Latency** (golden signal). Mean duration split by terminal "
+        "status — failed runs that die fast vs slow tell different stories (fast "
+        "fail = validation; slow fail = timeout/retry exhaustion).",
     ),
 ]
 y += 8
@@ -253,6 +301,9 @@ panels += [
         x=0,
         y=y,
         unit="ms",
+        description="**Saturation** (golden signal). Time a workflow task waited in "
+        "the queue before a worker picked it up. Rising latency = not enough worker "
+        "capacity for the task-queue depth; scale workers.",
     ),
     kql_panel(
         "Worker task slots available",
@@ -260,6 +311,9 @@ panels += [
         "| summarize Slots = avg(Sum) by bin(TimeGenerated, 1m)\n| order by TimeGenerated asc",
         x=12,
         y=y,
+        description="**Saturation** (golden signal). Free executor slots on the "
+        "worker pool. Slots hitting zero while schedule-to-start latency climbs "
+        "confirms the worker is the bottleneck.",
     ),
 ]
 y += 8
@@ -270,6 +324,11 @@ panels += [
         "| summarize Failures = sum(Sum) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
         x=0,
         y=y,
+        description="**Errors** (golden signal). Failed gRPC calls from the worker "
+        "to the Temporal frontend. Any sustained non-zero value points at a "
+        "connectivity/TLS/namespace problem between worker and server. Amber ≥1, "
+        "red ≥10 per 5m.",
+        thresholds=_thresholds([("green", None), ("yellow", 1), ("red", 10)]),
     ),
     kql_panel(
         "Sticky cache hit vs miss / 5m",
@@ -278,6 +337,9 @@ panels += [
         "| order by TimeGenerated asc",
         x=12,
         y=y,
+        description="Sticky-execution cache hits vs misses. A high miss ratio means "
+        "workers keep replaying history from scratch (cache evictions / worker "
+        "churn) — extra CPU and latency per task.",
     ),
 ]
 y += 8

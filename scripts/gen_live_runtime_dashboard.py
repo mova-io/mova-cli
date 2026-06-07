@@ -45,8 +45,15 @@ def _next_id() -> int:
 
 
 def _opts() -> dict:
+    # Golden-signals legend: a TABLE legend that surfaces last / max / mean per
+    # series, so an operator reads the current value AND the recent peak without
+    # hovering. `tooltip: multi` keeps all series aligned on hover.
     return {
-        "legend": {"displayMode": "list", "placement": "bottom"},
+        "legend": {
+            "displayMode": "table",
+            "placement": "bottom",
+            "calcs": ["lastNotNull", "max", "mean"],
+        },
         "tooltip": {"mode": "multi"},
     }
 
@@ -66,10 +73,30 @@ def row(title: str, y: int) -> dict:
     }
 
 
-def _fieldcfg(unit: str | None) -> dict:
-    defaults: dict = {"custom": {"drawStyle": "line", "fillOpacity": 10, "showPoints": "never"}}
+def _thresholds(steps: list[tuple[str, float | None]]) -> dict:
+    """Build a Grafana absolute-threshold config from (color, value) steps.
+
+    The first step's value must be ``None`` (the base band). Used to colour
+    saturation / error panels green→amber→red so an at-a-glance scan flags a
+    panel that has crossed an operational limit (golden-signals: saturation +
+    errors should be visually loud).
+    """
+    return {
+        "mode": "absolute",
+        "steps": [{"color": c, "value": v} for c, v in steps],
+    }
+
+
+def _fieldcfg(unit: str | None, thresholds: dict | None = None) -> dict:
+    custom: dict = {"drawStyle": "line", "fillOpacity": 10, "showPoints": "never"}
+    defaults: dict = {"custom": custom}
     if unit:
         defaults["unit"] = unit
+    if thresholds is not None:
+        defaults["thresholds"] = thresholds
+        defaults["color"] = {"mode": "thresholds"}
+        # Render the threshold bands as dashed lines on timeseries panels.
+        custom["thresholdsStyle"] = {"mode": "dashed"}
     return {"defaults": defaults, "overrides": []}
 
 
@@ -84,6 +111,8 @@ def metric_panel(
     h: int = 8,
     unit: str | None = None,
     apps: list[str] | None = None,
+    description: str = "",
+    thresholds: dict | None = None,
 ) -> dict:
     apps = apps or APPS
     # ONE single-resource target PER app — NOT one multi-resource target.
@@ -116,9 +145,10 @@ def metric_panel(
         "type": "timeseries",
         "id": _next_id(),
         "title": title,
+        "description": description,
         "datasource": DS,
         "gridPos": _grid(x, y, w, h),
-        "fieldConfig": _fieldcfg(unit),
+        "fieldConfig": _fieldcfg(unit, thresholds),
         "options": _opts(),
         "targets": targets,
     }
@@ -135,14 +165,17 @@ def kql_panel(
     unit: str | None = None,
     viz: str = "timeseries",
     result: str = "time_series",
+    description: str = "",
+    thresholds: dict | None = None,
 ) -> dict:
     panel = {
         "type": viz,
         "id": _next_id(),
         "title": title,
+        "description": description,
         "datasource": DS,
         "gridPos": _grid(x, y, w, h),
-        "fieldConfig": _fieldcfg(unit),
+        "fieldConfig": _fieldcfg(unit, thresholds),
         "options": _opts(),
         "targets": [
             {
@@ -166,18 +199,74 @@ y = 0
 panels.append(row("Runtime health — Container Apps (api · worker · temporal-worker)", y))
 y += 1
 panels += [
-    metric_panel("Requests / min (api)", "Requests", "Total", x=0, y=y, apps=["movate-dev-api"]),
-    metric_panel("CPU usage (nanocores)", "UsageNanoCores", "Average", x=12, y=y),
+    metric_panel(
+        "Requests / min (api)",
+        "Requests",
+        "Total",
+        x=0,
+        y=y,
+        apps=["movate-dev-api"],
+        description="**Traffic** (golden signal). Inbound HTTP requests to the api "
+        "Container App. A flat line at zero usually means no callers — or the app "
+        "is down (cross-check Replica count + Restart count).",
+    ),
+    metric_panel(
+        "CPU usage (nanocores)",
+        "UsageNanoCores",
+        "Average",
+        x=12,
+        y=y,
+        description="**Saturation** (golden signal). Average CPU per app in "
+        "nanocores (1e9 = 1 vCPU). Sustained near the per-replica limit drives "
+        "autoscaling and latency.",
+    ),
 ]
 y += 8
 panels += [
-    metric_panel("Memory working set", "WorkingSetBytes", "Average", x=0, y=y, unit="bytes"),
-    metric_panel("Replica count", "Replicas", "Average", x=12, y=y),
+    metric_panel(
+        "Memory working set",
+        "WorkingSetBytes",
+        "Average",
+        x=0,
+        y=y,
+        unit="bytes",
+        description="**Saturation** (golden signal). Resident memory per app. A "
+        "steady climb that never drops is the classic leak signature; watch for it "
+        "alongside RestartCount (OOM kills).",
+    ),
+    metric_panel(
+        "Replica count",
+        "Replicas",
+        "Average",
+        x=12,
+        y=y,
+        description="Active replica count per app (KEDA/HTTP autoscale). Confirms "
+        "scale-out under load and scale-to-zero when idle.",
+    ),
 ]
 y += 8
 panels += [
-    metric_panel("Restart count (crash-loop watch)", "RestartCount", "Maximum", x=0, y=y),
-    metric_panel("Rx/Tx bytes", "RxBytes", "Total", x=12, y=y, unit="bytes"),
+    metric_panel(
+        "Restart count (crash-loop watch)",
+        "RestartCount",
+        "Maximum",
+        x=0,
+        y=y,
+        description="**Errors** (golden signal). Container restarts — any sustained "
+        "non-zero value is a crash loop (bad config, OOM, failing health probe). "
+        "Amber ≥1, red ≥3 within the window.",
+        thresholds=_thresholds([("green", None), ("yellow", 1), ("red", 3)]),
+    ),
+    metric_panel(
+        "Rx/Tx bytes",
+        "RxBytes",
+        "Total",
+        x=12,
+        y=y,
+        unit="bytes",
+        description="Network ingress bytes per app — a coarse proxy for payload "
+        "volume; useful to correlate traffic spikes with bandwidth.",
+    ),
 ]
 y += 8
 
@@ -193,6 +282,9 @@ panels += [
         "| order by TimeGenerated asc",
         x=0,
         y=y,
+        description="**Traffic + Errors** (golden signals). Completed jobs per 5m "
+        "split by terminal status — `completed` vs `failed` series side by side is "
+        "the quickest health read on the worker.",
     ),
     kql_panel(
         "agent.execute latency p50 / p95 (ms)",
@@ -202,6 +294,9 @@ panels += [
         x=12,
         y=y,
         unit="ms",
+        description="**Latency** (golden signal). p50/p95 of the agent execution "
+        "span. p95 is the tail your slowest users feel; a widening p95-vs-p50 gap "
+        "means variance (cold starts, a slow downstream).",
     ),
 ]
 y += 8
@@ -216,6 +311,9 @@ panels += [
         x=0,
         y=y,
         unit="percent",
+        description="**Errors** (golden signal). Share of failed agent.execute "
+        "spans per 5m. Amber ≥1%, red ≥5% — the SLO-facing error budget burn line.",
+        thresholds=_thresholds([("green", None), ("yellow", 1), ("red", 5)]),
     ),
     kql_panel(
         "Recent failed agent.execute (last 50)",
@@ -226,6 +324,9 @@ panels += [
         y=y,
         viz="table",
         result="table",
+        description="The 50 most-recent failed executions with ResultCode + "
+        "OperationId — the drill-down companion to the error-rate panel; copy an "
+        "OperationId to trace the failing run end-to-end.",
     ),
 ]
 y += 8
@@ -240,6 +341,8 @@ panels += [
         "| summarize Tokens = sum(Sum) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
         x=0,
         y=y,
+        description="Total LLM tokens (prompt + completion) consumed per 5m across "
+        "all runs. The volume driver behind the cost panel to its right.",
     ),
     kql_panel(
         "LLM cost (USD) / 5m",
@@ -248,6 +351,9 @@ panels += [
         x=12,
         y=y,
         unit="currencyUSD",
+        description="Modeled LLM spend per 5m (priced from the model pricing table). "
+        "A spend spike with flat traffic points at a pricier model or larger "
+        "context.",
     ),
 ]
 y += 8
@@ -259,6 +365,9 @@ panels += [
         x=0,
         y=y,
         w=24,
+        description="**Saturation** (golden signal). Jobs currently executing on the "
+        "worker. A rising floor that never drains means intake is outpacing "
+        "throughput — scale workers or shed load.",
     ),
 ]
 y += 8
@@ -274,6 +383,9 @@ panels += [
         "| order by TimeGenerated asc",
         x=0,
         y=y,
+        description="**Saturation** (golden signal). Active asyncpg connections "
+        "(`in_use`) against the configured ceiling (`max`). `in_use` riding `max` "
+        "means the pool is the bottleneck — raise the pool or the DB tier.",
     ),
     kql_panel(
         "Pool waiting (blocked acquirers — early warning)",
@@ -281,6 +393,10 @@ panels += [
         "| summarize Waiting = max(Sum) by bin(TimeGenerated, 1m)\n| order by TimeGenerated asc",
         x=12,
         y=y,
+        description="**Saturation** (golden signal, leading indicator). Coroutines "
+        "blocked waiting for a pool connection. Any sustained non-zero value means "
+        "pool exhaustion is already adding latency. Amber ≥1, red ≥5.",
+        thresholds=_thresholds([("green", None), ("yellow", 1), ("red", 5)]),
     ),
 ]
 y += 8
@@ -293,6 +409,9 @@ panels += [
         x=0,
         y=y,
         w=24,
+        description="Idle (warm, unused) connections vs total pool `size`. Healthy "
+        "headroom keeps a few idle; persistently zero idle while `waiting` climbs "
+        "confirms the pool is undersized.",
     ),
 ]
 
