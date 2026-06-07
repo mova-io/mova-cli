@@ -195,19 +195,29 @@ def _unwrap_to_model(annotation: Any) -> type[BaseModel] | None:
     return None
 
 
-def format_agent_validation_error(exc: ValidationError, root_model: type[BaseModel]) -> str:
+def format_agent_validation_error(
+    exc: ValidationError,
+    root_model: type[BaseModel],
+    *,
+    filename: str = "agent.yaml",
+) -> str:
     """Render a pydantic :class:`ValidationError` as friendly, self-correcting lines.
 
-    The agent.yaml schema is strict (``extra="forbid"``) on purpose so a
+    The spec schema is strict (``extra="forbid"``) on purpose so a
     typo'd key is caught, but pydantic's raw message only says *that* a
-    key is rejected, not *what's allowed*. This formatter walks the model
-    tree along each error's ``loc`` to recover the set of valid fields at
-    the offending container, names the bad key, and offers a did-you-mean.
+    key is rejected, not *what's allowed* — and it appends an
+    ``errors.pydantic.dev`` trailer that's noise to an end user. This
+    formatter walks the model tree along each error's ``loc`` to recover
+    the set of valid fields at the offending container, names the bad key,
+    and offers a did-you-mean, dropping the pydantic trailer entirely.
 
     ``root_model`` is the model ``.model_validate(...)`` was called on
-    (``AgentSpec`` at the loader seam). It MUST NEVER raise — any failure
-    to resolve a container model degrades to a plain "not part of the
-    schema" line so the user still gets a readable diagnostic.
+    (``AgentSpec`` at the agent loader seam, ``SkillSpec`` at the skill
+    loader). ``filename`` labels the bundle file in the messages (defaults
+    to ``agent.yaml``; the skill loader passes ``skill.yaml``). It MUST
+    NEVER raise — any failure to resolve a container model degrades to a
+    plain "not part of the schema" line so the user still gets a readable
+    diagnostic.
     """
     lines: list[str] = []
     for err in exc.errors():
@@ -216,14 +226,16 @@ def format_agent_validation_error(exc: ValidationError, root_model: type[BaseMod
         msg = err.get("msg", "")
 
         if etype == "extra_forbidden" and loc:
-            lines.append(_format_extra_forbidden(loc, root_model))
+            lines.append(_format_extra_forbidden(loc, root_model, filename=filename))
         else:
             dotted = ".".join(str(seg) for seg in loc) if loc else "(root)"
             lines.append(f"✗ {dotted}: {msg}")
     return "\n".join(lines)
 
 
-def _format_extra_forbidden(loc: tuple[Any, ...], root_model: type[BaseModel]) -> str:
+def _format_extra_forbidden(
+    loc: tuple[Any, ...], root_model: type[BaseModel], *, filename: str = "agent.yaml"
+) -> str:
     """Build the friendly line for a single ``extra_forbidden`` error.
 
     Walks ``root_model`` along ``loc[:-1]`` (the path to the *container*
@@ -253,7 +265,7 @@ def _format_extra_forbidden(loc: tuple[Any, ...], root_model: type[BaseModel]) -
         if container is not None:
             allowed = sorted(container.model_fields.keys())
             where = (
-                "agent.yaml top level"
+                f"{filename} top level"
                 if len(loc) == 1
                 else "'" + ".".join(str(s) for s in container_path) + "'"
             )
@@ -272,7 +284,7 @@ def _format_extra_forbidden(loc: tuple[Any, ...], root_model: type[BaseModel]) -
 
     # Graceful degradation: complex Union / forward-ref / unexpected shape.
     dotted = ".".join(str(s) for s in loc)
-    return f"✗ unknown field '{bad_key}' in '{dotted}' — not part of the agent.yaml schema"
+    return f"✗ unknown field '{bad_key}' in '{dotted}' — not part of the {filename} schema"
 
 
 def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent

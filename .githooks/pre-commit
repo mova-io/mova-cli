@@ -1,23 +1,8 @@
 #!/bin/sh
-# Auto-bump the CalVer version (YYYY.M.D.N) on every commit, then re-stage
-# the version files so the bump is part of THIS commit.
-#
-# Enable once per clone:  ./scripts/install-hooks.sh
-#   (sets core.hooksPath=.githooks; hooks are not shared by git automatically)
-#
-# Fail-soft: if the bump can't run, warn but let the commit proceed — a
-# version-script hiccup must never block committing.
-
-PY="$(command -v python3 || command -v python)"
-if [ -z "$PY" ]; then
-	echo "pre-commit: python not found on PATH; skipping version bump" >&2
-	exit 0
-fi
-
-if "$PY" scripts/bump_version.py >/dev/null; then
-	git add pyproject.toml src/movate/__init__.py uv.lock
-else
-	echo "pre-commit: version bump failed; committing without a bump" >&2
-fi
-
+# No-op as of ADR 066: the CalVer version is DERIVED FROM GIT at build time
+# (hatch_build.py + scripts/calver_version.py), so there is no version line to
+# bump and re-stage on commit. This hook used to auto-bump pyproject.toml /
+# __init__.py / uv.lock — that's exactly the per-commit churn (and worktree-
+# propagation breakage) ADR 066 removed. Kept as a harmless no-op so existing
+# clones with core.hooksPath=.githooks don't error; safe to delete.
 exit 0

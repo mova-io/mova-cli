@@ -1060,3 +1060,19 @@ Mechanically: this file changes on every PR-shipping day. The
 [daily progress log](docs/progress/) is the source of truth for
 "what was shipped"; this file is the source of truth for "what's next
 + relative priority." Don't let them drift.
+
+## Temporal durable-execution rollout (ADR 065) + designed features — 2026-05-31
+
+Strategy: **Temporal as an *optional* durable-execution backend; native stays the
+floor** ([ADR 065](docs/adr/065-temporal-durable-execution-seam.md)). Adopt
+per-operation, not big-bang. Phase 0 (the `DurableExecution` seam) shipped (#661).
+
+- [x] **DurableExecution seam (Phase 0)** `[HIGH] [v1.1] [done #661]` — Protocol + native floor + `MOVATE_TEMPORAL_*` config selection. ADR 065 D1–D3.
+- [ ] **Fine-tune worker on the seam (Phase 1)** `[HIGH] [v1.1] [~2-3d]` — `TemporalDurableExecution` + the long-poll fine-tune worker (build dataset → dispatch → poll → register → eval-vs-base). First real adoption. ADR 065 D4.1 + [ADR 063](docs/adr/063-eval-to-finetune-loop.md) rollout.
+- [ ] **ACA Temporal server (bicep)** `[HIGH] [v1.1] [~2-4d]` — `enableTemporal=true` module, Azure-Postgres-backed, Web UI. In-tenant self-host. ADR 065 D6.
+- [ ] **HITL rollout (Phase 2)** `[HIGH] [v1.1] [~2-3d]` — signal-endpoint delivery (Temporal) · `awaiting_human` + pending-approval inventory · timeout/escalation · Teams card. [ADR 062](docs/adr/062-durable-hitl-human-node.md) rollout (core landed #657).
+- [ ] **Back the job queue with Standalone Activities (Phase 3)** `[MED] [v1.2] [~4-6d]` — move eval/bench/runs behind the seam; the reaper/visibility/retry/dead-letter become Temporal's. **High blast radius** — conformance-gate first.
+- [ ] **Sagas & timed flows (Phase 4)** `[MED] [v1.2] [~2wk]` — deploy saga (build→roll→rollback) · canary timed workflow · continuous-eval schedule.
+- [ ] **Streaming & scale (Phase 5)** `[MED] [v1.2+] [~1-2wk]` — Workflow Streams (durable `run --stream`) · External Payload Storage (Azure Blob) · Nexus (multi-agent composition) · task-queue fairness + worker versioning. (Replay-2026 features.)
+- [ ] **Catalog-publish skills/contexts (D5)** `[MED] [v1.1] [~3-4d]` — `kind` discriminator on the catalog; publish/clone managed skills/contexts. [ADR 064](docs/adr/064-catalog-publish-skills-contexts.md). Stacks on #650/#652.
+- [ ] **Fine-tune endpoint → worker** `[HIGH] [v1.1] [~2-3d]` — wire the kicked-off FINETUNE job (#659) to the worker handler via the seam (see Phase 1).

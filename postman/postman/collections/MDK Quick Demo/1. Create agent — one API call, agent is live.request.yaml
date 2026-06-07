@@ -1,0 +1,30 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/agents/from-wizard"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: text
+  content: |-
+    {
+      "name": "{{agent_name}}",
+      "agent_provider": "Movate",
+      "agent_type": "Task Agent",
+      "role": "Assistant",
+      "description": "Movate product support agent. Answers pricing and plan questions.",
+      "agent_role": "Concise, friendly support agent.",
+      "agent_goal": "Answer product and pricing FAQs accurately using the knowledge base.",
+      "agent_prompt": "You are a Movate product support agent. Answer the user's question concisely using the provided knowledge base context. If you don't have the information, say so honestly. Keep answers under 3 sentences unless asked for detail.",
+      "reference_output": "The Standard plan includes 10 user seats, 100GB storage, and 5 AI agents for $99/month.",
+      "ai_model": "openai/gpt-4o-mini-2024-07-18",
+      "ai_foundation": "Azure"
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      if (pm.response.code === 201) {
+          pm.test('Agent created', () => pm.response.to.have.status(201));
+          console.log('✅ Agent created: ' + pm.environment.get('agent_name'));
+      }
+    language: text/javascript
+order: 2000

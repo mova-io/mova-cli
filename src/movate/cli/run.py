@@ -909,9 +909,16 @@ def _dispatch_workflow(
     except WorkflowSpecLoadError as exc:
         console.print(f"[red]✗ workflow.yaml load failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
+    # A JUDGE node (ADR 056) may sit on a bounded reflection back-edge, which is
+    # a cycle — so judge workflows compile on the cycle-tolerant path and skip
+    # the linear phase gate (the native runner enforces its own runaway cap, and
+    # the JUDGE node enforces its own ``max_iterations`` bound). Every non-judge
+    # workflow still goes through the unchanged ``validate_linear`` gate.
+    has_judge = any(getattr(n, "type", None) == "judge" for n in spec.nodes)
     try:
-        graph = compile_workflow(spec, parent)
-        validate_linear(graph)
+        graph = compile_workflow(spec, parent, allow_cycles=has_judge)
+        if not has_judge:
+            validate_linear(graph)
     except WorkflowCompileError as exc:
         console.print(f"[red]✗ workflow validation failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
@@ -964,6 +971,9 @@ async def _run_local_workflow(
     # (override > workflow.yaml 'runtime:' > native), fail loud on an
     # unavailable backend (D6), then route. The native branch is byte-for-byte
     # today's path (no compile, no temporalio import).
+    from movate.runtime.langgraph_backend import (  # noqa: PLC0415
+        run_langgraph_workflow,
+    )
     from movate.runtime.workflow_backend import (  # noqa: PLC0415
         WorkflowBackendError,
         require_backend_available,
@@ -987,11 +997,27 @@ async def _run_local_workflow(
             except WorkflowRunError as exc:
                 console.print(f"[red]✗ workflow failed:[/red] {exc}")
                 raise typer.Exit(code=2) from None
+        elif effective == "langgraph":
+            # ADR 030 D1 — LangGraph in-process execution. Builds a StateGraph
+            # from the IR and executes via the same Executor the native runner
+            # uses (ADR 054 D3 reuse). Requires mdk[langgraph] extra.
+            try:
+                result = await run_langgraph_workflow(
+                    graph,
+                    initial_state,
+                    executor=rt.executor,
+                    tracer=rt.tracer,
+                    storage=rt.storage,
+                    tenant_id="local",
+                    mock=mock,
+                )
+            except Exception as exc:
+                console.print(f"[red]✗ langgraph execution failed:[/red] {exc}")
+                raise typer.Exit(code=2) from None
         else:
             # temporal — compile (Track B) + execute on Temporal via Track C
-            # activities. langgraph never reaches here (require_backend_available
-            # already failed loud). Reuses the SAME provider/pricing/tracer/
-            # storage the native runner uses (ADR 054 D3, one execution model).
+            # activities. Reuses the SAME provider/pricing/tracer/storage the
+            # native runner uses (ADR 054 D3, one execution model).
             from movate.providers.pricing import load_pricing  # noqa: PLC0415
 
             try:

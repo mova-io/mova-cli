@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -34,8 +35,13 @@ from movate.kb.embed import DEFAULT_EMBEDDING_MODEL, embed_texts, qualified_mode
 logger = logging.getLogger(__name__)
 
 # Same default tier as the rewriter / reranker / multi-hop planner — a
-# cheap, fast model is the right call for span-level extraction.
-DEFAULT_EXTRACTION_MODEL = "anthropic/claude-haiku-4-5-20251001"
+# cheap, fast model is the right call for span-level extraction. The model is
+# provider-flexible (LiteLLM): override via ``MDK_GRAPH_EXTRACT_MODEL`` to run
+# extraction on, e.g., ``openai/gpt-4o-mini-2024-07-18`` when the Anthropic
+# tier isn't provisioned. Default unchanged when the env var is absent.
+DEFAULT_EXTRACTION_MODEL = os.environ.get(
+    "MDK_GRAPH_EXTRACT_MODEL", "anthropic/claude-haiku-4-5-20251001"
+)
 
 # How many entity texts to embed per embedding API call (matches the
 # ingest pipeline's batch size).

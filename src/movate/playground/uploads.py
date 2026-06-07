@@ -16,7 +16,9 @@ This module is the thin adapter between that parser and the chat:
   :class:`UploadedDocument` the conversation layer can splice into
   context,
 * enforce a per-file size cap (the count cap is enforced by the UI's
-  file picker; the size cap is re-checked here as defence in depth).
+  file picker; the size cap is re-checked here as defence in depth),
+* enforce a MIME/type allowlist so only known-safe file types are
+  accepted (#218 upload hardening).
 
 Pure logic, no Chainlit — unit-testable in isolation. The Chainlit app
 reads bytes off the wire and calls :func:`adapt_upload`.
@@ -24,10 +26,20 @@ reads bytes off the wire and calls :func:`adapt_upload`.
 
 from __future__ import annotations
 
+import mimetypes
+import os
 from dataclasses import dataclass, field
 from enum import StrEnum
 
 from movate.kb.parsers import ParseResult, is_supported_extension, parse_document
+
+# Register MIME types that Python's ``mimetypes`` may not know.
+# These are common document extensions the playground's KB parser handles.
+mimetypes.add_type("text/markdown", ".md")
+mimetypes.add_type("text/markdown", ".markdown")
+mimetypes.add_type(
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"
+)
 
 # Extensions the shared parser supports via OCR (images). We hold these
 # but do NOT feed them as text context in v1 — vision is a future
@@ -35,6 +47,92 @@ from movate.kb.parsers import ParseResult, is_supported_extension, parse_documen
 _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".gif", ".webp", ".bmp"}
 )
+
+# ---------------------------------------------------------------------------
+# Upload hardening (#218) — MIME/type allowlist + configurable size limit
+# ---------------------------------------------------------------------------
+
+#: Default MIME type prefixes/types that the playground will accept.
+#: Configurable via ``MDK_PLAYGROUND_UPLOAD_MIME_ALLOWLIST`` (comma-separated).
+DEFAULT_MIME_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "text/*",
+        "application/pdf",
+        "application/json",
+        "image/*",
+    }
+)
+
+#: Default per-file upload ceiling in MB.  Configurable via
+#: ``MDK_PLAYGROUND_MAX_UPLOAD_MB`` env var.
+DEFAULT_PLAYGROUND_MAX_UPLOAD_MB: int = 10
+
+
+def configured_max_upload_mb() -> int:
+    """Read the per-file upload ceiling from the env (or the default).
+
+    The env var ``MDK_PLAYGROUND_MAX_UPLOAD_MB`` overrides the default
+    when set to a positive integer.  Non-numeric / non-positive values
+    fall back to the default silently.
+    """
+    raw = os.environ.get("MDK_PLAYGROUND_MAX_UPLOAD_MB", "")
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return DEFAULT_PLAYGROUND_MAX_UPLOAD_MB
+
+
+def configured_mime_allowlist() -> frozenset[str]:
+    """Read the MIME allowlist from the env (or the default).
+
+    ``MDK_PLAYGROUND_UPLOAD_MIME_ALLOWLIST`` is a comma-separated list of
+    MIME types or ``prefix/*`` patterns (e.g. ``text/*,application/pdf``).
+    """
+    raw = os.environ.get("MDK_PLAYGROUND_UPLOAD_MIME_ALLOWLIST", "")
+    if raw.strip():
+        return frozenset(entry.strip() for entry in raw.split(",") if entry.strip())
+    return DEFAULT_MIME_ALLOWLIST
+
+
+def _mime_matches_allowlist(mime: str, allowlist: frozenset[str]) -> bool:
+    """Check whether ``mime`` is permitted by the allowlist.
+
+    Supports exact matches (``application/pdf``) and prefix wildcards
+    (``text/*``).  A ``None`` / empty mime is rejected.
+    """
+    if not mime:
+        return False
+    mime_lower = mime.lower().split(";")[0].strip()  # strip params like charset
+    if mime_lower in allowlist:
+        return True
+    prefix = mime_lower.split("/")[0] + "/*"
+    return prefix in allowlist
+
+
+def check_mime_allowed(filename: str, allowlist: frozenset[str] | None = None) -> str | None:
+    """Return ``None`` if the file's MIME type is allowed, else an error message.
+
+    Uses Python's :mod:`mimetypes` to guess from the extension.  Unknown
+    extensions are rejected by default (the allowlist is opt-in).
+    """
+    if allowlist is None:
+        allowlist = configured_mime_allowlist()
+    mime, _ = mimetypes.guess_type(filename, strict=False)
+    if mime is None:
+        # Unknown extension — check if it's a known image or text extension
+        # that mimetypes might miss (defense in depth).
+        idx = filename.rfind(".")
+        ext = filename[idx:].lower() if idx >= 0 else ""
+        if ext in _IMAGE_EXTENSIONS:
+            return None  # images are always allowed (held as deferred)
+        return f"Unsupported file type: {ext or '(no extension)'}"
+    if _mime_matches_allowlist(mime, allowlist):
+        return None
+    return f"Unsupported file type: {os.path.splitext(filename)[1]} ({mime})"
 
 
 class UploadOutcome(StrEnum):
@@ -55,6 +153,9 @@ class UploadOutcome(StrEnum):
 
     TOO_LARGE = "too_large"
     """The file exceeded the per-file size cap; not read into context."""
+
+    MIME_REJECTED = "mime_rejected"
+    """The file's MIME type is not in the configured allowlist (#218)."""
 
     PARSE_FAILED = "parse_failed"
     """The parser ran but failed (corrupt / encrypted bytes)."""
@@ -96,29 +197,57 @@ def adapt_upload(
     content: bytes,
     *,
     max_size_mb: int,
+    mime_allowlist: frozenset[str] | None = None,
 ) -> UploadedDocument:
     """Convert one uploaded file into an :class:`UploadedDocument`.
 
     Decision order (each step short-circuits):
 
-    1. **size** — over ``max_size_mb`` → ``TOO_LARGE`` (defence in depth;
+    1. **MIME check** (#218) — reject files whose MIME type is not in the
+       configured allowlist → ``MIME_REJECTED``.
+    2. **size** — over ``max_size_mb`` → ``TOO_LARGE`` (defence in depth;
        the UI picker also caps this).
-    2. **image** — vision deferred → ``IMAGE_DEFERRED`` (held, not text).
-    3. **unsupported** — no parser for the extension → ``UNSUPPORTED``.
-    4. **parse** — run the shared KB extractor:
+    3. **image** — vision deferred → ``IMAGE_DEFERRED`` (held, not text).
+    4. **unsupported** — no parser for the extension → ``UNSUPPORTED``.
+    5. **parse** — run the shared KB extractor:
        ``None`` → ``PARSE_FAILED``; empty text → ``EMPTY``;
        otherwise → ``EXTRACTED`` with the text.
 
     Never raises — every failure mode maps to an :class:`UploadOutcome`
     so a single bad file degrades to a status line, not an exception.
+
+    Parameters
+    ----------
+    mime_allowlist:
+        Explicit allowlist to use.  ``None`` → MIME validation is
+        **skipped** (backward compatibility with callers that predate
+        #218).  Pass a ``frozenset`` (e.g. :data:`DEFAULT_MIME_ALLOWLIST`
+        or :func:`configured_mime_allowlist`) to enforce.
     """
     size_bytes = len(content)
+
+    # Step 1: MIME-type allowlist (#218).
+    # Only enforced when the caller passes an explicit allowlist — old
+    # callers that do not pass one get the pre-#218 behavior (no check).
+    if mime_allowlist is not None:
+        mime_err = check_mime_allowed(filename, allowlist=mime_allowlist)
+    else:
+        mime_err = None
+    if mime_err is not None:
+        return UploadedDocument(
+            filename=filename,
+            outcome=UploadOutcome.MIME_REJECTED,
+            size_bytes=size_bytes,
+            note=mime_err,
+        )
+
+    # Step 2: per-file size ceiling.
     if size_bytes > max_size_mb * 1024 * 1024:
         return UploadedDocument(
             filename=filename,
             outcome=UploadOutcome.TOO_LARGE,
             size_bytes=size_bytes,
-            note=f"{size_bytes / 1024 / 1024:.1f} MB exceeds the {max_size_mb} MB cap",
+            note=f"File too large (max {max_size_mb}MB)",
         )
 
     if is_image(filename):

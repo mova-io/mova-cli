@@ -1,0 +1,25 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true"
+method: POST
+headers:
+  Content-Type: application/json
+queryParams:
+  wait: "true"
+body:
+  type: text
+  content: |-
+    {
+      "input": {
+        "input": "What does the standard plan include?"
+      }
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      if (pm.response.code === 200) {
+          var body = pm.response.json();
+          if (body.run_id) pm.environment.set('run_id', body.run_id);
+          console.log('💬 GROUNDED answer: ' + JSON.stringify(body.output || body.answer || '(see response)').substring(0, 300));
+      }
+    language: text/javascript
+order: 6000

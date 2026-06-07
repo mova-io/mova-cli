@@ -165,6 +165,21 @@ async def attach_to_project(
             attached=False,
             reason="projects-storage layer not yet available on this storage backend",
         )
+    # Validate the project exists before attaching. The junction insert is
+    # ``INSERT OR IGNORE`` on every backend (no FK enforcement of project_id),
+    # so without this an agent would silently "attach" to a non-existent
+    # project — a typo'd ``project_id`` returned 200 / ``attached=true`` against
+    # a phantom project. Surface the clean 404 the docstring already promised.
+    # Guarded: a backend without ``get_project`` (older projects-storage) falls
+    # through to the prior best-effort behaviour rather than erroring.
+    get_project = getattr(storage, "get_project", None)
+    if get_project is not None:
+        project = await get_project(tenant_id, project_id)
+        if project is None:
+            raise AgentCreationError(
+                f"project {project_id!r} does not exist",
+                status_code=404,
+            )
     try:
         await attach_method(
             project_id=project_id,

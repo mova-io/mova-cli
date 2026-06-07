@@ -2,7 +2,7 @@
 
 ADR 048 (D3) defines voice as **a transport + two adapter seams that wrap
 the unchanged text Executor**. This module is those seams, in *exactly* the
-shape of :mod:`movate.providers.base` (the ``BaseLLMProvider`` seam):
+shape of the ``AgentTurn``/provider seam (the ``BaseLLMProvider`` seam):
 
 * streaming-friendly **async generators** of audio / text chunks,
 * ``api_key=``-style BYOK injection (resolved through the ADR 018 key store
@@ -35,7 +35,7 @@ the full answer exists).
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
@@ -134,6 +134,8 @@ class SpeechToTextProvider(Protocol):
         *,
         language: str | None = None,
         api_key: str | None = None,
+        keyterms: Sequence[str] | None = None,
+        endpointing_ms: int | None = None,
     ) -> AsyncIterator[TranscriptChunk]:
         """Transcribe a stream of audio into a stream of transcript chunks.
 
@@ -141,6 +143,23 @@ class SpeechToTextProvider(Protocol):
         the provider auto-detect. ``api_key`` is the tenant's BYOK key
         (ADR 018), resolved at the edge and passed in — adapters MUST NOT
         read a global env var when a key is supplied.
+
+        ``keyterms`` (ADR 071 D4, additive, optional) is a per-call list of
+        domain terms to **boost** at recognition time (names, acronyms, jargon
+        a general model mis-hears — ``["VPN", "Okta", "Mova-iO"]``). It lets the
+        transport pass an *agent-specific* vocabulary through this seam without a
+        per-agent adapter rebuild. Providers that support boosting (Deepgram)
+        honor it; providers that do not **MUST accept and ignore it**. ``None``
+        (the default) sends no boosting and is byte-for-byte the prior behavior.
+
+        ``endpointing_ms`` (ADR 073 D3, additive, optional) is a per-call
+        override of the silence-hold the provider waits before declaring the
+        utterance final — the dominant fixed latency of a pipeline turn. It lets
+        a *deliberate-speaker* agent hold longer (fewer mid-pause barge-ins) and
+        a *snappy* agent cut shorter, without rebuilding the adapter. Streaming
+        providers that expose endpointing (Deepgram) honor it for this call;
+        others **MUST accept and ignore it**. ``None`` (the default) keeps the
+        adapter's configured value and is byte-for-byte the prior behavior.
 
         Implementations MUST yield at least one chunk and MUST mark the
         terminal utterance with ``is_final=True`` so the transport knows

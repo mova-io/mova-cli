@@ -1,0 +1,19 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/sessions"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: text
+  content: "{}"
+scripts:
+  - type: afterResponse
+    code: |-
+      if (pm.response.code === 201 || pm.response.code === 200) {
+          var body = pm.response.json();
+          var sid = body.session_id || body.id;
+          if (sid) { pm.environment.set('session_id', sid); }
+          console.log('🧠 Session created: ' + sid);
+      }
+    language: text/javascript
+order: 8000

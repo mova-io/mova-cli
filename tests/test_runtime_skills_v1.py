@@ -227,6 +227,12 @@ def test_create_skill_spec_validation_failure_returns_422(
         headers=auth_header,
     )
     assert r.status_code == 422
+    # The customer-facing message is the friendly field list, NOT pydantic's
+    # raw dump (no errors.pydantic.dev trailer, no input_type=dict noise).
+    message = r.json()["detail"]["error"]["message"]
+    assert "errors.pydantic.dev" not in message
+    assert "input_type" not in message
+    assert "version" in message and "implementation" in message
 
 
 # ---------------------------------------------------------------------------

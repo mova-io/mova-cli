@@ -1,0 +1,11 @@
+$kind: collection
+description: |-
+  End-to-end demo: create agent → chat → add knowledge → chat again (grounded) → multi-turn session → voice.
+
+  See QUICK-DEMO-TONIGHT.md for the talk track.
+auth:
+  - id: bbcd2fb8-0ac7-4482-af26-47b3ba61a37b
+    type: bearer
+    name: bearer auth
+    credentials:
+      token: "{{api_key}}"

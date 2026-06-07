@@ -67,6 +67,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+import uuid
 from typing import Any
 
 # Chainlit is an optional dependency (``[playground]`` extra). Import
@@ -94,17 +96,25 @@ from movate.playground.connection import (
 from movate.playground.conversation import (
     ConversationState,
     FeedbackRoute,
+    Role,
     extract_output_text,
     feedback_route,
     select_backend,
 )
+from movate.playground.harvest_feedback import harvest_feedback_turn
 from movate.playground.state import resolve_data_layer_config
 from movate.playground.targets import (
     TARGETS_ENV_VAR,
     PlaygroundTarget,
     decode_targets,
 )
-from movate.playground.uploads import UploadOutcome, UploadStore, adapt_upload
+from movate.playground.uploads import (
+    UploadOutcome,
+    UploadStore,
+    adapt_upload,
+    configured_max_upload_mb,
+    configured_mime_allowlist,
+)
 from movate.playground.voice import (
     VoiceNotEnabledError,
     VoiceWSClient,
@@ -131,12 +141,24 @@ _K_FEEDBACK_SUBMITTED = "feedback_submitted"
 # per-turn chunk counter lets on_audio_end skip a no-audio recording.
 _K_VOICE_CLIENT = "voice_client"
 _K_VOICE_CHUNKS = "voice_chunks"
+# #220: timestamp of last capability fetch — used for staleness detection.
+_K_CAPS_FETCHED_AT = "caps_fetched_at"
+# #220: the target config (for bearer refresh on 401).
+_K_TARGET_CONFIG = "target_config"
 
 # Configured targets for multi-target mode, decoded ONCE at import from the
 # env var the CLI launcher sets (:data:`TARGETS_ENV_VAR`). Empty list →
 # single-runtime mode (the original behavior): no chat-profile picker, the
 # client is built from MDK_PLAYGROUND_RUNTIME_URL / _API_KEY as before.
 _TARGETS: list[PlaygroundTarget] = decode_targets(os.environ.get(TARGETS_ENV_VAR))
+
+# #218: upload hardening — resolve env-configurable limits ONCE at import.
+_UPLOAD_MAX_MB: int = configured_max_upload_mb()
+_UPLOAD_MIME_ALLOWLIST: frozenset[str] = configured_mime_allowlist()
+
+# #220: capability staleness threshold (seconds). When capabilities are older
+# than this, re-fetch on the next on_message and surface changes.
+_CAPS_STALENESS_S: float = 300.0  # 5 minutes
 
 
 def _targets_by_name() -> dict[str, PlaygroundTarget]:
@@ -323,6 +345,7 @@ async def _init_session() -> tuple[PlaygroundClient, RuntimeCapabilities]:
     if target is not None:
         client = _client_from_target(target)
         cl.user_session.set(_K_TARGET, target.name)
+        cl.user_session.set(_K_TARGET_CONFIG, target)
     else:
         client = _client_from_env()
     cl.user_session.set(_K_CLIENT, client)
@@ -332,6 +355,7 @@ async def _init_session() -> tuple[PlaygroundClient, RuntimeCapabilities]:
         raw_caps = None
     caps = parse_capabilities(raw_caps)
     cl.user_session.set(_K_CAPS, caps)
+    cl.user_session.set(_K_CAPS_FETCHED_AT, time.monotonic())
     cl.user_session.set(_K_CONVO, ConversationState())
     cl.user_session.set(_K_UPLOADS, UploadStore())
     # Item 1: connection monitor — probe the runtime on each turn.
@@ -586,6 +610,9 @@ async def _handle_uploads(message: cl.Message) -> None:
     reference the document. Images are held but noted as a deferred
     (text-only v1) capability. Each file gets an "Add to agent's KB
     permanently" action so RAG testing can persist it.
+
+    #218 upload hardening: MIME-type validation, configurable size limit,
+    and progress indication via an "uploading..." status message.
     """
     elements = [e for e in (message.elements or []) if getattr(e, "path", None)]
     if not elements:
@@ -602,19 +629,34 @@ async def _handle_uploads(message: cl.Message) -> None:
         ).send()
         elements = elements[: caps.max_upload_count]
 
+    # #218: use the playground's own configurable upload ceiling (the
+    # minimum of the env-configured limit and the runtime-advertised cap).
+    effective_max_mb = min(_UPLOAD_MAX_MB, caps.max_upload_mb)
+
     for el in elements:
         # ``path`` is guaranteed non-None by the filter above; bind it to a
         # str local so the open()/basename calls are type-clean.
         path = str(el.path)
         name = getattr(el, "name", None) or os.path.basename(path)
+
+        # #218: progress indication — show "uploading..." while processing.
+        progress = cl.Message(content=f"⏳ Processing **{name}**...")
+        await progress.send()
+
         try:
             with open(path, "rb") as fh:
                 content = fh.read()
         except OSError as exc:
-            await cl.Message(content=f"❌ Could not read {name!r}: {exc}").send()
+            progress.content = f"❌ Could not read {name!r}: {exc}"
+            await progress.update()
             continue
 
-        doc = adapt_upload(name, content, max_size_mb=caps.max_upload_mb)
+        doc = adapt_upload(
+            name,
+            content,
+            max_size_mb=effective_max_mb,
+            mime_allowlist=_UPLOAD_MIME_ALLOWLIST,
+        )
         store.add(doc)
 
         if doc.outcome == UploadOutcome.EXTRACTED:
@@ -628,23 +670,32 @@ async def _handle_uploads(message: cl.Message) -> None:
             )
         elif doc.outcome == UploadOutcome.EMPTY:
             msg = f"📎 **{name}** parsed but contained no text."
-        elif doc.outcome == UploadOutcome.TOO_LARGE:
-            msg = f"⚠ **{name}** — {doc.note}."
+        elif doc.outcome in {UploadOutcome.TOO_LARGE, UploadOutcome.MIME_REJECTED}:
+            msg = f"⚠️ **{name}** — {doc.note}."
         elif doc.outcome == UploadOutcome.UNSUPPORTED:
-            msg = f"⚠ **{name}** — unsupported file type; skipped."
+            msg = f"⚠️ **{name}** — unsupported file type; skipped."
         else:  # PARSE_FAILED
             msg = f"❌ **{name}** — {doc.note}."
 
-        ingestable = doc.outcome not in {UploadOutcome.TOO_LARGE, UploadOutcome.UNSUPPORTED}
+        rejected = doc.outcome in {
+            UploadOutcome.TOO_LARGE,
+            UploadOutcome.UNSUPPORTED,
+            UploadOutcome.MIME_REJECTED,
+        }
+        ingestable = not rejected
         # Stash the bytes so the persist action can forward them without a
         # re-read (the temp file may be gone by the time it's clicked).
-        cl.user_session.set(f"upload_bytes::{name}", content)
+        if ingestable:
+            cl.user_session.set(f"upload_bytes::{name}", content)
+
+        # Update the progress message with the outcome.
+        progress.content = msg
 
         # --persist-uploads: auto-ingest into the agent's KB. Otherwise
         # offer the opt-in action button (text docs + images via OCR —
         # the runtime's OCR may differ from the local parser).
         if ingestable and _auto_persist_uploads():
-            await cl.Message(content=msg).send()
+            await progress.update()
             await _ingest_to_kb(name, content)
             continue
         actions = []
@@ -657,7 +708,8 @@ async def _handle_uploads(message: cl.Message) -> None:
                     tooltip="Ingest this file into the agent's knowledge base for RAG",
                 )
             )
-        await cl.Message(content=msg, actions=actions).send()
+        progress.actions = actions
+        await progress.update()
 
 
 async def _ingest_to_kb(filename: str, content: bytes) -> None:
@@ -763,6 +815,62 @@ async def _check_connection() -> None:
         await cl.Message(content=slow_banner(monitor.last_duration_s)).send()
 
 
+async def _maybe_refresh_capabilities() -> None:
+    """#220: re-fetch capabilities if older than the staleness threshold.
+
+    When the runtime is redeployed mid-session its capabilities may change
+    (new features, removed features, updated limits). Rather than force the
+    operator to reload, we transparently re-detect on a timer. If the new
+    capabilities differ from the stored ones, a notice is surfaced.
+    """
+    fetched_at: float | None = cl.user_session.get(_K_CAPS_FETCHED_AT)
+    if fetched_at is not None and (time.monotonic() - fetched_at) < _CAPS_STALENESS_S:
+        return  # still fresh
+    client: PlaygroundClient | None = cl.user_session.get(_K_CLIENT)
+    if client is None:
+        return
+    old_caps: RuntimeCapabilities | None = cl.user_session.get(_K_CAPS)
+    try:
+        raw_caps = await client.get_capabilities()
+    except Exception:
+        raw_caps = None
+    new_caps = parse_capabilities(raw_caps)
+    cl.user_session.set(_K_CAPS, new_caps)
+    cl.user_session.set(_K_CAPS_FETCHED_AT, time.monotonic())
+    # Notify the operator only when something actually changed.
+    if old_caps is not None and old_caps != new_caps:
+        await cl.Message(content="ℹ️ Runtime updated — new capabilities detected.").send()
+
+
+async def _refresh_bearer_and_retry(
+    client: PlaygroundClient,
+) -> PlaygroundClient:
+    """#220: re-resolve the bearer token after a 401 and build a fresh client.
+
+    In the hosted multi-target playground the token may expire mid-session.
+    Rather than crashing, we re-read the token from the target config (which
+    may have been refreshed externally — e.g. via ``mdk auth login``), build
+    a fresh :class:`PlaygroundClient`, and store it in the session. Returns
+    the new client so the caller can retry.
+    """
+    target: PlaygroundTarget | None = cl.user_session.get(_K_TARGET_CONFIG)
+    if target is not None:
+        # Re-read the key from the env (it may have been rotated).
+        fresh_key = os.environ.get(target.key_env) or target.api_key
+        new_client = PlaygroundClient(
+            PlaygroundClientConfig(runtime_url=target.url, api_key=fresh_key)
+        )
+    else:
+        new_client = _client_from_env()
+    cl.user_session.set(_K_CLIENT, new_client)
+    return new_client
+
+
+def _make_request_id() -> str:
+    """Generate a unique X-Request-Id for a playground → runtime call (#220)."""
+    return f"pg-{uuid.uuid4().hex[:12]}"
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     """Handle one operator turn: uploads → run → render → feedback.
@@ -774,6 +882,9 @@ async def on_message(message: cl.Message) -> None:
     """
     # Item 1: probe the runtime before each turn; surface status changes.
     await _check_connection()
+
+    # #220: capability staleness — re-detect if the last fetch is stale.
+    await _maybe_refresh_capabilities()
 
     # Process any attached files first so this turn's context includes them.
     await _handle_uploads(message)
@@ -792,16 +903,16 @@ async def on_message(message: cl.Message) -> None:
             await cl.Message(content="Pick an agent first from the buttons above.").send()
         return
 
-    # Item 1: if the runtime was found unreachable, show a friendly retry
-    # hint rather than letting the run attempt fail with a raw exception.
+    # #216: if the ConnectionMonitor says DISCONNECTED, skip retries and
+    # show the failure immediately -- no point burning backoff time when the
+    # runtime is confirmed down. Point the operator to ``mdk doctor``.
     conn_state: ConnectionState = cl.user_session.get(_K_CONN_STATE, ConnectionState.CONNECTED)
     if conn_state == ConnectionState.DISCONNECTED:
         await cl.Message(
             content=(
-                "⚠️ Runtime unreachable — retrying...\n\n"
-                "The last reachability check found the runtime unreachable. "
-                "Your message will be sent once the runtime is back — "
-                "or try again in a moment."
+                "❌ Runtime unavailable. Check `mdk doctor` or try again later.\n\n"
+                "_The last reachability check found the runtime unreachable "
+                "-- skipping retries to avoid a long wait._"
             )
         ).send()
         return
@@ -832,7 +943,7 @@ async def on_message(message: cl.Message) -> None:
         )
         return
 
-    # Buffered path (today's behavior) — through the backend.
+    # Buffered path -- through the backend, with 429/quota UX (#216).
     thinking = cl.Message(content="")
     await thinking.send()
     try:
@@ -844,13 +955,57 @@ async def on_message(message: cl.Message) -> None:
             documents=docs,
         )
     except TimeoutError as exc:
-        thinking.content = f"⏱ Timed out: {exc}"
+        rid = getattr(client, "last_request_id", "")
+        rid_hint = f" (request_id: `{rid}`)" if rid else ""
+        thinking.content = f"⏱ Timed out: {exc}{rid_hint}"
         await thinking.update()
         return
     except Exception as exc:
-        thinking.content = f"❌ Run failed: {type(exc).__name__}: {exc}"
-        await thinking.update()
-        return
+        from movate.playground.client import (  # noqa: PLC0415
+            _is_quota_exceeded,
+            _is_rate_limited,
+            _parse_retry_after,
+        )
+
+        # #220: bearer refresh on 401 — re-resolve the token and retry once.
+        if _is_auth_error(exc):
+            await cl.Message(content="🔄 Re-authenticating...").send()
+            client = await _refresh_bearer_and_retry(client)
+            backend = select_backend(caps, client)
+            cl.user_session.set(_K_BACKEND, backend)
+            try:
+                result = await backend.send_turn(
+                    agent=agent_name,
+                    user_message=display_text,
+                    base_input=base_input,
+                    state=convo,
+                    documents=docs,
+                )
+            except Exception as retry_exc:
+                rid = getattr(client, "last_request_id", "")
+                rid_hint = f" (request_id: `{rid}`)" if rid else ""
+                thinking.content = (
+                    f"❌ Run failed after re-auth: "
+                    f"{type(retry_exc).__name__}: {retry_exc}{rid_hint}"
+                )
+                await thinking.update()
+                return
+        # #216: differentiate retryable vs. non-retryable errors.
+        elif _is_rate_limited(exc):
+            if _is_quota_exceeded(exc):
+                thinking.content = "⚠️ Quota exceeded for this key. Contact your admin."
+            else:
+                retry_after = _parse_retry_after(exc)
+                wait_hint = f" -- waiting {retry_after:.0f}s" if retry_after else ""
+                thinking.content = f"⚠️ Rate limited{wait_hint}. Please try again shortly."
+            await thinking.update()
+            return
+        else:
+            rid = getattr(client, "last_request_id", "")
+            rid_hint = f" (request_id: `{rid}`)" if rid else ""
+            thinking.content = f"❌ Run failed: {type(exc).__name__}: {exc}{rid_hint}"
+            await thinking.update()
+            return
 
     text = result.output_text or "_(no output)_"
     if result.status not in {"success", "unknown"}:
@@ -899,6 +1054,7 @@ async def _run_streaming(
     run_id: str | None = None
     final_output: dict[str, Any] = {}
     status = "success"
+    truncated = False
     try:
         async for event in client.stream_run(agent=agent_name, input_data=run_input):
             if event.is_token:
@@ -913,11 +1069,20 @@ async def _run_streaming(
                 err_text = event.data.get("message", "stream error")
                 await msg.stream_token(f"\n\n❌ {err_text}")
     except Exception as exc:
-        await msg.stream_token(f"\n\n❌ Stream failed: {type(exc).__name__}: {exc}")
-        await msg.update()
-        return
+        # #217: streaming-drop resilience -- finalize partial content with a
+        # truncation marker rather than leaving a half-rendered bubble.
+        truncated = True
+        logger.warning(
+            "SSE stream dropped mid-response (%s: %s); finalizing partial message.",
+            type(exc).__name__,
+            exc,
+        )
+        if collected:
+            await msg.stream_token("\n\n⚠️ [response truncated -- connection lost]")
+        else:
+            msg.content = "⚠️ [response truncated -- connection lost before any content arrived]"
 
-    # Reconstruct the assistant text — prefer the terminal output's text
+    # Reconstruct the assistant text -- prefer the terminal output's text
     # field; fall back to the concatenated token deltas. Record the
     # completed exchange (user + assistant) now that the turn is done.
     assistant_text = extract_output_text(final_output) or "".join(collected)
@@ -926,6 +1091,9 @@ async def _run_streaming(
     cl.user_session.set("last_run_id", run_id)
     if status not in {"success", "unknown"} and not collected:
         msg.content = f"⚠ status `{status}`"
+    # #217: mark truncated messages visually.
+    if truncated and collected:
+        msg.content = f"⚠️ _(truncated)_ {msg.content}" if msg.content else "⚠️ _(truncated)_"
     msg.actions = _feedback_actions(run_id)
     await msg.update()
 
@@ -996,42 +1164,49 @@ async def _render_voice_turn(ws: VoiceWSClient, msg: cl.Message) -> None:
             composed = f"{composed}\n\n`{latency_badge}`" if composed else f"`{latency_badge}`"
         return composed
 
-    async for frame in ws.iter_turn():
-        if frame.is_partial:
-            # Item 3: stream each partial into the live message so the operator
-            # sees STT progress in real-time (caption-style, updated in-place).
-            _last_caption = f"(listening) {frame.text}"
-            msg.content = _compose(_last_caption)
-            await msg.update()
-        elif frame.is_final_transcript:
-            # Final transcript replaces the last partial caption.
-            transcript = frame.text
-            _last_caption = f"you said: “{transcript}”"
-            msg.content = _compose(_last_caption)
-            await msg.update()
-        elif frame.is_agent_token:
-            # Item 3: use stream_token for agent tokens so the answer feels live.
-            answer_parts.append(frame.text)
-            # Rebuild full content to keep the transcript header visible.
-            caption = _last_caption if _last_caption else ""
-            msg.content = _compose(caption)
-            await msg.update()
-        elif frame.is_audio:
-            audio_frames.append(frame)
-        elif frame.is_latency:
-            # Latency badge frame — capture it; the terminal update renders it
-            # under the answer (and the next compose pins it live).
-            latency_badge = frame.latency_badge
-            msg.content = _compose(_last_caption if _last_caption else "")
-            await msg.update()
-        elif frame.is_error:
-            stage = frame.data.get("stage", "?")
-            message = frame.data.get("message", "voice error")
-            answer_parts.append(f"\n\n❌ voice {stage} error: {message}")
-            msg.content = _compose(_last_caption if _last_caption else "")
-            await msg.update()
-        elif frame.is_done:
-            run_id = frame.data.get("run_id") or None
+    try:
+        async for frame in ws.iter_turn():
+            if frame.is_partial:
+                _last_caption = f"(listening) {frame.text}"
+                msg.content = _compose(_last_caption)
+                await msg.update()
+            elif frame.is_final_transcript:
+                transcript = frame.text
+                _last_caption = f"you said: “{transcript}”"
+                msg.content = _compose(_last_caption)
+                await msg.update()
+            elif frame.is_agent_token:
+                answer_parts.append(frame.text)
+                caption = _last_caption if _last_caption else ""
+                msg.content = _compose(caption)
+                await msg.update()
+            elif frame.is_audio:
+                audio_frames.append(frame)
+            elif frame.is_latency:
+                latency_badge = frame.latency_badge
+                msg.content = _compose(_last_caption if _last_caption else "")
+                await msg.update()
+            elif frame.is_error:
+                stage = frame.data.get("stage", "?")
+                message = frame.data.get("message", "voice error")
+                answer_parts.append(f"\n\n❌ voice {stage} error: {message}")
+                msg.content = _compose(_last_caption if _last_caption else "")
+                await msg.update()
+            elif frame.is_done:
+                run_id = frame.data.get("run_id") or None
+    except Exception as exc:
+        # #217: voice TTS stream drop -- finalize partial content.
+        logger.warning(
+            "Voice WS dropped mid-turn (%s: %s); preserving partial content.",
+            type(exc).__name__,
+            exc,
+        )
+        if answer_parts:
+            answer_parts.append("\n\n⚠️ [response truncated -- connection lost]")
+        else:
+            answer_parts.append("⚠️ [voice stream dropped -- connection lost]")
+        msg.content = _compose(_last_caption if _last_caption else "")
+        await msg.update()
 
     # Play the synthesized audio back (one element, auto-played). Falls through
     # silently when TTS produced nothing (e.g. a degraded text-only turn).
@@ -1156,9 +1331,37 @@ def _feedback_actions(run_id: str | None) -> list[cl.Action]:
     ]
 
 
+def _turn_io_for_run(convo: ConversationState | None, run_id: str) -> tuple[str, str]:
+    """Look up a turn's (user_input, assistant_output) by its ``run_id``.
+
+    Reads the playground's structured :class:`ConversationState` mirror — the
+    assistant turn carries the ``run_id``; the nearest preceding user turn is
+    its input. Returns empty strings when the turn can't be located (e.g. a
+    resumed thread whose mirror lacks this run). Pure + side-effect-free so the
+    feedback-harvest path stays unit-testable and never touches the render path.
+    """
+    if convo is None:
+        return "", ""
+    output_text = ""
+    idx: int | None = None
+    for i, turn in enumerate(convo.turns):
+        if turn.role is Role.ASSISTANT and turn.run_id == run_id:
+            output_text = turn.text
+            idx = i
+            break
+    if idx is None:
+        return "", ""
+    user_input = ""
+    for j in range(idx - 1, -1, -1):
+        if convo.turns[j].role is Role.USER:
+            user_input = convo.turns[j].text
+            break
+    return user_input, output_text
+
+
 @cl.action_callback("feedback")
 async def on_feedback(action: cl.Action) -> None:
-    """Persist 👍/👎 (+ optional comment) for a run.
+    """Persist 👍/👎 (+ optional comment) for a run, and harvest an eval case.
 
     Routes to the feedback API when the runtime advertises it (ADR 045
     D14), else the existing persistence path — never regressing today's
@@ -1170,6 +1373,13 @@ async def on_feedback(action: cl.Action) -> None:
       buttons can't be double-submitted).
     * On success: emits "✓ Thanks!" confirmation.
     * On failure: emits a toast-style note and leaves buttons active.
+
+    Eval-harvest (ADR 016 D1): on a recorded thumb the turn becomes a
+    **proposed** eval case written to ``<agent>/evals/harvested.jsonl`` — the
+    same human-review artifact ``mdk eval harvest`` produces, never auto-
+    promoted into the live dataset. 👎 prompts for an optional *expected-better*
+    answer and lands needs-review (no asserted expected); 👍 lands a golden
+    case. Best-effort: if harvest is unavailable the feedback still records.
     """
     client: PlaygroundClient = cl.user_session.get(_K_CLIENT)
     caps: RuntimeCapabilities = cl.user_session.get(_K_CAPS)
@@ -1201,34 +1411,74 @@ async def on_feedback(action: cl.Action) -> None:
         if text:
             comment_text = text
 
-    try:
-        user = cl.user_session.get("user")
-        user_id = (
-            getattr(user, "identifier", None)
-            if user is not None
-            else os.environ.get("MDK_PLAYGROUND_USER_ID", "playground-anonymous")
-        )
-        await client.post_feedback(
-            run_id=run_id,
-            score=score,
-            comment=comment_text,
-            user_id=user_id,
-        )
-    except Exception as exc:
-        # Item 4: on failure, surface a toast-style message and leave buttons active.
-        await cl.Message(
-            content=f"⚠️ Feedback couldn't be saved — try again. ({type(exc).__name__}: {exc})"
-        ).send()
+    user = cl.user_session.get("user")
+    user_id = (
+        getattr(user, "identifier", None)
+        if user is not None
+        else os.environ.get("MDK_PLAYGROUND_USER_ID", "playground-anonymous")
+    )
+    # #219: feedback delivery robustness -- retry once on failure.
+    _fb_result, _fb_ok = await client.post_feedback_with_retry(
+        run_id=run_id,
+        score=score,
+        comment=comment_text,
+        user_id=user_id,
+        max_retries=1,
+        retry_delay_s=2.0,
+    )
+    if not _fb_ok:
+        # On failure after retry: leave buttons active so the user can try again.
+        await cl.Message(content="⚠️ Feedback couldn't be saved -- try again.").send()
         return
 
     # Item 4: mark this run+value as submitted (idempotency) + confirm visually.
     submitted.add(feedback_key)
     cl.user_session.set(_K_FEEDBACK_SUBMITTED, submitted)
 
+    # Eval-harvest (ADR 016 D1): turn this graded turn into a *proposed* eval
+    # case via the existing harvest pipeline. On a 👎, optionally ask the tester
+    # for the expected-better answer so the proposed case carries a suggested
+    # expected (still needs-review — a human confirms before it enters the gate).
+    expected_better: str | None = None
+    if score == -1:
+        better_msg = await cl.AskUserMessage(
+            content=(
+                "Optional: what *should* the answer have been? "
+                "This seeds a proposed eval case for review (or press Enter to skip)."
+            ),
+            timeout=120,
+        ).send()
+        if better_msg and isinstance(better_msg, dict):
+            better_text = better_msg.get("output", "").strip()
+            if better_text:
+                expected_better = better_text
+
+    agent_name = cl.user_session.get(_K_AGENT)
+    agent_detail = cl.user_session.get(_K_AGENT_DETAIL) or {}
+    convo: ConversationState | None = cl.user_session.get(_K_CONVO)
+    user_input, output_text = _turn_io_for_run(convo, run_id)
+    harvested_to = harvest_feedback_turn(
+        value="up" if score == 1 else "down",
+        run_id=run_id,
+        user_input=user_input,
+        output_text=output_text,
+        comment=comment_text,
+        expected_better=expected_better,
+        agent_name=str(agent_name) if agent_name else None,
+        agent_version=(agent_detail.get("version") if isinstance(agent_detail, dict) else None),
+    )
+
     suffix = " + comment" if comment_text else ""
     via = "feedback API" if route is FeedbackRoute.FEEDBACK_API else "runtime persistence"
+    harvest_note = ""
+    if harvested_to is not None:
+        kind = "golden eval case" if score == 1 else "proposed eval case (needs review)"
+        harvest_note = f" Saved as a {kind} for review — run `mdk eval harvest` to promote."
     await cl.Message(
-        content=(f"✓ Thanks! Feedback saved ({'👍' if score == 1 else '👎'}{suffix}) via {via}.")
+        content=(
+            f"✓ Thanks! Feedback saved ({'👍' if score == 1 else '👎'}{suffix}) via {via}."
+            f"{harvest_note}"
+        )
     ).send()
 
 

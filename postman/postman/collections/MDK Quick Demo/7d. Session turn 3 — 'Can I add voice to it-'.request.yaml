@@ -1,0 +1,18 @@
+$kind: http-request
+name: 7d. Session turn 3 — 'Can I add voice to it?'
+url: "{{runtime_url}}/api/v1/agents/{{agent_name}}/runs?wait=true"
+method: POST
+headers:
+  Content-Type: application/json
+queryParams:
+  wait: "true"
+body:
+  type: text
+  content: |-
+    {
+      "input": {
+        "input": "Can I add voice capabilities to my agents? What does that cost?"
+      },
+      "session_id": "{{session_id}}"
+    }
+order: 11000

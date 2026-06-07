@@ -111,7 +111,11 @@ def test_mdk_binary_alias_registered() -> None:
 def test_doctor_runs() -> None:
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
-    assert __version__ in result.stdout
+    # Assert the CalVer *base* (pre-``+local`` segment) — the doctor table
+    # truncates the version cell, and on a dirty dev tree __version__ carries a
+    # ``+g<sha>.dirty`` PEP 440 local segment (ADR 066) that gets clipped. The
+    # base (e.g. ``2026.6.7.5``) always renders.
+    assert __version__.split("+")[0] in result.stdout
 
 
 @pytest.mark.unit

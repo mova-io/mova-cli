@@ -1,0 +1,37 @@
+api_version: movate/v1
+kind: Agent
+
+name: refund-finalize
+version: 0.1.0
+description: |
+  Finalize node. Reads the triage `summary` and the human's `decision` from
+  workflow state and produces a short customer-facing `outcome` confirmation.
+owner: ""
+
+model:
+  provider: openai/gpt-4o-mini-2024-07-18
+  params:
+    temperature: 0.3
+    max_tokens: 256
+  fallback:
+    - provider: anthropic/claude-haiku-4-5-20251001
+
+prompt: ./prompt.md
+
+schema:
+  input:
+    summary: string
+    decision: string
+  output:
+    outcome: string
+
+timeouts:
+  call_ms: 30000
+  total_ms: 45000
+
+budget:
+  max_cost_usd_per_run: 0.05
+
+tags:
+  - refund
+  - finalize
