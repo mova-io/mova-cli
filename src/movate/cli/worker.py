@@ -152,6 +152,17 @@ def worker(
             "workflow + the activities, and runs a Temporal worker (needs mdk[temporal])."
         ),
     ),
+    from_storage: bool = typer.Option(
+        False,
+        "--from-storage",
+        envvar="MDK_TEMPORAL_WORKFLOWS_FROM_STORAGE",
+        help=(
+            "(temporal backend, ADR 088) ALSO load published 'runtime: temporal' "
+            "workflows from storage for --tenant-id, not just the filesystem — so "
+            "`mdk workflow publish <wf>` makes it hostable without writing to the "
+            "agents volume. Default off; the filesystem scan wins on a name clash."
+        ),
+    ),
 ) -> None:
     """Drain the queue, dispatch each job, persist the result.
 
@@ -175,6 +186,7 @@ def worker(
             _run_temporal_worker(
                 tenant_id=tenant_id,
                 workflows_path=workflows_path,
+                from_storage=from_storage,
                 mock=mock,
             )
         )
@@ -343,6 +355,7 @@ async def _run_temporal_worker(
     *,
     tenant_id: str | None,
     workflows_path: Path,
+    from_storage: bool = False,
     mock: bool,
 ) -> None:
     """Run a Temporal worker (``mdk worker --backend temporal``, ADR 055 D4).
@@ -392,6 +405,19 @@ async def _run_temporal_worker(
     temporal_wfs = {
         name: g for name, g in workflows.items() if getattr(g, "runtime", "native") == "temporal"
     }
+    # ADR 088 — opt-in second source: published runtime:temporal workflows from
+    # storage. Merged with the filesystem scan; filesystem wins on a name clash
+    # (local-dev override). Default off → behavior unchanged.
+    if from_storage:
+        from movate.runtime.registry import load_published_temporal_workflows  # noqa: PLC0415
+
+        published = await load_published_temporal_workflows(
+            rt.storage, tenant_id=tenant_id or "local"
+        )
+        for name, graph in published.items():
+            temporal_wfs.setdefault(name, graph)  # filesystem entry wins
+        if published:
+            hint(f"[dim]loaded {len(published)} published temporal workflow(s) from storage[/dim]")
     if not temporal_wfs:
         err.print(
             f"[yellow]⚠[/yellow] no [bold]runtime: temporal[/bold] workflows at "

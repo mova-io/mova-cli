@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
 from movate.core.workflow import (
@@ -119,6 +120,52 @@ def scan_workflows(root: Path) -> dict[str, WorkflowGraph]:
             continue
         graphs[spec.name] = graph
 
+    return graphs
+
+
+async def load_published_temporal_workflows(
+    storage: Any,
+    *,
+    tenant_id: str,
+) -> dict[str, WorkflowGraph]:
+    """Load published ``runtime: temporal`` workflows from STORAGE (ADR 088).
+
+    The Temporal worker's primary discovery is the filesystem
+    (:func:`scan_workflows`), but a deployed worker's volume is often empty. This
+    second, opt-in source lets ``mdk workflow publish`` make a workflow hostable:
+    list the tenant's published workflow bundles (ADR 037), materialize each
+    bundle's ``files`` to a temp dir, and run the SAME :func:`scan_workflows`
+    loader/compiler — so there is no divergent reconstruction. Keeps only
+    ``runtime: temporal`` graphs.
+
+    Fail-soft like :func:`scan_workflows`: a bad/uncompilable bundle is skipped
+    with a warning; the rest still load. Returns name → graph.
+    """
+    import tempfile  # noqa: PLC0415
+
+    try:
+        bundles = await storage.list_workflows(tenant_id=tenant_id, published_only=True)
+    except Exception as exc:  # pragma: no cover - storage hiccup must not crash the worker
+        logger.warning("published_workflows_list_failed tenant=%s reason=%s", tenant_id, exc)
+        return {}
+
+    graphs: dict[str, WorkflowGraph] = {}
+    for record in bundles:
+        full = await storage.get_workflow_bundle(record.name, tenant_id=tenant_id)
+        files = getattr(full, "files", None) or {}
+        if "workflow.yaml" not in files:
+            continue
+        with tempfile.TemporaryDirectory() as tmp:
+            wf_dir = Path(tmp) / record.name
+            for rel, content in files.items():
+                dest = wf_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8")
+            # Reuse the one true loader; it already skips non-temporal/invalid.
+            loaded = scan_workflows(Path(tmp))
+        for name, graph in loaded.items():
+            if getattr(graph, "runtime", "native") == "temporal":
+                graphs[name] = graph
     return graphs
 
 
