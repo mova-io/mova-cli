@@ -624,6 +624,15 @@ var appInsightsExportEnabled = enableAppInsights && !empty(appInsightsConnection
 var prometheusEnabled = enablePrometheus && appInsightsExportEnabled
 var prometheusName = 'movate-${env}-prometheus'
 
+// Trace sink the api/worker/temporal-worker run under (ADR 015). Self-hosted
+// Langfuse + App Insights both on → 'both' (fan out to the Langfuse LLM UI AND
+// the OTLP→App Insights APM); only App Insights → 'otlp'; only Langfuse →
+// 'langfuse'; neither → '' (legacy auto-detect / silent). Previously hardcoded
+// 'otlp', which meant a deployed self-hosted Langfuse received NO traces.
+var effectiveTraceSink = deployLangfuse && appInsightsExportEnabled
+  ? 'both'
+  : (appInsightsExportEnabled ? 'otlp' : (deployLangfuse ? 'langfuse' : ''))
+
 // ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
@@ -877,7 +886,7 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     // The endpoint is the collector's INTERNAL ingress base URL: ACA internal
     // ingress serves on :443 → targetPort 4318, and the OTLP/HTTP exporter
     // appends /v1/traces itself, so it's just https://<fqdn> (no port).
-    traceSink: appInsightsExportEnabled ? 'otlp' : ''
+    traceSink: effectiveTraceSink
     otelExporterEndpoint: appInsightsExportEnabled ? 'https://${otelCollector!.outputs.fqdn}' : ''
     // Pass the CAE storage config name when Azure Files is enabled;
     // empty string means no volume mount (pod-local /app/agents).
@@ -912,7 +921,7 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     // 'otlp' + the collector endpoint gated on the SAME condition — see the
     // api module above for why pairing them keeps the fail-loud OtelTracer
     // safe, and why the endpoint is the bare https://<fqdn> (no port).
-    traceSink: appInsightsExportEnabled ? 'otlp' : ''
+    traceSink: effectiveTraceSink
     otelExporterEndpoint: appInsightsExportEnabled ? 'https://${otelCollector!.outputs.fqdn}' : ''
     tags: tags
   }
@@ -1014,7 +1023,7 @@ module temporalWorker 'modules/containerapp-temporal-worker.bicep' = if (enableT
     temporalHost: temporal!.outputs.temporalHost
     userAssignedIdentityId: workerUai.id
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
-    traceSink: appInsightsExportEnabled ? 'otlp' : ''
+    traceSink: effectiveTraceSink
     otelExporterEndpoint: appInsightsExportEnabled ? 'https://${otelCollector!.outputs.fqdn}' : ''
     tags: tags
   }
