@@ -145,9 +145,10 @@ _POOL_METRICS = {
     "mdk.db.pool.max",
 }
 
-# ADR 082 — the Temporal operational workbook is built solely on the durable-
-# workflow completion counter (per-workflow timing lives in the Temporal Web UI).
-_TEMPORAL_METRICS = {"mdk.workflow.completed"}
+# ADR 082 (+ follow-on) — the Temporal operational workbook is built on the
+# durable-workflow completion counter plus its latency companion
+# ``mdk.workflow.duration_ms`` (per-run timing still lives in the Temporal Web UI).
+_TEMPORAL_METRICS = {"mdk.workflow.completed", "mdk.workflow.duration_ms"}
 
 _CASES = [
     pytest.param(_GRAFANA, "json", _ALL_FIVE | _POOL_METRICS, id="grafana"),

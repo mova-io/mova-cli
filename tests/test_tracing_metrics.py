@@ -28,6 +28,7 @@ from movate.tracing import (
     record_run_usage,
     record_voice_turn,
     record_workflow_completed,
+    record_workflow_duration,
 )
 from movate.tracing.metrics import _State
 
@@ -250,6 +251,47 @@ def test_record_workflow_completed_emits_counter_with_attrs() -> None:
     }
     assert by_attrs[("refund_approval", "success", "temporal", "tenant-a")] == 1
     assert by_attrs[("refund_approval", "error", "temporal", "tenant-a")] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not _otel_installed(), reason="needs OTel SDK")
+def test_record_workflow_duration_emits_histogram_with_attrs() -> None:
+    """ADR 082 follow-on: durable-workflow duration histogram carries the same
+    workflow/status/runtime/tenant attrs and drops negative (clock-skew) values."""
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader  # noqa: PLC0415
+
+    reader = InMemoryMetricReader()
+    init_metrics(reader=reader)
+    assert metrics_mod._state.workflow_duration_ms is not None  # instrument built
+
+    record_workflow_duration(
+        workflow="refund_approval",
+        status="success",
+        runtime="temporal",
+        tenant_id="tenant-a",
+        duration_ms=1234.5,
+    )
+    # Negative duration (clock skew) is dropped, not recorded.
+    record_workflow_duration(
+        workflow="refund_approval",
+        status="success",
+        runtime="temporal",
+        tenant_id="tenant-a",
+        duration_ms=-5.0,
+    )
+
+    metrics = _collect(reader)
+    assert "mdk.workflow.duration_ms" in metrics
+    points = metrics["mdk.workflow.duration_ms"]
+    # One histogram datapoint (the negative was dropped) with the full attr set.
+    assert len(points) == 1
+    dp = points[0]
+    assert dp.attributes["workflow"] == "refund_approval"
+    assert dp.attributes["status"] == "success"
+    assert dp.attributes["runtime"] == "temporal"
+    assert dp.attributes["tenant"] == "tenant-a"
+    assert dp.count == 1
+    assert dp.sum == pytest.approx(1234.5)
 
 
 @pytest.mark.unit
