@@ -353,6 +353,18 @@ class ModelParamDefaults(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    provider: str | None = Field(
+        default=None,
+        description=(
+            "Project-default model provider (a LiteLLM model id, e.g. "
+            "``openai/gpt-4o-mini``) written by the scaffold. Descriptive "
+            "today — it is NOT merged into agents (the layered-defaults merge "
+            "only fills `model.params`, never the required per-agent "
+            "`model.provider`). Accepted here so a scaffolded project loads; a "
+            "future ADR can promote it to an enforced default. See "
+            "movate.core.layered_defaults for what actually merges."
+        ),
+    )
     params: dict[str, object] = Field(
         default_factory=dict,
         description=(
@@ -590,6 +602,24 @@ class KnowledgeConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ProjectStorageConfig(BaseModel):
+    """Project-level ``storage:`` hint written by the scaffold.
+
+    The scaffold (`mdk demo new`) stamps a ``storage: {backend, path}``
+    block into the project file so the demo is self-contained. The storage
+    LAYER owns the authoritative storage schema (see ``movate.storage``);
+    this model is a forward-compatible *passthrough* so a scaffolded project
+    parses without ``load_project_config`` crashing. ``extra="allow"`` keeps
+    it permissive — unfamiliar storage keys don't error here; they're the
+    storage layer's concern, not the project-config loader's.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    backend: str | None = None
+    path: str | None = None
+
+
 class ProjectConfig(BaseModel):
     """Project-wide defaults — overrideable via CLI flags.
 
@@ -613,6 +643,58 @@ class ProjectConfig(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    # ── Project identity / descriptive header ────────────────────────────────
+    # The canonical scaffold (`mdk init --project`, `mdk demo new`) writes a
+    # descriptive header at the top of the project file:
+    #
+    #     api_version: movate/v1
+    #     kind: Project
+    #     name: demo-faq
+    #     version: 0.1.0
+    #     description: ...
+    #
+    # These are project-level METADATA — they identify the project and are
+    # NEVER merged into any agent.yaml (only the `defaults:` block reaches
+    # agent loading, via movate.core.layered_defaults, which reads only
+    # model.params / timeouts / budget). They were previously absent here, so a
+    # freshly-scaffolded project crashed every caller of load_project_config()
+    # with `extra_forbidden` — e.g. `mdk validate` of a demo-new / init
+    # scaffolded agent. Declaring them as accepted-but-unused fields lets the
+    # scaffold round-trip while `extra="forbid"` still catches genuine typos in
+    # the config-bearing blocks below (a misspelled `polcy:` still fails loudly).
+    api_version: str | None = Field(
+        default=None,
+        description=(
+            "Project-file API version stamped by the scaffold (e.g. "
+            "``movate/v1``). Descriptive only — not enforced today."
+        ),
+    )
+    kind: str | None = Field(
+        default=None,
+        description="Scaffold document kind (e.g. ``Project``). Descriptive only.",
+    )
+    name: str | None = Field(
+        default=None,
+        description="Human-readable project name. Descriptive only — never merged into agents.",
+    )
+    version: str | None = Field(
+        default=None,
+        description="Project version string. Descriptive only.",
+    )
+    description: str | None = Field(
+        default=None,
+        description="One-line project description. Descriptive only.",
+    )
+    storage: ProjectStorageConfig | None = Field(
+        default=None,
+        description=(
+            "Project-level storage hint written by the scaffold (backend + "
+            "path). Forward-compatible passthrough — the storage layer owns "
+            "this schema; accepted here so a scaffolded project loads. "
+            "Empty/absent = the runtime's storage defaults apply."
+        ),
+    )
 
     agents_dir: str = "./agents"
     workflows_dir: str = "./workflows"

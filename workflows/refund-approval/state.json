@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "description": "Shared state for the durable refund-approval workflow.",
+  "properties": {
+    "request": {
+      "type": "string",
+      "description": "The customer's refund request (free text)."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Triage agent's short summary of the request."
+    },
+    "recommended_decision": {
+      "type": "string",
+      "description": "Triage agent's recommendation: 'approve' or 'deny'."
+    },
+    "decision": {
+      "type": "string",
+      "description": "The human approver's decision (from the resume signal)."
+    },
+    "approver": {
+      "type": "string",
+      "description": "Who approved/denied (from the resume signal)."
+    },
+    "outcome": {
+      "type": "string",
+      "description": "Finalize agent's confirmation of the recorded outcome."
+    },
+    "tenant_id": {
+      "type": "string",
+      "description": "Tenant context stamped by the runtime."
+    }
+  }
+}

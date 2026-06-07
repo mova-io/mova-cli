@@ -39,9 +39,15 @@ param location string = resourceGroup().location
 @description('Container image (e.g. movate:0.5.0). Pushed to ACR before this deployment runs.')
 param image string
 
-@description('Postgres admin password. Should be a Key Vault reference in the bicepparam file.')
+@description('''
+Postgres admin password (Key Vault reference in the bicepparam file). REQUIRED on
+the first deploy of a new server (and to rotate); LEAVE EMPTY on redeploys of an
+existing server so the current password is retained (postgres.bicep omits the
+property when empty). Passing a value on every redeploy is the footgun that reset
+the password out from under the apps — deploy-temporal.sh passes empty by default.
+''')
 @secure()
-param postgresAdminPassword string
+param postgresAdminPassword string = ''
 
 @description('Tags applied to every resource.')
 param tags object = {
@@ -179,6 +185,60 @@ overrides; ``-1`` means "use the module default".
 param playgroundMinReplicas int = -1
 
 @description('''
+Deploy the hosted knowledge-graph dashboard Container App (ADR 081) — a
+shareable, Entra-SSO-gated viewer for the GraphRAG knowledge graph (ADR 046),
+in the SAME Container Apps Environment as the runtime. Default-off + purely
+additive (mirrors ``enablePlayground``): when false, ZERO graph-viewer resources
+are emitted and the template is byte-for-byte unchanged.
+
+The graph QUERY API already ships inside the api app (ADR 046); this only adds
+the hosted VIEWER. Same two-pass story as the playground — the app references two
+Key Vault secrets (``graph-runtime-key``, ``graph-entra-client-secret``) that ACA
+validates at create time, so populate them first (see docs/graph-app-deploy.md),
+then flip this true.
+
+REQUIRES ``enableApiWorker = true`` (the viewer proxies the api app's in-env
+FQDN) AND ``graphEntraClientId`` set (Easy Auth binds to the operator-pre-created
+Entra app registration at create time).
+''')
+param enableGraphApp bool = false
+
+@description('''
+Entra ID (Azure AD) application **client id** for the graph dashboard's Easy
+Auth (ADR 081, mirrors ADR 053 D4). The app registration is
+**operator-pre-created** OUTSIDE Bicep via:
+    az ad app create --display-name "movate-graph-${env}" \
+        --web-redirect-uris "https://<graph-fqdn>/.auth/login/aad/callback"
+Copy the printed appId here. Required when ``enableGraphApp`` is true; ignored
+otherwise. See docs/graph-app-deploy.md for the full ordering.
+''')
+param graphEntraClientId string = ''
+
+@description('''
+Tenant id whose Entra directory issues the graph dashboard's Easy Auth tokens.
+Empty (default) → the deployment's own tenant (``subscription().tenantId``). Set
+only for a cross-tenant app registration.
+''')
+param graphEntraTenantId string = ''
+
+@description('''
+Initial knowledge-graph project id the hosted dashboard loads on open (ADR 081).
+The dashboard has an in-UI project switcher, so this only seeds the first view;
+empty (default) opens the switcher with nothing preselected.
+''')
+param graphProjectId string = ''
+
+@description('''
+Cold-start knob for the graph dashboard (ADR 081). Override for the viewer
+Container App's ``scale.minReplicas``. Leave at the ``-1`` sentinel (default) to
+keep the module default of ``0`` (scale-to-zero). Set ``1``+ to keep it warm.
+Any value ``>= 0`` overrides; ``-1`` means "use the module default".
+''')
+@minValue(-1)
+@maxValue(10)
+param graphMinReplicas int = -1
+
+@description('''
 Comma-separated list of origins (no spaces) the API's CORS layer
 allows. Becomes ``MDK_CORS_ALLOWED_ORIGINS`` on the API container.
 Empty string means "no browser callers configured" — the API still
@@ -223,6 +283,44 @@ param deployLangfuse bool = false
 
 @description('Langfuse image. Pin a 2.x tag (e.g. langfuse/langfuse:2.95.0) for reproducible deploys.')
 param langfuseImage string = 'langfuse/langfuse:2'
+
+@description('''
+Deploy a self-hosted Temporal server (ADR 078) — a Container App running
+temporalio/auto-setup, internal gRPC on :7233, backed by `temporal` +
+`temporal_visibility` databases on the shared Postgres — and point the API +
+worker at it via TEMPORAL_HOST. Off by default; when false ZERO Temporal infra
+is emitted and the apps are byte-for-byte unchanged (durable workflows stay
+opt-in — native is the floor, ADR 065).
+
+REQUIRES enableApiWorker=true (the apps consume TEMPORAL_HOST). Two-pass like
+the rest: deploy infra + ensure the pg-admin-password Key Vault secret is set,
+then flip this true. NOTE (ADR 078 D6): the single auto-setup container is one
+non-HA Temporal cluster pinned at a single replica. Alternative to Temporal
+Cloud (point TEMPORAL_HOST at the cloud namespace instead) — both ride the same
+BYOK seam (ADR 054 D5).
+''')
+param enableTemporal bool = false
+
+@description('Temporal auto-setup image (ADR 078). PIN a tag — never :latest — so schema setup is reproducible.')
+param temporalImage string = 'temporalio/auto-setup:1.25.2'
+
+@description('''
+Deploy the Temporal Web UI (ADR 078 D6) — browse workflows, histories, task
+queues, and pending signals instead of grepping container logs. Gated off by
+default. Requires enableTemporal=true (it connects to the self-hosted frontend).
+
+⚠ The UI is UNAUTHENTICATED and exposes all workflow data. Default ingress is
+INTERNAL (reach it via the CAE / a port-forward). Flip ``temporalUiExternal``
+true ONLY for a dev/POC where public exposure of workflow data is acceptable —
+prefer IP restrictions / SSO otherwise.
+''')
+param enableTemporalUi bool = false
+
+@description('Temporal Web UI image (ADR 078 D6). PIN a tag — never :latest.')
+param temporalUiImage string = 'temporalio/ui:2.34.0'
+
+@description('Expose the Temporal Web UI publicly (external ingress). Default false = internal-only. See enableTemporalUi warning.')
+param temporalUiExternal bool = false
 
 @description('''
 Provision a workspace-linked Application Insights component and route the
@@ -390,6 +488,11 @@ var workerMinReplicasEffective = workerMinReplicas >= 0 ? max(workerMinReplicas,
 var playgroundMinReplicasDefault = 0
 var playgroundMinReplicasEffective = playgroundMinReplicas >= 0 ? max(playgroundMinReplicas, 0) : playgroundMinReplicasDefault
 
+// Graph dashboard minReplicas (ADR 081) — same -1-sentinel → module-default(0)
+// scheme as the playground above.
+var graphMinReplicasDefault = 0
+var graphMinReplicasEffective = graphMinReplicas >= 0 ? max(graphMinReplicas, 0) : graphMinReplicasDefault
+
 // ---------------------------------------------------------------------------
 // Resource names — see docs/v1.0-azure-design §2 for the convention.
 // ---------------------------------------------------------------------------
@@ -415,6 +518,9 @@ var saName = 'movate${env}sa${sfxNoHyphen}'
 var teamsBotName = 'movate-${env}-teams-bot'
 var botServiceName = 'movate-${env}-bot'
 var playgroundName = 'movate-${env}-playground'
+// Hosted knowledge-graph dashboard (ADR 081) — RG-scoped name; the app is gated
+// on enableGraphApp, the UAI is created unconditionally (cold-deploy safety).
+var graphName = 'movate-${env}-graph'
 // User-assigned identities for the api + worker + teams-bot apps.
 // Pre-created at this level (before the app modules) so role assignments
 // can be granted to their principalIds BEFORE the apps exist. Avoids
@@ -428,8 +534,19 @@ var apiUaiName = 'movate-${env}-api-mi'
 var workerUaiName = 'movate-${env}-worker-mi'
 var teamsBotUaiName = 'movate-${env}-teams-bot-mi'
 var playgroundUaiName = 'movate-${env}-playground-mi'
+var graphUaiName = 'movate-${env}-graph-mi'
 var langfuseName = 'movate-${env}-langfuse'
 var langfuseUaiName = 'movate-${env}-langfuse-mi'
+// Self-hosted Temporal server (ADR 078) — RG-scoped names; the app is gated
+// on enableTemporal, the UAI is created unconditionally (cold-deploy safety).
+var temporalName = 'movate-${env}-temporal'
+var temporalUaiName = 'movate-${env}-temporal-mi'
+// Temporal worker (ADR 080 D1) — the process that executes runtime:temporal
+// workflows. Reuses the native worker UAI (same image + secrets).
+var temporalWorkerName = 'movate-${env}-temporal-worker'
+// Temporal Web UI (ADR 078 D6) — RG-scoped; gated on enableTemporalUi. Public
+// image, no UAI needed.
+var temporalUiName = 'movate-${env}-temporal-ui'
 // RG-scoped — no global-uniqueness suffix needed (App Insights component
 // names only have to be unique within the resource group).
 var appInsightsName = 'movate-${env}-appi'
@@ -508,6 +625,7 @@ module pg 'modules/postgres.bicep' = {
     backupRetentionDays: pgBackupDays
     adminPassword: postgresAdminPassword
     createLangfuseDatabase: deployLangfuse
+    createTemporalDatabases: enableTemporal
     tags: tags
   }
 }
@@ -627,11 +745,29 @@ resource playgroundUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01
   tags: tags
 }
 
+// Graph dashboard app UAI (ADR 081). Same rationale as the playground UAI:
+// pre-create unconditionally so its ACR-pull + KV-secrets-read role assignments
+// land on pass 1, before the Container App's first revision.
+resource graphUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: graphUaiName
+  location: location
+  tags: tags
+}
+
 // Langfuse app UAI. Created unconditionally (cheap, idempotent) so its
 // KV-secrets-read grant lands before the app's first revision — even
 // though the app itself is gated on deployLangfuse.
 resource langfuseUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: langfuseUaiName
+  location: location
+  tags: tags
+}
+
+// Temporal server UAI (ADR 078). Created unconditionally (cheap, idempotent)
+// so its KV-secrets-read grant (the Postgres password) lands before the app's
+// first revision — even though the app itself is gated on enableTemporal.
+resource temporalUai 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: temporalUaiName
   location: location
   tags: tags
 }
@@ -659,6 +795,11 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: apiUai.id
     corsAllowedOrigins: corsAllowedOrigins
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    // Self-hosted Temporal frontend (ADR 078). Empty when enableTemporal=false
+    // → no TEMPORAL_* env emitted → selecting runtime:temporal fails loud
+    // (ADR 055 D6), never a silent downgrade. The API needs this to signal a
+    // durable run's handle from the resume endpoint (ADR 062 D2).
+    temporalHost: enableTemporal ? temporal!.outputs.temporalHost : ''
     // 'otlp' + the collector endpoint are gated on the SAME condition
     // (appInsightsExportEnabled) so the otlp sink always has an endpoint to
     // ship to — movate's fail-loud OtelTracer can't raise TraceSinkError.
@@ -695,6 +836,8 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     userAssignedIdentityId: workerUai.id
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    // Self-hosted Temporal frontend (ADR 078) — empty when off (see api above).
+    temporalHost: enableTemporal ? temporal!.outputs.temporalHost : ''
     // 'otlp' + the collector endpoint gated on the SAME condition — see the
     // api module above for why pairing them keeps the fail-loud OtelTracer
     // safe, and why the endpoint is the bare https://<fqdn> (no port).
@@ -749,6 +892,81 @@ module langfuse 'modules/langfuse.bicep' = if (deployLangfuse) {
     publicUrl: 'https://${langfuseName}.${cae.outputs.defaultDomain}'
     image: langfuseImage
     userAssignedIdentityId: langfuseUai.id
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Self-hosted Temporal server (ADR 078). Gated on enableTemporal AND
+// enableApiWorker (the apps consume its TEMPORAL_HOST). Runs the public
+// temporalio/auto-setup image on the shared CAE, talks to the `temporal` +
+// `temporal_visibility` databases on the shared Postgres (created by the pg
+// module when enableTemporal=true), reads the Postgres password from Key Vault,
+// and is reachable only by internal gRPC :7233. The api + worker pick up its
+// host:port as TEMPORAL_HOST above. Zero app code change — the worker/API
+// connect via the existing BYOK seam (ADR 054 D5).
+// ---------------------------------------------------------------------------
+module temporal 'modules/containerapp-temporal.bicep' = if (enableTemporal && enableApiWorker) {
+  name: 'temporal-${env}'
+  params: {
+    name: temporalName
+    location: location
+    environmentId: cae.outputs.envId
+    keyVaultUri: kv.outputs.vaultUri
+    userAssignedIdentityId: temporalUai.id
+    postgresFqdn: pg.outputs.serverFqdn
+    postgresAdminUsername: pg.outputs.adminUsername
+    image: temporalImage
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal worker (ADR 080 D1). Executes runtime:temporal workflows by polling
+// the Temporal task queue — without it, durable workflows compile + register but
+// never run. Gated on the SAME condition as the server; reuses the native worker
+// UAI (same image + AcrPull + KV-read). Connects to the server's internal FQDN
+// via TEMPORAL_HOST (the same value threaded into the api/worker above).
+// ---------------------------------------------------------------------------
+module temporalWorker 'modules/containerapp-temporal-worker.bicep' = if (enableTemporal && enableApiWorker) {
+  name: 'temporal-worker-${env}'
+  params: {
+    name: temporalWorkerName
+    location: location
+    environmentId: cae.outputs.envId
+    acrLoginServer: acr.outputs.loginServer
+    image: image
+    keyVaultUri: kv.outputs.vaultUri
+    postgresFqdn: pg.outputs.serverFqdn
+    postgresDatabase: pg.outputs.databaseName
+    postgresAdminUsername: pg.outputs.adminUsername
+    temporalHost: temporal!.outputs.temporalHost
+    userAssignedIdentityId: workerUai.id
+    langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
+    traceSink: appInsightsExportEnabled ? 'otlp' : ''
+    otelExporterEndpoint: appInsightsExportEnabled ? 'https://${otelCollector!.outputs.fqdn}' : ''
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Temporal Web UI (ADR 078 D6). Browse workflows / histories / pending signals
+// in a browser instead of grepping logs. Gated on enableTemporalUi AND the same
+// enableTemporal && enableApiWorker that bring up the server it connects to.
+// Public temporalio/ui image (no UAI / registries). Connects to the frontend's
+// internal gRPC FQDN (temporalHost = <fqdn>:7233). Internal ingress by default;
+// temporalUiExternal flips it public (unauthenticated — dev/POC only).
+// ---------------------------------------------------------------------------
+module temporalUi 'modules/containerapp-temporal-ui.bicep' = if (enableTemporalUi && enableTemporal && enableApiWorker) {
+  name: 'temporal-ui-${env}'
+  params: {
+    name: temporalUiName
+    location: location
+    environmentId: cae.outputs.envId
+    temporalAddress: temporal!.outputs.temporalHost
+    image: temporalUiImage
+    external: temporalUiExternal
+    publicUrl: temporalUiExternal ? 'https://${temporalUiName}.${cae.outputs.defaultDomain}' : ''
     tags: tags
   }
 }
@@ -921,6 +1139,43 @@ module playground 'modules/containerapp-playground.bicep' = if (enablePlayground
 }
 
 // ---------------------------------------------------------------------------
+// Hosted knowledge-graph dashboard (ADR 081). A shareable, Entra-SSO-gated
+// viewer for the GraphRAG knowledge graph. The graph QUERY API already ships
+// inside the api app (ADR 046); this only adds the hosted VIEWER (`mdk graph
+// dashboard`, headless). Gated on enableGraphApp AND enableApiWorker (the viewer
+// proxies the api app's in-env FQDN — nothing to show without the runtime),
+// mirroring the playground. Default-off + additive: with enableGraphApp=false
+// the module isn't instantiated, so no graph app / authConfig is emitted and the
+// template is byte-for-byte unchanged.
+//
+// Easy Auth binds to an operator-pre-created Entra app registration
+// (graphEntraClientId); the client secret + the read-scoped runtime bearer are
+// read from Key Vault. The empty graphEntraTenantId default resolves to
+// subscription().tenantId inside the module.
+// ---------------------------------------------------------------------------
+module graphApp 'modules/containerapp-graph.bicep' = if (enableGraphApp && enableApiWorker) {
+  name: 'graph-${env}'
+  params: {
+    name: graphName
+    location: location
+    environmentId: cae.outputs.envId
+    acrLoginServer: acr.outputs.loginServer
+    acrResourceId: acr.outputs.registryId
+    image: image
+    keyVaultUri: kv.outputs.vaultUri
+    // Talk to the api app over the in-env ingress FQDN (same env → reachable).
+    runtimeUrl: enableApiWorker ? 'https://${api!.outputs.fqdn}' : ''
+    projectId: graphProjectId
+    entraClientId: graphEntraClientId
+    // Empty → the module falls back to subscription().tenantId.
+    entraTenantId: empty(graphEntraTenantId) ? subscription().tenantId : graphEntraTenantId
+    minReplicas: graphMinReplicasEffective
+    userAssignedIdentityId: graphUai.id
+    tags: tags
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Role assignments — give the Container Apps' managed identities the
 // permissions they need:
 //
@@ -1051,6 +1306,31 @@ resource playgroundKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   }
 }
 
+// Graph dashboard role assignments (ADR 081). Mirror the playground grants — the
+// viewer needs ACR-pull (same image) + KV-secrets-read (graph-runtime-key,
+// graph-entra-client-secret). Un-gated from enableGraphApp (the UAI always
+// exists; assignments are cheap + idempotent) so they land on pass 1 before the
+// app's first revision.
+resource graphAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: acrResource
+  name: guid(acrResource.id, graphUaiName, acrPullRoleId)
+  properties: {
+    principalId: graphUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+  }
+}
+
+resource graphKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: kvResource
+  name: guid(kvResource.id, graphUaiName, kvSecretsUserRoleId)
+  properties: {
+    principalId: graphUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
+  }
+}
+
 // Langfuse needs KV-secrets-read (DB URL + nextauth/salt/encryption-key).
 // No AcrPull grant — it runs the public langfuse/langfuse image, not ours.
 // Un-gated (the UAI always exists) so it lands on pass 1.
@@ -1059,6 +1339,19 @@ resource langfuseKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(kvResource.id, langfuseUaiName, kvSecretsUserRoleId)
   properties: {
     principalId: langfuseUai.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
+  }
+}
+
+// Temporal server needs KV-secrets-read (the Postgres password). No AcrPull
+// grant — it runs the public temporalio/auto-setup image, not ours. Un-gated
+// (the UAI always exists) so it lands on pass 1 (ADR 078 D4).
+resource temporalKvRead 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: kvResource
+  name: guid(kvResource.id, temporalUaiName, kvSecretsUserRoleId)
+  properties: {
+    principalId: temporalUai.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', kvSecretsUserRoleId)
   }
@@ -1089,8 +1382,14 @@ output botServiceId string = enableTeamsBot ? botService!.outputs.botServiceId :
 @description('Shareable (Entra-SSO-gated) URL of the hosted playground (ADR 053). Empty when enablePlayground=false. Share THIS link with invited testers; access is gated by Easy Auth.')
 output playgroundUrl string = (enablePlayground && enableApiWorker) ? playground!.outputs.playgroundUrl : ''
 
+@description('Public (Entra-SSO-gated) URL of the hosted knowledge-graph dashboard (ADR 081). Empty when enableGraphApp=false. Share THIS link; access is gated by Easy Auth.')
+output graphUrl string = (enableGraphApp && enableApiWorker) ? graphApp!.outputs.graphUrl : ''
+
 @description('Self-hosted Langfuse URL. Empty when deployLangfuse=false. Open it to create a project + mint keys, then store them in KV as langfuse-public-key / langfuse-secret-key.')
 output langfuseUrl string = deployLangfuse ? langfuse!.outputs.publicUrl : ''
+
+@description('Temporal Web UI URL. Empty when enableTemporalUi=false OR the UI is internal-only (temporalUiExternal=false → reach it via the CAE / a port-forward).')
+output temporalUiUrl string = (enableTemporalUi && enableTemporal && enableApiWorker) ? temporalUi!.outputs.url : ''
 
 @description('App Insights component name. Empty when enableAppInsights=false. The connection string is intentionally NOT output (it carries an ingestion key).')
 output appInsightsName string = enableAppInsights ? appInsights!.outputs.name : ''

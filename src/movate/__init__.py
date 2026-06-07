@@ -3,8 +3,19 @@
 from __future__ import annotations
 
 import logging
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
-__version__ = "2026.5.30.8"
+# ADR 066 — the version is DERIVED FROM GIT at build time and baked into the
+# installed package metadata; it is NOT a committed literal here (so PRs never
+# conflict on a version line). Read it back from the installed distribution.
+# Editable installs carry the version computed at `uv pip install -e` time
+# (refresh by reinstalling). The sentinel only appears for a source tree with no
+# built metadata at all — never for a normal install.
+try:
+    __version__ = _pkg_version("movate-cli")
+except PackageNotFoundError:  # pragma: no cover - source tree without built metadata
+    __version__ = "0+unknown"
 
 
 class _LiteLLMBotocoreNoiseFilter(logging.Filter):

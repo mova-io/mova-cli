@@ -1,0 +1,14 @@
+name: MDK Quick Demo
+values:
+  - key: runtime_url
+    value: 'https://movate-dev-api.bluebush-9aec1e70.eastus2.azurecontainerapps.io'
+  - key: api_key
+    value: YOUR_MDK_API_KEY
+  - key: agent_name
+    value: demo-support
+  - key: voice_demo_url
+    value: 'https://mdk-voice-demo.delightfulcoast-91af3b05.eastus.azurecontainerapps.io'
+  - key: run_id
+    value: ''
+  - key: session_id
+    value: ''

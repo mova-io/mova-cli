@@ -1,0 +1,4 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/capabilities"
+method: GET
+order: 13000

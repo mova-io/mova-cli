@@ -16,15 +16,26 @@ CLAUDE.md rule 5 — flagged new surface:
     connects to the existing WS ``/api/v1/agents/{name}/voice``.
   * ``mdk voice providers list`` — new, opt-in CLI verb; reads the existing
     ``GET /api/v1/capabilities`` endpoint (no new server surface).
-  Neither verb changes any existing CLI shape.
+  * ``mdk voice say`` / ``mdk voice transcribe`` / ``mdk voice ask`` — new,
+    opt-in CLI verbs that drive the REST one-shot ``POST
+    /api/v1/agents/{name}/voice`` (ADR 050 D2/D11) via :class:`MovateClient`.
+  None of these verbs changes any existing CLI shape.
 """
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
+
+if TYPE_CHECKING:
+    # Imported under TYPE_CHECKING for typing only; the runtime import lives in
+    # the verbs that use it. Naming it at module scope is also what the CLI↔API
+    # parity gate (tests/test_cli_api_parity.py) reads to classify the voice
+    # ``say``/``transcribe``/``ask`` verbs as remote-capable (ADR 050 D11).
+    from movate.core.client import MovateClient
+    from movate.voice.base import SpeechToTextProvider, TextToSpeechProvider
 
 err = Console(stderr=True)
 
@@ -589,3 +600,629 @@ async def _providers_list_async(*, base_url: str, api_key: str | None) -> None:
     err.print(f"  modes:         {', '.join(modes) if modes else '(none)'}")
     err.print(f"  STT providers: {', '.join(stt_providers) if stt_providers else '(none)'}")
     err.print(f"  TTS providers: {', '.join(tts_providers) if tts_providers else '(none)'}")
+
+
+# ---------------------------------------------------------------------------
+# One-shot REST verbs — ``say`` / ``transcribe`` / ``ask`` (ADR 050 D2 / D11)
+#
+# The request/response parity to the streaming ``voice try``: each drives the
+# REST one-shot ``POST /api/v1/agents/{name}/voice`` through ``MovateClient``
+# (so the CLI↔API parity gate maps them to that endpoint). ``say`` speaks typed
+# text, ``transcribe`` turns an audio file into a transcript, ``ask`` runs a
+# full audio→answer→audio turn. All take ``--target`` (the remote runtime).
+# ---------------------------------------------------------------------------
+
+
+def _make_client(base_url: str, api_key: str | None) -> MovateClient:
+    """Build a :class:`MovateClient` bound to the target + bearer key."""
+    from movate.core.client import MovateClient  # noqa: PLC0415
+
+    return MovateClient(base_url=base_url, api_key=api_key or "")
+
+
+def _write_audio_out(audio_b64: str | None, out_path: str | None) -> None:
+    """Decode a turn's inline audio and either save it or report its size."""
+    import base64  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    if not audio_b64:
+        err.print("[dim]  (no audio returned)[/dim]")
+        return
+    raw = base64.b64decode(audio_b64)
+    if out_path:
+        Path(out_path).write_bytes(raw)
+        err.print(
+            f"[bold green]✓[/bold green] wrote {len(raw)} bytes of audio → [bold]{out_path}[/bold]"
+        )
+    else:
+        err.print(f"[dim]  ({len(raw)} bytes of audio returned; pass --out to save)[/dim]")
+
+
+@voice_app.command("say")
+def voice_say(
+    agent: Annotated[str, typer.Argument(help="Agent name on the target runtime.")],
+    text: Annotated[str, typer.Argument(help="Text for the agent to answer / speak.")],
+    target: Annotated[
+        str | None,
+        typer.Option("--target", "-t", help="Runtime URL or config target name."),
+    ] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option("--api-key", help="Bearer key for the runtime (falls back to env vars)."),
+    ] = None,
+    out: Annotated[
+        str | None,
+        typer.Option("--out", "-o", help="Write the synthesized answer audio to this file."),
+    ] = None,
+    tts: Annotated[
+        str | None, typer.Option("--tts", help="TTS provider override (e.g. 'cartesia').")
+    ] = None,
+    voice_id: Annotated[
+        str | None, typer.Option("--voice-id", help="TTS voice id override.")
+    ] = None,
+    mock: Annotated[
+        bool, typer.Option("--mock", help="Run the agent stage offline (no live LLM key).")
+    ] = False,
+) -> None:
+    """Speak a one-shot answer: text in → the agent answers → spoken audio out.
+
+    Drives ``POST /api/v1/agents/{name}/voice`` (ADR 050 D2/D11) with the typed
+    ``text`` — STT is bypassed server-side, so this is the "have the agent say
+    something" path. Prints the agent's answer text and saves/sizes the
+    synthesized audio.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Have faq-bot answer a question and save the spoken reply[/dim]
+      $ mdk voice say faq-bot "what are your hours?" --out reply.pcm
+    """
+    import asyncio  # noqa: PLC0415
+
+    asyncio.run(
+        _voice_oneshot_async(
+            agent=agent,
+            base_url=_resolve_target_url(target),
+            api_key=_resolve_api_key(api_key),
+            text=text,
+            audio_path=None,
+            out=out,
+            tts=tts,
+            voice_id=voice_id,
+            stt=None,
+            audio_out="inline",
+            mock=mock,
+            show_transcript=False,
+        )
+    )
+
+
+@voice_app.command("transcribe")
+def voice_transcribe(
+    audio: Annotated[str, typer.Argument(help="Path to an audio file to transcribe.")],
+    agent: Annotated[
+        str,
+        typer.Option(
+            "--agent",
+            "-a",
+            help="Agent whose voice route runs the transcription (any agent works).",
+        ),
+    ] = "default",
+    target: Annotated[
+        str | None,
+        typer.Option("--target", "-t", help="Runtime URL or config target name."),
+    ] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option("--api-key", help="Bearer key for the runtime (falls back to env vars)."),
+    ] = None,
+    stt: Annotated[
+        str | None, typer.Option("--stt", help="STT provider override (e.g. 'deepgram').")
+    ] = None,
+    language: Annotated[
+        str | None, typer.Option("--language", help="STT language hint (e.g. 'en').")
+    ] = None,
+    codec: Annotated[
+        str, typer.Option("--codec", help="Codec of the input audio (pcm16/opus/mulaw).")
+    ] = "pcm16",
+) -> None:
+    """Transcribe an audio file: audio in → transcript out (STT only).
+
+    Drives ``POST /api/v1/agents/{name}/voice?audio=none`` (ADR 050 D2/D11):
+    sends the file, prints the recognized transcript, and skips synthesis (no
+    answer audio). The agent still runs (a voice turn IS a run, ADR 050 D1), but
+    only the transcript is surfaced.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Transcribe a recording[/dim]
+      $ mdk voice transcribe call.wav --target https://mdk-prod.example.com
+    """
+    import asyncio  # noqa: PLC0415
+
+    asyncio.run(
+        _voice_oneshot_async(
+            agent=agent,
+            base_url=_resolve_target_url(target),
+            api_key=_resolve_api_key(api_key),
+            text=None,
+            audio_path=audio,
+            out=None,
+            tts=None,
+            voice_id=None,
+            stt=stt,
+            language=language,
+            codec=codec,
+            audio_out="none",
+            mock=False,
+            show_transcript=True,
+            transcript_only=True,
+        )
+    )
+
+
+@voice_app.command("ask")
+def voice_ask(
+    agent: Annotated[str, typer.Argument(help="Agent name on the target runtime.")],
+    audio: Annotated[str, typer.Argument(help="Path to an audio file (the spoken question).")],
+    target: Annotated[
+        str | None,
+        typer.Option("--target", "-t", help="Runtime URL or config target name."),
+    ] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option("--api-key", help="Bearer key for the runtime (falls back to env vars)."),
+    ] = None,
+    out: Annotated[
+        str | None,
+        typer.Option("--out", "-o", help="Write the synthesized answer audio to this file."),
+    ] = None,
+    stt: Annotated[str | None, typer.Option("--stt", help="STT provider override.")] = None,
+    tts: Annotated[str | None, typer.Option("--tts", help="TTS provider override.")] = None,
+    voice_id: Annotated[
+        str | None, typer.Option("--voice-id", help="TTS voice id override.")
+    ] = None,
+    language: Annotated[str | None, typer.Option("--language", help="STT language hint.")] = None,
+    codec: Annotated[
+        str, typer.Option("--codec", help="Codec of the input audio (pcm16/opus/mulaw).")
+    ] = "pcm16",
+    mock: Annotated[
+        bool, typer.Option("--mock", help="Run the agent stage offline (no live LLM key).")
+    ] = False,
+) -> None:
+    """Ask in one shot: spoken audio in → transcript + answer + spoken audio out.
+
+    The request/response companion to ``voice try`` — drives the REST one-shot
+    ``POST /api/v1/agents/{name}/voice`` (ADR 050 D2). Prints the recognized
+    transcript and the agent's answer, and saves/sizes the synthesized reply
+    audio.
+
+    [bold]Examples:[/bold]
+
+      [dim]# One-shot spoken Q&A against a recorded question[/dim]
+      $ mdk voice ask faq-bot question.wav --out answer.pcm
+    """
+    import asyncio  # noqa: PLC0415
+
+    asyncio.run(
+        _voice_oneshot_async(
+            agent=agent,
+            base_url=_resolve_target_url(target),
+            api_key=_resolve_api_key(api_key),
+            text=None,
+            audio_path=audio,
+            out=out,
+            tts=tts,
+            voice_id=voice_id,
+            stt=stt,
+            language=language,
+            codec=codec,
+            audio_out="inline",
+            mock=mock,
+            show_transcript=True,
+        )
+    )
+
+
+async def _voice_oneshot_async(
+    *,
+    agent: str,
+    base_url: str,
+    api_key: str | None,
+    text: str | None,
+    audio_path: str | None,
+    out: str | None,
+    tts: str | None,
+    voice_id: str | None,
+    stt: str | None,
+    language: str | None = None,
+    codec: str = "pcm16",
+    audio_out: str,
+    mock: bool,
+    show_transcript: bool,
+    transcript_only: bool = False,
+) -> None:
+    """Shared async core for ``say`` / ``transcribe`` / ``ask``.
+
+    Reads the audio file (when given), POSTs to the one-shot voice endpoint via
+    :class:`MovateClient`, and renders the transcript / answer / audio result.
+    Errors (unreachable runtime, missing voice extra → 503, agent 404) are
+    surfaced as a clear message + non-zero exit, never a traceback.
+    """
+    from pathlib import Path  # noqa: PLC0415
+
+    from movate.core.client import MovateClientError  # noqa: PLC0415
+
+    audio_bytes: bytes | None = None
+    filename = "audio.wav"
+    if audio_path is not None:
+        p = Path(audio_path)
+        if not p.is_file():
+            err.print(f"[red]✗[/red] audio file not found: {audio_path}")
+            raise typer.Exit(code=1)
+        audio_bytes = p.read_bytes()
+        filename = p.name
+
+    client = _make_client(base_url, api_key)
+    try:
+        try:
+            result = await client.voice_oneshot(
+                agent=agent,
+                audio=audio_bytes,
+                text=text,
+                filename=filename,
+                stt=stt,
+                tts=tts,
+                voice_id=voice_id,
+                language=language,
+                codec=codec,
+                mock=mock,
+                audio_out=audio_out,
+            )
+        except MovateClientError as exc:
+            err.print(f"[red]✗ voice request failed[/red] (HTTP {exc.status_code}): {exc.message}")
+            raise typer.Exit(code=1) from exc
+        except Exception as exc:
+            err.print(f"[red]✗[/red] could not reach {base_url}: {exc}")
+            raise typer.Exit(code=1) from exc
+    finally:
+        await client.aclose()
+
+    if show_transcript:
+        err.print(f"[bold cyan]transcript:[/bold cyan] {result.transcript}")
+    if not transcript_only:
+        err.print(f"[bold green]answer:[/bold green] {result.response_text}")
+        _write_audio_out(result.audio_bytes_b64, out)
+    if result.status and result.status != "success":
+        detail = f": {result.error}" if result.error else ""
+        err.print(f"[yellow]status: {result.status}[/yellow]{detail}")
+
+
+# ---------------------------------------------------------------------------
+# mdk voice call — outbound Twilio test call (ADR 074 D9)
+# ---------------------------------------------------------------------------
+
+
+def _require_telephony_extra() -> None:
+    """Gate behind the ``[telephony]`` optional extra."""
+    import importlib.util  # noqa: PLC0415
+
+    if importlib.util.find_spec("twilio") is None:
+        err.print(
+            "[red]✗[/red] The [bold]mdk\\[telephony][/bold] extra is not installed.\n"
+            "  Run: [bold]pip install 'movate-cli[telephony]'[/bold]\n"
+            "  (or: [bold]uv pip install 'movate-cli[telephony]'[/bold])"
+        )
+        raise typer.Exit(code=1)
+
+
+@voice_app.command("call")
+def voice_call(
+    agent: Annotated[str, typer.Argument(help="Agent name to connect the call to.")],
+    to: Annotated[
+        str,
+        typer.Option("--to", help="Phone number to call (E.164, e.g. +12175551234)."),
+    ],
+    from_number: Annotated[
+        str,
+        typer.Option(
+            "--from",
+            help="Your Twilio phone number (E.164). Defaults to TWILIO_PHONE_NUMBER env var.",
+        ),
+    ] = "",
+    target: Annotated[
+        str | None,
+        typer.Option("--target", "-t", help="Runtime URL (defaults to local dev)."),
+    ] = None,
+    transport: Annotated[
+        str,
+        typer.Option("--transport", help="Telephony transport to use."),
+    ] = "twilio",
+) -> None:
+    """Initiate an outbound phone call and connect it to an mdk voice agent.
+
+    For testing: calls ``--to`` from your Twilio number and bridges the call
+    to the agent via the Twilio Media Stream. Requires the ``[telephony]``
+    extra and ``TWILIO_ACCOUNT_SID`` / ``TWILIO_AUTH_TOKEN`` env vars.
+
+    [bold]Example:[/bold]
+
+      [dim]$ mdk voice call support-agent --to +12175551234 --from +12179195393[/dim]
+    """
+    import os  # noqa: PLC0415
+
+    _require_telephony_extra()
+
+    if transport != "twilio":
+        err.print(f"[red]✗[/red] unsupported transport: {transport!r} (only 'twilio' for now)")
+        raise typer.Exit(code=1)
+
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    if not account_sid or not auth_token:
+        err.print(
+            "[red]✗[/red] TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set.\n"
+            "  Run: [bold]mdk auth login twilio[/bold]"
+        )
+        raise typer.Exit(code=1)
+
+    twilio_number = from_number or os.environ.get("TWILIO_PHONE_NUMBER", "").strip()
+    if not twilio_number:
+        err.print(
+            "[red]✗[/red] --from or TWILIO_PHONE_NUMBER env var is required.\n"
+            "  Example: --from +12179195393"
+        )
+        raise typer.Exit(code=1)
+
+    base_url = _resolve_target_url(target)
+    # Build the TwiML that tells Twilio to open a Media Stream back to us.
+    twiml_url = f"{base_url}/api/v1/agents/{agent}/call/twilio"
+
+    from twilio.rest import Client  # noqa: PLC0415
+
+    client = Client(account_sid, auth_token)
+    err.print(
+        f"[bold]Calling[/bold] {to} from {twilio_number} "
+        f"-> agent [cyan]{agent}[/cyan] at {twiml_url}"
+    )
+    call = client.calls.create(
+        to=to,
+        from_=twilio_number,
+        url=twiml_url,
+        method="POST",
+    )
+    err.print(f"[green]✓[/green] Call initiated: SID={call.sid}")
+
+
+# ---------------------------------------------------------------------------
+# ``mdk voice bench`` — reproducible STT/TTS eval harness (ADR 049 D5)
+# ---------------------------------------------------------------------------
+
+
+@voice_app.command("bench")
+def voice_bench(
+    corpus_dir: Annotated[
+        str | None,
+        typer.Option(
+            "--corpus",
+            help="Path to corpus directory with manifest.json (default: tests/voice/corpus).",
+        ),
+    ] = None,
+    output: Annotated[
+        str,
+        typer.Option("--output", "-o", help="Output format: 'table' (default) or 'json'."),
+    ] = "table",
+    save_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--save-baseline",
+            help="Write results as voice-bench-baseline.json for future regression checks.",
+        ),
+    ] = False,
+    fail_on_regression: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-regression",
+            help="Compare against voice-bench-baseline.json; exit non-zero on regression.",
+        ),
+    ] = False,
+    baseline_path: Annotated[
+        str | None,
+        typer.Option(
+            "--baseline",
+            help="Path to baseline file (default: voice-bench-baseline.json in project root).",
+        ),
+    ] = None,
+    use_fakes: Annotated[
+        bool,
+        typer.Option(
+            "--fakes",
+            help="Use in-memory fake providers (for CI / harness validation).",
+        ),
+    ] = False,
+) -> None:
+    """Run the voice eval/regression harness over a golden audio corpus.
+
+    Benchmarks configured STT providers on WER + latency, and TTS providers on
+    first-byte + total latency. Compares against a saved baseline to catch
+    regressions (ADR 049 D5 — standing bake-off).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Run with fake providers (CI / harness validation)[/dim]
+      $ mdk voice bench --fakes
+
+      [dim]# Run and save a baseline[/dim]
+      $ mdk voice bench --fakes --save-baseline
+
+      [dim]# Run and fail on regression[/dim]
+      $ mdk voice bench --fakes --fail-on-regression
+
+      [dim]# JSON output for CI consumption[/dim]
+      $ mdk voice bench --fakes --output json
+    """
+    import asyncio  # noqa: PLC0415
+
+    asyncio.run(
+        _voice_bench_async(
+            corpus_dir=corpus_dir,
+            output=output,
+            save_baseline_flag=save_baseline,
+            fail_on_regression=fail_on_regression,
+            baseline_path=baseline_path,
+            use_fakes=use_fakes,
+        )
+    )
+
+
+async def _voice_bench_async(
+    *,
+    corpus_dir: str | None,
+    output: str,
+    save_baseline_flag: bool,
+    fail_on_regression: bool,
+    baseline_path: str | None,
+    use_fakes: bool,
+) -> None:
+    """Async core of ``mdk voice bench``."""
+    from pathlib import Path  # noqa: PLC0415
+
+    from movate.voice.bench import BenchReport as _BenchReport  # noqa: PLC0415
+    from movate.voice.bench import (  # noqa: PLC0415
+        bench_stt,
+        bench_tts,
+        load_audio_chunks,
+        load_corpus,
+    )
+    from movate.voice.bench import compare_to_baseline as _compare  # noqa: PLC0415
+    from movate.voice.bench import load_baseline as _load_baseline  # noqa: PLC0415
+    from movate.voice.bench import save_baseline as _save_baseline  # noqa: PLC0415
+
+    cdir = Path(corpus_dir) if corpus_dir else Path("tests/voice/corpus")
+    if not (cdir / "manifest.json").is_file():
+        err.print(f"[red]x[/red] Corpus manifest not found at {cdir / 'manifest.json'}")
+        raise typer.Exit(code=1)
+
+    corpus_items = load_corpus(cdir)
+    if not corpus_items:
+        err.print("[red]x[/red] Corpus is empty.")
+        raise typer.Exit(code=1)
+
+    stt_providers, tts_providers = _resolve_bench_providers(use_fakes)
+
+    stt_corpus = [
+        (load_audio_chunks(cdir, item.filename), item.expected_transcript) for item in corpus_items
+    ]
+    tts_phrases = [item.expected_transcript for item in corpus_items]
+
+    report = _BenchReport()
+    for stt in stt_providers:
+        report.stt_reports.append(await bench_stt(stt, stt_corpus))
+    for tts in tts_providers:
+        report.tts_reports.append(await bench_tts(tts, tts_phrases))
+
+    _emit_bench_output(report, output)
+
+    bl_path = Path(baseline_path) if baseline_path else Path("voice-bench-baseline.json")
+    if save_baseline_flag:
+        _save_baseline(report, bl_path)
+        err.print(f"\n[bold green]baseline saved:[/bold green] {bl_path}")
+
+    if fail_on_regression:
+        _check_regression(report, bl_path, _compare, _load_baseline)
+
+
+def _resolve_bench_providers(
+    use_fakes: bool,
+) -> tuple[list[SpeechToTextProvider], list[TextToSpeechProvider]]:
+    """Return (stt_providers, tts_providers) for the bench run."""
+    if use_fakes:
+        from movate.voice.doubles import FakeSTT, FakeTTS  # noqa: PLC0415
+
+        return [FakeSTT(transcript="hello")], [FakeTTS()]
+    err.print(
+        "[yellow]note:[/yellow] No real providers configured. "
+        "Use --fakes for harness validation, or configure STT/TTS providers."
+    )
+    raise typer.Exit(code=1)
+
+
+def _emit_bench_output(report: object, output: str) -> None:
+    """Render bench results to stderr as a table or JSON."""
+    import json as _json  # noqa: PLC0415
+
+    from movate.voice.bench import BenchReport  # noqa: PLC0415
+
+    assert isinstance(report, BenchReport)
+    if output == "json":
+        err.print(_json.dumps(report.to_dict(), indent=2))
+    else:
+        _render_bench_table(report)
+
+
+def _check_regression(
+    report: object,
+    bl_path: object,
+    compare_fn: object,
+    load_fn: object,
+) -> None:
+    """Compare report against baseline and exit non-zero on regression."""
+    from pathlib import Path  # noqa: PLC0415
+
+    from movate.voice.bench import BenchReport  # noqa: PLC0415
+
+    assert isinstance(report, BenchReport)
+    assert isinstance(bl_path, Path)
+    if not bl_path.is_file():
+        err.print(
+            f"[red]x[/red] Baseline file not found: {bl_path}\n  Run with --save-baseline first."
+        )
+        raise typer.Exit(code=1)
+    baseline = load_fn(bl_path)  # type: ignore[operator]
+    regressions = compare_fn(report, baseline)  # type: ignore[operator]
+    if regressions:
+        err.print(f"\n[red]REGRESSION DETECTED ({len(regressions)}):[/red]")
+        for reg in regressions:
+            err.print(f"  [red]x[/red] {reg.message}")
+        raise typer.Exit(code=1)
+    err.print("\n[bold green]No regressions detected.[/bold green]")
+
+
+def _render_bench_table(report: object) -> None:
+    """Render the bench report as a Rich table."""
+    from rich.table import Table  # noqa: PLC0415
+
+    from movate.voice.bench import BenchReport  # noqa: PLC0415
+
+    assert isinstance(report, BenchReport)
+
+    if report.stt_reports:
+        table = Table(title="STT Benchmark", show_lines=True)
+        table.add_column("Provider", style="bold")
+        table.add_column("WER", justify="right")
+        table.add_column("p50 Latency (ms)", justify="right")
+        table.add_column("p95 Latency (ms)", justify="right")
+        table.add_column("Samples", justify="right")
+        for r in report.stt_reports:
+            table.add_row(
+                r.provider,
+                f"{r.mean_wer:.1%}",
+                f"{r.p50_latency_ms:.0f}",
+                f"{r.p95_latency_ms:.0f}",
+                str(len(r.items)),
+            )
+        err.print(table)
+
+    if report.tts_reports:
+        table = Table(title="TTS Benchmark", show_lines=True)
+        table.add_column("Provider", style="bold")
+        table.add_column("First-byte (ms)", justify="right")
+        table.add_column("Total (ms)", justify="right")
+        table.add_column("Samples", justify="right")
+        for tr in report.tts_reports:
+            table.add_row(
+                tr.provider,
+                f"{tr.mean_first_byte_ms:.0f}",
+                f"{tr.mean_total_ms:.0f}",
+                str(len(tr.items)),
+            )
+        err.print(table)

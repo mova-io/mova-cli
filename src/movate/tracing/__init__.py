@@ -63,6 +63,8 @@ from movate.tracing.metrics import (
     init_metrics,
     record_job_completed,
     record_run_usage,
+    record_voice_turn,
+    record_workflow_completed,
     register_pool_metrics,
 )
 from movate.tracing.null import SilentTracer
@@ -103,11 +105,13 @@ __all__ = [
     "record_audit_event",
     "record_job_completed",
     "record_run_usage",
+    "record_voice_turn",
+    "record_workflow_completed",
     "register_pool_metrics",
 ]
 
 # Valid values for the ADR-015 deployment sink selector.
-_VALID_SINKS = ("none", "langfuse", "otlp", "both")
+_VALID_SINKS = ("none", "langfuse", "langsmith", "otlp", "both")
 
 
 class TraceSinkError(Exception):
@@ -152,6 +156,9 @@ def _build_from_sink(sink: str) -> Tracer:
     if sink == "langfuse":
         return _require_langfuse()
 
+    if sink == "langsmith":
+        return _require_langsmith()
+
     if sink == "otlp":
         return _require_otel()
 
@@ -176,6 +183,25 @@ def _require_langfuse() -> Tracer:
             "MOVATE_TRACE_SINK=langfuse but Langfuse is unavailable: "
             f"{exc}. Install with `uv tool install --reinstall movate-cli "
             "--extra langfuse` and set LANGFUSE_SECRET_KEY / LANGFUSE_PUBLIC_KEY."
+        ) from exc
+
+
+def _require_langsmith() -> Tracer:
+    """Build the LangSmith tracer or raise an actionable :class:`TraceSinkError`."""
+    try:
+        from movate.integrations.langsmith_tracer import (  # noqa: PLC0415 - lazy by design
+            LangSmithTracer,
+            LangSmithUnavailableError,
+        )
+    except ImportError as exc:  # pragma: no cover - tracer module has no deps
+        raise TraceSinkError(f"langsmith tracer module failed to import: {exc}") from exc
+    try:
+        return LangSmithTracer()
+    except LangSmithUnavailableError as exc:
+        raise TraceSinkError(
+            "MOVATE_TRACE_SINK=langsmith but LangSmith is unavailable: "
+            f"{exc}. Install with `uv sync --extra langchain` "
+            "and set LANGSMITH_API_KEY."
         ) from exc
 
 
@@ -226,18 +252,24 @@ def _build_legacy() -> Tracer:
     if explicit == "langfuse":
         return _build_langfuse_or_fallback()
 
+    if explicit == "langsmith":
+        return _build_langsmith_or_fallback()
+
     if explicit == "otel":
         return _build_otel_or_fallback()
 
     # Auto-detect: both / one / neither configured.
     has_lf = bool(os.environ.get("LANGFUSE_SECRET_KEY", "").strip())
     has_otel = bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip())
+    has_ls = bool(os.environ.get("LANGSMITH_API_KEY", "").strip())
     if has_lf and has_otel:
         return _build_composite_or_fallback(explicit_request=False)
     if has_lf:
         return _build_langfuse_or_fallback()
     if has_otel:
         return _build_otel_or_fallback()
+    if has_ls:
+        return _build_langsmith_or_fallback()
 
     return SilentTracer()
 
@@ -256,6 +288,14 @@ def _build_langfuse_or_fallback() -> Tracer:
     # Fall back to SilentTracer, NOT StdoutTracer: the operator asked for
     # Langfuse, not a flood of JSON spans interleaved with progress bars.
     # Use MOVATE_TRACER=stdout explicitly if you want span output.
+    return SilentTracer()
+
+
+def _build_langsmith_or_fallback() -> Tracer:
+    tracer = _try_build_langsmith()
+    if tracer is not None:
+        return tracer
+    # Same rationale as Langfuse fallback above.
     return SilentTracer()
 
 
@@ -306,6 +346,23 @@ def _try_build_langfuse() -> Tracer | None:
             return None
     except ImportError as exc:  # pragma: no cover - tracer module has no deps
         _warn_once("langfuse-import", f"[movate] Langfuse tracer module failed to import: {exc}")
+        return None
+
+
+def _try_build_langsmith() -> Tracer | None:
+    try:
+        from movate.integrations.langsmith_tracer import (  # noqa: PLC0415 - lazy by design
+            LangSmithTracer,
+            LangSmithUnavailableError,
+        )
+
+        try:
+            return LangSmithTracer()
+        except LangSmithUnavailableError as exc:
+            _warn_once("langsmith", f"[movate] LangSmith unavailable, skipping: {exc}")
+            return None
+    except ImportError as exc:  # pragma: no cover - tracer module has no deps
+        _warn_once("langsmith-import", f"[movate] LangSmith tracer module failed to import: {exc}")
         return None
 
 

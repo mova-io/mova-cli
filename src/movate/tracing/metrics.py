@@ -83,6 +83,19 @@ METRIC_JOBS_IN_FLIGHT = "mdk.jobs.in_flight"
 METRIC_RUN_TOKENS = "mdk.run.tokens"
 METRIC_RUN_COST_USD = "mdk.run.cost_usd"
 
+# ADR 082 — durable-workflow completions. The native runner's terminal jobs are
+# already counted by ``mdk.jobs.completed{kind=WORKFLOW}`` at the dispatch edge,
+# but a Temporal-executed workflow NEVER goes through that edge: it runs in the
+# Temporal worker and emits only its activities' ``agent.execute`` spans. This
+# dedicated counter gives durable workflows a first-class completion signal —
+# emitted from the Temporal terminal activity (``persist_workflow_result_activity``).
+# Attrs: ``status`` (success/error), ``runtime`` (the backend that ran it —
+# currently always ``temporal`` here; the ``runtime`` dimension is forward-compat
+# so a native emitter can later share this instrument), ``workflow`` (the workflow
+# name — bounded, low-cardinality like ``kind``; NOT the run_id), ``tenant``.
+# Backs the Temporal operational workbook (throughput + success/failure rate).
+METRIC_WORKFLOW_COMPLETED = "mdk.workflow.completed"
+
 # ADR 034 D3 — Postgres connection-pool saturation. Observable gauges sampled
 # from the LIVE per-pod asyncpg pool at collection time (see
 # :func:`register_pool_metrics`), not recorded at a hot edge. The scale risk
@@ -107,6 +120,18 @@ METRIC_DB_POOL_MAX = "mdk.db.pool.max"
 # of the pool, and pair the count with the advisory per-tenant cap.
 METRIC_SSE_CONNECTIONS_ACTIVE = "mdk.sse.connections_active"
 
+# Voice turn latency (ADR 024/036/073) — the voice subsystem stamps per-stage
+# ``at_ms`` offsets on its event stream and computes a ``VoiceTurnLatency`` at the
+# WS edge (``compute_turn_latency``). Until now those numbers lived only in the
+# per-turn latency badge and an in-process MetricsObserver — never exported. These
+# bridge them to OTel so an operator sees voice health (the headline first-audio
+# latency, STT endpoint + TTS first-audio breakdown, turn volume, and barge-in
+# rate) alongside the agent/job signals. Recorded once per turn at the edge.
+METRIC_VOICE_RESPONDED_MS = "mdk.voice.responded_ms"  # turn start → first audio (headline)
+METRIC_VOICE_STT_FINAL_MS = "mdk.voice.stt_final_ms"  # turn start → STT endpoint
+METRIC_VOICE_TTS_FIRST_AUDIO_MS = "mdk.voice.tts_first_audio_ms"  # turn start → first TTS frame
+METRIC_VOICE_TURNS = "mdk.voice.turns"  # completed voice turns (attr: interrupted = barge-in)
+
 #: Every OTel instrument name this module emits. The single source of truth the
 #: dashboards-as-code drift guard cross-checks against (a dashboard may only
 #: reference a metric that appears here).
@@ -117,12 +142,17 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_JOBS_IN_FLIGHT,
         METRIC_RUN_TOKENS,
         METRIC_RUN_COST_USD,
+        METRIC_WORKFLOW_COMPLETED,
         METRIC_DB_POOL_SIZE,
         METRIC_DB_POOL_IDLE,
         METRIC_DB_POOL_IN_USE,
         METRIC_DB_POOL_WAITING,
         METRIC_DB_POOL_MAX,
         METRIC_SSE_CONNECTIONS_ACTIVE,
+        METRIC_VOICE_RESPONDED_MS,
+        METRIC_VOICE_STT_FINAL_MS,
+        METRIC_VOICE_TTS_FIRST_AUDIO_MS,
+        METRIC_VOICE_TURNS,
     }
 )
 
@@ -148,7 +178,12 @@ class _State:
     jobs_in_flight: Any = None  # UpDownCounter[int]
     run_tokens: Any = None  # Counter[int]
     run_cost_usd: Any = None  # Counter[float]
+    workflow_completed: Any = None  # Counter[int]  (ADR 082)
     sse_connections_active: Any = None  # UpDownCounter[int]
+    voice_responded_ms: Any = None  # Histogram[float]
+    voice_stt_final_ms: Any = None  # Histogram[float]
+    voice_tts_first_audio_ms: Any = None  # Histogram[float]
+    voice_turns: Any = None  # Counter[int]
 
     # ADR 034 D3 — DB pool observable gauges are registered lazily by
     # ``register_pool_metrics`` (after storage.init at the edge), not in
@@ -272,6 +307,15 @@ def init_metrics(*, reader: Any | None = None) -> None:
         unit="usd",
         description="Total LLM cost (USD) of executed runs.",
     )
+    _state.workflow_completed = meter.create_counter(
+        METRIC_WORKFLOW_COMPLETED,
+        unit="1",
+        description=(
+            "Durable workflows reaching a terminal status (success/error), "
+            "emitted from the Temporal terminal activity (ADR 082). Attrs: "
+            "workflow, status, runtime, tenant."
+        ),
+    )
     _state.sse_connections_active = meter.create_up_down_counter(
         METRIC_SSE_CONNECTIONS_ACTIVE,
         unit="1",
@@ -279,6 +323,26 @@ def init_metrics(*, reader: Any | None = None) -> None:
             "SSE event-stream subscribers currently holding open a "
             "GET /api/v1/events/stream connection (ADR 035 D3)."
         ),
+    )
+    _state.voice_responded_ms = meter.create_histogram(
+        METRIC_VOICE_RESPONDED_MS,
+        unit="ms",
+        description="Voice turn latency: turn start → first audio the user hears (headline).",
+    )
+    _state.voice_stt_final_ms = meter.create_histogram(
+        METRIC_VOICE_STT_FINAL_MS,
+        unit="ms",
+        description="Voice turn latency: turn start → STT endpoint (user words final).",
+    )
+    _state.voice_tts_first_audio_ms = meter.create_histogram(
+        METRIC_VOICE_TTS_FIRST_AUDIO_MS,
+        unit="ms",
+        description="Voice turn latency: turn start → first synthesized audio frame.",
+    )
+    _state.voice_turns = meter.create_counter(
+        METRIC_VOICE_TURNS,
+        unit="1",
+        description="Completed voice turns (attr: interrupted=true for a barge-in).",
     )
 
     _state.initialized = True
@@ -506,6 +570,67 @@ def record_run_usage(
         _state.run_cost_usd.add(float(cost_usd), {"tenant": tenant_id})
 
 
+def record_workflow_completed(
+    *,
+    workflow: str,
+    status: str,
+    runtime: str,
+    tenant_id: str,
+) -> None:
+    """Record one durable workflow reaching a terminal status (ADR 082).
+
+    Bumps ``mdk.workflow.completed`` (attrs: ``workflow``, ``status``,
+    ``runtime``, ``tenant``). ``status`` is the terminal
+    :class:`WorkflowStatus` value (``success`` / ``error``); ``runtime`` is the
+    backend that executed it (``temporal`` for the durable path that calls this).
+    ``workflow`` is the workflow *name* (bounded, low-cardinality — never the
+    run_id). No-op when metrics are off / OTel absent (the instrument is ``None``).
+
+    Emitted from the Temporal terminal activity so durable workflows — which
+    never hit the native dispatch edge that powers ``mdk.jobs.completed`` — get a
+    first-class throughput + success/failure signal for the operational workbook.
+    """
+    if _state.workflow_completed is None:
+        return
+    _state.workflow_completed.add(
+        1,
+        {
+            "workflow": workflow,
+            "status": status,
+            "runtime": runtime,
+            "tenant": tenant_id,
+        },
+    )
+
+
+def record_voice_turn(
+    *,
+    tenant_id: str,
+    responded_ms: float | None = None,
+    stt_final_ms: float | None = None,
+    tts_first_audio_ms: float | None = None,
+    interrupted: bool = False,
+) -> None:
+    """Record one completed voice turn's latency breakdown + barge-in flag.
+
+    Bridges the voice subsystem's per-turn ``VoiceTurnLatency`` (computed at the
+    WS edge via ``compute_turn_latency``) to OTel: the headline first-audio
+    latency plus the STT-endpoint / TTS-first-audio milestones (each a histogram;
+    ``None`` milestones are skipped, e.g. a turn that errored at STT), and a turn
+    counter tagged ``interrupted`` so an operator sees barge-in rate. No-op when
+    metrics are off / OTel absent; never raises.
+    """
+    if _state.voice_turns is None:
+        return
+    if responded_ms is not None:
+        _state.voice_responded_ms.record(float(responded_ms), {"tenant": tenant_id})
+    if stt_final_ms is not None:
+        _state.voice_stt_final_ms.record(float(stt_final_ms), {"tenant": tenant_id})
+    if tts_first_audio_ms is not None:
+        _state.voice_tts_first_audio_ms.record(float(tts_first_audio_ms), {"tenant": tenant_id})
+    _state.voice_turns.add(1, {"tenant": tenant_id, "interrupted": str(interrupted).lower()})
+
+
 def inc_in_flight(*, tenant_id: str) -> None:
     """Increment the in-flight job gauge (attrs: ``tenant``). No-op when off."""
     if _state.jobs_in_flight is None:
@@ -562,6 +687,11 @@ __all__ = [
     "METRIC_RUN_COST_USD",
     "METRIC_RUN_TOKENS",
     "METRIC_SSE_CONNECTIONS_ACTIVE",
+    "METRIC_VOICE_RESPONDED_MS",
+    "METRIC_VOICE_STT_FINAL_MS",
+    "METRIC_VOICE_TTS_FIRST_AUDIO_MS",
+    "METRIC_VOICE_TURNS",
+    "METRIC_WORKFLOW_COMPLETED",
     "PoolStatsCallback",
     "dec_in_flight",
     "dec_sse_connections",
@@ -570,5 +700,7 @@ __all__ = [
     "init_metrics",
     "record_job_completed",
     "record_run_usage",
+    "record_voice_turn",
+    "record_workflow_completed",
     "register_pool_metrics",
 ]

@@ -115,6 +115,44 @@ def test_load_workflow_spec_accepts_directory_path(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+def test_runtime_field_defaults_to_native(tmp_path: Path) -> None:
+    """Existing workflow.yaml files (no ``runtime:`` set) keep the v0.3
+    behavior: WorkflowSpec.runtime defaults to ``"native"`` (ADR 054 D2,
+    zero behavior change for the default load path)."""
+    yaml_path = _linear_two_node(tmp_path)
+    spec, _ = load_workflow_spec(yaml_path)
+    assert spec.runtime == "native"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("runtime", ["native", "langgraph", "temporal"])
+def test_runtime_field_accepts_known_backends(tmp_path: Path, runtime: str) -> None:
+    """The ``runtime:`` enum accepts every backend declared in ADR 054 D2 —
+    ``native`` (default in-process runner), ``langgraph`` (ADR 030 export
+    target), and ``temporal`` (ADR 054 durable backend, opt-in via
+    ``mdk[temporal]``)."""
+    yaml_path = _linear_two_node(tmp_path)
+    raw = yaml.safe_load(yaml_path.read_text())
+    raw["runtime"] = runtime
+    yaml_path.write_text(yaml.safe_dump(raw))
+    spec, _ = load_workflow_spec(yaml_path)
+    assert spec.runtime == runtime
+
+
+@pytest.mark.unit
+def test_runtime_field_rejects_unknown_value(tmp_path: Path) -> None:
+    """An unknown ``runtime:`` value fails Pydantic validation at parse time
+    (no silent drop to ``native``) — keeps the enum exhaustive and surfaces
+    typos / forward-references to unshipped backends loud."""
+    yaml_path = _linear_two_node(tmp_path)
+    raw = yaml.safe_load(yaml_path.read_text())
+    raw["runtime"] = "argo-workflows"
+    yaml_path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(WorkflowSpecLoadError, match="validation failed"):
+        load_workflow_spec(yaml_path)
+
+
+@pytest.mark.unit
 def test_load_workflow_spec_missing_file(tmp_path: Path) -> None:
     with pytest.raises(WorkflowSpecLoadError, match="not found"):
         load_workflow_spec(tmp_path)

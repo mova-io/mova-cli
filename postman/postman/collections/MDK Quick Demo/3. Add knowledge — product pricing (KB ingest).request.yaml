@@ -1,0 +1,22 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/agents/{{agent_name}}/kb"
+method: POST
+headers:
+  Content-Type: application/json
+body:
+  type: text
+  content: |-
+    {
+      "kind": "text",
+      "title": "product-pricing",
+      "content": "# Movate Product Plans\n\n## Starter Plan ($29/mo)\n- 3 user seats\n- 10GB storage\n- Email support (business hours)\n- 1 AI agent\n\n## Standard Plan ($99/mo)\n- 10 user seats\n- 100GB storage\n- Priority email + chat support\n- 5 AI agents\n- Knowledge base (RAG)\n- Basic analytics\n\n## Enterprise Plan (custom pricing)\n- Unlimited seats\n- Unlimited storage\n- 24/7 dedicated support + SLA\n- Unlimited AI agents\n- Knowledge graphs + advanced RAG\n- SSO / SAML\n- Custom model fine-tuning\n- On-premise deployment option\n\n## Add-ons\n- Voice agent: +$20/mo per agent\n- Phone bridge (Twilio): +$50/mo\n- Advanced analytics dashboard: +$30/mo"
+    }
+scripts:
+  - type: afterResponse
+    code: |-
+      if (pm.response.code === 200) {
+          var body = pm.response.json();
+          console.log('📚 Chunks saved: ' + (body.chunks_saved || body.chunks || '?'));
+      }
+    language: text/javascript
+order: 4000

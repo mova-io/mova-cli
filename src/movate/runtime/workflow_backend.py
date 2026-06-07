@@ -74,7 +74,8 @@ def require_backend_available(effective_runtime: str) -> None:
     """Fail loud (D6) if the selected backend cannot execute — BEFORE any run.
 
     * ``native``    → always available; no-op.
-    * ``langgraph`` → not yet wired (ADR 055 step 3); raise.
+    * ``langgraph`` → wired (ADR 030 D1); the ``[langgraph]`` extra must be
+      importable, else raise the install hint.
     * ``temporal``  → the ``[temporal]`` extra must be importable AND a
       connection configured; raise with the matching hint otherwise.
 
@@ -84,12 +85,8 @@ def require_backend_available(effective_runtime: str) -> None:
     if effective_runtime == "native":
         return
     if effective_runtime == "langgraph":
-        raise WorkflowBackendError(
-            "LangGraph backend execution is not yet wired (ADR 055 step 3); "
-            "use runtime 'native' or 'temporal'. (The LangGraph compiler exists "
-            "for `mdk export langgraph`, but selecting it for execution is "
-            "deliberately rejected rather than silently downgraded.)"
-        )
+        _require_langgraph_extra()
+        return
     if effective_runtime == "temporal":
         _require_temporal_extra()
         _resolve_temporal_connection()  # raises if no TEMPORAL_HOST configured.
@@ -106,6 +103,17 @@ def _require_temporal_extra() -> None:
         raise WorkflowBackendError(
             "The [temporal] extra is not installed. "
             "Install with: uv tool install --editable '.[temporal]' --force"
+        ) from exc
+
+
+def _require_langgraph_extra() -> None:
+    """Raise the install hint if the ``[langgraph]`` extra is absent (D6)."""
+    try:
+        import langgraph  # noqa: F401, PLC0415 — availability probe only.
+    except ImportError as exc:
+        raise WorkflowBackendError(
+            "The [langgraph] extra is not installed. "
+            "Install with: uv tool install --editable '.[langgraph]' --force"
         ) from exc
 
 
@@ -147,6 +155,88 @@ def _resolve_temporal_connection() -> TemporalConnection:
     namespace = os.environ.get("TEMPORAL_NAMESPACE", "").strip() or "default"
     tls_cert = os.environ.get("TEMPORAL_TLS_CERT", "").strip() or None
     return TemporalConnection(host=host, namespace=namespace, tls_cert_path=tls_cert)
+
+
+async def get_temporal_client() -> Any:
+    """Connect to Temporal from the resolved BYOK config and return the client.
+
+    Factors the connect + optional-TLS pattern inlined in
+    :func:`run_temporal_workflow` / :func:`run_temporal_worker` so callers that
+    only need a client — notably the runtime's resume-on-signal endpoint, which
+    signals a paused durable run's handle (ADR 062 D2) — get one without
+    duplicating the connection plumbing. Reads ``TEMPORAL_HOST`` /
+    ``TEMPORAL_NAMESPACE`` / ``TEMPORAL_TLS_CERT`` via
+    :func:`_resolve_temporal_connection` (fail-loud if ``TEMPORAL_HOST`` is
+    unset). Lazy ``temporalio`` import keeps the native-only install at zero
+    cost (ADR 054 D7).
+    """
+    from temporalio.client import Client  # noqa: PLC0415
+    from temporalio.service import TLSConfig  # noqa: PLC0415
+
+    conn = _resolve_temporal_connection()
+    tls: Any = False
+    if conn.tls_cert_path:
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
+    return await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
+
+
+def _build_temporal_metrics_runtime() -> Any | None:
+    """A ``temporalio`` Runtime that exports the SDK's built-in metrics to OTLP.
+
+    The Temporal Python SDK emits worker/client telemetry — task-queue backlog
+    (``temporal_*_schedule_to_start_latency``), worker slot availability, poll
+    success, sticky-cache hit rate, request latency/failures — that mdk's own
+    instruments can't see (ADR 082 follow-on). Wiring a Runtime with an
+    OpenTelemetry metrics exporter pushes them to the SAME OTLP collector the
+    app's spans/metrics use (ADR 020), so they land in App Insights / Prometheus
+    as ``temporal_*`` series alongside the ``mdk.*`` ones.
+
+    Returns ``None`` (→ caller uses temporalio's default Runtime, zero SDK
+    metrics, unchanged behavior) when no OTLP endpoint / metrics sink is
+    configured, AND on any error building the Runtime — telemetry must never stop
+    a worker from starting (fail-soft, mirrors ``init_metrics``). Only the
+    long-lived worker calls this: one Runtime per process (a fresh Runtime per
+    short-lived client would re-init core telemetry needlessly).
+    """
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if not endpoint:
+        return None
+    # Gate on the same condition mdk's own metrics use, so an operator who turned
+    # the sink off (MOVATE_TRACE_SINK=none / langfuse) doesn't get Temporal metrics.
+    try:
+        from movate.tracing.metrics import _otlp_metrics_enabled  # noqa: PLC0415
+
+        if not _otlp_metrics_enabled():
+            return None
+    except Exception:  # pragma: no cover - tracing import shouldn't fail
+        pass
+    try:
+        from temporalio.runtime import (  # noqa: PLC0415
+            OpenTelemetryConfig,
+            Runtime,
+            TelemetryConfig,
+        )
+
+        protocol = (
+            os.environ.get("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "").strip().lower()
+            or os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "").strip().lower()
+        )
+        is_http = protocol in ("http/protobuf", "http", "httpprotobuf")
+        return Runtime(
+            telemetry=TelemetryConfig(metrics=OpenTelemetryConfig(url=endpoint, http=is_http))
+        )
+    except Exception as exc:  # pragma: no cover - fail-soft like init_metrics
+        import sys  # noqa: PLC0415
+
+        sys.stderr.write(
+            f"[movate] Temporal SDK metrics unavailable, using default runtime: {exc}\n"
+        )
+        return None
 
 
 def load_compiled_workflow_class(module_source: str, class_name: str) -> Any:
@@ -235,9 +325,11 @@ async def run_temporal_workflow(
     from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
         call_agent_activity,
         call_gate_activity,
+        call_human_activity,
         call_judge_activity,
         call_skill_activity,
         configure_activities,
+        persist_workflow_result_activity,
     )
 
     wf_id = workflow_run_id or str(uuid4())
@@ -284,6 +376,8 @@ async def run_temporal_workflow(
             call_skill_activity,
             call_gate_activity,
             call_judge_activity,
+            call_human_activity,
+            persist_workflow_result_activity,
         ],
         wf_id=wf_id,
         run_state=run_state,
@@ -395,17 +489,19 @@ async def run_temporal_worker(
     from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
         call_agent_activity,
         call_gate_activity,
+        call_human_activity,
         call_judge_activity,
         call_skill_activity,
         configure_activities,
+        persist_workflow_result_activity,
     )
 
     _require_temporal_extra()
     conn = _resolve_temporal_connection()
 
     # Compile every temporal-declared workflow to a registrable class. A
-    # workflow that fails to compile (e.g. a HUMAN node — Phase 2) is surfaced
-    # loudly rather than silently dropped.
+    # workflow that fails to compile (an unsupported node type — sub-workflow /
+    # function, ADR 054) is surfaced loudly rather than silently dropped.
     compiler = TemporalCompiler()
     workflow_classes: list[Any] = []
     registered: list[str] = []
@@ -435,7 +531,14 @@ async def run_temporal_worker(
 
         tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
 
-    client = await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
+    # Export the Temporal SDK's built-in worker/client metrics to OTLP (ADR 082
+    # follow-on) when an OTLP endpoint is configured — one Runtime for this
+    # long-lived worker process; None → temporalio's default Runtime (unchanged).
+    metrics_runtime = _build_temporal_metrics_runtime()
+    connect_kwargs: dict[str, Any] = {"namespace": conn.namespace, "tls": tls}
+    if metrics_runtime is not None:
+        connect_kwargs["runtime"] = metrics_runtime
+    client = await Client.connect(conn.host, **connect_kwargs)
 
     worker = Worker(
         client,
@@ -446,6 +549,8 @@ async def run_temporal_worker(
             call_skill_activity,
             call_gate_activity,
             call_judge_activity,
+            call_human_activity,
+            persist_workflow_result_activity,
         ],
         # Run compiled workflows unsandboxed — the source is generated at
         # runtime (not a file the sandbox can re-import); determinism is
@@ -466,6 +571,7 @@ __all__ = [
     "VALID_RUNTIMES",
     "TemporalConnection",
     "WorkflowBackendError",
+    "get_temporal_client",
     "load_compiled_workflow_class",
     "require_backend_available",
     "resolve_effective_runtime",

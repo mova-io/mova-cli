@@ -256,6 +256,11 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Bounded multi-agent simulation: a FIXED roster of two participants under a supervisor, hard-capped turns, terminating JUDGE. NOT a swarm.",  # noqa: E501
         "SUPERVISOR → (A → B → JUDGE) x2 → done",
     ),
+    # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
+    # they were pushed directly to main substantially incomplete (sub-agents
+    # missing canonical YAML schemas + judge examples; templates missing root
+    # GOVERNANCE.md + judge), which broke the required lint-and-test check and
+    # jammed the merge queue. Re-land them complete via a proper PR.
 }
 
 
@@ -302,6 +307,11 @@ WORKFLOW_TEMPLATES: dict[str, str] = {
     # workflow.yaml structure (ADR 017 IR). The starter referenced by
     # ADR 028 D2.
     "workflow-starter": "workflow_starter",
+    # Self-improving reflection loop (ADR 056 D4): produce → JUDGE →
+    # (revise → produce)* bounded by max_iterations, with the judge's
+    # feedback threaded into each revision. The canonical "judge node +
+    # bounded loop" reference.
+    "reflective-agent": "reflective_agent",
 }
 
 

@@ -34,11 +34,12 @@
 // When enableWorkbooks=false, main.bicep does not instantiate this module at all,
 // so ZERO workbook resources are emitted and the template is unchanged.
 //
-// SCOPE NOTE: this module ships the FOUR persona Workbooks (operator / platform /
-// eval-and-drift / tenant-ops). The fifth in-repo JSON,
-// infra/azure-monitor/workbooks/insights.workbook.json, is an intelligence-layer
-// Workbook whose narrative panels read the ADR-047 Observability Intelligence API
-// (NOT an App* table), so it is intentionally left out of this deploy surface.
+// SCOPE NOTE: this module ships the four persona Workbooks (operator / platform /
+// eval-and-drift / tenant-ops) PLUS the temporal operational Workbook (ADR 082).
+// The intelligence-layer JSON, infra/azure-monitor/workbooks/insights.workbook.json,
+// is an intelligence-layer Workbook whose narrative panels read the ADR-047
+// Observability Intelligence API (NOT an App* table), so it is intentionally left
+// out of this deploy surface.
 
 @description('Resource id of the EXISTING Log Analytics workspace the workspace-based App Insights writes its App* tables to. Each Workbook\'s `sourceId` is set to this, and the KQL items bind to it. Passed from logs.outputs.workspaceId in main.bicep — the same workspace monitor-alerts.bicep scopes to.')
 param workspaceResourceId string
@@ -115,6 +116,25 @@ resource tenantOpsWorkbook 'Microsoft.Insights/workbooks@2023-06-01' = {
   }
 }
 
+// Temporal operational workbook (ADR 082) — durable-workflow throughput +
+// success/failure rate from the mdk.workflow.completed counter the Temporal
+// terminal activity emits. Rides the SAME enableWorkbooks gate; only meaningful
+// once the self-hosted Temporal backend (ADR 078) is deployed + emitting, but
+// the workbook is harmless (empty panels) otherwise.
+resource temporalWorkbook 'Microsoft.Insights/workbooks@2023-06-01' = {
+  name: guid(resourceGroup().id, 'mdk-temporal-workbook')
+  location: location
+  tags: tags
+  kind: 'shared'
+  properties: {
+    displayName: '${namePrefix}temporal'
+    serializedData: loadTextContent('../../azure-monitor/workbooks/temporal.workbook.json')
+    sourceId: workspaceResourceId
+    category: 'workbook'
+    version: '1.0'
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Outputs — resource ids so main.bicep / downstream tooling can reference the
 // deployed Workbooks (e.g. to print a portal link after deploy).
@@ -131,3 +151,6 @@ output evalAndDriftWorkbookId string = evalAndDriftWorkbook.id
 
 @description('Resource id of the deployed tenant-ops Workbook.')
 output tenantOpsWorkbookId string = tenantOpsWorkbook.id
+
+@description('Resource id of the deployed temporal Workbook (ADR 082).')
+output temporalWorkbookId string = temporalWorkbook.id

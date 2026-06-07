@@ -26,6 +26,8 @@ from movate.tracing import (
     init_metrics,
     record_job_completed,
     record_run_usage,
+    record_voice_turn,
+    record_workflow_completed,
 )
 from movate.tracing.metrics import _State
 
@@ -74,6 +76,8 @@ def test_helpers_are_noops_when_uninitialized() -> None:
     # Instruments are None (the reset fixture guarantees it).
     record_job_completed(kind="agent", status="success", duration_ms=12, tenant_id="t1")
     record_run_usage(tenant_id="t1", tokens=100, cost_usd=0.01)
+    record_workflow_completed(workflow="wf", status="success", runtime="temporal", tenant_id="t1")
+    record_voice_turn(tenant_id="t1", responded_ms=420.0, stt_final_ms=120.0)
     inc_in_flight(tenant_id="t1")
     dec_in_flight(tenant_id="t1")
     # Reached here without raising — the assertion is "no exception".
@@ -218,6 +222,38 @@ def test_record_run_usage_emits_token_and_cost_counters() -> None:
 
 @pytest.mark.unit
 @pytest.mark.skipif(not _otel_installed(), reason="needs OTel SDK")
+def test_record_workflow_completed_emits_counter_with_attrs() -> None:
+    """ADR 082: durable-workflow completion counter carries workflow/status/runtime/tenant."""
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader  # noqa: PLC0415
+
+    reader = InMemoryMetricReader()
+    init_metrics(reader=reader)
+    assert metrics_mod._state.workflow_completed is not None  # instrument built
+
+    record_workflow_completed(
+        workflow="refund_approval", status="success", runtime="temporal", tenant_id="tenant-a"
+    )
+    record_workflow_completed(
+        workflow="refund_approval", status="error", runtime="temporal", tenant_id="tenant-a"
+    )
+
+    metrics = _collect(reader)
+    assert "mdk.workflow.completed" in metrics
+    by_attrs = {
+        (
+            dp.attributes["workflow"],
+            dp.attributes["status"],
+            dp.attributes["runtime"],
+            dp.attributes["tenant"],
+        ): dp.value
+        for dp in metrics["mdk.workflow.completed"]
+    }
+    assert by_attrs[("refund_approval", "success", "temporal", "tenant-a")] == 1
+    assert by_attrs[("refund_approval", "error", "temporal", "tenant-a")] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not _otel_installed(), reason="needs OTel SDK")
 def test_record_run_usage_skips_none_values() -> None:
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader  # noqa: PLC0415
 
@@ -229,6 +265,47 @@ def test_record_run_usage_skips_none_values() -> None:
     # Neither counter should have produced datapoints.
     assert not metrics.get("mdk.run.tokens")
     assert not metrics.get("mdk.run.cost_usd")
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not _otel_installed(), reason="needs OTel SDK")
+def test_record_voice_turn_emits_latency_histograms_and_turn_counter() -> None:
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader  # noqa: PLC0415
+
+    reader = InMemoryMetricReader()
+    init_metrics(reader=reader)
+    assert metrics_mod._state.voice_turns is not None  # instruments built
+
+    record_voice_turn(
+        tenant_id="tenant-a",
+        responded_ms=850.0,
+        stt_final_ms=300.0,
+        tts_first_audio_ms=700.0,
+        interrupted=True,
+    )
+    metrics = _collect(reader)
+    assert "mdk.voice.responded_ms" in metrics
+    assert "mdk.voice.stt_final_ms" in metrics
+    assert "mdk.voice.tts_first_audio_ms" in metrics
+    # Turn counter carries the barge-in flag + tenant.
+    dp = metrics["mdk.voice.turns"][0]
+    assert dp.attributes["interrupted"] == "true"
+    assert dp.attributes["tenant"] == "tenant-a"
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not _otel_installed(), reason="needs OTel SDK")
+def test_record_voice_turn_skips_none_milestones() -> None:
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader  # noqa: PLC0415
+
+    reader = InMemoryMetricReader()
+    init_metrics(reader=reader)
+    # A turn that errored at STT: only the turn counter, no latency datapoints.
+    record_voice_turn(tenant_id="t1")
+    metrics = _collect(reader)
+    assert metrics.get("mdk.voice.turns")  # counted
+    assert not metrics.get("mdk.voice.responded_ms")
+    assert not metrics.get("mdk.voice.stt_final_ms")
 
 
 @pytest.mark.unit

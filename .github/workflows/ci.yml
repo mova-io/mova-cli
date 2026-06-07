@@ -16,7 +16,12 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 — the version is git-derived (ADR 066): the editable
+      # install below runs the hatch metadata hook, which counts commits to
+      # compute the CalVer counter N. A shallow clone would undercount N.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -26,12 +31,12 @@ jobs:
       - name: Set up Python
         run: uv python install 3.11
 
-      # NOTE (ADR 059): the per-PR "Version bump gate" was REMOVED. PRs no
-      # longer carry a version bump — the CalVer version is assigned once, at
-      # merge, by `.github/workflows/release-version.yml` (push-to-main). This
-      # eliminated the version-file conflicts + forced re-bumps that the
-      # branch-local version caused. The pyproject↔uv.lock consistency check
-      # below stays (it catches a real dep-drift bug, orthogonal to versioning).
+      # NOTE (ADR 066): the version is DERIVED FROM GIT at build time and is not
+      # committed in any file — so PRs never carry a version diff and never
+      # conflict on a version line (this supersedes ADR 059's at-merge bump,
+      # which couldn't push to protected main). The pyproject↔uv.lock consistency
+      # check below stays (it catches a real dep-drift bug, orthogonal to
+      # versioning; uv.lock no longer pins movate-cli's own version).
 
       # Catches pyproject.toml ↔ uv.lock drift. If you bump a dep in
       # pyproject.toml without re-running `uv lock`, the Docker build's

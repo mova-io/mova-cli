@@ -29,6 +29,14 @@ kind: Workflow
 
 name: task-oriented
 version: 0.1.0
+
+# Execution runtime — picked per workflow.
+# native    = in-process (default, fast, ephemeral)
+# langgraph = export-and-execute via LangGraph (ADR 030)
+# temporal  = deterministic, durable, replayable (ADR 054)
+# Flip to `runtime: temporal` for durable multi-day execution + replay debugging.
+# runtime: native
+
 description: >
   Bounded supervisor fan-out: a planner decomposes a request into a fixed,
   capped set of task branches, each run by a typed task agent, then collected.

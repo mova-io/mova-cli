@@ -1,0 +1,4 @@
+$kind: http-request
+url: "{{runtime_url}}/api/v1/runs/{{run_id}}/trace"
+method: GET
+order: 7000
