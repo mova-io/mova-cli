@@ -74,7 +74,8 @@ def require_backend_available(effective_runtime: str) -> None:
     """Fail loud (D6) if the selected backend cannot execute — BEFORE any run.
 
     * ``native``    → always available; no-op.
-    * ``langgraph`` → not yet wired (ADR 055 step 3); raise.
+    * ``langgraph`` → wired (ADR 030 D1); the ``[langgraph]`` extra must be
+      importable, else raise the install hint.
     * ``temporal``  → the ``[temporal]`` extra must be importable AND a
       connection configured; raise with the matching hint otherwise.
 
@@ -154,6 +155,31 @@ def _resolve_temporal_connection() -> TemporalConnection:
     namespace = os.environ.get("TEMPORAL_NAMESPACE", "").strip() or "default"
     tls_cert = os.environ.get("TEMPORAL_TLS_CERT", "").strip() or None
     return TemporalConnection(host=host, namespace=namespace, tls_cert_path=tls_cert)
+
+
+async def get_temporal_client() -> Any:
+    """Connect to Temporal from the resolved BYOK config and return the client.
+
+    Factors the connect + optional-TLS pattern inlined in
+    :func:`run_temporal_workflow` / :func:`run_temporal_worker` so callers that
+    only need a client — notably the runtime's resume-on-signal endpoint, which
+    signals a paused durable run's handle (ADR 062 D2) — get one without
+    duplicating the connection plumbing. Reads ``TEMPORAL_HOST`` /
+    ``TEMPORAL_NAMESPACE`` / ``TEMPORAL_TLS_CERT`` via
+    :func:`_resolve_temporal_connection` (fail-loud if ``TEMPORAL_HOST`` is
+    unset). Lazy ``temporalio`` import keeps the native-only install at zero
+    cost (ADR 054 D7).
+    """
+    from temporalio.client import Client  # noqa: PLC0415
+    from temporalio.service import TLSConfig  # noqa: PLC0415
+
+    conn = _resolve_temporal_connection()
+    tls: Any = False
+    if conn.tls_cert_path:
+        from pathlib import Path as _Path  # noqa: PLC0415
+
+        tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
+    return await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
 
 
 def load_compiled_workflow_class(module_source: str, class_name: str) -> Any:
@@ -242,9 +268,11 @@ async def run_temporal_workflow(
     from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
         call_agent_activity,
         call_gate_activity,
+        call_human_activity,
         call_judge_activity,
         call_skill_activity,
         configure_activities,
+        persist_workflow_result_activity,
     )
 
     wf_id = workflow_run_id or str(uuid4())
@@ -291,6 +319,8 @@ async def run_temporal_workflow(
             call_skill_activity,
             call_gate_activity,
             call_judge_activity,
+            call_human_activity,
+            persist_workflow_result_activity,
         ],
         wf_id=wf_id,
         run_state=run_state,
@@ -402,17 +432,19 @@ async def run_temporal_worker(
     from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
         call_agent_activity,
         call_gate_activity,
+        call_human_activity,
         call_judge_activity,
         call_skill_activity,
         configure_activities,
+        persist_workflow_result_activity,
     )
 
     _require_temporal_extra()
     conn = _resolve_temporal_connection()
 
     # Compile every temporal-declared workflow to a registrable class. A
-    # workflow that fails to compile (e.g. a HUMAN node — Phase 2) is surfaced
-    # loudly rather than silently dropped.
+    # workflow that fails to compile (an unsupported node type — sub-workflow /
+    # function, ADR 054) is surfaced loudly rather than silently dropped.
     compiler = TemporalCompiler()
     workflow_classes: list[Any] = []
     registered: list[str] = []
@@ -453,6 +485,8 @@ async def run_temporal_worker(
             call_skill_activity,
             call_gate_activity,
             call_judge_activity,
+            call_human_activity,
+            persist_workflow_result_activity,
         ],
         # Run compiled workflows unsandboxed — the source is generated at
         # runtime (not a file the sandbox can re-import); determinism is
@@ -473,6 +507,7 @@ __all__ = [
     "VALID_RUNTIMES",
     "TemporalConnection",
     "WorkflowBackendError",
+    "get_temporal_client",
     "load_compiled_workflow_class",
     "require_backend_available",
     "resolve_effective_runtime",

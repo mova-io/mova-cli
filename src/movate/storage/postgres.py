@@ -719,6 +719,11 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_version TEXT;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS paused_node_id TEXT;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS paused_state JSONB;
 ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS human_task JSONB;
+-- ADR 062 D2: which backend owns this run. NULL on pre-migration / native rows
+-- → None → the resume-on-signal endpoint defaults to the native re-walk; only
+-- 'temporal' routes the resume to a Temporal signal. Additive + nullable, same
+-- backward-compatible story as the paused_* columns above.
+ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS runtime TEXT;
 
 -- ADR 017 D5 (PR 2): resume-on-signal. The signal endpoint enqueues a
 -- JobKind.WORKFLOW continuation job carrying the workflow_run_id to resume
@@ -3498,8 +3503,8 @@ class PostgresProvider:
             INSERT INTO workflow_runs (
                 workflow_run_id, tenant_id, workflow, workflow_version,
                 status, initial_state, final_state, error_node_id, error,
-                created_at, paused_node_id, paused_state, human_task
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                created_at, paused_node_id, paused_state, human_task, runtime
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (workflow_run_id) DO UPDATE SET
                 tenant_id        = EXCLUDED.tenant_id,
                 workflow         = EXCLUDED.workflow,
@@ -3512,7 +3517,8 @@ class PostgresProvider:
                 created_at       = EXCLUDED.created_at,
                 paused_node_id   = EXCLUDED.paused_node_id,
                 paused_state     = EXCLUDED.paused_state,
-                human_task       = EXCLUDED.human_task
+                human_task       = EXCLUDED.human_task,
+                runtime          = EXCLUDED.runtime
             """,
             w.workflow_run_id,
             w.tenant_id,
@@ -3527,6 +3533,7 @@ class PostgresProvider:
             w.paused_node_id,
             w.paused_state,
             w.human_task,
+            w.runtime,
         )
 
     async def get_workflow_run(
@@ -5778,6 +5785,8 @@ def _row_to_workflow_run(row: asyncpg.Record) -> WorkflowRunRecord:
         paused_node_id=row["paused_node_id"],
         paused_state=dict(row["paused_state"]) if row["paused_state"] else None,
         human_task=dict(row["human_task"]) if row["human_task"] else None,
+        # ADR 062 D2: backend owner. NULL on pre-migration / native rows → None.
+        runtime=row["runtime"],
     )
 
 

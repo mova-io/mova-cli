@@ -401,11 +401,16 @@ async def _run_temporal_worker(
     # Resolve connection details for the startup banner (ADR 054 D8/D12).
     # require_backend_available already validated; this is a cheap re-resolve.
     conn = _resolve_temporal_connection()
+    # Mirror the activities registered by run_temporal_worker() in
+    # workflow_backend.py — keep this banner list in sync with that worker's
+    # activities=[...] so the startup banner doesn't under-report what's wired.
     activity_names = [
         "call_agent_activity",
         "call_skill_activity",
         "call_gate_activity",
         "call_judge_activity",
+        "call_human_activity",
+        "persist_workflow_result_activity",
     ]
 
     if temporal_wfs:

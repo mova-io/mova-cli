@@ -1,9 +1,10 @@
 #!/bin/sh
-# One-time dev setup: route git hooks to the tracked .githooks/ directory so
-# the CalVer version (YYYY.M.D.N) auto-bumps on every commit.
+# One-time dev setup: route git hooks to the tracked .githooks/ directory.
 #
-# Git does not share hooks automatically (they live in .git/hooks, which is
-# not version-controlled), so each clone runs this once:
+# NOTE (ADR 066): the version is now DERIVED FROM GIT at build time, so the
+# pre-commit hook no longer bumps a version — it's a no-op today. This script is
+# kept so `core.hooksPath=.githooks` is wired for any FUTURE shared hook; running
+# it is harmless but currently does nothing version-related.
 #
 #     ./scripts/install-hooks.sh
 #
@@ -14,4 +15,4 @@ git config core.hooksPath .githooks
 chmod +x .githooks/pre-commit 2>/dev/null || true
 
 echo "✓ Git hooks enabled (core.hooksPath=.githooks)."
-echo "  Versions now auto-bump as YYYY.M.D.N on every commit."
+echo "  Version is git-derived at build time (ADR 066) — no per-commit bump."

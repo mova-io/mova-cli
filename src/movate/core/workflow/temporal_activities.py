@@ -534,11 +534,109 @@ def _extract_verdict_label(state: dict[str, Any]) -> str:
     return ""
 
 
+@_activity.defn  # type: ignore[untyped-decorator]
+async def call_human_activity(
+    node_id: str,
+    state: dict[str, Any],
+    run_id: str,
+    prompt: str,
+    output_contract: list[str],
+    approvers: list[str],
+    workflow_name: str,
+    workflow_version: str,
+) -> None:
+    """HUMAN node → persist a durable awaiting-human pause record (ADR 062).
+
+    Compiler contract (``_emit_human_node``): the workflow calls this activity,
+    then parks on ``workflow.wait_condition`` until a ``human_response`` signal
+    arrives. This activity records the pause in the mdk store so an operator can
+    list it (``GET /workflow-runs?status=paused``) and a transport can render
+    the approval; the HTTP signal endpoint (``POST /workflow-runs/{id}/signal``)
+    reads this record, validates the decision against ``output_contract``, then
+    signals the Temporal handle — which resolves the ``wait_condition``.
+
+    Mirrors the native runner's pause write (``runner.py`` HUMAN branch): same
+    PAUSED status, ``paused_node_id``, ``paused_state`` and ``human_task`` shape
+    — plus ``runtime='temporal'`` so the signal endpoint routes the resume to
+    the Temporal handle instead of enqueuing a native re-walk (ADR 062 D2). The
+    activity returns nothing; its effect is the persisted checkpoint.
+    """
+    from movate.core.models import WorkflowRunRecord, WorkflowStatus  # noqa: PLC0415
+
+    ctx = _get_context()
+    human_task = {
+        "prompt": prompt,
+        "output_contract": list(output_contract),
+        "approvers": list(approvers),
+    }
+    record = WorkflowRunRecord(
+        workflow_run_id=run_id,
+        tenant_id=_resolve_tenant_id(ctx, state),
+        workflow=workflow_name,
+        workflow_version=workflow_version,
+        status=WorkflowStatus.PAUSED,
+        initial_state=dict(state),
+        final_state=dict(state),
+        paused_node_id=node_id,
+        paused_state=dict(state),
+        human_task=human_task,
+        runtime="temporal",
+    )
+    await ctx.storage.save_workflow_run(record)
+
+
+@_activity.defn  # type: ignore[untyped-decorator]
+async def persist_workflow_result_activity(
+    run_id: str,
+    status: str,
+    initial_state: dict[str, Any],
+    final_state: dict[str, Any],
+    error: str | None,
+    workflow_name: str,
+    workflow_version: str,
+) -> None:
+    """Write the TERMINAL ``WorkflowRunRecord`` for a Temporal run (ADR 080 D2).
+
+    The compiler emits a call to this around the workflow body: on success (and,
+    via a handled exception, on error) the workflow persists its terminal state
+    to the mdk store so ``mdk runs show`` is accurate and a resumed HITL run is
+    flipped out of ``PAUSED`` (clearing the ``?status=paused`` approvals list).
+    The native runner writes this record at end-of-run; the long-lived Temporal
+    worker has no per-workflow completion callback, so the workflow persists its
+    own terminal state from within an activity (side effects in activities,
+    ADR 054 D10). Upserts on ``workflow_run_id`` — overwriting any prior PAUSED
+    checkpoint under the same id (``run_id`` == the Temporal workflow id, D6).
+    """
+    from movate.core.models import (  # noqa: PLC0415
+        ErrorInfo,
+        WorkflowRunRecord,
+        WorkflowStatus,
+    )
+
+    ctx = _get_context()
+    record = WorkflowRunRecord(
+        workflow_run_id=run_id,
+        tenant_id=_resolve_tenant_id(ctx, final_state),
+        workflow=workflow_name,
+        workflow_version=workflow_version,
+        status=WorkflowStatus(status),
+        initial_state=dict(initial_state),
+        final_state=dict(final_state),
+        error=(
+            ErrorInfo(type="temporal_workflow_error", message=error) if error is not None else None
+        ),
+        runtime="temporal",
+    )
+    await ctx.storage.save_workflow_run(record)
+
+
 __all__ = [
     "ActivityContext",
     "call_agent_activity",
     "call_gate_activity",
+    "call_human_activity",
     "call_judge_activity",
     "call_skill_activity",
     "configure_activities",
+    "persist_workflow_result_activity",
 ]

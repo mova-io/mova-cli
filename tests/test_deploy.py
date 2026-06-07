@@ -449,7 +449,7 @@ def test_cli_deploy_full_run_invokes_acr_build_and_two_updates(
     # two containerapp updates. Each call begins with 'az'. The pgvector
     # pre-flight's read-only `az postgres ...` call is filtered out — it's a
     # gate, not part of the build/roll shape under test.
-    deploy_calls = [c for c in mock_subprocess if "postgres" not in c]
+    deploy_calls = [c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c]
     assert len(deploy_calls) == 3
     build_cmd = deploy_calls[0]
     assert build_cmd[:3] == ["az", "acr", "build"]
@@ -482,7 +482,7 @@ def test_cli_deploy_skip_build_omits_acr_build(deploy_env, mock_subprocess) -> N
         ],
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    deploy_calls = [c for c in mock_subprocess if "postgres" not in c]
+    deploy_calls = [c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c]
     assert len(deploy_calls) == 2
     assert all(c[:3] == ["az", "containerapp", "update"] for c in deploy_calls)
 
@@ -504,7 +504,7 @@ def test_cli_deploy_only_api_runs_one_update(deploy_env, mock_subprocess) -> Non
         ],
     )
     assert result.exit_code == 0, result.stdout + result.stderr
-    deploy_calls = [c for c in mock_subprocess if "postgres" not in c]
+    deploy_calls = [c for c in mock_subprocess if c and c[0] == "az" and "postgres" not in c]
     assert len(deploy_calls) == 2  # build + 1 update
     update_cmd = deploy_calls[1]
     assert "movate-prod-api" in update_cmd
