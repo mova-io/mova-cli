@@ -398,7 +398,13 @@ class _FakeCartesiaClient:
 async def test_cartesia_buffers_text_and_streams_frames() -> None:
     fake_tts = _FakeCartesiaTTS([b"frame1", b"frame2", b"frame3"])
     tts = CartesiaTTS(client=_FakeCartesiaClient(fake_tts))
-    audio = [c async for c in tts.synthesize(_text_stream("hello ", "there"), voice_id="voice-xyz")]
+    # Cartesia voice ids are UUIDs; a UUID is passed through. (A non-UUID name —
+    # e.g. a portable "alloy" — falls back to the adapter default per ADR 049, so
+    # the passthrough assertion below must use a real UUID.)
+    caller_voice = "11111111-1111-1111-1111-111111111111"
+    audio = [
+        c async for c in tts.synthesize(_text_stream("hello ", "there"), voice_id=caller_voice)
+    ]
     # Each emitted frame becomes one AudioChunk (streamed, not re-sliced).
     assert [c.data for c in audio] == [b"frame1", b"frame2", b"frame3"]
     assert all(c.codec == "pcm16" for c in audio)
@@ -409,8 +415,8 @@ async def test_cartesia_buffers_text_and_streams_frames() -> None:
     # Raw PCM output format so bytes map onto pcm16 with no container.
     assert call["output_format"]["encoding"] == "pcm_s16le"
     assert call["output_format"]["container"] == "raw"
-    # The caller-supplied voice id was passed through.
-    assert call["voice"]["id"] == "voice-xyz"
+    # The caller-supplied (UUID) voice id was passed through.
+    assert call["voice"]["id"] == caller_voice
 
 
 async def test_cartesia_default_voice_when_unset() -> None:

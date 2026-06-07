@@ -1,1 +1,0 @@
-{"input": {"query": "I was charged twice for my subscription last month."}, "expected": {"response": "I can see the duplicate charge on your account. I have initiated a refund for the extra payment, which should appear within 3-5 business days. Your subscription remains active and correctly billed going forward.", "resolved": true}}

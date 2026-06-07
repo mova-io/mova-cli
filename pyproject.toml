@@ -4,7 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "movate-cli"
-version = "2026.6.6.2"
+# Version is DERIVED FROM GIT at build time (ADR 066), never committed here — so
+# PRs never conflict on a version line. See hatch_build.py + scripts/calver_version.py.
+dynamic = ["version"]
 description = "movate — declarative platform for building, evaluating, and deploying AI agents"
 authors = [{ name = "Movate", email = "engineering@movate.com" }]
 license = { text = "Proprietary" }
@@ -434,6 +436,11 @@ dev = [
 # cycle — until then both are first-class.
 movate = "movate.cli.main:app"
 mdk = "movate.cli.main:app"
+
+# ADR 066 — the version is a dynamic field populated by the custom metadata hook
+# (hatch_build.py), which computes CalVer from git history at build time.
+[tool.hatch.metadata.hooks.custom]
+path = "hatch_build.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/movate"]

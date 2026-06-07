@@ -26,7 +26,6 @@ import hashlib
 import json
 import logging
 import os
-import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1028,6 +1027,18 @@ async def _finalize_voice_turn(
 
     latency = compute_turn_latency(result.events)
     audio_dur_s = (latency.stt_final_ms or 0.0) / 1000.0
+
+    # Bridge the per-turn voice latency to OTel — once per turn, at this edge,
+    # alongside cost recording (voice observability). No-op when metrics are off.
+    from movate.tracing import record_voice_turn  # noqa: PLC0415
+
+    record_voice_turn(
+        tenant_id=tenant_id,
+        responded_ms=latency.responded_in_ms,
+        stt_final_ms=latency.stt_final_ms,
+        tts_first_audio_ms=latency.tts_first_audio_ms,
+        interrupted=str(getattr(result, "status", "")).lower() == "interrupted",
+    )
 
     run_record = await store.get_run(result.run_id, tenant_id=tenant_id)
     if run_record is None:
@@ -4781,7 +4792,7 @@ def _load_sample_cases(bundle: AgentBundle, *, limit: int = 3) -> list[dict[str,
     return rows
 
 
-def build_app(
+def build_app(  # noqa: PLR0912
     storage: StorageProvider,
     *,
     agents: list[AgentBundle] | None = None,
@@ -15829,7 +15840,7 @@ def build_app(
             _twilio_active_agent_name = agents_reg[0].spec.name if agents_reg else ""
         if not _twilio_active_agent_name:
             return Response(
-                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured.</Say></Response>',
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>No agent configured.</Say></Response>',  # noqa: E501
                 media_type="application/xml",
             )
         # Redirect to the per-agent TwiML endpoint.
@@ -15951,7 +15962,7 @@ def build_app(
         try:
             from twilio.rest import Client as TwilioClient  # noqa: PLC0415
         except ImportError:
-            raise HTTPException(
+            raise HTTPException(  # noqa: B904
                 status_code=501,
                 detail="twilio SDK not installed; add mdk[telephony]",
             )
@@ -15971,7 +15982,7 @@ def build_app(
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(
+            raise HTTPException(  # noqa: B904
                 status_code=502,
                 detail=f"Twilio API error: {exc}",
             )
@@ -16071,7 +16082,7 @@ def build_app(
         # Voice-context cue: nudge the agent to respond conversationally
         # (short sentences, no markdown) so TTS sounds natural. Same hint
         # used by the standalone demo server (server.py _LYZR_VOICE_HINT).
-        _VOICE_HINT = (
+        _VOICE_HINT = (  # noqa: N806
             "please respond conversationally in 1-3 short sentences suitable "
             "for text-to-speech playback. Do not use markdown, headers, bullet "
             "lists, numbered steps, or section labels. Summarize key info "
@@ -16536,7 +16547,7 @@ def build_app(
     import time as _time_mod  # noqa: PLC0415
 
     _lyzr_agents_cache: dict[str, tuple[float, dict[str, object]]] = {}
-    _LYZR_AGENTS_TTL_S = 60.0
+    _LYZR_AGENTS_TTL_S = 60.0  # noqa: N806
 
     def _resolve_lyzr_key(request: Request) -> str:
         header_key = (request.headers.get("x-lyzr-api-key") or "").strip()
@@ -16566,19 +16577,20 @@ def build_app(
             )
             r.raise_for_status()
             raw = r.json() or []
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
         def _summary(a: dict[str, object]) -> dict[str, object]:
             tools = a.get("tools") or []
-            tool_names = [t.get("name") for t in tools if isinstance(t, dict)]
+            tool_names = [t.get("name") for t in tools if isinstance(t, dict)]  # type: ignore[attr-defined]
             instructions = str(a.get("agent_instructions") or "")
             return {
                 "id": a.get("_id"),
                 "name": a.get("name") or "(unnamed)",
                 "description": (str(a.get("description") or ""))[:200],
                 "role": a.get("agent_role") or "",
-                "instructions_snippet": instructions[:280] + ("..." if len(instructions) > 280 else ""),
+                "instructions_snippet": instructions[:280]
+                + ("..." if len(instructions) > 280 else ""),  # noqa: PLR2004
                 "tools": tool_names,
                 "features": a.get("features") or [],
             }
@@ -16607,16 +16619,19 @@ def build_app(
             )
             r.raise_for_status()
             a = r.json()
-            return {"ok": True, "agent": {
-                "id": a.get("_id"),
-                "name": a.get("name"),
-                "description": (str(a.get("description") or ""))[:200],
-                "role": a.get("agent_role") or "",
-                "instructions_snippet": (str(a.get("agent_instructions") or ""))[:280],
-                "tools": [t.get("name") for t in (a.get("tools") or []) if isinstance(t, dict)],
-                "features": a.get("features") or [],
-            }}
-        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": True,
+                "agent": {
+                    "id": a.get("_id"),
+                    "name": a.get("name"),
+                    "description": (str(a.get("description") or ""))[:200],
+                    "role": a.get("agent_role") or "",
+                    "instructions_snippet": (str(a.get("agent_instructions") or ""))[:280],
+                    "tools": [t.get("name") for t in (a.get("tools") or []) if isinstance(t, dict)],
+                    "features": a.get("features") or [],
+                },
+            }
+        except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
@@ -16624,16 +16639,46 @@ def build_app(
     # Fetches live from Cartesia's /voices API (cached 1h), falls back
     # to a single default voice if the API is unreachable.
     # ------------------------------------------------------------------
-    _OPENAI_VOICES = [
-        {"id": "alloy", "label": "Alloy", "description": "neutral, balanced", "use_case": "general support, default"},
-        {"id": "echo", "label": "Echo", "description": "calm, measured male", "use_case": "customer service, IVR"},
-        {"id": "fable", "label": "Fable", "description": "warm British accent", "use_case": "storytelling, training"},
-        {"id": "onyx", "label": "Onyx", "description": "deep, authoritative male", "use_case": "announcements, alerts"},
-        {"id": "nova", "label": "Nova", "description": "bright, friendly female", "use_case": "help desk, assistant"},
-        {"id": "shimmer", "label": "Shimmer", "description": "soft, expressive female", "use_case": "wellness, calm settings"},
+    _OPENAI_VOICES = [  # noqa: N806
+        {
+            "id": "alloy",
+            "label": "Alloy",
+            "description": "neutral, balanced",
+            "use_case": "general support, default",
+        },
+        {
+            "id": "echo",
+            "label": "Echo",
+            "description": "calm, measured male",
+            "use_case": "customer service, IVR",
+        },
+        {
+            "id": "fable",
+            "label": "Fable",
+            "description": "warm British accent",
+            "use_case": "storytelling, training",
+        },
+        {
+            "id": "onyx",
+            "label": "Onyx",
+            "description": "deep, authoritative male",
+            "use_case": "announcements, alerts",
+        },
+        {
+            "id": "nova",
+            "label": "Nova",
+            "description": "bright, friendly female",
+            "use_case": "help desk, assistant",
+        },
+        {
+            "id": "shimmer",
+            "label": "Shimmer",
+            "description": "soft, expressive female",
+            "use_case": "wellness, calm settings",
+        },
     ]
     _cartesia_cache: tuple[float, list[dict[str, str]]] | None = None
-    _CARTESIA_TTL = 3600.0
+    _CARTESIA_TTL = 3600.0  # noqa: N806
 
     def _classify_use_case(desc: str) -> str:
         d = desc.lower()
@@ -16655,6 +16700,7 @@ def build_app(
             return []
         try:
             import httpx  # noqa: PLC0415
+
             r = httpx.get(
                 "https://api.cartesia.ai/voices/",
                 headers={"X-API-Key": key, "Cartesia-Version": "2024-06-10"},
@@ -16664,20 +16710,37 @@ def build_app(
             voices = r.json() or []
         except Exception:
             return []
-        SKIP = ("fairy", "gaming", "pikachu", "robot", "elf", "demon", "ghost", "alien")
-        PREFERRED = ("support", "professional", "natural", "conversational", "assistant",
-                     "warm", "friendly", "customer", "guide", "explainer")
-        en = [v for v in voices if isinstance(v, dict) and v.get("language") == "en"
-              and v.get("is_public") and v.get("id") and v.get("name")
-              and not any(s in (v.get("description") or "").lower() for s in SKIP)
-              and not any(s in (v.get("name") or "").lower() for s in SKIP)]
+        SKIP = ("fairy", "gaming", "pikachu", "robot", "elf", "demon", "ghost", "alien")  # noqa: N806
+        PREFERRED = (  # noqa: N806
+            "support",
+            "professional",
+            "natural",
+            "conversational",
+            "assistant",
+            "warm",
+            "friendly",
+            "customer",
+            "guide",
+            "explainer",
+        )
+        en = [
+            v
+            for v in voices
+            if isinstance(v, dict)
+            and v.get("language") == "en"
+            and v.get("is_public")
+            and v.get("id")
+            and v.get("name")
+            and not any(s in (v.get("description") or "").lower() for s in SKIP)
+            and not any(s in (v.get("name") or "").lower() for s in SKIP)
+        ]
 
-        def score(v: dict) -> int:
+        def score(v: dict) -> int:  # type: ignore[type-arg]
             d = str(v.get("description") or "").lower()
             return sum(1 for k in PREFERRED if k in d)
 
         en.sort(key=lambda v: (-score(v), str(v.get("name") or "")))
-        by_gender: dict[str, list] = {"f": [], "m": []}
+        by_gender: dict[str, list] = {"f": [], "m": []}  # type: ignore[type-arg]
         seen: set[str] = set()
         for v in en:
             nm = str(v.get("name") or "").split(" - ")[0].strip().lower()
@@ -16685,19 +16748,22 @@ def build_app(
                 continue
             seen.add(nm)
             g = "f" if str(v.get("gender") or "").lower().startswith("fem") else "m"
-            if len(by_gender[g]) < 8:
+            if len(by_gender[g]) < 8:  # noqa: PLR2004
                 by_gender[g].append(v)
         picked = by_gender["f"] + by_gender["m"]
 
-        def norm(v: dict) -> dict[str, str]:
+        def norm(v: dict) -> dict[str, str]:  # type: ignore[type-arg]
             name = str(v.get("name") or "").split(" - ")[0].strip()
             gs = "F" if str(v.get("gender") or "").lower().startswith("fem") else "M"
             desc = str(v.get("description") or "").strip().rstrip(".")
-            if len(desc) > 80:
+            if len(desc) > 80:  # noqa: PLR2004
                 desc = desc[:77] + "..."
-            return {"id": str(v["id"]), "label": f"{name} ({gs})",
-                    "description": desc or f"{gs} voice",
-                    "use_case": _classify_use_case(desc)}
+            return {
+                "id": str(v["id"]),
+                "label": f"{name} ({gs})",
+                "description": desc or f"{gs} voice",
+                "use_case": _classify_use_case(desc),
+            }
 
         return [norm(v) for v in picked]
 
@@ -16705,6 +16771,7 @@ def build_app(
     async def _tts_voices() -> dict[str, Any]:
         nonlocal _cartesia_cache
         import asyncio  # noqa: PLC0415
+
         cart_voices: list[dict[str, str]] = []
         now = _time_mod.monotonic()
         if _cartesia_cache and now - _cartesia_cache[0] < _CARTESIA_TTL:
@@ -16714,11 +16781,19 @@ def build_app(
             if cart_voices:
                 _cartesia_cache = (now, cart_voices)
         if not cart_voices:
-            cart_voices = [{"id": "a0e99841-438c-4a64-b679-ae501e7d6091",
-                           "label": "Clara (F)", "description": "Adapter default voice",
-                           "use_case": "general use"}]
-        return {"ok": True, "voices": {"openai": _OPENAI_VOICES, "cartesia": cart_voices},
-                "cartesia_live": bool(_cartesia_cache)}
+            cart_voices = [
+                {
+                    "id": "a0e99841-438c-4a64-b679-ae501e7d6091",
+                    "label": "Clara (F)",
+                    "description": "Adapter default voice",
+                    "use_case": "general use",
+                }
+            ]
+        return {
+            "ok": True,
+            "voices": {"openai": _OPENAI_VOICES, "cartesia": cart_voices},
+            "cartesia_live": bool(_cartesia_cache),
+        }
 
     # ------------------------------------------------------------------
     # GET / — Serve the voice demo app (examples/web_demo/index.html).
@@ -16730,8 +16805,17 @@ def build_app(
     _demo_html: str = ""
     _demo_candidates = [
         "/app/web_demo/index.html",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "index.html"),
-        os.path.join(os.environ.get("MOVATE_AGENTS_PATH", "/app/agents"), "..", "web_demo", "index.html"),
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "examples",
+            "web_demo",
+            "index.html",
+        ),
+        os.path.join(
+            os.environ.get("MOVATE_AGENTS_PATH", "/app/agents"), "..", "web_demo", "index.html"
+        ),
     ]
     for _p in _demo_candidates:
         _p = os.path.normpath(_p)
@@ -16746,7 +16830,9 @@ def build_app(
     # Mount /static for voice demo assets (logos, etc.).
     _static_candidates = [
         "/app/web_demo/static",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "static"),
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "static"
+        ),
     ]
     for _sp in _static_candidates:
         _sp = os.path.normpath(_sp)

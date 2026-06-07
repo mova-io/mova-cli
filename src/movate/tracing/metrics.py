@@ -107,6 +107,18 @@ METRIC_DB_POOL_MAX = "mdk.db.pool.max"
 # of the pool, and pair the count with the advisory per-tenant cap.
 METRIC_SSE_CONNECTIONS_ACTIVE = "mdk.sse.connections_active"
 
+# Voice turn latency (ADR 024/036/073) — the voice subsystem stamps per-stage
+# ``at_ms`` offsets on its event stream and computes a ``VoiceTurnLatency`` at the
+# WS edge (``compute_turn_latency``). Until now those numbers lived only in the
+# per-turn latency badge and an in-process MetricsObserver — never exported. These
+# bridge them to OTel so an operator sees voice health (the headline first-audio
+# latency, STT endpoint + TTS first-audio breakdown, turn volume, and barge-in
+# rate) alongside the agent/job signals. Recorded once per turn at the edge.
+METRIC_VOICE_RESPONDED_MS = "mdk.voice.responded_ms"  # turn start → first audio (headline)
+METRIC_VOICE_STT_FINAL_MS = "mdk.voice.stt_final_ms"  # turn start → STT endpoint
+METRIC_VOICE_TTS_FIRST_AUDIO_MS = "mdk.voice.tts_first_audio_ms"  # turn start → first TTS frame
+METRIC_VOICE_TURNS = "mdk.voice.turns"  # completed voice turns (attr: interrupted = barge-in)
+
 #: Every OTel instrument name this module emits. The single source of truth the
 #: dashboards-as-code drift guard cross-checks against (a dashboard may only
 #: reference a metric that appears here).
@@ -123,6 +135,10 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_DB_POOL_WAITING,
         METRIC_DB_POOL_MAX,
         METRIC_SSE_CONNECTIONS_ACTIVE,
+        METRIC_VOICE_RESPONDED_MS,
+        METRIC_VOICE_STT_FINAL_MS,
+        METRIC_VOICE_TTS_FIRST_AUDIO_MS,
+        METRIC_VOICE_TURNS,
     }
 )
 
@@ -149,6 +165,10 @@ class _State:
     run_tokens: Any = None  # Counter[int]
     run_cost_usd: Any = None  # Counter[float]
     sse_connections_active: Any = None  # UpDownCounter[int]
+    voice_responded_ms: Any = None  # Histogram[float]
+    voice_stt_final_ms: Any = None  # Histogram[float]
+    voice_tts_first_audio_ms: Any = None  # Histogram[float]
+    voice_turns: Any = None  # Counter[int]
 
     # ADR 034 D3 — DB pool observable gauges are registered lazily by
     # ``register_pool_metrics`` (after storage.init at the edge), not in
@@ -279,6 +299,26 @@ def init_metrics(*, reader: Any | None = None) -> None:
             "SSE event-stream subscribers currently holding open a "
             "GET /api/v1/events/stream connection (ADR 035 D3)."
         ),
+    )
+    _state.voice_responded_ms = meter.create_histogram(
+        METRIC_VOICE_RESPONDED_MS,
+        unit="ms",
+        description="Voice turn latency: turn start → first audio the user hears (headline).",
+    )
+    _state.voice_stt_final_ms = meter.create_histogram(
+        METRIC_VOICE_STT_FINAL_MS,
+        unit="ms",
+        description="Voice turn latency: turn start → STT endpoint (user words final).",
+    )
+    _state.voice_tts_first_audio_ms = meter.create_histogram(
+        METRIC_VOICE_TTS_FIRST_AUDIO_MS,
+        unit="ms",
+        description="Voice turn latency: turn start → first synthesized audio frame.",
+    )
+    _state.voice_turns = meter.create_counter(
+        METRIC_VOICE_TURNS,
+        unit="1",
+        description="Completed voice turns (attr: interrupted=true for a barge-in).",
     )
 
     _state.initialized = True
@@ -506,6 +546,34 @@ def record_run_usage(
         _state.run_cost_usd.add(float(cost_usd), {"tenant": tenant_id})
 
 
+def record_voice_turn(
+    *,
+    tenant_id: str,
+    responded_ms: float | None = None,
+    stt_final_ms: float | None = None,
+    tts_first_audio_ms: float | None = None,
+    interrupted: bool = False,
+) -> None:
+    """Record one completed voice turn's latency breakdown + barge-in flag.
+
+    Bridges the voice subsystem's per-turn ``VoiceTurnLatency`` (computed at the
+    WS edge via ``compute_turn_latency``) to OTel: the headline first-audio
+    latency plus the STT-endpoint / TTS-first-audio milestones (each a histogram;
+    ``None`` milestones are skipped, e.g. a turn that errored at STT), and a turn
+    counter tagged ``interrupted`` so an operator sees barge-in rate. No-op when
+    metrics are off / OTel absent; never raises.
+    """
+    if _state.voice_turns is None:
+        return
+    if responded_ms is not None:
+        _state.voice_responded_ms.record(float(responded_ms), {"tenant": tenant_id})
+    if stt_final_ms is not None:
+        _state.voice_stt_final_ms.record(float(stt_final_ms), {"tenant": tenant_id})
+    if tts_first_audio_ms is not None:
+        _state.voice_tts_first_audio_ms.record(float(tts_first_audio_ms), {"tenant": tenant_id})
+    _state.voice_turns.add(1, {"tenant": tenant_id, "interrupted": str(interrupted).lower()})
+
+
 def inc_in_flight(*, tenant_id: str) -> None:
     """Increment the in-flight job gauge (attrs: ``tenant``). No-op when off."""
     if _state.jobs_in_flight is None:
@@ -562,6 +630,10 @@ __all__ = [
     "METRIC_RUN_COST_USD",
     "METRIC_RUN_TOKENS",
     "METRIC_SSE_CONNECTIONS_ACTIVE",
+    "METRIC_VOICE_RESPONDED_MS",
+    "METRIC_VOICE_STT_FINAL_MS",
+    "METRIC_VOICE_TTS_FIRST_AUDIO_MS",
+    "METRIC_VOICE_TURNS",
     "PoolStatsCallback",
     "dec_in_flight",
     "dec_sse_connections",
@@ -570,5 +642,6 @@ __all__ = [
     "init_metrics",
     "record_job_completed",
     "record_run_usage",
+    "record_voice_turn",
     "register_pool_metrics",
 ]
