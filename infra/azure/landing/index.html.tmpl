@@ -10,6 +10,9 @@
   body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,#16203a 0,var(--bg) 60%);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   .wrap{max-width:980px;margin:0 auto;padding:56px 24px 80px}
   h1{font-size:34px;margin:0 0 4px;letter-spacing:-.02em}
+  .brand{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:0 0 6px}
+  .brand svg{height:52px;width:auto;display:block}
+  .brand-badge{font-size:12px;color:var(--mut);border:1px solid var(--line);border-radius:999px;padding:4px 12px;letter-spacing:.06em;text-transform:uppercase}
   .sub{color:var(--mut);margin:0 0 36px}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
   a.card{display:block;text-decoration:none;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;transition:.15s}
@@ -24,7 +27,22 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Movate MDK <span style="color:var(--pink)">·</span> Live Demo</h1>
+  <div class="brand">
+    <svg viewBox="0 0 380 100" role="img" aria-label="mova io">
+      <defs>
+        <linearGradient id="movaio" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#ec4899"/>
+          <stop offset=".5" stop-color="#f97316"/>
+          <stop offset="1" stop-color="#fbbf24"/>
+        </linearGradient>
+      </defs>
+      <text x="0" y="74" font-family="system-ui,'Segoe UI',Roboto,sans-serif" font-weight="800" font-size="84" letter-spacing="-2" fill="var(--fg)">mova</text>
+      <rect x="248" y="16" width="106" height="68" rx="18" fill="none" stroke="url(#movaio)" stroke-width="8"/>
+      <text x="268" y="72" font-family="system-ui,'Segoe UI',Roboto,sans-serif" font-weight="800" font-size="58" fill="#fbbf24">io</text>
+      <text x="358" y="26" font-family="system-ui,sans-serif" font-size="18" fill="var(--mut)">&#8482;</text>
+    </svg>
+    <span class="brand-badge">MDK · Live Demo</span>
+  </div>
   <p class="sub">Build, evaluate, and deploy AI agents — all hosted on Azure Container Apps.</p>
   <div class="grid">
     <a class="card" href="__OPENWEBUI_URL__" target="_blank">
@@ -33,18 +51,18 @@
     <a class="card" href="__PLAYGROUND_URL__" target="_blank">
       <h2>🧪 Chainlit Playground</h2><p>Structured-input UI — drive task agents (ticket-triager, resume-screener) with typed fields + voice.</p>
       <span class="tag">public</span></a>
-    <a class="card" href="__GRAFANA_URL__" target="_blank">
-      <h2>📊 Grafana Dashboards</h2><p>Live runtime metrics from Azure Monitor — requests, CPU, replicas, memory.</p>
-      <span class="tag">public · no login</span></a>
+    <a class="card" href="__API_URL__/docs" target="_blank">
+      <h2>⚙️ Runtime API</h2><p>The OpenAPI surface — 126 routes: agents, skills, contexts, KB, eval, voice.</p>
+      <span class="tag">bearer-auth</span></a>
     <a class="card" href="__TEMPORAL_UI_URL__" target="_blank">
       <h2>⏳ Temporal UI</h2><p>Inspect durable workflows — per-run history, pending HUMAN approvals, replay.</p>
       <span class="tag">public · no login</span></a>
     <a class="card" href="__LANGFUSE_URL__" target="_blank">
       <h2>🔭 Langfuse</h2><p>Self-hosted LLM tracing — agent/workflow traces, latency, token cost, per-run drill-down.</p>
       <span class="tag">login: demo@movate.dev / MovateDemo2026!</span></a>
-    <a class="card" href="__API_URL__/docs" target="_blank">
-      <h2>⚙️ Runtime API</h2><p>The OpenAPI surface — 126 routes: agents, skills, contexts, KB, eval, voice.</p>
-      <span class="tag">bearer-auth</span></a>
+    <a class="card" href="__GRAFANA_URL__" target="_blank">
+      <h2>📊 Grafana Dashboards</h2><p>Live runtime metrics from Azure Monitor — requests, CPU, replicas, memory.</p>
+      <span class="tag">public · no login</span></a>
   </div>
   <div class="note">
     <b>Postman demo:</b> import <code>postman/movate-core-flow.postman_collection.json</code>, set <code>runtime_url</code> to the Runtime API host and <code>bearer_token</code> to Deva's key — run the folder top to bottom: project → agent → skill → context → KB → validate → eval → voice.
