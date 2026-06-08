@@ -2984,6 +2984,61 @@ class AgentBundleRecord(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+class AgentStatus(StrEnum):
+    """Operational lifecycle state for an agent (ADR 090 D1).
+
+    This is **operational** state an operator sets at runtime — NOT something
+    declared in the immutable ``agent.yaml`` bundle. Absent state ⇒ ``ACTIVE``,
+    so every existing agent reads as active with no migration.
+
+    Forward-compat (ADR 090, Tier 2): a future per-agent-container reconciler
+    consumes this same vocabulary — ``ACTIVE`` → a running/min≥1 ACA app,
+    ``DISABLED`` → scaled-to-zero, ``DEPRECATED`` → running but unlisted.
+    """
+
+    ACTIVE = "active"
+    """Served, listed, and shown in pickers. The default for any agent without
+    an explicit state row."""
+    DEPRECATED = "deprecated"
+    """Still served (existing callers keep working) but hidden from discovery
+    pickers (Chainlit, catalog default view). The reversible "soft retire"."""
+    DISABLED = "disabled"
+    """Not served — runs reject with 409 ``agent_disabled`` — and hidden from
+    pickers. Reversible (unlike delete), preserves the registry + history."""
+
+
+class AgentRuntimeState(BaseModel):
+    """Mutable per-agent operational state, keyed by ``(tenant_id, name)``
+    (ADR 090 D1).
+
+    Kept deliberately **separate** from the immutable :class:`AgentBundleRecord`:
+    lifecycle is an operational decision (an operator retires an agent), not an
+    authored one, so disabling must not require re-publishing a bundle. A missing
+    row is treated as :attr:`AgentStatus.ACTIVE` everywhere — back-compat by
+    construction.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str
+    name: str
+    """The agent name — the lifecycle key paired with ``tenant_id``. Spans all
+    versions of the agent (lifecycle is per-name, not per-version)."""
+    status: AgentStatus = AgentStatus.ACTIVE
+    updated_at: datetime = Field(default_factory=_now)
+    updated_by: str | None = None
+    """Auth identity that last set this state (ADR 013), or ``None`` for a
+    system default."""
+    note: str | None = Field(
+        default=None,
+        max_length=512,
+        description=(
+            "Optional operator reason for the current state, surfaced in the "
+            "control-plane UI. Example: 'retired 2026-06, use faq-v2'."
+        ),
+    )
+
+
 class WorkflowBundleRecord(BaseModel):
     """One published, versioned **workflow** bundle (ADR 037 — workflow API parity).
 

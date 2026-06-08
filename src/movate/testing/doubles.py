@@ -22,6 +22,7 @@ from movate.core.models import (
     _DEFAULT_PROJECT_NAME,
     _TENANT_SYSTEM_PRINCIPAL,
     AgentBundleRecord,
+    AgentRuntimeState,
     ApiKeyRecord,
     AuditRecord,
     BatchRecord,
@@ -95,6 +96,9 @@ class InMemoryStorage:
         self.evals: list[EvalRecord] = []
         self.bench: list[BenchRecord] = []
         self.agent_bundles: list[AgentBundleRecord] = []
+        # ADR 090 D1: mutable per-(tenant_id, name) operational state. Absent
+        # key ⇒ ACTIVE upstream (no row written until an operator sets one).
+        self.agent_states: dict[tuple[str, str], AgentRuntimeState] = {}
         # ADR 060 D1: skill + context analogues of agent_bundles. Same shape;
         # the registry doubles as the version history.
         self.skills: list[SkillRecord] = []
@@ -656,6 +660,22 @@ class InMemoryStorage:
         to_delete = [b for b in self.agent_bundles if _matches(b)]
         self.agent_bundles = [b for b in self.agent_bundles if not _matches(b)]
         return len(to_delete)
+
+    # ------------------------------------------------------------------
+    # Agent runtime state (ADR 090 D1/D2) — mutable per-(tenant, name) status.
+    # ------------------------------------------------------------------
+
+    async def get_agent_state(self, name: str, *, tenant_id: str) -> AgentRuntimeState | None:
+        return self.agent_states.get((tenant_id, name))
+
+    async def set_agent_state(self, state: AgentRuntimeState) -> None:
+        self.agent_states[(state.tenant_id, state.name)] = state
+
+    async def list_agent_states(self, *, tenant_id: str) -> list[AgentRuntimeState]:
+        return sorted(
+            (s for (t, _n), s in self.agent_states.items() if t == tenant_id),
+            key=lambda s: s.name,
+        )
 
     # ------------------------------------------------------------------
     # Skills registry (ADR 060 D1) — mirrors the agent-bundle surface.

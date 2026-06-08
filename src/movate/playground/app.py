@@ -596,7 +596,10 @@ async def start() -> None:
     client, caps = await _init_session()
 
     try:
-        agents = await client.list_agents()
+        # ADR 090: the picker lists only ACTIVE agents (server-side filter)
+        # with a live health probe, so deprecated/disabled/broken agents never
+        # clutter the dropdown or error on click.
+        agents = await client.list_agents(only_active=True, with_health=True)
     except Exception as exc:
         if _is_auth_error(exc) and target is not None:
             await cl.Message(
@@ -628,6 +631,12 @@ async def start() -> None:
             )
         ).send()
         return
+
+    # ADR 090: drop any agent the runtime flagged unhealthy (resolve/load/lint
+    # failure). ``status`` filtering already happened server-side; this is the
+    # health gate. ``!= "unhealthy"`` keeps 'healthy'/'unknown' (an older
+    # runtime that doesn't populate health degrades to showing everything).
+    agents = [a for a in agents if a.get("health") != "unhealthy"]
 
     if not agents:
         scope = f" on target **{target.name}**" if target is not None else ""

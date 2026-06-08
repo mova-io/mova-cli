@@ -74,6 +74,8 @@ from movate.core.graph.query import GraphMode
 from movate.core.loader import AgentBundle
 from movate.core.models import (
     AgentBundleRecord,
+    AgentRuntimeState,
+    AgentStatus,
     ApiKeyEnv,
     BatchRecord,
     BenchRecord,
@@ -219,6 +221,7 @@ from movate.runtime.schemas import (
     AgentDatasetUploadView,
     AgentDeletedView,
     AgentDetailView,
+    AgentHealthView,
     AgentHistoryView,
     AgentListView,
     AgentMetricsView,
@@ -227,6 +230,8 @@ from movate.runtime.schemas import (
     AgentRevertedView,
     AgentRevertSubmission,
     AgentRunSubmission,
+    AgentStatusUpdateRequest,
+    AgentStatusView,
     AgentUpdatedView,
     AgentValidationCostForecast,
     AgentValidationIssue,
@@ -2766,6 +2771,77 @@ async def _smoke_preview_score(bundle: AgentBundle, cases: list[Any]) -> dict[st
     return {"mock_pass_rate": round(rate, 4), "tested_against_model": "mock"}
 
 
+def _probe_agent_health(bundle: AgentBundle) -> tuple[bool, str]:
+    """Cheap agent health (ADR 090 D3): the bundle already loaded cleanly (it's
+    in the registry), and the prompt linter finds no error-severity issues.
+
+    Catches the common "deprecated agent that doesn't work" cases — a malformed
+    prompt template, a broken schema reference — without spending an LLM call.
+    Never raises; a linter failure is itself reported as unhealthy.
+    """
+    try:
+        from movate.core.prompt_linter import lint_prompt  # noqa: PLC0415
+
+        errors = [i for i in lint_prompt(bundle) if i.severity == "error"]
+    except Exception as exc:
+        return False, f"lint_failed: {exc}"
+    if errors:
+        return False, f"{errors[0].code}: {errors[0].message}"
+    return True, ""
+
+
+def _minimal_input_for_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Build a minimal schema-valid input from an agent's input schema —
+    required props filled with a type-appropriate placeholder. Used to drive
+    the optional ``?probe=run`` health dry-run."""
+    props = schema.get("properties", {})
+    required = schema.get("required") or list(props)
+    placeholder = {"string": "ping", "integer": 1, "number": 1, "boolean": True}
+    out: dict[str, Any] = {}
+    for name in required:
+        prop = props.get(name, {})
+        out[name] = placeholder.get(prop.get("type", "string"), "ping")
+        if prop.get("type") == "array":
+            out[name] = []
+        elif prop.get("type") == "object":
+            out[name] = {}
+    return out
+
+
+async def _probe_agent_health_run(bundle: AgentBundle) -> tuple[bool, str]:
+    """Deeper health (ADR 090 D3, ``?probe=run``): the cheap check plus one
+    ``MockProvider`` dry-run turn against a minimal generated input. Confirms
+    the agent runs end-to-end (executor + skills wiring) without an LLM bill.
+    Never raises."""
+    ok, detail = _probe_agent_health(bundle)
+    if not ok:
+        return ok, detail
+    try:
+        from movate.core.executor import Executor  # noqa: PLC0415
+        from movate.core.models import RunRequest  # noqa: PLC0415
+        from movate.providers.mock import MockProvider  # noqa: PLC0415
+        from movate.providers.pricing import load_pricing  # noqa: PLC0415
+        from movate.testing import InMemoryStorage  # noqa: PLC0415
+        from movate.tracing import build_tracer  # noqa: PLC0415
+
+        ephemeral = InMemoryStorage()
+        await ephemeral.init()
+        executor = Executor(
+            provider=MockProvider(),
+            pricing=load_pricing(),
+            storage=ephemeral,
+            tracer=build_tracer(),
+            tenant_id="__health__",
+        )
+        sample = _minimal_input_for_schema(bundle.input_schema)
+        resp = await executor.execute(bundle, RunRequest(agent=bundle.spec.name, input=sample))
+    except Exception as exc:
+        return False, f"probe_run_failed: {exc}"
+    if getattr(resp, "status", None) == "error":
+        return False, "mock dry-run returned error status"
+    return True, ""
+
+
 async def _sse_audit_job_stream(
     *,
     store: StorageProvider,
@@ -3565,6 +3641,36 @@ def _model_info_to_view(info: ModelInfo) -> ModelInfoView:
         notes=info.notes,
         in_pricing_table=info.in_pricing_table,
     )
+
+
+async def _agent_status_map(store: StorageProvider, *, tenant_id: str) -> dict[str, AgentStatus]:
+    """Tenant's name→status overlay (ADR 090). Defensive: a backend without
+    the agent-state surface (or a transient error) degrades to "all active" —
+    an empty map, so every agent reads ACTIVE. Never raises."""
+    getter = getattr(store, "list_agent_states", None)
+    if getter is None:
+        return {}
+    try:
+        states = await getter(tenant_id=tenant_id)
+    except Exception:
+        logger.warning("agent_state_list_failed tenant_id=%s", tenant_id, exc_info=True)
+        return {}
+    return {s.name: s.status for s in states}
+
+
+async def _agent_status(store: StorageProvider, name: str, *, tenant_id: str) -> AgentStatus:
+    """One agent's status (ADR 090); absent row / unsupported backend ⇒ ACTIVE."""
+    getter = getattr(store, "get_agent_state", None)
+    if getter is None:
+        return AgentStatus.ACTIVE
+    try:
+        st = await getter(name, tenant_id=tenant_id)
+    except Exception:
+        logger.warning(
+            "agent_state_get_failed name=%s tenant_id=%s", name, tenant_id, exc_info=True
+        )
+        return AgentStatus.ACTIVE
+    return st.status if st is not None else AgentStatus.ACTIVE
 
 
 def _render_agent_detail(bundle: AgentBundle) -> AgentDetailView:
@@ -5947,6 +6053,8 @@ def build_app(
         role: str | None = None,
         capabilities: str | None = None,
         tags: str | None = None,
+        status: str | None = None,
+        health: bool = False,
     ) -> AgentCatalogView:
         """List all agents in the catalog with marketplace metadata.
 
@@ -5958,18 +6066,23 @@ def build_app(
           agent must declare ALL listed capabilities (subset match).
         * ``?tags=acme,production`` — comma-separated; agent must carry
           ALL listed tags (subset match).
+        * ``?status=active`` — lifecycle filter (ADR 090): ``active`` /
+          ``deprecated`` / ``disabled``. Omitted ⇒ all states (back-compat);
+          every item carries its ``status`` regardless.
+        * ``?health=1`` — probe each returned agent's health (resolve + load)
+          and populate ``health`` (``healthy``/``unhealthy``). Off by default —
+          health is a live check, so the plain list stays cheap.
 
         Filters are ANDed. Omitting a filter returns all agents.
 
-        Drives the Mova iO Angular Agent Catalog page — every card
-        on the catalog is rendered from entries in this list.
+        Drives the Mova iO Angular Agent Catalog page and the Agent Control
+        Plane (ADR 090) — every card / row is rendered from this list.
 
         Errors:
 
         * **401** — missing / bad bearer token
         """
-        _ = ctx.tenant_id  # future per-tenant isolation
-
+        store: StorageProvider = request.app.state.storage
         agents: list[AgentBundle] = request.app.state.agents
 
         # Normalise filter params.
@@ -5980,6 +6093,11 @@ def build_app(
             else None
         )
         tag_filter = {t.strip().lower() for t in tags.split(",") if t.strip()} if tags else None
+        status_filter = status.lower().strip() if status else None
+
+        # ADR 090: one tenant-scoped read overlays operational status onto the
+        # FS-scanned catalog; absent row ⇒ ACTIVE.
+        status_map = await _agent_status_map(store, tenant_id=ctx.tenant_id)
 
         items: list[AgentCatalogItemView] = []
         for b in agents:
@@ -5994,6 +6112,13 @@ def build_app(
                 agent_tags = {t.lower() for t in spec.tags}
                 if not tag_filter.issubset(agent_tags):
                     continue
+            agent_status = status_map.get(spec.name, AgentStatus.ACTIVE)
+            if status_filter and agent_status.value != status_filter:
+                continue
+            health_str = "unknown"
+            if health:
+                ok, _detail = _probe_agent_health(b)
+                health_str = "healthy" if ok else "unhealthy"
             items.append(
                 AgentCatalogItemView(
                     name=spec.name,
@@ -6004,10 +6129,111 @@ def build_app(
                     persona=spec.persona,
                     capabilities=list(spec.capabilities),
                     tags=list(spec.tags),
+                    status=agent_status.value,
+                    health=health_str,
                 )
             )
 
         return AgentCatalogView(agents=items, count=len(items))
+
+    @v1.patch(
+        "/agents/{name}/status",
+        response_model=AgentStatusView,
+        tags=["agents-v1"],
+        dependencies=[_scope("admin")],
+    )
+    async def v1_set_agent_status(
+        name: str,
+        body: AgentStatusUpdateRequest,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> AgentStatusView:
+        """Set an agent's operational lifecycle state (ADR 090 D4).
+
+        ``active`` → served + listed; ``deprecated`` → served but hidden from
+        pickers; ``disabled`` → not served (runs 409) + hidden. Reversible —
+        unlike delete, this preserves the registry and history. Drives the
+        Agent Control Plane's enable/disable/deprecate toggles.
+
+        Errors:
+
+        * **401/403** — missing token / not ``admin``
+        * **404** — agent ``name`` not found
+        * **422** — ``status`` is not one of active/deprecated/disabled
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        if not any(b.spec.name == name for b in agents):
+            raise not_found("agent", name)
+        try:
+            new_status = AgentStatus(body.status.strip().lower())
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"invalid status {body.status!r}; expected one of "
+                    "'active', 'deprecated', 'disabled'"
+                ),
+            ) from None
+        store: StorageProvider = request.app.state.storage
+        state = AgentRuntimeState(
+            tenant_id=ctx.tenant_id,
+            name=name,
+            status=new_status,
+            updated_by=ctx.api_key_id,
+            note=body.note,
+        )
+        await store.set_agent_state(state)
+        return AgentStatusView(
+            name=name,
+            status=new_status.value,
+            note=state.note,
+            updated_at=state.updated_at.isoformat(),
+            updated_by=state.updated_by,
+        )
+
+    @v1.get(
+        "/agents/{name}/health",
+        response_model=AgentHealthView,
+        tags=["agents-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_agent_health(
+        name: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        probe: str | None = None,
+    ) -> AgentHealthView:
+        """Derived health for one agent (ADR 090 D3).
+
+        Default: resolve + load + prompt-lint the bundle — a clean result means
+        the agent is wired correctly (catches a removed skill, a bad model ref,
+        a malformed prompt — the "deprecated agents that don't respond" case).
+        ``?probe=run`` additionally drives one ``MockProvider`` dry-run turn for
+        an end-to-end signal (no LLM bill). Health is computed, never stored.
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        * **404** — agent ``name`` not found
+        """
+        agents: list[AgentBundle] = request.app.state.agents
+        bundle = next((b for b in agents if b.spec.name == name), None)
+        if bundle is None:
+            raise not_found("agent", name)
+        store: StorageProvider = request.app.state.storage
+        status = await _agent_status(store, name, tenant_id=ctx.tenant_id)
+        probed_run = (probe or "").strip().lower() == "run"
+        if probed_run:
+            ok, detail = await _probe_agent_health_run(bundle)
+        else:
+            ok, detail = _probe_agent_health(bundle)
+        return AgentHealthView(
+            name=name,
+            healthy=ok,
+            status=status.value,
+            detail=detail,
+            probed_run=probed_run,
+        )
 
     @v1.post(
         "/agents",
@@ -9359,6 +9585,16 @@ def build_app(
         )
         if bundle is None:
             raise not_found("agent", name)
+
+        # ADR 090: a DISABLED agent is not served — reject before any spend.
+        # ACTIVE + DEPRECATED run normally (deprecated is merely hidden from
+        # discovery pickers; existing callers keep working). Re-enable via
+        # PATCH /api/v1/agents/{name}/status.
+        if await _agent_status(store, name, tenant_id=ctx.tenant_id) is AgentStatus.DISABLED:
+            raise conflict(
+                f"agent {name!r} is disabled (ADR 090) — re-enable via "
+                f"PATCH /api/v1/agents/{name}/status"
+            )
 
         # ADR 045 D10 — stateful sessions. When ``session_id`` is set, the
         # session must already exist and belong to this tenant (404-not-403),

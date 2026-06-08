@@ -790,6 +790,14 @@ class AgentCatalogItemView(BaseModel):
     persona: str = ""
     capabilities: list[str] = []
     tags: list[str] = []
+    status: str = "active"
+    """Operational lifecycle state (ADR 090): ``active`` / ``deprecated`` /
+    ``disabled``. Defaulted so existing clients that ignore it are unaffected;
+    an agent with no explicit state row reads ``active``."""
+    health: str = "unknown"
+    """Derived health (ADR 090 D3): ``healthy`` / ``unhealthy`` / ``unknown``.
+    ``unknown`` unless the catalog was fetched with ``?health=1`` (health is a
+    live probe, not stored), so the default list stays cheap."""
 
 
 class AgentCatalogView(BaseModel):
@@ -799,6 +807,51 @@ class AgentCatalogView(BaseModel):
 
     agents: list[AgentCatalogItemView]
     count: int
+
+
+class AgentStatusUpdateRequest(BaseModel):
+    """``PATCH /api/v1/agents/{name}/status`` request body (ADR 090 D4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(description="New lifecycle state: 'active', 'deprecated', or 'disabled'.")
+    note: str | None = Field(
+        default=None,
+        max_length=512,
+        description="Optional operator reason, surfaced in the control plane.",
+    )
+
+
+class AgentStatusView(BaseModel):
+    """``PATCH /api/v1/agents/{name}/status`` response — the new state (ADR 090 D4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    status: str
+    note: str | None = None
+    updated_at: str
+    updated_by: str | None = None
+
+
+class AgentHealthView(BaseModel):
+    """``GET /api/v1/agents/{name}/health`` response (ADR 090 D3).
+
+    Health is **derived** (resolve + load the bundle), never stored — so it
+    can't go stale. ``healthy`` means the agent resolves and loads cleanly;
+    ``unhealthy`` carries the diagnostic (missing skill, bad model ref,
+    malformed yaml — exactly the 'deprecated agents that don't work' case).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    healthy: bool
+    status: str
+    detail: str = ""
+    probed_run: bool = False
+    """True when ``?probe=run`` drove a MockProvider dry-run turn for a deeper
+    signal (default is the cheaper resolve+load check only)."""
 
 
 class AgentUpdatedView(BaseModel):
