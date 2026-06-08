@@ -1,6 +1,6 @@
 # ADR 089 — Non-blocking Temporal dispatch for durable HITL workflows
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-06-08
 - Related: ADR 054 (Temporal Track B/C), ADR 055 (runtime dispatch fork),
   ADR 062 (durable HITL / HUMAN node), ADR 080 (Temporal terminal-state sync),

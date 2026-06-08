@@ -990,9 +990,24 @@ class WorkerDispatch:
             )
 
         # Default: temporal
+        import os  # noqa: PLC0415
+
         from movate.providers.pricing import load_pricing  # noqa: PLC0415
         from movate.runtime.workflow_backend import run_temporal_workflow  # noqa: PLC0415
 
+        # ADR 089 / #759: when enabled, dispatch a durable HITL workflow
+        # NON-blocking so an unbounded human pause doesn't hold this dispatcher
+        # slot (which starves the queue). Default OFF — zero regression — because
+        # detached dispatch REQUIRES a long-lived `mdk worker --backend temporal`
+        # to host the workflow (the deployed setup has one; a lone queue worker
+        # does not). run_temporal_workflow only takes the non-blocking path for
+        # HUMAN-node graphs, so a non-pausing temporal workflow is unaffected.
+        detached = os.environ.get("MDK_TEMPORAL_DETACHED_HITL", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         return await run_temporal_workflow(
             graph,
             job.input,
@@ -1002,6 +1017,7 @@ class WorkerDispatch:
             provider=provider,
             tenant_id=job.tenant_id,
             mock=use_mock,
+            detached=detached,
         )
 
     @staticmethod
