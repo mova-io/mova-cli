@@ -10,7 +10,7 @@
 #
 # Mock-mode keeps the gate hermetic — no API keys, $0 cost, deterministic
 # scoring. For real-LLM eval (which IS what you want for an actual
-# customer-facing agent), look at ``.github/workflows/eval-gate.example.yml``
+# customer-facing agent), look at ``docs/ci/eval-gate.example.yml``
 # and wire your provider keys via repo secrets.
 
 name: agents

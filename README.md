@@ -296,7 +296,7 @@ mdk eval ./faq-agent --mock \
 ```
 
 Full CI workflow at
-[.github/workflows/eval-gate.example.yml](.github/workflows/eval-gate.example.yml).
+[docs/ci/eval-gate.example.yml](docs/ci/eval-gate.example.yml).
 Walkthrough: [docs/ci-eval-gate.md](docs/ci-eval-gate.md).
 
 ### 5. Debug a regression with replay
