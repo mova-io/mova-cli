@@ -68,6 +68,17 @@ echo "→ opening NSG ports 22 / 7233 / 8080"
 az vm open-port --resource-group "$RG" --name "$VM_NAME" --port 7233 --priority 1010 >/dev/null
 az vm open-port --resource-group "$RG" --name "$VM_NAME" --port 8080 --priority 1020 >/dev/null
 
+# ---- stable DNS label (#767): a VM rebuild changes the public IP, which would
+# silently break the worker's TEMPORAL_HOST + the landing tile. A DNS label gives
+# a stable <label>.<region>.cloudapp.azure.com name that survives IP changes.
+DNS_LABEL="${DNS_LABEL:-$VM_NAME}"
+PIP_NAME="$(az vm show -g "$RG" -n "$VM_NAME" --query "networkProfile.networkInterfaces[0].id" -o tsv \
+  | xargs -I{} az network nic show --ids {} --query "ipConfigurations[0].publicIPAddress.id" -o tsv \
+  | xargs -I{} basename {})"
+VM_FQDN="$(az network public-ip update -g "$RG" -n "$PIP_NAME" --dns-name "$DNS_LABEL" \
+  --query "dnsSettings.fqdn" -o tsv)"
+echo "→ DNS label set: ${VM_FQDN}"
+
 # ---- allow the VM's public IP through the Postgres firewall -----------------
 VM_IP="$(az vm list-ip-addresses -g "$RG" -n "$VM_NAME" --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv)"
 echo "→ allowing VM IP ${VM_IP} through Postgres firewall"
@@ -76,8 +87,8 @@ az postgres flexible-server firewall-rule create \
   --rule-name "temporal-vm" --start-ip-address "$VM_IP" --end-ip-address "$VM_IP" \
   --output none
 
-FQDN="$(az vm show -d -g "$RG" -n "$VM_NAME" --query fqdns -o tsv 2>/dev/null || true)"
-ADDR="${FQDN:-$VM_IP}"
+# Prefer the stable DNS FQDN over the bare IP for all wiring.
+ADDR="${VM_FQDN:-$VM_IP}"
 cat <<DONE
 
 ✅ Temporal VM provisioned. Docker pulls + first-boot schema check take ~2-3 min.
