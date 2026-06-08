@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mova-iO Voice Playground</title>
+<style>
+:root {
+  /* DARK MODE — default. Light mode below via [data-theme="light"]. */
+  --bg:#0f1117; --panel:#161a23;
+  --muted:#aab2c5; --soft:#c8cfdc; --text:#ffffff;
+  --accent:#7ab1ff; --ok:#34d058; --warn:#ffb454; --err:#ff6b6b;
+  --c1:#7ab1ff; --c2:#34d058; --c3:#ffb454; --c4:#d186ff; --c5:#ff6b6b;
+  --surface:#1f2533; --surface-2:#262d3f; --border:#2a3142;
+  --shadow-color:0,0,0; --shadow-alpha:0.3;
+  --grid:#222a3a;
+  --gate-bg:rgba(15,17,23,0.92);
+  --mono:'SF Mono',Menlo,monospace;
+}
+[data-theme="light"] {
+  --bg:#f7f9fc; --panel:#ffffff;
+  --muted:#5a6478; --soft:#3a4256; --text:#0e1320;
+  --accent:#1f6dd1; --ok:#1c8f3c; --warn:#b56a06; --err:#c43030;
+  --c1:#1f6dd1; --c2:#1c8f3c; --c3:#b56a06; --c4:#7a3ec0; --c5:#c43030;
+  --surface:#eef1f6; --surface-2:#e2e7ef; --border:#cdd4de;
+  --shadow-color:30,40,60; --shadow-alpha:0.12;
+  --grid:#dfe4ec;
+  --gate-bg:rgba(247,249,252,0.92);
+}
+* { box-sizing: border-box; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;
+       background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased;
+       display:flex; flex-direction:column; min-height:100vh; }
+header { padding:14px 24px; border-bottom:1px solid rgba(255,255,255,0.08);
+         display:flex; align-items:center; gap:12px;
+         background:#0c1a3d; color:#ffffff; order:1; }
+header h1 { color:#ffffff; }
+header .muted { color:rgba(255,255,255,0.72); }
+header .dot { background:rgba(255,255,255,0.35); }
+header .badge,
+header #theme-toggle {
+  background:rgba(255,255,255,0.12) !important;
+  color:#ffffff !important;
+}
+header .badge:hover,
+header #theme-toggle:hover { background:rgba(255,255,255,0.20) !important; }
+header .meter { background:rgba(255,255,255,0.12); }
+.brand-link { display:inline-flex; align-items:flex-start; justify-content:center;
+              padding:2px 0; transition:opacity .15s; }
+.brand-link:hover { opacity:0.85; }
+.brand-logo { height:32px; width:auto; display:block; }
+/* ™ superscript — completes the official "mova iO™" wordmark on the navy bar
+   without needing a separate trademarked asset. Sits at the top-right of the
+   mark, white-with-alpha so it reads on navy in both themes. */
+.brand-tm { font-size:9px; line-height:1; font-weight:600; margin-left:1px; margin-top:2px;
+            color:rgba(255,255,255,0.75); }
+.gate-tm { font-size:11px; line-height:1; font-weight:600; margin-left:2px; margin-top:2px;
+           color:rgba(255,255,255,0.8); }
+#lyzr-agent-meta { order:4; }
+.controls { order:3; border-top:0; border-bottom:1px solid var(--border); }
+main { order:5; }
+#gate { order:0; }
+#lyzr-agent-meta.collapsed { min-height:0; padding:8px 16px; }
+#lyzr-agent-meta.collapsed #lyzr-meta-body { display:none; }
+#lyzr-agent-meta:not(.collapsed) #lyzr-meta-caret { transform:rotate(90deg); }
+h1 { font-size:16px; font-weight:600; margin:0; letter-spacing:0.2px; }
+.dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+.dot.ok { background:var(--ok); }
+.dot.warn { background:var(--warn); }
+.dot.err { background:var(--err); }
+main { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:16px; padding:16px; max-width:1280px; margin:0 auto; width:100%; }
+@media (max-width: 980px) { main { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 700px) { main { grid-template-columns: 1fr; } }
+.dim { color:var(--muted); font-size:11px; }
+.kv { display:flex; gap:4px; align-items:baseline; }
+.kv .lbl { color:var(--muted); font-size:11px; min-width:64px; }
+.kv .val { font-size:12px; font-family:var(--mono); word-break:break-word; }
+.panel { background:var(--panel); border-radius:10px; padding:14px 16px; min-height:160px; }
+.panel h2 { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:1px;
+            color:var(--muted); margin:0 0 10px; }
+.row { display:flex; justify-content:space-between; align-items:center; padding:4px 0; font-size:13px; }
+.row .k { color:var(--muted); }
+.row .v { font-variant-numeric:tabular-nums; font-weight:500; }
+.transcript, .answer { font-size:15px; line-height:1.5; min-height:48px; white-space:pre-wrap; }
+.muted { color:var(--muted); font-style:italic; }
+.thinking { color:var(--accent); font-style:italic;
+            animation: thinking-pulse 1.2s ease-in-out infinite; }
+@keyframes thinking-pulse { 0%,100% { opacity:.55; } 50% { opacity:1; } }
+.chart-legend { display:flex; gap:12px; font-size:11px; color:var(--soft); margin-top:6px;
+                flex-wrap:wrap; }
+.chart-legend .lg { display:inline-flex; align-items:center; gap:4px; }
+.chart-legend .sw { display:inline-block; width:10px; height:10px; border-radius:2px; }
+#lyzr-meta-desc, #lyzr-meta-instructions { color:var(--soft) !important; }
+.badge { display:inline-block; padding:2px 8px; border-radius:6px; background:var(--surface); font-size:12px;
+         color:var(--accent); font-variant-numeric:tabular-nums; }
+.events { font-family:var(--mono); font-size:11px; line-height:1.55;
+          max-height:240px; overflow:auto; color:var(--soft); }
+.events .e { padding:1px 0; }
+.events .e.err { color:var(--err); }
+.events .e.final { color:var(--text); }
+.events .e.warn { color:var(--warn); }
+#events-details summary { list-style:none; }
+#events-details summary::-webkit-details-marker { display:none; }
+#events-details summary h2::before { content:'▸ '; font-size:12px; }
+#events-details[open] summary h2::before { content:'▾ '; }
+.controls { padding:18px 24px; }
+.controls-row { display:flex; gap:12px; justify-content:center; align-items:center; flex-wrap:wrap; }
+button { font-size:13px; font-weight:500; padding:8px 14px; border:0; border-radius:6px;
+         background:var(--surface); color:var(--text); cursor:pointer; }
+button:hover { background:var(--surface-2); }
+button:disabled { opacity:0.4; cursor:not-allowed; }
+button.primary { background:var(--accent); color:white; font-weight:600; padding:14px 28px; border-radius:999px;
+                 box-shadow:0 2px 8px rgba(91,155,255,0.3); font-size:14px; }
+button.primary.live { background:var(--err); box-shadow:0 0 0 6px rgba(239,68,68,0.2); }
+.hint { color:var(--muted); font-size:12px; margin-top:8px; text-align:center; }
+.error { color:var(--err); font-size:13px; padding:8px 0; text-align:center; }
+.meter { width:160px; height:8px; background:var(--surface-2); border-radius:4px; overflow:hidden; position:relative; }
+.meter > .bar { height:100%; width:0%; background:linear-gradient(90deg, var(--ok) 0%, var(--warn) 70%, var(--err) 100%);
+                transition: width 60ms linear; }
+.gate { position:fixed; inset:0; background:var(--gate-bg); display:flex; align-items:center;
+        justify-content:center; flex-direction:column; gap:18px; z-index:100; }
+.gate.hidden { display:none; }
+.gate h2 { font-size:18px; margin:0; }
+.gate .start { font-size:16px; padding:16px 32px; border-radius:8px; background:var(--accent); color:white;
+               cursor:pointer; border:0; font-weight:600; }
+.agent-id-input { background:var(--surface); color:var(--text); border:1px solid var(--border);
+                  border-radius:6px; padding:6px 10px; font-family:var(--mono); font-size:11px; width:240px; }
+.agent-select { background:var(--surface); color:var(--text); border:1px solid var(--border);
+                border-radius:6px; padding:6px 10px; font-size:12px; min-width:240px; max-width:340px; }
+</style>
+</head>
+<body>
+
+<!-- Audio-unlock gate (Safari/Chrome autoplay block). Branded with the Mova-iO
+     logo + title so the first thing a visitor sees is the product. -->
+<div id="gate" class="gate">
+  <div style="padding:14px 22px;background:#0c1a3d;border-radius:10px;
+              display:inline-flex;align-items:flex-start;">
+    <img src="/static/mova-io-logo.png" alt="Mova-iO" style="height:42px;width:auto;display:block;" /><sup class="gate-tm">™</sup>
+  </div>
+  <h2 style="font-size:22px;">Mova-iO Voice Playground</h2>
+  <div class="muted" style="max-width:380px;text-align:center;">
+    Click to enable microphone and audio playback in this browser.
+  </div>
+  <button class="start" id="gate-start">▶ Start</button>
+  <div id="deploy-info" class="muted" style="font-size:11px;opacity:0.6;margin-top:4px;
+       font-variant-numeric:tabular-nums;font-family:var(--mono);">
+    loading deploy info…
+  </div>
+</div>
+
+<header>
+  <a href="https://www.movate.com/" target="_blank" rel="noopener noreferrer"
+     title="Movate" class="brand-link">
+    <img src="/static/mova-io-logo.png" class="brand-logo" alt="Movate" /><sup class="brand-tm">™</sup>
+  </a>
+  <span id="status" class="dot"></span>
+  <h1>Mova-iO Voice Playground</h1>
+  <span id="status-text" class="muted" style="font-size:12px;"></span>
+  <div style="flex:1"></div>
+  <span id="deploy-badge" class="muted" style="font-size:10px;opacity:0.5;
+        font-variant-numeric:tabular-nums;font-family:var(--mono);
+        white-space:nowrap;"></span>
+  <!-- Light/dark mode toggle — persists in localStorage (key: "mdk-theme"). -->
+  <button id="theme-toggle" class="badge"
+          title="Toggle light/dark mode"
+          style="cursor:pointer;color:var(--text);padding:2px 8px;border:0;">🌙</button>
+  <span class="muted" style="font-size:11px;">mic</span>
+  <div class="meter" title="mic input level"><div class="bar" id="meter"></div></div>
+</header>
+
+<!-- "Currently voicing" — agent metadata, populated from the agentConfig the
+     Lyzr /sessions/start response returns (engine, model, voice, language). -->
+<div id="lyzr-agent-meta" class="panel collapsed"
+     style="display:none;margin:8px 16px;border-left:3px solid #5b9bff;">
+  <h2 id="lyzr-meta-toggle"
+      style="margin:0;display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">
+    <span id="lyzr-meta-caret" style="font-size:10px;transition:transform .15s;">▶</span>
+    <span>Currently voicing:</span>
+    <span id="lyzr-meta-name-inline" style="color:var(--text);font-weight:600;
+          text-transform:none;letter-spacing:0;font-size:13px;">—</span>
+  </h2>
+  <div id="lyzr-meta-body" style="margin-top:10px;">
+    <div class="row">
+      <span class="k">Agent ID</span>
+      <span class="v" id="lyzr-meta-id" style="font-family:var(--mono);">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Engine</span>
+      <span class="v" id="lyzr-meta-engine">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Model</span>
+      <span class="v" id="lyzr-meta-model">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Voice</span>
+      <span class="v" id="lyzr-meta-voice">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Language</span>
+      <span class="v" id="lyzr-meta-language">—</span>
+    </div>
+    <div class="row">
+      <span class="k">Session</span>
+      <span class="v" id="lyzr-meta-session" style="font-family:var(--mono);">—</span>
+    </div>
+  </div>
+</div>
+
+<div class="controls">
+  <div class="controls-row" style="margin-bottom:14px;">
+    <span class="muted" style="font-size:11px;">Mova-iO agent</span>
+    <select id="agent-select" class="agent-select">
+      <option value="__preset__">loading…</option>
+      <option value="__custom__">Other (enter agent ID)…</option>
+    </select>
+    <!-- Free-text override — shown when "Other" is picked. -->
+    <input id="agent-id" type="text" placeholder="24-char Mova-iO agent ID"
+           spellcheck="false" autocomplete="off" class="agent-id-input"
+           style="display:none;" />
+  </div>
+  <div class="controls-row">
+    <button id="talk" class="primary" disabled>🎙️ Start call</button>
+    <!-- Shown only when the room is joined but the mic publish was blocked, so
+         the user can grant permission and retry without dropping the call. -->
+    <button id="mic-retry" style="display:none;">🎤 Enable mic</button>
+  </div>
+  <div class="hint" id="hint">click Start call — the agent greets you, then just talk. Click again to hang up.</div>
+  <div class="error" id="err"></div>
+</div>
+
+<main>
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>This turn</h2>
+    <div class="row">
+      <span class="k">You said</span>
+      <span class="v"><span class="badge" id="badge"></span></span>
+    </div>
+    <div class="transcript" id="transcript"><span class="muted">click Start call and start talking…</span></div>
+    <hr style="border:0; border-top:1px solid var(--border); margin:14px 0;" />
+    <div class="row">
+      <span class="k">Agent answer</span>
+      <span class="v"></span>
+    </div>
+    <div class="answer" id="answer"><span class="muted">—</span></div>
+  </section>
+
+  <!-- Real-time activity monitor — heart-monitor-style scrolling strip. Top
+       trace = mic input level. Bottom trace = agent output level. Vertical tick
+       markers along the top edge mark events. 60-second window. -->
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>Live activity (last 60 sec)</h2>
+    <canvas id="monitor-canvas" style="width:100%;height:140px;display:block;
+      background:var(--surface);border-radius:6px;"></canvas>
+    <div class="chart-legend" style="margin-top:6px;">
+      <span class="lg"><span class="sw" style="background:var(--c1);"></span>Mic input</span>
+      <span class="lg"><span class="sw" style="background:var(--c4);"></span>Agent output</span>
+      <span class="lg"><span class="sw" style="background:var(--c2);"></span>● your transcript</span>
+      <span class="lg"><span class="sw" style="background:var(--c3);"></span>● agent transcript</span>
+      <span style="margin-left:auto;color:var(--muted);font-family:var(--mono);font-variant-numeric:tabular-nums;min-width:12em;text-align:right;" id="monitor-now">—</span>
+    </div>
+  </section>
+
+  <section class="panel" style="grid-column: 1 / -1;">
+    <details id="events-details">
+      <summary style="cursor:pointer;user-select:none;"><h2 style="display:inline;">Event stream (raw)</h2></summary>
+      <div class="events" id="events"></div>
+    </details>
+  </section>
+</main>
+
+<!-- LiveKit JS SDK (UMD global: LivekitClient). Pinned to the v2 major. -->
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<script>
+// ─── State ────────────────────────────────────────────────────────────────
+const LK = window.LivekitClient;
+let ac = null;                 // shared AudioContext (created on the gate gesture)
+let audioUnlocked = false;
+let room = null;               // LivekitClient.Room
+let connected = false;
+let connecting = false;
+let roomName = null;
+let sessionId = null;
+let micAnalyser = null;        // Web Audio analyser over the local mic track
+let agentAnalyser = null;      // … over the subscribed agent audio track
+let defaultAgentId = '6a26e4fc6d80be4fdfe65fa1';
+// One stable identity per browser tab — Lyzr requires a userIdentity string.
+const userIdentity = 'web-' + Math.random().toString(36).slice(2, 10);
+// Accumulators for the live transcript (interim text replaced until final).
+let userText = '', agentText = '';
+
+const $ = (id) => document.getElementById(id);
+
+// ─── Status + event log helpers ─────────────────────────────────────────────
+function setStatus(kind, text) {
+  const dot = $('status');
+  dot.className = 'dot' + (kind ? ' ' + kind : '');
+  $('status-text').textContent = text || '';
+}
+function setError(msg) { $('err').textContent = msg || ''; }
+function logEvent(text, cls) {
+  const box = $('events');
+  const line = document.createElement('div');
+  line.className = 'e' + (cls ? ' ' + cls : '');
+  const t = new Date().toISOString().slice(11, 23);
+  line.textContent = `${t}  ${text}`;
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+  while (box.childElementCount > 400) box.removeChild(box.firstChild);
+}
+
+// ─── Theme toggle (persists in localStorage) ────────────────────────────────
+const THEME_KEY = 'mdk-theme';
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  $('theme-toggle').textContent = theme === 'light' ? '☀️' : '🌙';
+  try { localStorage.setItem(THEME_KEY, theme); } catch (_) {}
+}
+$('theme-toggle').addEventListener('click', () => {
+  const cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+  applyTheme(cur === 'light' ? 'dark' : 'light');
+});
+applyTheme(localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark');
+
+// ─── Agent picker (preset + free-text override) ─────────────────────────────
+const agentSelect = $('agent-select');
+const agentIdInput = $('agent-id');
+agentSelect.addEventListener('change', () => {
+  const custom = agentSelect.value === '__custom__';
+  agentIdInput.style.display = custom ? '' : 'none';
+  if (custom) agentIdInput.focus();
+});
+function currentAgentId() {
+  if (agentSelect.value === '__custom__') return (agentIdInput.value || '').trim();
+  return defaultAgentId;
+}
+
+// ─── Currently-voicing panel ─────────────────────────────────────────────────
+$('lyzr-meta-toggle').addEventListener('click', () => {
+  $('lyzr-agent-meta').classList.toggle('collapsed');
+});
+function showAgentMeta(agentId, cfg) {
+  const meta = $('lyzr-agent-meta');
+  meta.style.display = '';
+  meta.classList.remove('collapsed');
+  $('lyzr-meta-name-inline').textContent = agentId;
+  $('lyzr-meta-id').textContent = agentId;
+  $('lyzr-meta-session').textContent = sessionId || '—';
+  const eng = (cfg && cfg.engine) || {};
+  $('lyzr-meta-engine').textContent = eng.kind || '—';
+  $('lyzr-meta-model').textContent = eng.llm || eng.model || '—';
+  $('lyzr-meta-voice').textContent = eng.voice || eng.voice_id || '—';
+  $('lyzr-meta-language').textContent = eng.language || '—';
+}
+
+// ─── Boot: load /config for the preset agent + deploy badge ─────────────────
+(async function boot() {
+  try {
+    const r = await fetch('/config');
+    const c = await r.json();
+    if (c.defaultAgentId) defaultAgentId = c.defaultAgentId;
+    const opt = agentSelect.querySelector('option[value="__preset__"]');
+    if (opt) opt.textContent = `Demo agent · ${defaultAgentId}`;
+    const tag = c.buildTag && c.buildTag !== 'dev' ? ` · ${c.buildTag}` : '';
+    $('deploy-badge').textContent = `agent ${defaultAgentId}${tag}`;
+    $('deploy-info').textContent = `agent ${defaultAgentId}${tag}`;
+  } catch (e) {
+    $('deploy-info').textContent = 'config unavailable';
+    logEvent('failed to load /config: ' + e, 'warn');
+  }
+})();
+
+// ─── Audio-unlock gate ──────────────────────────────────────────────────────
+$('gate-start').addEventListener('click', async () => {
+  try {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    if (ac.state === 'suspended') await ac.resume();
+    audioUnlocked = true;
+  } catch (_) {}
+  $('gate').classList.add('hidden');
+  $('talk').disabled = false;
+  setStatus('', 'ready');
+});
+
+// ─── Connect / disconnect ────────────────────────────────────────────────────
+$('talk').addEventListener('click', () => {
+  if (connecting) return;
+  if (connected) endCall();
+  else startCall();
+});
+$('mic-retry').addEventListener('click', enableMic);
+
+function makeAnalyser(mediaStreamTrack) {
+  if (!ac || !mediaStreamTrack) return null;
+  try {
+    const stream = new MediaStream([mediaStreamTrack]);
+    const src = ac.createMediaStreamSource(stream);
+    const an = ac.createAnalyser();
+    an.fftSize = 1024;
+    src.connect(an);  // analysis only — not connected to destination, no double playback
+    return an;
+  } catch (e) {
+    logEvent('analyser error: ' + e, 'warn');
+    return null;
+  }
+}
+
+async function startCall() {
+  setError('');
+  const agentId = currentAgentId();
+  if (!agentId) { setError('Enter a Mova-iO agent ID first.'); return; }
+  connecting = true;
+  $('talk').disabled = true;
+  setStatus('warn', 'starting session…');
+  logEvent(`POST /sessions/start  agent=${agentId}`);
+
+  let data;
+  try {
+    const resp = await fetch('/sessions/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId, userIdentity }),
+    });
+    data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+  } catch (e) {
+    setError('Could not start session: ' + e.message);
+    logEvent('start failed: ' + e.message, 'err');
+    connecting = false; $('talk').disabled = false; setStatus('err', 'session failed');
+    return;
+  }
+
+  roomName = data.roomName;
+  sessionId = data.sessionId;
+  const url = data.livekitUrl || data.url;
+  const token = data.userToken || data.token;
+  logEvent(`session ${sessionId} · room ${roomName}`, 'final');
+  showAgentMeta(agentId, data.agentConfig);
+
+  if (!url || !token) {
+    setError('Lyzr did not return a LiveKit url/token.');
+    logEvent('missing livekitUrl/userToken in response', 'err');
+    connecting = false; $('talk').disabled = false; setStatus('err', 'bad response');
+    return;
+  }
+
+  // getUserMedia (which the mic publish needs) requires a secure context —
+  // https:// or localhost. Bail early with a clear message rather than a cryptic
+  // "Permission denied" from deep inside the SDK.
+  if (!window.isSecureContext) {
+    setError('Voice needs a secure context — open this app over https:// or http://localhost.');
+    logEvent('insecure context — getUserMedia blocked', 'err');
+    connecting = false; $('talk').disabled = false; setStatus('err', 'needs https');
+    return;
+  }
+
+  // 1) Join the room. A failure here is a token/network/LiveKit problem.
+  setStatus('warn', 'connecting to room…');
+  room = new LK.Room({ adaptiveStream: true, dynacast: true });
+  wireRoom(room);
+  try {
+    await room.connect(url, token);
+  } catch (e) {
+    setError('Could not join the agent room: ' + e.message);
+    logEvent('room connect failed: ' + e.message, 'err');
+    await teardown();
+    connecting = false; $('talk').disabled = false; setStatus('err', 'connect failed');
+    return;
+  }
+
+  // 2) Publish the mic. This is the step that throws "Permission denied" when
+  //    mic access is blocked (or there's no mic — e.g. an embedded preview).
+  //    Keep the room connected on failure so the agent's greeting still plays;
+  //    the user can grant the mic and click "Enable mic" to retry.
+  let micOk = true;
+  try {
+    await room.localParticipant.setMicrophoneEnabled(true);
+  } catch (e) {
+    micOk = false;
+    const denied = e && (e.name === 'NotAllowedError' || /permission/i.test(e.message || ''));
+    const noDevice = e && (e.name === 'NotFoundError' || /not\s*found|no.*device/i.test(e.message || ''));
+    setError(denied
+      ? 'Microphone blocked — allow mic access in your browser (the 🎤/🔒 icon by the address bar), then click Enable mic. You can still hear the agent. (If you\'re in the embedded preview, open http://localhost:8766 in a normal browser tab — previews have no mic.)'
+      : noDevice
+        ? 'No microphone found — connect one, then click Enable mic. You can still hear the agent.'
+        : 'Mic could not start: ' + e.message + ' — you can still hear the agent; click Enable mic to retry.');
+    logEvent('mic enable failed: ' + (e && e.name) + ' ' + (e && e.message), 'err');
+  }
+
+  // Resume autoplay for any already-buffered remote audio (user-gesture path).
+  try { await room.startAudio(); } catch (_) {}
+  if (micOk) hookMicAnalyser();
+
+  connected = true;
+  connecting = false;
+  $('talk').disabled = false;
+  $('talk').classList.add('live');
+  $('talk').textContent = '⏹ End call';
+  $('agent-select').disabled = true;
+  $('agent-id').disabled = true;
+  $('mic-retry').style.display = micOk ? 'none' : '';
+  setStatus(micOk ? 'ok' : 'warn', micOk ? 'live' : 'live (no mic)');
+  $('hint').textContent = micOk
+    ? 'the agent will greet you — just talk. Click End call to hang up.'
+    : 'connected — listening to the agent. Enable your mic to talk back.';
+  resetTurn();
+}
+
+// Retry mic publish after the user grants permission, without dropping the call.
+async function enableMic() {
+  if (!room || !connected) return;
+  setError('');
+  try {
+    await room.localParticipant.setMicrophoneEnabled(true);
+    hookMicAnalyser();
+    $('mic-retry').style.display = 'none';
+    setStatus('ok', 'live');
+    $('hint').textContent = 'the agent will greet you — just talk. Click End call to hang up.';
+    logEvent('mic enabled', 'final');
+  } catch (e) {
+    setError('Still no mic access: ' + (e && e.message || e));
+    logEvent('mic retry failed: ' + (e && e.message), 'err');
+  }
+}
+
+function wireRoom(r) {
+  const E = LK.RoomEvent;
+  r.on(E.Connected, () => logEvent('room connected', 'final'));
+  r.on(E.Disconnected, (reason) => {
+    logEvent('room disconnected' + (reason != null ? ' (' + reason + ')' : ''), 'warn');
+    if (connected) endCall(true);
+  });
+  r.on(E.TrackSubscribed, (track, pub, participant) => {
+    logEvent(`track subscribed: ${track.kind} from ${participant.identity}`);
+    if (track.kind === LK.Track.Kind.Audio) {
+      const el = track.attach();
+      el.autoplay = true;
+      el.style.display = 'none';
+      el.setAttribute('data-lk', '1');
+      document.body.appendChild(el);
+      el.play().catch(() => {});
+      agentAnalyser = makeAnalyser(track.mediaStreamTrack);
+    }
+  });
+  r.on(E.TrackUnsubscribed, (track) => {
+    try { track.detach().forEach((el) => el.remove()); } catch (_) {}
+    if (track.kind === LK.Track.Kind.Audio) agentAnalyser = null;
+  });
+  // Transcription — modern LiveKit Agents path.
+  if (E.TranscriptionReceived) {
+    r.on(E.TranscriptionReceived, (segments, participant) => {
+      const isLocal = participant && participant.identity === r.localParticipant.identity;
+      for (const seg of segments) handleTranscript(isLocal ? 'user' : 'agent', seg.text, seg.final);
+    });
+  }
+  // Data packets — some agent builds push transcription as JSON over data.
+  r.on(E.DataReceived, (payload, participant, kind, topic) => {
+    // Raw data packets are logged for visibility only. Transcripts come from
+    // TranscriptionReceived + the lk.transcription text stream — parsing them
+    // here too would double-log every line.
+    let txt = '';
+    try { txt = new TextDecoder().decode(payload); } catch (_) { return; }
+    logEvent(`data${topic ? ' [' + topic + ']' : ''}: ${txt.slice(0, 200)}`);
+  });
+}
+
+// Newer LiveKit forwards transcription over a text stream on 'lk.transcription'.
+function registerTextStream(r) {
+  if (!r.registerTextStreamHandler) return;
+  try {
+    r.registerTextStreamHandler('lk.transcription', async (reader, info) => {
+      const isLocal = info && info.identity === r.localParticipant.identity;
+      const role = isLocal ? 'user' : 'agent';
+      let buf = '';
+      for await (const chunk of reader) { buf += chunk; handleTranscript(role, buf, false); }
+      handleTranscript(role, buf, true);
+    });
+  } catch (e) { logEvent('text stream handler error: ' + e, 'warn'); }
+}
+
+function hookMicAnalyser() {
+  try {
+    const pubs = Array.from(room.localParticipant.trackPublications.values());
+    const micPub = pubs.find((p) => p.track && p.kind === LK.Track.Kind.Audio);
+    if (micPub && micPub.track) {
+      micAnalyser = makeAnalyser(micPub.track.mediaStreamTrack);
+      startMeter();
+    }
+  } catch (e) { logEvent('mic analyser error: ' + e, 'warn'); }
+  registerTextStream(room);
+}
+
+// ─── Transcript rendering ────────────────────────────────────────────────────
+// Last final line logged per role, so the same final delivered by more than one
+// transport (TranscriptionReceived + the lk.transcription text stream) is logged
+// once. Time-windowed so the same phrase said again later still records.
+const lastFinal = { user: { text: null, t: 0 }, agent: { text: null, t: 0 } };
+function resetTurn() {
+  userText = ''; agentText = '';
+  lastFinal.user = { text: null, t: 0 };
+  lastFinal.agent = { text: null, t: 0 };
+  $('transcript').innerHTML = '<span class="muted">listening…</span>';
+  $('answer').innerHTML = '<span class="muted">—</span>';
+  $('badge').textContent = '';
+}
+function handleTranscript(role, text, final) {
+  if (!text) return;
+  const prev = role === 'user' ? userText : agentText;
+  const changed = text !== prev;  // another path re-delivering identical text → no-op
+  if (role === 'user') {
+    userText = text;
+    if (changed) { $('transcript').textContent = text; pushMonEvent('user', getColor('--c2')); }
+  } else {
+    agentText = text;
+    if (changed) { $('answer').textContent = text; pushMonEvent('agent', getColor('--c3')); }
+  }
+  if (!final) return;
+  const lf = lastFinal[role];
+  const dup = lf.text === text && (performance.now() - lf.t) < 5000;
+  lf.text = text; lf.t = performance.now();
+  if (dup) return;
+  if (role === 'user') $('badge').textContent = 'you';
+  logEvent((role === 'user' ? 'you: ' : 'agent: ') + text, 'final');
+}
+function getColor(varName) {
+  return getComputedStyle(document.documentElement).getPropertyValue(varName).trim() || '#888';
+}
+
+// ─── End call ────────────────────────────────────────────────────────────────
+async function endCall(remote) {
+  if (!connected && !connecting) return;
+  const rn = roomName;
+  await teardown();
+  connected = false;
+  connecting = false;
+  $('talk').classList.remove('live');
+  $('talk').textContent = '🎙️ Start call';
+  $('talk').disabled = false;
+  $('mic-retry').style.display = 'none';
+  $('agent-select').disabled = false;
+  $('agent-id').disabled = false;
+  stopMeter();
+  setStatus('', remote ? 'call ended' : 'ready');
+  $('hint').textContent = 'click Start call — the agent greets you, then just talk. Click again to hang up.';
+  if (rn && !remote) {
+    try {
+      await fetch('/sessions/end', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomName: rn }),
+      });
+      logEvent('POST /sessions/end  room=' + rn, 'final');
+    } catch (e) { logEvent('end failed: ' + e.message, 'warn'); }
+  }
+  roomName = null; sessionId = null;
+}
+
+async function teardown() {
+  if (room) {
+    try { await room.disconnect(); } catch (_) {}
+    room = null;
+  }
+  micAnalyser = null;
+  agentAnalyser = null;
+  document.querySelectorAll('audio[data-lk]').forEach((el) => el.remove());
+}
+
+// ─── Real-time activity monitor (scrolling strip-chart) ──────────────────────
+const MON_WINDOW_S = 60;
+const MON_FPS = 30;
+const MON_N = MON_WINDOW_S * MON_FPS;
+const monMic = new Float32Array(MON_N);
+const monAgent = new Float32Array(MON_N);
+let monIdx = 0;
+let monLastSampleAt = 0;
+let monRaf = 0;
+let monStartTime = performance.now();
+const monEvents = [];
+
+function pushMonEvent(kind, color) {
+  monEvents.push({ idx: monIdx, color, kind });
+  if (monEvents.length > 300) monEvents.splice(0, monEvents.length - 300);
+}
+function samplePeak(analyser) {
+  if (!analyser) return 0;
+  const buf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(buf);
+  let peak = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = Math.abs(buf[i] - 128);
+    if (v > peak) peak = v;
+  }
+  return Math.min(1, (peak / 128) * 2.2);
+}
+function tickMonitor(now) {
+  monRaf = requestAnimationFrame(tickMonitor);
+  if (now - monLastSampleAt < 1000 / MON_FPS) return;
+  monLastSampleAt = now;
+  monMic[monIdx] = samplePeak(micAnalyser);
+  monAgent[monIdx] = samplePeak(agentAnalyser);
+  monIdx = (monIdx + 1) % MON_N;
+  const elapsedSec = Math.floor((now - monStartTime) / 1000);
+  const monNow = $('monitor-now');
+  if (monNow && monNow.dataset.lastSec !== String(elapsedSec)) {
+    monNow.dataset.lastSec = String(elapsedSec);
+    monNow.textContent = `elapsed ${elapsedSec}s · samples ${MON_FPS}/s`;
+  }
+  drawMonitor();
+}
+let monCssW = 800, monCssH = 140;
+const _monResizeObs = new ResizeObserver((entries) => {
+  for (const e of entries) {
+    monCssW = e.contentRect.width || 800;
+    monCssH = e.contentRect.height || 140;
+  }
+});
+let _monObsAttached = false;
+function drawMonitor() {
+  const c = $('monitor-canvas');
+  if (!c) return;
+  if (!_monObsAttached) { _monResizeObs.observe(c); _monObsAttached = true; monCssW = c.clientWidth || 800; monCssH = c.clientHeight || 140; }
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = monCssW, cssH = monCssH;
+  if (c.width !== Math.round(cssW * dpr) || c.height !== Math.round(cssH * dpr)) {
+    c.width = Math.round(cssW * dpr); c.height = Math.round(cssH * dpr);
+  }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  const cs = getComputedStyle(document.documentElement);
+  const colGrid = cs.getPropertyValue('--grid').trim() || '#222a3a';
+  const colMic = cs.getPropertyValue('--c1').trim() || '#7ab1ff';
+  const colAgent = cs.getPropertyValue('--c4').trim() || '#d186ff';
+  const colMid = cs.getPropertyValue('--muted').trim() || '#7c8497';
+  ctx.strokeStyle = colGrid; ctx.lineWidth = 1;
+  ctx.beginPath();
+  const stepPx = cssW / (MON_WINDOW_S / 5);
+  for (let s = 0; s <= MON_WINDOW_S / 5; s++) {
+    const x = Math.round(s * stepPx) + 0.5;
+    ctx.moveTo(x, 0); ctx.lineTo(x, cssH);
+  }
+  ctx.moveTo(0, cssH / 2 + 0.5); ctx.lineTo(cssW, cssH / 2 + 0.5);
+  ctx.stroke();
+  ctx.fillStyle = colMid; ctx.font = '9px "SF Mono", Menlo, monospace';
+  for (let s = 0; s <= MON_WINDOW_S; s += 10) {
+    const x = (s / MON_WINDOW_S) * cssW;
+    ctx.fillText(`-${MON_WINDOW_S - s}s`, x + 2, cssH - 2);
+  }
+  const midY = cssH / 2;
+  const half = midY - 4;
+  function plotTrace(buf, color, sign) {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < MON_N; i++) {
+      const readIdx = (monIdx + i) % MON_N;
+      const x = (i / MON_N) * cssW;
+      const y = midY + sign * buf[readIdx] * half;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.fillStyle = color + (color.startsWith('#') ? '22' : '');
+    ctx.lineTo(cssW, midY); ctx.lineTo(0, midY);
+    ctx.fill();
+  }
+  plotTrace(monMic, colMic, -1);
+  plotTrace(monAgent, colAgent, +1);
+  for (const ev of monEvents) {
+    const delta = (monIdx - ev.idx + MON_N) % MON_N;
+    if (delta >= MON_N) continue;
+    const x = ((MON_N - delta) / MON_N) * cssW;
+    ctx.fillStyle = ev.color;
+    ctx.fillRect(x - 1, 0, 2, 8);
+  }
+  ctx.strokeStyle = colMid; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(cssW - 1, 0); ctx.lineTo(cssW - 1, cssH);
+  ctx.stroke();
+}
+function startMonitor() {
+  monStartTime = performance.now();
+  monLastSampleAt = 0; monIdx = 0;
+  monMic.fill(0); monAgent.fill(0);
+  monEvents.length = 0;
+  cancelAnimationFrame(monRaf);
+  monRaf = requestAnimationFrame(tickMonitor);
+}
+window.addEventListener('load', startMonitor);
+
+// ─── Mic level meter ──────────────────────────────────────────────────────────
+let meterRaf = 0;
+function startMeter() {
+  cancelAnimationFrame(meterRaf);
+  if (!micAnalyser) return;
+  const data = new Uint8Array(micAnalyser.fftSize);
+  const tick = () => {
+    if (!micAnalyser) return;
+    micAnalyser.getByteTimeDomainData(data);
+    let peak = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = Math.abs(data[i] - 128);
+      if (v > peak) peak = v;
+    }
+    $('meter').style.width = Math.min(100, (peak / 128) * 220) + '%';
+    meterRaf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+function stopMeter() {
+  cancelAnimationFrame(meterRaf);
+  $('meter').style.width = '0%';
+}
+
+// Tear the session down if the tab closes mid-call (best-effort).
+window.addEventListener('beforeunload', () => {
+  if (roomName) navigator.sendBeacon &&
+    navigator.sendBeacon('/sessions/end', new Blob([JSON.stringify({ roomName })], { type: 'application/json' }));
+});
+</script>
+</body>
+</html>
