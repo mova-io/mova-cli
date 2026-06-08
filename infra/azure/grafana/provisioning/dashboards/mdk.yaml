@@ -1,0 +1,21 @@
+# Auto-provision the in-repo Azure-Monitor dashboards (dashboards/grafana/azure/
+# *.json — Temporal, Voice, Executive, Live Runtime) into Grafana on container
+# start, so a fresh deploy already shows them under the "MDK" folder with no
+# manual import (#764). The Dockerfile copies those JSONs to the path below.
+#
+# editable: true + allowUiUpdates so an operator can still tweak a panel live;
+# the file is the source of truth on the next deploy.
+apiVersion: 1
+
+providers:
+  - name: mdk
+    orgId: 1
+    folder: "MDK"
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/mdk
+      foldersFromFilesStructure: false

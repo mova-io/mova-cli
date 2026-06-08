@@ -1,0 +1,26 @@
+# Auto-provisioned Azure Monitor datasource for the movate-dev Grafana (#764).
+#
+# grafana-oss runs with NO persistent volume, so anything created via the API
+# (the old hand-import) is WIPED on every redeploy. Provisioning makes the
+# datasource + dashboards survive a deploy.
+#
+# The uid is PINNED to the value the in-repo dashboards reference
+# (dashboards/grafana/azure/*.json all target uid "ffnrfwjnew5xcc"), so the
+# auto-provisioned dashboards bind on first load with no "pick a datasource"
+# step. Auth is managed identity — the GF_AZURE_MANAGED_IDENTITY_ENABLED=true +
+# AZURE_SUBSCRIPTION_ID env on the container app supply the rest; Grafana
+# expands ${AZURE_SUBSCRIPTION_ID} here at provisioning time.
+apiVersion: 1
+
+datasources:
+  - name: Azure Monitor
+    uid: ffnrfwjnew5xcc
+    type: grafana-azure-monitor-datasource
+    access: proxy
+    orgId: 1
+    isDefault: true
+    editable: false
+    jsonData:
+      azureAuthType: msi
+      cloudName: azuremonitor
+      subscriptionId: ${AZURE_SUBSCRIPTION_ID}
