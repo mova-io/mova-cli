@@ -130,10 +130,21 @@ class TraceSinkError(Exception):
 def build_tracer() -> Tracer:
     """Select a Tracer from the environment.
 
-    ``MOVATE_TRACE_SINK`` (ADR 015) wins when set; otherwise the legacy
-    ``MOVATE_TRACER`` + auto-detect path runs, byte-for-byte unchanged.
+    The deployment sink selector (ADR 015) wins when set: ``MDK_TRACE_SINK``
+    is canonical, ``MOVATE_TRACE_SINK`` the deprecated alias (MDK rename). We
+    read ``MDK_`` first and fall back to ``MOVATE_`` directly here — NOT relying
+    on the ``sync_env_aliases`` bridge — because the tracer can be built before
+    that shim runs on some entry paths, which silently dropped a deployed
+    ``MDK_TRACE_SINK`` to the legacy ``MOVATE_TRACER`` auto-detect (it sent traces
+    to stdout instead of Langfuse — observed 2026-06-08, #757). When neither is
+    set, the legacy ``MOVATE_TRACER`` auto-detect path runs, byte-for-byte
+    unchanged.
     """
-    sink = os.environ.get("MOVATE_TRACE_SINK", "").strip().lower()
+    sink = (
+        (os.environ.get("MDK_TRACE_SINK") or os.environ.get("MOVATE_TRACE_SINK") or "")
+        .strip()
+        .lower()
+    )
     if sink:
         return _build_from_sink(sink)
 
@@ -149,7 +160,7 @@ def build_tracer() -> Tracer:
 def _build_from_sink(sink: str) -> Tracer:
     if sink not in _VALID_SINKS:
         raise TraceSinkError(
-            f"MOVATE_TRACE_SINK={sink!r} is not recognized; valid values: {', '.join(_VALID_SINKS)}"
+            f"MDK_TRACE_SINK={sink!r} is not recognized; valid values: {', '.join(_VALID_SINKS)}"
         )
 
     if sink == "none":
