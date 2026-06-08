@@ -1,7 +1,10 @@
 # Example: gate PRs on movate eval scores.
 #
-# Copy this file into your *consumer* repo (the repo holding your agents) at
-# `.github/workflows/eval-gate.yml` and commit. Post-Sprint-W (May 2026)
+# NOTE: this file lives in docs/ (NOT .github/workflows/) on purpose — GitHub
+# only runs workflows physically located in .github/workflows/, so keeping the
+# example here means it never executes as a gate in THIS repo. Copy it into your
+# *consumer* repo (the repo holding your agents) at `.github/workflows/eval-gate.yml`
+# and commit. Post-Sprint-W (May 2026)
 # the workflow uses `mdk eval --all` so it sweeps every agent in
 # `agents/` without a matrix entry per agent — adding a new agent is
 # zero CI churn.
@@ -54,7 +57,10 @@ jobs:
         run: uv python install 3.11
 
       - name: Install movate
-        run: uv pip install --system movate-cli
+        # `uv tool install` puts the `mdk` CLI on PATH without touching the
+        # runner's externally-managed system Python (avoids the PEP 668
+        # "externally managed" error that `uv pip install --system` hits).
+        run: uv tool install movate-cli
 
       - name: Run mdk eval --all
         # Exits 1 if any agent's mean score falls below --gate.
@@ -102,7 +108,10 @@ jobs:
         run: uv python install 3.11
 
       - name: Install movate
-        run: uv pip install --system movate-cli
+        # `uv tool install` puts the `mdk` CLI on PATH without touching the
+        # runner's externally-managed system Python (avoids the PEP 668
+        # "externally managed" error that `uv pip install --system` hits).
+        run: uv tool install movate-cli
 
       - name: Refresh baseline
         run: |

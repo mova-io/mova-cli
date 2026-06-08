@@ -1555,7 +1555,7 @@ between two real processes.
   drop the file at `.movate/<agent>/baseline.json` without pre-creating
   the dir.
 - Example workflow at
-  [.github/workflows/eval-gate.example.yml](.github/workflows/eval-gate.example.yml)
+  [docs/ci/eval-gate.example.yml](docs/ci/eval-gate.example.yml)
   with `gate-pr` (PR-time regression check) and `refresh-baseline`
   (main-branch refresh) jobs. Docs at
   [docs/ci-eval-gate.md](docs/ci-eval-gate.md). Six new tests cover

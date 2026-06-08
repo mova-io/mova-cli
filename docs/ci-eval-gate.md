@@ -7,7 +7,7 @@ Block PR merges when the eval suite regresses. Two pieces compose here:
    for ephemeral CI runners (sqlite is per-runner, JSON files travel with
    the repo).
 2. An example GitHub Actions workflow at
-   [.github/workflows/eval-gate.example.yml](../.github/workflows/eval-gate.example.yml).
+   [docs/ci/eval-gate.example.yml](../docs/ci/eval-gate.example.yml).
 
 This doc explains the flow and how to wire it in your own repo.
 
@@ -53,7 +53,7 @@ In your *consumer* repo (the one holding agents, not movate-cli itself):
 2. **Copy the example workflow**:
 
     ```bash
-    cp /path/to/movate-cli/.github/workflows/eval-gate.example.yml \
+    cp /path/to/movate-cli/docs/ci/eval-gate.example.yml \
        .github/workflows/eval-gate.yml
     ```
 
