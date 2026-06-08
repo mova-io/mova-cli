@@ -1,0 +1,121 @@
+# Self-hosted Langfuse v3 — VM + docker-compose (ADR 015/039 follow-on).
+#
+# WHY v3 (not the simpler v2 Postgres-only image): the mdk LangfuseTracer is
+# v3-native (client.start_span / start_observation). A v2 server silently drops
+# v3-SDK traces (incident 2026-06-08: UI/login/ingestion all worked, but
+# app-emitted traces never landed — root cause was SDK v3 ↔ server v2). v3 needs
+# the full async-ingestion backing stack:
+#
+#   langfuse-web     — UI + API (ingestion endpoint)        :3000
+#   langfuse-worker  — async ingestion processor (queue → ClickHouse)
+#   clickhouse       — analytics/trace store (the v3 requirement v2 lacked)
+#   redis            — ingestion queue + cache
+#   minio            — S3-compatible blob store (raw event/media payloads)
+#
+# The transactional DB REUSES the existing shared Azure Postgres (`langfuse`
+# database) — no new managed DB. ClickHouse/Redis/MinIO are compose-local with
+# persistent volumes on the VM.
+#
+# Secrets come from a NON-committed .env (deploy-langfuse-vm.sh injects them from
+# Key Vault). Team URL: http://<vm-fqdn>:3000 (shared login via LANGFUSE_INIT_*).
+
+services:
+  langfuse-web:
+    image: langfuse/langfuse:3
+    restart: unless-stopped
+    depends_on:
+      clickhouse: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    ports:
+      - "3000:3000"
+    environment: &langfuse-env
+      DATABASE_URL: ${LANGFUSE_DATABASE_URL:?set in .env}        # Azure Postgres `langfuse` db
+      SALT: ${LANGFUSE_SALT:?set in .env}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?set in .env}    # 64 hex chars
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?set in .env}
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:?set in .env}        # http://<vm-fqdn>:3000
+      TELEMETRY_ENABLED: "true"
+      LANGFUSE_INIT_ORG_ID: movate
+      LANGFUSE_INIT_ORG_NAME: Movate
+      LANGFUSE_INIT_PROJECT_ID: mdk
+      LANGFUSE_INIT_PROJECT_NAME: MDK
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:?set in .env}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:?set in .env}
+      LANGFUSE_INIT_USER_EMAIL: demo@movate.dev
+      LANGFUSE_INIT_USER_NAME: Demo
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?set in .env}
+      # ClickHouse (v3 analytics store)
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in .env}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      # Redis (ingestion queue)
+      REDIS_CONNECTION_STRING: redis://default:${REDIS_PASSWORD:?set in .env}@redis:6379
+      # S3 / MinIO (raw event blobs)
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:?set in .env}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    restart: unless-stopped
+    depends_on:
+      clickhouse: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    environment: *langfuse-env
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in .env}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  redis:
+    image: docker.io/redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set in .env}"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:?set in .env}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  clickhouse_data:
+  clickhouse_logs:
+  minio_data:
