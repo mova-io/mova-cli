@@ -115,13 +115,13 @@ def test_load_workflow_spec_accepts_directory_path(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-def test_runtime_field_defaults_to_native(tmp_path: Path) -> None:
-    """Existing workflow.yaml files (no ``runtime:`` set) keep the v0.3
-    behavior: WorkflowSpec.runtime defaults to ``"native"`` (ADR 054 D2,
-    zero behavior change for the default load path)."""
+def test_runtime_field_defaults_to_auto(tmp_path: Path) -> None:
+    """A workflow.yaml with no ``runtime:`` set defaults to ``"auto"`` (ADR 091)
+    — resolved to temporal-when-available-else-native at dispatch. Where Temporal
+    is unconfigured (local/CI) that is byte-for-byte the old native path."""
     yaml_path = _linear_two_node(tmp_path)
     spec, _ = load_workflow_spec(yaml_path)
-    assert spec.runtime == "native"
+    assert spec.runtime == "auto"
 
 
 @pytest.mark.unit

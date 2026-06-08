@@ -382,7 +382,13 @@ async def _replay_workflow(
             context="replay",
         )
         raise typer.Exit(code=2)
-    runtime = getattr(graph, "runtime", "native") or "native"
+    # ADR 091 — the run's RECORDED backend is authoritative (an ``auto``
+    # workflow may have run on Temporal or native depending on availability at
+    # run time). Prefer record.runtime; fall back to resolving the on-disk graph
+    # for older records that predate the field.
+    from movate.runtime.workflow_backend import resolve_effective_runtime  # noqa: PLC0415
+
+    runtime = getattr(record, "runtime", None) or resolve_effective_runtime(graph, None)
     if runtime != "temporal":
         error(
             f"replay requires a Temporal-backed run (runtime: temporal); this run used {runtime}.",

@@ -93,11 +93,13 @@ class WorkflowGraph:
     """Directory containing the source ``workflow.yaml``. Used by the runner
     to resolve any relative paths the compiler couldn't pre-resolve."""
 
-    runtime: str = "native"
-    """The declared execution backend (ADR 055 D1), surfaced read-only from
-    ``WorkflowSpec.runtime`` by the compiler. One of ``"native"`` (default —
-    the in-process :class:`~movate.core.workflow.runner.WorkflowRunner`),
-    ``"temporal"`` (ADR 054), or ``"langgraph"`` (ADR 030). The dispatch fork
+    runtime: str = "auto"
+    """The declared execution backend (ADR 055 D1, ADR 091), surfaced read-only
+    from ``WorkflowSpec.runtime`` by the compiler. One of ``"auto"`` (default —
+    Temporal when available + compilable, else native; resolved by
+    ``resolve_effective_runtime``), ``"native"`` (the in-process
+    :class:`~movate.core.workflow.runner.WorkflowRunner`), ``"temporal"``
+    (ADR 054), or ``"langgraph"`` (ADR 030). The dispatch fork
     (and ``mdk show``) read this without re-parsing ``workflow.yaml``. A
     ``--runtime`` CLI override never mutates this — it is the workflow's
     *declared* home; the override is applied at the selection point only."""

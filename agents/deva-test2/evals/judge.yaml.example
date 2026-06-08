@@ -1,0 +1,22 @@
+# Optional LLM-as-judge config. Rename to `judge.yaml` to enable.
+#
+# RULE: judge family MUST differ from agent family (e.g. agent=openai/* →
+# judge cannot be openai/* or azure/*). The eval engine rejects same-family
+# configs at parse time, not at run time, so misconfigs surface immediately.
+#
+# For variance defense, run `mdk eval` with --runs 3 (or 5) when using
+# llm_judge so the per-case score is the mean of N independent judgments.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the actual answer against the expected answer for semantic
+  equivalence. Penalize hallucinations. A 1.0 = fully correct,
+  0.5 = partially correct, 0.0 = wrong or unsafe.
+
+threshold: 0.7

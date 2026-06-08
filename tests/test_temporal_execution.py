@@ -208,13 +208,14 @@ def _load_graph(yaml_path: Path) -> Any:
 
 
 @pytest.mark.unit
-def test_runtime_field_defaults_native(tmp_path: Path) -> None:
-    """A workflow.yaml with no ``runtime:`` key compiles to graph.runtime='native'."""
+def test_runtime_field_defaults_auto(tmp_path: Path) -> None:
+    """A workflow.yaml with no ``runtime:`` key defaults to 'auto' (ADR 091),
+    resolved to temporal-when-available-else-native at dispatch (not here)."""
     graph = _load_graph(_scaffold_two_step(tmp_path))
-    assert graph.runtime == "native"
+    assert graph.runtime == "auto"
     # And the spec surfaces it too.
     spec, _ = load_workflow_spec(_scaffold_two_step(tmp_path / "b"))
-    assert spec.runtime == "native"
+    assert spec.runtime == "auto"
 
 
 @pytest.mark.unit
@@ -253,7 +254,7 @@ def test_effective_runtime_rejects_bad_override(tmp_path: Path) -> None:
     graph = _load_graph(_scaffold_two_step(tmp_path))
     with pytest.raises(WorkflowBackendError):
         resolve_effective_runtime(graph, "bogus")
-    assert set(VALID_RUNTIMES) == {"native", "langgraph", "temporal"}
+    assert set(VALID_RUNTIMES) == {"auto", "native", "langgraph", "temporal"}
 
 
 # ---------------------------------------------------------------------------
