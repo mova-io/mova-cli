@@ -1,0 +1,70 @@
+# Self-hosted Temporal — VM + docker-compose, backed by the EXISTING Azure
+# Postgres Flexible Server (ADR 078 follow-on; supersedes the ACA temporal app
+# whose raw-TCP internal ingress proved chronically unreachable, 2026-06-08).
+#
+# Two services on one host with DIRECT ports — no ACA ingress in the path:
+#   * temporal  — temporalio/auto-setup (frontend/history/matching/worker + schema
+#                 setup) on :7233 (gRPC). Reuses the shared Azure Postgres
+#                 `temporal` + `temporal_visibility` DBs (already schema'd).
+#   * temporal-ui — temporalio/ui on :8080, talks to temporal:7233 over the
+#                 compose network.
+#
+# The env mirrors the working ACA module (containerapp-temporal.bicep) verbatim
+# so behaviour is identical — only the host/networking changes. POSTGRES_PWD is
+# injected from a NON-committed .env (see .env.example) / the deploy script.
+#
+# Bring up:  docker compose up -d
+# Logs:      docker compose logs -f temporal
+# Team URL:  http://<vm-fqdn>:8080   (UI)   |   <vm-fqdn>:7233 (worker gRPC)
+
+services:
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    restart: unless-stopped
+    ports:
+      - "7233:7233" # gRPC frontend — the mdk worker / signal endpoint connect here
+    environment:
+      DB: postgres12
+      POSTGRES_SEEDS: ${POSTGRES_SEEDS:?set in .env}
+      DB_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PWD: ${POSTGRES_PWD:?set in .env}
+      DBNAME: temporal
+      VISIBILITY_DBNAME: temporal_visibility
+      # DBs already exist + are schema'd from the ACA run — only (idempotent)
+      # schema setup runs, never CREATE DATABASE.
+      SKIP_DB_CREATE: "true"
+      SKIP_SCHEMA_SETUP: "false"
+      # TLS to Azure Postgres (mandates SSL). Both prefixes required: POSTGRES_TLS_*
+      # for the schema tool, SQL_TLS_* for the server's runtime connection. Host
+      # verification off (encrypted, no CA bundle) — same posture as the apps.
+      POSTGRES_TLS_ENABLED: "true"
+      POSTGRES_TLS_DISABLE_HOST_VERIFICATION: "true"
+      SQL_TLS_ENABLED: "true"
+      SQL_TLS_ENABLE_HOST_VERIFICATION: "false"
+      SQL_TLS_SERVER_NAME: ${POSTGRES_SEEDS:?set in .env}
+      SQL_MAX_CONNS: "20"
+      SQL_VIS_MAX_CONNS: "10"
+      ENABLE_ES: "false"
+      BIND_ON_IP: "0.0.0.0"
+      DEFAULT_NAMESPACE: default
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "127.0.0.1:7233", "cluster", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    restart: unless-stopped
+    depends_on:
+      - temporal
+    ports:
+      - "8080:8080" # Web UI — the team's dashboard URL
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_UI_PORT: "8080"
+      # Open for the demo env (matches the prior "no login" posture). Put behind
+      # an auth proxy / restrict the NSG for anything beyond dev.
+      TEMPORAL_CORS_ORIGINS: "*"
