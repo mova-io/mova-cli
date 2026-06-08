@@ -273,9 +273,16 @@ class Executor:
                 # Langfuse's first-class trace fields (user_id / session_id
                 # / tags) rather than the metadata blob. Other tracers
                 # receive them as regular attributes (harmless).
-                "_session_id": request.session_id,
+                #
+                # #788 — group multi-turn conversations into one Langfuse
+                # session (fall back to the thread_id so a conversation is one
+                # trace tree, not N disjoint traces), and tag every trace with
+                # operational facets (agent + tenant) on top of the agent's
+                # authored marketplace tags — so traces are filterable by
+                # customer/agent in the Langfuse UI, not just by the bundle's tags.
+                "_session_id": request.session_id or thread_id,
                 "_user_id": request.user_id,
-                "_tags": spec.tags or [],
+                "_tags": [*(spec.tags or []), f"agent:{spec.name}", f"tenant:{tenant_id}"],
             },
             parent=parent_span,
         )
