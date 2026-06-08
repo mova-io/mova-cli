@@ -443,6 +443,73 @@ _AGENT_LABEL_MAX_DESC = 60  # max description chars in the picker label
 _AGENT_LABEL_MAX_TAGS = 3  # max tags shown in the label
 _SCHEMA_HINT_MAX_FIELDS = 6  # max input-field names listed in the power-user hint
 
+# Name → natural sample text for the auto-built example input, so the example
+# reads like a real request instead of "<request>". Falls back to a generic
+# placeholder for unknown field names.
+_EXAMPLE_BY_FIELD_NAME = {
+    "text": "Summarize the quarterly results in one sentence.",
+    "input": "Summarize the quarterly results in one sentence.",
+    "question": "What is your refund policy?",
+    "query": "What is your refund policy?",
+    "request": "Customer wants a refund for order #1234 — item arrived damaged.",
+    "message": "Hi, I need help with my account.",
+    "prompt": "Write a short welcome email.",
+    "topic": "durable workflows",
+    "code": "def add(a, b):\n    return a - b",
+    "resume": "Senior backend engineer, 8 years Python, led a payments team.",
+    "ticket": "App crashes on login after the latest update.",
+}
+
+
+def _example_value_for_prop(name: str, prop: dict[str, Any]) -> Any:
+    """Pick an example value for one input-schema property.
+
+    Prefers a schema-provided ``example`` / ``examples[0]`` / ``default``; else
+    a name-aware natural string (so the example reads like a real request); else
+    a type-appropriate placeholder.
+    """
+    if not isinstance(prop, dict):
+        return f"<{name}>"
+    if "example" in prop:
+        return prop["example"]
+    ex = prop.get("examples")
+    if isinstance(ex, list) and ex:
+        return ex[0]
+    if "default" in prop:
+        return prop["default"]
+    typ = prop.get("type")
+    if typ in (None, "string"):
+        return _EXAMPLE_BY_FIELD_NAME.get(name.lower(), f"example {name}")
+    if typ in ("integer", "number"):
+        return 1
+    if typ == "boolean":
+        return True
+    if typ == "array":
+        return []
+    if typ == "object":
+        return {}
+    return f"<{name}>"
+
+
+def example_input_for_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Build a copy-paste-ready example input from an agent's input schema (#768).
+
+    Required fields first (they're what a run actually needs), then the rest, up
+    to ``_SCHEMA_HINT_MAX_FIELDS``. Empty when the schema has no properties.
+    Pure + deterministic so the playground can surface "here's exactly what to
+    send" instead of just naming fields — agents reject generic input, which was
+    the #1 source of "it errored" confusion.
+    """
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict) or not props:
+        return {}
+    required = [r for r in (schema.get("required") or []) if r in props]
+    ordered = required + [p for p in props if p not in required]
+    out: dict[str, Any] = {}
+    for name in ordered[:_SCHEMA_HINT_MAX_FIELDS]:
+        out[name] = _example_value_for_prop(name, props[name])
+    return out
+
 
 def _agent_picker_label(agent: dict[str, Any]) -> str:
     """Build a rich label for the agent picker (Item 2).
@@ -639,9 +706,18 @@ async def on_pick_agent(action: cl.Action) -> None:
     if props:
         fields = ", ".join(f"`{p}`" for p in props[:_SCHEMA_HINT_MAX_FIELDS])
         more = ", …" if len(props) > _SCHEMA_HINT_MAX_FIELDS else ""
+        # A concrete, copy-paste-ready example (#768) so it's obvious what to
+        # send — agents reject generic input, which was the #1 "it errored"
+        # confusion. The example is valid JSON the structured-input parser
+        # accepts verbatim; tweak the values and send.
+        example = example_input_for_schema(schema)
+        example_block = ""
+        if example:
+            example_block = "\n\n```json\n" + json.dumps(example, indent=2) + "\n```"
         schema_hint = (
             "\n\n*Power tip: paste a JSON object to set structured fields "
-            f"({fields}{more}) — or just chat normally.*"
+            f"({fields}{more}) — or just chat normally. Example to copy + edit:*"
+            f"{example_block}"
         )
 
     await cl.Message(
