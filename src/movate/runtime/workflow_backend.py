@@ -291,6 +291,7 @@ async def run_temporal_workflow(
     workflow_run_id: str | None = None,
     mock: bool = False,
     defaults: Any = None,
+    detached: bool = False,
 ) -> WorkflowResult:
     """Compile ``graph`` to Temporal and execute it, returning a WorkflowResult.
 
@@ -367,21 +368,35 @@ async def run_temporal_workflow(
     if mock:
         run_state["mock"] = True
 
-    final_state, status, error = await _execute_on_temporal(
-        client=client,
-        worker_cls=Worker,
-        workflow_cls=workflow_cls,
-        activities=[
-            call_agent_activity,
-            call_skill_activity,
-            call_gate_activity,
-            call_judge_activity,
-            call_human_activity,
-            persist_workflow_result_activity,
-        ],
-        wf_id=wf_id,
-        run_state=run_state,
-    )
+    # ADR 089 / #759: for a durable HITL workflow dispatched in "detached" mode,
+    # do NOT spin up an ephemeral worker and await the result — that holds the
+    # dispatcher's slot for the entire (unbounded) human pause and starves the
+    # queue. Instead START the workflow non-blocking and return immediately; the
+    # long-lived `mdk worker --backend temporal` hosts it, the pause record
+    # (call_human_activity) makes it listable, and ADR 080 terminal-sync writes
+    # the final state on resume. Only HUMAN-node graphs take this path — a
+    # non-pausing temporal workflow finishes in seconds, so blocking is cheap and
+    # keeps the inline result (the job output IS the workflow output).
+    if detached and _graph_has_human_node(graph):
+        final_state, status, error = await _start_on_temporal(
+            client=client, workflow_cls=workflow_cls, wf_id=wf_id, run_state=run_state
+        )
+    else:
+        final_state, status, error = await _execute_on_temporal(
+            client=client,
+            worker_cls=Worker,
+            workflow_cls=workflow_cls,
+            activities=[
+                call_agent_activity,
+                call_skill_activity,
+                call_gate_activity,
+                call_judge_activity,
+                call_human_activity,
+                persist_workflow_result_activity,
+            ],
+            wf_id=wf_id,
+            run_state=run_state,
+        )
 
     finished = time.monotonic()
     return WorkflowResult(
@@ -450,6 +465,58 @@ async def _execute_on_temporal(
 
     final_state = result if isinstance(result, dict) else {"result": result}
     return final_state, WorkflowStatus.SUCCESS, None
+
+
+def _graph_has_human_node(graph: WorkflowGraph) -> bool:
+    """True if ``graph`` contains a HUMAN node (a durable HITL pause point).
+
+    Detected from the IR node types the compiler already populates — no new
+    metadata. Used to scope ADR 089's non-blocking dispatch to exactly the
+    workflows that can park for an unbounded human wait.
+    """
+    from movate.core.workflow.ir import NodeType  # noqa: PLC0415
+
+    return any(node.type == NodeType.HUMAN for node in graph.nodes.values())
+
+
+async def _start_on_temporal(
+    *,
+    client: Any,
+    workflow_cls: Any,
+    wf_id: str,
+    run_state: dict[str, Any],
+) -> tuple[dict[str, Any], Any, Any]:
+    """Start ``workflow_cls`` on Temporal NON-blocking (ADR 089 / #759).
+
+    No ephemeral worker, no await: the long-lived ``mdk worker --backend
+    temporal`` hosts the workflow + its activities (the workflow type name is
+    identical because both compile the same graph deterministically). Returns a
+    ``PAUSED`` outcome immediately — ``_workflow_result_to_outcome`` maps that to
+    a successful (accepted) job, and the durable run-record lifecycle (ADR 062
+    pause record + ADR 080 terminal sync) is the source of truth for the result.
+
+    ``REJECT_DUPLICATE`` id-reuse makes a re-dispatched job (same workflow_run_id,
+    ADR 054 D6) a no-op rather than a second execution.
+    """
+    from temporalio.common import WorkflowIDReusePolicy  # noqa: PLC0415
+
+    from movate.core.models import ErrorInfo, WorkflowStatus  # noqa: PLC0415
+
+    try:
+        await client.start_workflow(
+            workflow_cls.run,
+            run_state,
+            id=wf_id,
+            task_queue=DEFAULT_TASK_QUEUE,
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+        )
+    except Exception as exc:  # connect/start failure — fail loud, don't pretend paused.
+        return (
+            dict(run_state),
+            WorkflowStatus.ERROR,
+            ErrorInfo(type="temporal_workflow_start_failed", message=str(exc), retryable=True),
+        )
+    return dict(run_state), WorkflowStatus.PAUSED, None
 
 
 async def run_temporal_worker(
