@@ -33,8 +33,12 @@ set -uo pipefail
 RUNTIME_URL="${RUNTIME_URL:-}"
 API_KEY="${API_KEY:-}"
 WORKFLOW="${WORKFLOW:-}"
-INPUT="${INPUT:-{\"text\":\"smoke\"}}"
-DECISION="${DECISION:-{\"decision\":\"approve\"}}"
+# NOTE: do NOT default these with ${VAR:-{...}} — a brace inside the default
+# value collides with the brace closing ${...}, so bash appends a stray '}' to
+# ANY provided value (e.g. INPUT='{"request":"x"}' became '{"request":"x"}}' →
+# invalid JSON). Assign the JSON default on a separate line instead.
+INPUT="${INPUT:-}"; [ -n "$INPUT" ] || INPUT='{"text":"smoke"}'
+DECISION="${DECISION:-}"; [ -n "$DECISION" ] || DECISION='{"decision":"approve"}'
 TIMEOUT="${TIMEOUT:-120}"
 
 pass() { printf '  \033[32m✓\033[0m %s\n' "$1"; }
@@ -88,8 +92,18 @@ info "workflow: ${WORKFLOW}"
 BEFORE=$(paused_ids_for_workflow | sort -u)
 
 hdr "1. Submit the workflow"
-SUBMIT=$(curl -fsS -X POST "${AUTH[@]}" \
-  -d "{\"kind\":\"workflow\",\"target\":\"${WORKFLOW}\",\"input\":${INPUT}}" \
+# Build the payload with python3 (already a dep, used by jget) rather than shell
+# string-interpolation — INPUT can contain spaces / commas / unicode, which made
+# the old inline -d brittle. Also validates INPUT is well-formed JSON up front.
+PAYLOAD=$(MDK_WF="$WORKFLOW" MDK_IN="$INPUT" python3 -c '
+import os, json, sys
+try:
+    inp = json.loads(os.environ["MDK_IN"])
+except Exception as e:
+    sys.stderr.write(f"INPUT is not valid JSON: {e}\n"); sys.exit(2)
+print(json.dumps({"kind": "workflow", "target": os.environ["MDK_WF"], "input": inp}))
+') || fail "INPUT is not valid JSON: ${INPUT}"
+SUBMIT=$(printf '%s' "$PAYLOAD" | curl -fsS -X POST "${AUTH[@]}" --data @- \
   "${RUNTIME_URL}/run" 2>/dev/null) || fail "submit failed (POST /run) — check RUNTIME_URL / API_KEY / scope"
 JOB_ID=$(printf '%s' "$SUBMIT" | jget "['job_id']")
 [ -n "$JOB_ID" ] || fail "no job_id in submit response: $SUBMIT"
@@ -107,8 +121,15 @@ done
 pass "run ${RUN_ID} is PAUSED awaiting human decision"
 
 hdr "3. Signal the human decision"
-SIG=$(curl -fsS -X POST "${AUTH[@]}" \
-  -d "{\"decision\":${DECISION}}" \
+SIG_PAYLOAD=$(MDK_DEC="$DECISION" python3 -c '
+import os, json, sys
+try:
+    dec = json.loads(os.environ["MDK_DEC"])
+except Exception as e:
+    sys.stderr.write(f"DECISION is not valid JSON: {e}\n"); sys.exit(2)
+print(json.dumps({"decision": dec}))
+') || fail "DECISION is not valid JSON: ${DECISION}"
+SIG=$(printf '%s' "$SIG_PAYLOAD" | curl -fsS -X POST "${AUTH[@]}" --data @- \
   "${RUNTIME_URL}/api/v1/workflow-runs/${RUN_ID}/signal" 2>/dev/null) \
   || fail "signal failed — decision must supply every output_contract key (set DECISION=...)"
 pass "signalled (decision=${DECISION})"
