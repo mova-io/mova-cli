@@ -1,7 +1,12 @@
 # ADR 074 — Telephony bridge: LiveKit + Twilio transports for voice agents (Phase 3)
 
-**Status:** Proposed
-**Date:** 2026-06-03
+**Status:** Accepted — transports shipped: Phase 3a LiveKit (`voice/transports/
+livekit.py`, #709) + Phase 3b Twilio (`voice/transports/twilio.py` + the
+`/api/v1/agents/{name}/call/twilio*` inbound webhook/Media-Stream routes), both
+behind the `mdk[telephony]` extra with tests. **Remaining: deployment + a
+phone-callable demo** (no telephony infra is stood up yet) — see the "last mile"
+note below. Phase 3c (Daily) deferred.
+**Date:** 2026-06-03 _(status reconciled to shipped reality 2026-06-08)_
 **Deciders:** Engineering + Deva (Movate)
 **Builds on / composes with (changes nothing in their wire contracts):**
 ADR 048 (voice agents — the three speech seams, the WS transport, the pipeline,
