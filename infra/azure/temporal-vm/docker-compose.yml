@@ -65,6 +65,10 @@ services:
     environment:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_UI_PORT: "8080"
-      # Open for the demo env (matches the prior "no login" posture). Put behind
-      # an auth proxy / restrict the NSG for anything beyond dev.
-      TEMPORAL_CORS_ORIGINS: "*"
+      # NOTE: do NOT set TEMPORAL_CORS_ORIGINS="*" — the UI templates it into its
+      # config YAML and a bare "*" is an invalid YAML alias char, which corrupts
+      # config/docker.yaml and crash-loops the UI ("config file corrupted: line 26").
+      # The UI serves its own API same-origin on :8080, so CORS is not needed for
+      # the dashboard. If you genuinely need cross-origin access, set this to a
+      # CONCRETE url list (e.g. "http://host:8080"), never "*".
+      # TEMPORAL_CORS_ORIGINS: "http://<vm-fqdn>:8080"
