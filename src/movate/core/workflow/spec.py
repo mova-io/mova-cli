@@ -306,9 +306,93 @@ class JudgeNodeSpec(BaseModel):
         return self
 
 
-# NodeSpec is a discriminated union of agent, intent-router, human, and judge nodes.
+class SupervisorNodeSpec(BaseModel):
+    """One ``supervisor`` workflow node as written in YAML (ADR 092 D4).
+
+    The **bounded managerial pattern**: a *manager* agent repeatedly delegates to
+    a FIXED allowlist of *specialist* agents until it decides the task is done or
+    a hard delegation cap is hit. The bounds are the point — vs the unbounded
+    recursive spawning of an open swarm (ADR 038 D5, declined). The delegation
+    loop is INTERNAL to this single node (the graph stays acyclic), so a
+    supervisor workflow is linear in shape: ``… → supervisor → …``.
+
+    Per round the runner: runs ``manager`` over the current state; reads its
+    ``decision_field`` output — a specialist id from ``specialists`` to delegate
+    to next, or the sentinel ``"done"``; runs that specialist and merges its
+    output into state; loops. ``max_delegations`` is the mandatory cap so a
+    manager that never says "done" cannot run away.
+
+    Additive + ``extra="forbid"`` (rule 5): no existing workflow declares
+    ``supervisor``, so every existing workflow is byte-for-byte unchanged.
+    Per-delegation cost/token *budget* enforcement is the unified governance
+    contract (ADR 092 D5 / Phase 4); this phase ships the structural bounds
+    (fixed allowlist + delegation cap).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=128)
+    type: Literal["supervisor"]
+    manager: str = Field(
+        ...,
+        description="Ref (path) to the manager/delegator agent, resolved like any node ref.",
+    )
+    specialists: dict[str, str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "The FIXED specialist allowlist: map of specialist id → agent ref. The "
+            "manager may delegate ONLY to these ids; widening it is a reviewable "
+            "edit to this file, not a runtime decision."
+        ),
+    )
+    max_delegations: int = Field(
+        4,
+        ge=1,
+        le=20,
+        description=(
+            "Mandatory cap (ADR 092 D4) on delegation rounds. After this many "
+            "manager turns the loop terminates regardless of the manager's "
+            "decision — the anti-runaway bound."
+        ),
+    )
+    decision_field: str = Field(
+        "next",
+        description=(
+            "The manager's output key holding the chosen specialist id (or the "
+            "sentinel 'done'). Defaults to 'next'."
+        ),
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not re.match(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$", v):
+            raise ValueError(
+                f"node id {v!r} must be lowercase alphanumeric with hyphens/underscores"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_specialists(self) -> SupervisorNodeSpec:
+        if "done" in self.specialists:
+            raise ValueError(
+                f"supervisor node {self.id!r}: 'done' is the reserved terminate "
+                f"sentinel and cannot be a specialist id"
+            )
+        for sid in self.specialists:
+            if not re.match(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$", sid):
+                raise ValueError(
+                    f"supervisor node {self.id!r}: specialist id {sid!r} must be "
+                    f"lowercase alphanumeric with hyphens/underscores"
+                )
+        return self
+
+
+# NodeSpec is a discriminated union of agent, intent-router, human, judge, and
+# supervisor nodes.
 NodeSpec = Annotated[
-    AgentNodeSpec | IntentRouterNodeSpec | HumanNodeSpec | JudgeNodeSpec,
+    AgentNodeSpec | IntentRouterNodeSpec | HumanNodeSpec | JudgeNodeSpec | SupervisorNodeSpec,
     Field(discriminator="type"),
 ]
 

@@ -327,7 +327,7 @@ class WorkflowRunner:
         finally:
             self._executor.tracer.end_span(wf_span)
 
-    async def _walk_traced(
+    async def _walk_traced(  # noqa: PLR0912 — node-type dispatch loop (agent/judge/router/human/supervisor)
         self,
         graph: WorkflowGraph,
         *,
@@ -453,6 +453,47 @@ class WorkflowRunner:
                 # result is (chosen_node_id, classifier_run_records)
                 chosen_next, router_runs = result
                 runs.extend(router_runs)
+                current_id = chosen_next
+                continue
+
+            if node.type is NodeType.SUPERVISOR:
+                # --- SUPERVISOR dispatch (ADR 092 D4) -------------------------
+                result = await self._run_supervisor(
+                    node_id=node_id,
+                    node=node,
+                    state=state,
+                    graph=graph,
+                    wf_id=wf_id,
+                    mock=mock,
+                    wf_span=wf_span,
+                )
+                if isinstance(result, WorkflowResult):
+                    await self._storage.save_workflow_run(
+                        WorkflowRunRecord(
+                            workflow_run_id=wf_id,
+                            tenant_id=self._tenant_id,
+                            workflow=graph.name,
+                            workflow_version=graph.version,
+                            status=WorkflowStatus.ERROR,
+                            initial_state=initial_state,
+                            final_state=state,
+                            error_node_id=result.error_node_id,
+                            error=result.error,
+                        )
+                    )
+                    return WorkflowResult(
+                        workflow_run_id=wf_id,
+                        status=WorkflowStatus.ERROR,
+                        initial_state=initial_state,
+                        final_state=state,
+                        runs=runs + result.runs,
+                        error_node_id=result.error_node_id,
+                        error=result.error,
+                        started_at=started,
+                        finished_at=time.monotonic(),
+                    )
+                chosen_next, supervisor_runs = result
+                runs.extend(supervisor_runs)
                 current_id = chosen_next
                 continue
 
@@ -1002,6 +1043,104 @@ class WorkflowRunner:
         the loop) from a genuine forward exit. Read-only.
         """
         return any(e.from_id == from_id and e.to_id == to_id for e in graph.find_back_edges())
+
+    # --------------------------------------------------------- supervisor node
+
+    async def _run_supervisor(
+        self,
+        *,
+        node_id: str,
+        node: Any,
+        state: dict[str, Any],
+        graph: WorkflowGraph,
+        wf_id: str,
+        mock: bool,
+        wf_span: SpanCtx,
+    ) -> tuple[str | None, list[RunRecord]] | WorkflowResult:
+        """Dispatch a SUPERVISOR node — the bounded managerial loop (ADR 092 D4).
+
+        Each round: run the ``manager`` agent over the current state; read its
+        ``decision_field`` output — a specialist id from the FIXED ``specialists``
+        allowlist to delegate to, or the sentinel ``"done"``; run that specialist
+        and merge its output into state. The loop is bounded by
+        ``max_delegations`` — a manager that never says "done" still terminates,
+        the anti-runaway point of the pattern. The delegation is internal to this
+        node, so on completion the walk advances to the node's sequential
+        successor.
+
+        Returns ``(next_node_id | None, [run_records])`` on success, or a partial
+        :class:`WorkflowResult` if the manager or a specialist agent errors.
+        Under ``mock=True`` the loop is a deterministic no-op (manager "decides
+        done") so the pipeline runs under ``mdk run --mock`` without spend.
+        """
+        meta = node.metadata
+        manager_ref: str = meta["manager"]
+        specialists: dict[str, str] = meta.get("specialists", {})
+        max_delegations: int = int(meta.get("max_delegations", 4) or 4)
+        decision_field: str = meta.get("decision_field", "next")
+
+        seq_next = self._sequential_successor(graph, node_id)
+        runs: list[RunRecord] = []
+
+        if mock:
+            # Deterministic terminate so --mock exercises the supervisor exit
+            # without spend (parity with the judge/router mock paths).
+            return seq_next, runs
+
+        manager_node = WorkflowNode(id=node_id, type=NodeType.AGENT, ref=manager_ref)
+
+        for _ in range(max_delegations):
+            # 1. The manager decides who to delegate to next (or "done").
+            m_resp, m_summary = await self._run_one_agent(
+                manager_node, node_id, state, wf_id, wf_span
+            )
+            runs.append(m_summary)
+            if m_resp.status != "success":
+                await self._storage.save_run(m_summary)
+                return self._supervisor_error(wf_id, node_id, state, runs, m_resp.error)
+            state.update(m_resp.data)
+
+            choice = str(m_resp.data.get(decision_field, "")).strip()
+            if choice == "done" or choice not in specialists:
+                # Explicit done, or an out-of-allowlist choice (treated as done —
+                # the manager may NOT reach beyond its fixed roster).
+                break
+
+            # 2. Delegate to the chosen specialist; merge its output into state.
+            spec_node_id = f"{node_id}/{choice}"
+            spec_node = WorkflowNode(id=spec_node_id, type=NodeType.AGENT, ref=specialists[choice])
+            s_resp, s_summary = await self._run_one_agent(
+                spec_node, spec_node_id, state, wf_id, wf_span
+            )
+            runs.append(s_summary)
+            if s_resp.status != "success":
+                await self._storage.save_run(s_summary)
+                return self._supervisor_error(wf_id, spec_node_id, state, runs, s_resp.error)
+            state.update(s_resp.data)
+
+        return seq_next, runs
+
+    def _supervisor_error(
+        self,
+        wf_id: str,
+        error_node_id: str,
+        state: dict[str, Any],
+        runs: list[RunRecord],
+        error: ErrorInfo | None,
+    ) -> WorkflowResult:
+        """A partial-failure :class:`WorkflowResult` for a supervisor sub-agent
+        error — carries the accumulated runs so the caller threads them through."""
+        return WorkflowResult(
+            workflow_run_id=wf_id,
+            status=WorkflowStatus.ERROR,
+            initial_state=state,
+            final_state=state,
+            runs=runs,
+            error_node_id=error_node_id,
+            error=error,
+            started_at=0.0,
+            finished_at=time.monotonic(),
+        )
 
     async def _run_intent_router(
         self,

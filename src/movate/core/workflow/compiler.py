@@ -36,6 +36,7 @@ from movate.core.workflow.spec import (
     HumanNodeSpec,
     IntentRouterNodeSpec,
     JudgeNodeSpec,
+    SupervisorNodeSpec,
     WorkflowSpec,
 )
 
@@ -173,6 +174,38 @@ def compile_workflow(
                     "on_accept": ns.on_accept,
                     "on_revise": ns.on_revise,
                     "max_iterations": ns.max_iterations,
+                },
+            )
+        elif isinstance(ns, SupervisorNodeSpec):
+            # SUPERVISOR node (ADR 092 D4). Resolve the manager ref + every
+            # specialist ref to absolute paths so a typo fails loud at compile
+            # time (mirroring agent-ref resolution). The delegation loop is
+            # internal to this node, so the graph stays acyclic — no synthetic
+            # edges. Bounds (allowlist + cap) live in metadata for the runner.
+            resolved_manager = (workflow_dir / ns.manager).resolve()
+            if not resolved_manager.exists():
+                raise WorkflowCompileError(
+                    f"supervisor node {ns.id!r}: manager ref path does not exist: "
+                    f"{resolved_manager}"
+                )
+            resolved_specialists: dict[str, str] = {}
+            for sid, sref in ns.specialists.items():
+                resolved_sref = (workflow_dir / sref).resolve()
+                if not resolved_sref.exists():
+                    raise WorkflowCompileError(
+                        f"supervisor node {ns.id!r}: specialist {sid!r} ref path does "
+                        f"not exist: {resolved_sref}"
+                    )
+                resolved_specialists[sid] = str(resolved_sref)
+            nodes[ns.id] = WorkflowNode(
+                id=ns.id,
+                type=NodeType.SUPERVISOR,
+                ref=str(resolved_manager),  # the manager agent (the delegator)
+                metadata={
+                    "manager": str(resolved_manager),
+                    "specialists": resolved_specialists,
+                    "max_delegations": ns.max_delegations,
+                    "decision_field": ns.decision_field,
                 },
             )
         else:
@@ -413,12 +446,15 @@ def validate_linear(graph: WorkflowGraph) -> None:
         NodeType.INTENT_ROUTER,
         NodeType.HUMAN,
         NodeType.JUDGE,
+        # SUPERVISOR (ADR 092 D4) — its delegation loop is internal to the node,
+        # so the graph stays linear/acyclic; permitted like a single agent node.
+        NodeType.SUPERVISOR,
     }
     bad_types = sorted(n.id for n in graph.nodes.values() if n.type not in _allowed_types)
     if bad_types:
         raise WorkflowCompileError(
-            f"v0.3 supports only type=agent, type=intent-router, type=human, and "
-            f"type=judge nodes; offenders: {', '.join(bad_types)}. "
+            f"v0.3 supports only type=agent, type=intent-router, type=human, "
+            f"type=judge, and type=supervisor nodes; offenders: {', '.join(bad_types)}. "
             f"Tools/sub-workflows land in v1.1+."
         )
 

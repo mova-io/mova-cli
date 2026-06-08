@@ -43,7 +43,9 @@ VALID_RUNTIMES = ("auto", "native", "langgraph", "temporal")
 # Node types the Temporal compiler can't emit yet (raise NotImplementedError):
 # an ``auto`` workflow that uses one stays on native rather than failing (ADR 091
 # D2). Kept as bare names to avoid importing the IR enum at module scope.
-_TEMPORAL_UNSUPPORTED_NODE_TYPES = frozenset({"function", "sub_workflow"})
+# ``supervisor`` (ADR 092 D4) runs on native today; its Temporal lowering is
+# Phase 3b, so an ``auto`` supervisor workflow prefers native until then.
+_TEMPORAL_UNSUPPORTED_NODE_TYPES = frozenset({"function", "sub_workflow", "supervisor"})
 
 # The task queue the local-run ephemeral worker and the compiled workflow share.
 # ``mdk worker --backend temporal`` uses the same default (one queue name keeps
