@@ -36,12 +36,16 @@ without any cross-pod invalidation machinery (ADR 014 risks section).
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 from movate.core.config import AgentDefaults
 from movate.core.loader import AgentBundle, AgentLoadError, load_agent
@@ -165,6 +169,127 @@ def materialize_bundle(record: AgentBundleRecord) -> Path:
     return target
 
 
+async def hydrate_agent_resources(
+    storage: StorageProvider,
+    agent_dir: Path,
+    *,
+    tenant_id: str,
+) -> int:
+    """Fill an agent's referenced-but-not-shipped skills/contexts from the
+    managed store (ADR 060 D4 — registry resolution).
+
+    Reads the materialized ``agent.yaml`` directly (BEFORE :func:`load_agent`,
+    which would raise on an unresolvable ref) and, for each ``skills:`` /
+    ``contexts:`` entry NOT already present on disk under ``agent_dir``, looks
+    it up in the tenant-scoped registry (``get_skill`` / ``get_context``) and
+    writes it into the materialized dir — ``skills/<name>/`` (the record's
+    files) and ``contexts/<name>.md`` (the record's body) — so the existing
+    filesystem resolver finds it.
+
+    Precedence (ADR 060 D6): **the bundle wins.** A skill/context already
+    shipped on disk is never overwritten — author-locally bundles resolve
+    exactly as before; the store only fills refs the bundle lacks (e.g. those
+    added by ``POST /api/v1/agents/{name}/skills`` attach, which records the
+    ref without shipping the files).
+
+    Returns the count hydrated. Best-effort + fail-safe: a backend without the
+    registry methods, a missing row, or a write error is logged and skipped —
+    the loader then raises its normal "skill/context not found" diagnostic,
+    which is the correct outcome for a genuinely unresolvable ref. A store blip
+    therefore never breaks a self-contained bundle (the common case is a
+    no-op).
+    """
+    get_skill = getattr(storage, "get_skill", None)
+    get_context = getattr(storage, "get_context", None)
+    if get_skill is None and get_context is None:
+        return 0  # registry not on this backend — nothing to hydrate
+
+    try:
+        raw = yaml.safe_load((agent_dir / "agent.yaml").read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return 0
+    if not isinstance(raw, dict):
+        return 0
+
+    hydrated = 0
+    if get_skill is not None:
+        hydrated += await _hydrate_skills(get_skill, agent_dir, raw.get("skills") or [], tenant_id)
+    if get_context is not None:
+        hydrated += await _hydrate_contexts(
+            get_context, agent_dir, raw.get("contexts") or [], tenant_id
+        )
+
+    # If we hydrated a skills/ or contexts/ tree the bundle didn't ship, ensure
+    # ``load_agent``'s project-root walk resolves to THIS dir (same marker
+    # ``materialize_bundle`` drops for self-contained bundles).
+    if hydrated and not (agent_dir / "project.yaml").is_file():
+        with contextlib.suppress(OSError):
+            (agent_dir / "project.yaml").write_text("{}\n", encoding="utf-8")
+
+    return hydrated
+
+
+async def _hydrate_skills(getter: Any, agent_dir: Path, refs: Any, tenant_id: str) -> int:
+    """Materialize each ``skills:`` ref not already on disk (bundle wins, D6).
+
+    Entries are ``SkillRef`` (``{name, version}``) or bare name strings; the
+    version field is a CONSTRAINT, so we fetch latest and let
+    ``resolve_agent_skills`` check it against the materialized skill's version.
+    """
+    if not isinstance(refs, list):
+        return 0
+    count = 0
+    for ref in refs:
+        name = ref.get("name") if isinstance(ref, dict) else str(ref)
+        if not name or (agent_dir / "skills" / name / "skill.yaml").is_file():
+            continue
+        record = await _safe_get(getter, name, tenant_id, kind="skill")
+        if record is None:
+            continue
+        try:
+            _write_files(agent_dir / "skills" / name, record.files)
+            count += 1
+        except OSError:
+            logger.warning("skill_materialize_failed name=%s", name, exc_info=True)
+    return count
+
+
+async def _hydrate_contexts(getter: Any, agent_dir: Path, refs: Any, tenant_id: str) -> int:
+    """Materialize each ``contexts:`` ref (bare name) not already on disk as
+    ``contexts/<name>.md`` (bundle wins, D6)."""
+    if not isinstance(refs, list):
+        return 0
+    count = 0
+    for ref in refs:
+        name = str(ref) if ref else None
+        if not name:
+            continue
+        ctx_file = agent_dir / "contexts" / f"{name}.md"
+        if ctx_file.is_file():
+            continue
+        record = await _safe_get(getter, name, tenant_id, kind="context")
+        if record is None:
+            continue
+        try:
+            ctx_file.parent.mkdir(parents=True, exist_ok=True)
+            ctx_file.write_text(record.body, encoding="utf-8")
+            count += 1
+        except OSError:
+            logger.warning("context_materialize_failed name=%s", name, exc_info=True)
+    return count
+
+
+async def _safe_get(getter: Any, name: str, tenant_id: str, *, kind: str) -> Any:
+    """Tenant-scoped registry lookup that never raises — logs + returns None."""
+    try:
+        return await getter(name, tenant_id=tenant_id, version=None)
+    except Exception:
+        logger.warning(
+            "%s_registry_resolve_failed name=%s tenant_id=%s", kind, name, tenant_id, exc_info=True
+        )
+        return None
+
+
 async def resolve_agent_bundle(
     storage: StorageProvider,
     name: str,
@@ -198,6 +323,11 @@ async def resolve_agent_bundle(
     if record is not None:
         try:
             agent_dir = materialize_bundle(record)
+            # ADR 060 D4: fill any attached-but-not-shipped skill/context refs
+            # from the managed store into the materialized dir BEFORE load_agent
+            # resolves them. No-op for self-contained bundles (the common case);
+            # bundle-shipped resources always win (D6).
+            await hydrate_agent_resources(storage, agent_dir, tenant_id=tenant_id)
             # Empty defaults: the materialized bundle is self-contained
             # and must NOT inherit the worker/API process's CWD project
             # config. Mirrors how persist_bundle validates a staged bundle.
@@ -439,6 +569,7 @@ __all__ = [
     "PublishResult",
     "bundle_files_from_dir",
     "content_hash",
+    "hydrate_agent_resources",
     "import_filesystem_agents",
     "materialize_bundle",
     "publish_agent_bundle",
