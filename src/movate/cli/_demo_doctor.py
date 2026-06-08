@@ -55,6 +55,10 @@ _MIN_AGENTS = 2
 # on demand, not by the seed).
 _PLAYGROUND_PORT = int(os.environ.get("MDK_PLAYGROUND_PORT", "8765"))
 
+# HTTP status at/above which a live-surface probe counts as failed (4xx/5xx).
+# 401/403/405 are special-cased as "reachable but gated" in _probe_surface.
+_HTTP_ERROR_FLOOR = 400
+
 
 @dataclass
 class Check:
@@ -77,7 +81,7 @@ def _ok_mark(c: Check) -> str:
 
 
 async def _gather_checks(  # noqa: PLR0912 — branch count is inherent to a multi-section readiness scan
-    *, run_agents: bool
+    *, run_agents: bool, surfaces: bool = False
 ) -> list[Check]:
     """Run every readiness check against the seeded demo state.
 
@@ -266,6 +270,14 @@ async def _gather_checks(  # noqa: PLR0912 — branch count is inherent to a mul
 
     # --- Playground reachability (beat 5) — soft, off-storage ---
     checks.append(_check_playground())
+
+    # --- Live deployed-surface health (opt-in via --surfaces) ---
+    # Probes the actual hosted endpoints (api / temporal / langfuse / grafana /
+    # playgrounds / voice demos) so a pre-demo flight catches a down service
+    # before you're in front of the customer. URLs come from MDK_DEMO_SURFACES
+    # (never hardcoded), so this stays generic across environments.
+    if surfaces:
+        checks.extend(await _check_surfaces())
     return checks
 
 
@@ -373,6 +385,77 @@ def _check_playground() -> Check:
         )
 
 
+def _demo_surfaces() -> list[tuple[str, str]]:
+    """Parse the live surfaces to probe from ``MDK_DEMO_SURFACES``.
+
+    Format: a comma-separated ``name=url`` list, e.g.::
+
+        MDK_DEMO_SURFACES="api=https://…/health,temporal=http://…:8080,langfuse=http://…:3000"
+
+    Deliberately env-driven (never a hardcoded host) so the same check works
+    across dev / demo / customer environments. Empty/unset ⇒ no surface rows.
+    """
+    raw = os.environ.get("MDK_DEMO_SURFACES", "").strip()
+    pairs: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        part = entry.strip()
+        if "=" not in part:
+            continue
+        name, url = part.split("=", 1)
+        name, url = name.strip(), url.strip()
+        if name and url:
+            pairs.append((name, url))
+    return pairs
+
+
+def _probe_surface(name: str, url: str) -> Check:
+    """HTTP-GET one deployed surface; report reachable + status + latency.
+
+    Stdlib only (no httpx dep on the core CLI path). A 401/403/405 still means
+    the service is UP (auth-gated or method-restricted), so those count as
+    reachable — only a connection/timeout/5xx failure is a red row. Hard so a
+    pre-demo gate (``mdk demo doctor --surfaces``) exits non-zero on a down one.
+    """
+    import time  # noqa: PLC0415
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "mdk-demo-doctor"})
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            ms = int((time.monotonic() - t0) * 1000)
+            code = int(resp.status)
+            return Check(
+                f"surface: {name}", code < _HTTP_ERROR_FLOOR, f"HTTP {code} in {ms}ms — {url}"
+            )
+    except urllib.error.HTTPError as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        # Reachable but gated/method-restricted → the surface is alive.
+        alive = exc.code in (401, 403, 405)
+        return Check(f"surface: {name}", alive, f"HTTP {exc.code} in {ms}ms — {url}")
+    except Exception as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        return Check(
+            f"surface: {name}", False, f"unreachable after {ms}ms — {type(exc).__name__} — {url}"
+        )
+
+
+async def _check_surfaces() -> list[Check]:
+    """Probe every configured live surface concurrently (off-storage)."""
+    pairs = _demo_surfaces()
+    if not pairs:
+        return [
+            Check(
+                "live surfaces",
+                False,
+                'set MDK_DEMO_SURFACES="name=url,…" to health-check deployed endpoints',
+                hard=False,
+            )
+        ]
+    return list(await asyncio.gather(*[asyncio.to_thread(_probe_surface, n, u) for n, u in pairs]))
+
+
 def doctor(
     run_agents: bool = typer.Option(
         False,
@@ -384,6 +467,16 @@ def doctor(
             "resolve. Offline, $0. Off by default to keep the check fast."
         ),
     ),
+    surfaces: bool = typer.Option(
+        False,
+        "--surfaces/--no-surfaces",
+        help=(
+            "Also HTTP-probe the live deployed surfaces (api / temporal / "
+            "langfuse / grafana / playgrounds / voice demos) so a pre-demo "
+            'flight catches a down service. URLs come from MDK_DEMO_SURFACES="'
+            'name=url,…" — never hardcoded. A down surface fails the verdict.'
+        ),
+    ),
 ) -> None:
     """Confirm the Monday-demo environment is GO (run after ``mdk demo seed``).
 
@@ -392,12 +485,17 @@ def doctor(
     registered + valid (one voice-capable), and a workflow is present. Exits
     non-zero if any hard check fails, so a pre-demo script can gate on it.
 
+    With ``--surfaces`` it also pings the live hosted endpoints (from
+    ``MDK_DEMO_SURFACES``) — the pre-demo "is everything up?" pre-flight.
+
     [bold]Examples:[/bold]
 
       [dim]$ mdk demo doctor                 # readiness checklist[/dim]
       [dim]$ mdk demo doctor --run-agents    # + a mock agent run[/dim]
+      [dim]$ MDK_DEMO_SURFACES="api=https://…/health,langfuse=http://…:3000" \\[/dim]
+      [dim]    mdk demo doctor --surfaces    # + live deployed-surface health[/dim]
     """
-    checks = asyncio.run(_gather_checks(run_agents=run_agents))
+    checks = asyncio.run(_gather_checks(run_agents=run_agents, surfaces=surfaces))
 
     table = Table(title="mdk demo doctor — Monday readiness", title_justify="left")
     table.add_column("check", style="cyan")
