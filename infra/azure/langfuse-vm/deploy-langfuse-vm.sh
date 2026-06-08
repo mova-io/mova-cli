@@ -57,6 +57,17 @@ az vm create -g "$RG" -n "$VM_NAME" --location "$LOCATION" \
 rm -f "$CI"
 az vm open-port -g "$RG" -n "$VM_NAME" --port 3000 --priority 1010 >/dev/null
 
+# Stable DNS label (#767) so a VM rebuild (new IP) doesn't break the apps'
+# LANGFUSE_HOST + the landing tile. NEXTAUTH_URL below uses this FQDN (NextAuth
+# requires the canonical URL to match the host the team browses to).
+DNS_LABEL="${DNS_LABEL:-$VM_NAME}"
+PIP_NAME="$(az vm show -g "$RG" -n "$VM_NAME" --query "networkProfile.networkInterfaces[0].id" -o tsv \
+  | xargs -I{} az network nic show --ids {} --query "ipConfigurations[0].publicIPAddress.id" -o tsv \
+  | xargs -I{} basename {})"
+VM_FQDN="$(az network public-ip update -g "$RG" -n "$PIP_NAME" --dns-name "$DNS_LABEL" \
+  --query "dnsSettings.fqdn" -o tsv)"
+echo "→ DNS label set: ${VM_FQDN}"
+
 VM_IP="$(az vm list-ip-addresses -g "$RG" -n "$VM_NAME" --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv)"
 echo "→ allowing VM IP ${VM_IP} through Postgres firewall"
 az postgres flexible-server firewall-rule create -g "$RG" --name "$PG_SERVER_NAME" \
@@ -77,7 +88,7 @@ LANGFUSE_DATABASE_URL=${LF_DB_URL}
 LANGFUSE_SALT=${LF_SALT}
 LANGFUSE_ENCRYPTION_KEY=${LF_ENC}
 LANGFUSE_NEXTAUTH_SECRET=${LF_NEXTAUTH}
-LANGFUSE_NEXTAUTH_URL=http://${VM_IP}:3000
+LANGFUSE_NEXTAUTH_URL=http://${VM_FQDN}:3000
 LANGFUSE_INIT_PROJECT_PUBLIC_KEY=${LF_PUB}
 LANGFUSE_INIT_PROJECT_SECRET_KEY=${LF_SEC}
 LANGFUSE_INIT_USER_PASSWORD=${INIT_PW}
@@ -91,8 +102,8 @@ $SSH "cd /opt/langfuse && sudo docker compose up -d"
 cat <<DONE
 
 ✅ Langfuse v3 provisioning started (ClickHouse migration + first boot ~3-5 min).
-   Web UI:   http://${VM_IP}:3000   (login: demo@movate.dev / ${INIT_PW})
+   Web UI:   http://${VM_FQDN}:3000   (login: demo@movate.dev / ${INIT_PW})
    Project:  MDK (keys = the LANGFUSE_PUBLIC/SECRET_KEY the apps already send)
 
-Point the apps at it:  LANGFUSE_HOST=http://${VM_IP}:3000  on api/worker/temporal-worker.
+Point the apps at it:  LANGFUSE_HOST=http://${VM_FQDN}:3000  on api/worker/temporal-worker.
 DONE
