@@ -1,6 +1,6 @@
 # ADR 092 — DAG workflows: parallel fan-out/fan-in + bounded supervisor
 
-Status: Accepted — phased; Phase 1 building now.
+Status: Accepted — phased; Phases 1 + 2 shipped, Phases 3–4 pending.
 Date: 2026-06-08
 Deciders: Engineering + Deva (Movate)
 Builds on: ADR 038 (governable pattern library), ADR 054/055 (Temporal backend),
@@ -89,9 +89,16 @@ the *resolved* backend (e.g. a fan-out on `runtime: native` before D2 lands, or 
 
 - **Phase 1 — native fan-out (the diamond):** `validate_dag` + the block
   executor (D2) + spec support for fan-out/fan-in edges + D6 lint + tests.
-  *Outcome: a fan-out workflow authors, validates, and RUNS on native.* ← ready.
-- **Phase 2 — Temporal fan-out + parity:** wire `emit_fan_out` (D3) + the
-  cross-backend conformance test.
+  *Outcome: a fan-out workflow authors, validates, and RUNS on native.* ✅ shipped.
+- **Phase 2 — Temporal fan-out + parity (D3):** the Temporal compiler lowers a
+  canonical single-node-branch diamond to `await asyncio.gather(*[execute_activity
+  …])` (durable parallelism), joining by the declared strategy and advancing to
+  the fan-in node; branch-interior nodes are emitted inside the gather, not as
+  standalone dispatch arms. Multi-node branches fail loud on Temporal (use
+  `runtime: native`). A cross-backend conformance test asserts native and
+  Temporal reach the same joined state for the same diamond. ✅ shipped. *(With
+  ADR 091, a fan-out `runtime: auto` then prefers Temporal where parallel
+  orchestration is durable.)*
 - **Phase 3 — bounded supervisor (D4):** the managerial primitive, both backends.
 - **Phase 4 — governance-contract unification (D5):** uniform caps + enforcement.
 

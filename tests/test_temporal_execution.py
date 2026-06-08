@@ -389,6 +389,157 @@ async def test_temporal_smoke_matches_native(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Fan-out parity (ADR 092 Phase 2 / D3) — a canonical diamond runs concurrently
+# on Temporal (asyncio.gather) and reaches the SAME joined state the native
+# fan-out runner does. This is the cross-backend conformance anchor for D3.
+# ---------------------------------------------------------------------------
+
+
+class _DiamondProvider(BaseLLMProvider):
+    """Deterministic per-output-key provider for the diamond conformance test.
+
+    Returns ``{<out_key>: <out_key>.upper()}`` based on the ``as <key>`` suffix
+    the agents' prompts carry — identical on native + Temporal so the two
+    backends are comparable.
+    """
+
+    name = "diamond"
+    version = "0.0.1"
+
+    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        body = request.messages[0].content
+        for key in ("seed", "a_out", "b_out", "final"):
+            if f"as {key}" in body:
+                return CompletionResponse(text=json.dumps({key: key.upper()}))
+        return CompletionResponse(text="{}")  # pragma: no cover
+
+    async def stream(self, request: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    async def embed(self, text: str, *, model: str) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+
+def _scaffold_diamond(tmp_path: Path) -> Path:
+    """``start ⇉ {a, b} ⇉ merge`` — a canonical single-node-branch diamond
+    (``runtime: temporal``)."""
+    wf = tmp_path / "wf"
+    _make_agent(wf / "agents" / "start", name="start-agent", input_key="text", output_key="seed")
+    _make_agent(wf / "agents" / "a", name="a-agent", input_key="seed", output_key="a_out")
+    _make_agent(wf / "agents" / "b", name="b-agent", input_key="seed", output_key="b_out")
+    _make_agent(wf / "agents" / "merge", name="merge-agent", input_key="seed", output_key="final")
+    wf.mkdir(parents=True, exist_ok=True)
+    (wf / "state.json").write_text(
+        json.dumps(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {"text": {"type": "string"}},
+            }
+        )
+    )
+    (wf / "workflow.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "api_version": "movate/v1",
+                "kind": "Workflow",
+                "name": "diamond-workflow",
+                "version": "0.1.0",
+                "runtime": "temporal",
+                "state_schema": "./state.json",
+                "entrypoint": "start",
+                "nodes": [
+                    {"id": "start", "type": "agent", "ref": "./agents/start"},
+                    {"id": "a", "type": "agent", "ref": "./agents/a"},
+                    {"id": "b", "type": "agent", "ref": "./agents/b"},
+                    {"id": "merge", "type": "agent", "ref": "./agents/merge"},
+                ],
+                "edges": [
+                    {"from": "start", "to": "a", "kind": "fan_out"},
+                    {"from": "start", "to": "b", "kind": "fan_out"},
+                    {"from": "a", "to": "merge", "kind": "fan_in"},
+                    {"from": "b", "to": "merge", "kind": "fan_in"},
+                ],
+            }
+        )
+    )
+    return wf / "workflow.yaml"
+
+
+@pytest.mark.smoke
+async def test_temporal_fan_out_matches_native(tmp_path: Path) -> None:
+    """A canonical diamond fan-out reaches the SAME joined state on Temporal
+    (durable ``asyncio.gather`` parallelism) as on the native fan-out runner."""
+    pricing = load_pricing()
+    initial_state = {"text": "hello"}
+    graph = _load_graph(_scaffold_diamond(tmp_path))
+
+    # --- NATIVE baseline (the native fan-out block executor, ADR 092 Phase 1) -
+    native_storage = InMemoryStorage()
+    await native_storage.init()
+    native_runner = WorkflowRunner(
+        executor=Executor(
+            provider=_DiamondProvider(),
+            pricing=pricing,
+            storage=native_storage,
+            tracer=NullTracer(),
+        ),
+        storage=native_storage,
+    )
+    native_result = await native_runner.run(graph, initial_state=dict(initial_state))
+    assert native_result.status is WorkflowStatus.SUCCESS
+    assert native_result.final_state == {
+        "text": "hello",
+        "seed": "SEED",
+        "a_out": "A_OUT",
+        "b_out": "B_OUT",
+        "final": "FINAL",
+    }
+
+    # --- TEMPORAL via the in-memory test env (durable parallelism) ------------
+    temporal_storage = InMemoryStorage()
+    await temporal_storage.init()
+    configure_activities(
+        storage=temporal_storage,
+        pricing=pricing,
+        tracer=NullTracer(),
+        provider=_DiamondProvider(),
+        tenant_id="local",
+    )
+    compiled = TemporalCompiler().compile(graph)
+    workflow_cls = load_compiled_workflow_class(
+        compiled.module_source, compiled.workflow_class_name
+    )
+    env = await WorkflowEnvironment.start_time_skipping()
+    async with (
+        env,
+        Worker(
+            env.client,
+            task_queue=DEFAULT_TASK_QUEUE,
+            workflows=[workflow_cls],
+            activities=[
+                call_agent_activity,
+                call_skill_activity,
+                call_gate_activity,
+                call_judge_activity,
+                persist_workflow_result_activity,
+            ],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ),
+    ):
+        temporal_final = await env.client.execute_workflow(
+            workflow_cls.run,
+            {**initial_state, "tenant_id": "local"},
+            id="conformance-fanout-1",
+            task_queue=DEFAULT_TASK_QUEUE,
+        )
+
+    temporal_final.pop("tenant_id", None)
+    assert temporal_final == native_result.final_state
+
+
+# ---------------------------------------------------------------------------
 # Durable HITL (ADR 062) — HUMAN node pauses durably + resumes on a signal,
 # matching the native runner's pause/resume final state (D7 parity), plus the
 # Temporal-only durable timeout route (D4).
