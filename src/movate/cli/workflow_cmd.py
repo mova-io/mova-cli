@@ -31,8 +31,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import typer
 from rich.console import Console
@@ -63,6 +65,32 @@ err = Console(stderr=True)
 
 # Length of "YYYY-MM-DDTHH:MM:SS" for timestamp display truncation.
 _TS_DISPLAY_LEN = 19
+
+
+def _resolve_temporal_ui_base(override: str | None = None) -> str | None:
+    """The Temporal Web base URL: ``--ui-url`` > ``MDK_TEMPORAL_UI_URL`` >
+    ``TEMPORAL_UI_URL`` (the env the landing page already exports). ``None`` when
+    unconfigured — the caller prints a setup hint rather than a broken link."""
+    return (
+        override
+        or os.environ.get("MDK_TEMPORAL_UI_URL")
+        or os.environ.get("TEMPORAL_UI_URL")
+        or None
+    )
+
+
+def _temporal_web_url(base_url: str, namespace: str, run_id: str) -> str:
+    """Deep-link to a run's Temporal Web timeline.
+
+    A ``runtime: temporal`` (or ``auto``→temporal) run's id IS its Temporal
+    workflow id (ADR 054 D6), so its durable execution lives at
+    ``<ui>/namespaces/<ns>/workflows/<run_id>``.
+    """
+    base = base_url.rstrip("/")
+    ns = quote(namespace, safe="")
+    wid = quote(run_id, safe="")
+    return f"{base}/namespaces/{ns}/workflows/{wid}"
+
 
 workflow_app = typer.Typer(
     name="workflow",
@@ -143,6 +171,70 @@ def runs(
             prompt,
         )
     stdout.print(table)
+    # Discoverability: a run's durable Temporal timeline is one command away
+    # (only meaningful when a Temporal Web URL is configured).
+    if _resolve_temporal_ui_base() is not None:
+        hint(
+            "[dim]↗ open a run's durable trace in Temporal Web: "
+            "[bold]mdk workflow web <workflow_run_id> --open[/bold][/dim]"
+        )
+
+
+@workflow_app.command("web")
+def web(
+    run_id: str = typer.Argument(
+        ...,
+        help=(
+            "The workflow_run_id (== the Temporal workflow id, ADR 054 D6). "
+            "From [bold]mdk workflow runs[/bold]."
+        ),
+        metavar="RUN_ID",
+    ),
+    namespace: str = typer.Option(
+        None,
+        "--namespace",
+        "-n",
+        help="Temporal namespace (default: $TEMPORAL_NAMESPACE or 'default').",
+    ),
+    ui_url: str = typer.Option(
+        None,
+        "--ui-url",
+        help="Temporal Web base URL (default: $MDK_TEMPORAL_UI_URL / $TEMPORAL_UI_URL).",
+    ),
+    open_browser: bool = typer.Option(
+        False, "--open", help="Open the deep-link in your default browser."
+    ),
+) -> None:
+    """Print (or [bold]--open[/bold]) the Temporal Web deep-link for a run.
+
+    A ``runtime: temporal`` (or ``auto``→temporal) run's id IS its Temporal
+    workflow id (ADR 054 D6), so its full durable timeline — every activity,
+    retry, signal, and pause — lives at
+    ``<ui>/namespaces/<ns>/workflows/<run_id>``. This jumps you straight there
+    from [bold]mdk workflow runs[/bold].
+
+    [bold]Examples:[/bold]
+
+      [dim]# print the URL[/dim]
+      $ mdk workflow web 7f3c2a91-...
+
+      [dim]# open it in the browser[/dim]
+      $ mdk workflow web 7f3c2a91-... --open
+    """
+    base = _resolve_temporal_ui_base(ui_url)
+    if base is None:
+        error(
+            "no Temporal Web URL configured. Set [bold]MDK_TEMPORAL_UI_URL[/bold] "
+            "(or pass [bold]--ui-url[/bold]), e.g. https://temporal-ui.example.com"
+        )
+        raise typer.Exit(code=2)
+    ns = namespace or os.environ.get("TEMPORAL_NAMESPACE") or "default"
+    url = _temporal_web_url(base, ns, run_id)
+    stdout.print(url, soft_wrap=True, highlight=False)
+    if open_browser:
+        import webbrowser  # noqa: PLC0415 — stdlib, only needed on --open
+
+        webbrowser.open(url)
 
 
 @workflow_app.command("signal")
