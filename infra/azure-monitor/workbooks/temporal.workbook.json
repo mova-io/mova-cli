@@ -215,6 +215,22 @@
         "json": "## Still elsewhere\n\n- **Per-workflow execution timeline / history / pending signals** \u2014 the **Temporal Web UI** (ADR 078 D6, `enableTemporalUi`). This workbook is aggregate trends; the Web UI is per-run drill-down.\n- **Per-workflow duration histogram** \u2014 derivable from the SDK metrics above once a stable activity/workflow-latency series is confirmed for your SDK version (see the discovery table)."
       },
       "name": "elsewhere-note"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AppMetrics\n| where Name == \"mdk.temporal.worker.registered_workflows\"\n| summarize arg_max(TimeGenerated, Sum) by Name\n| project Registered = toint(Sum)",
+        "size": 4,
+        "title": "temporal worker - registered workflows (0 = connected but hosts nothing! #784)",
+        "timeContext": {
+          "durationMs": 3600000
+        },
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "tiles"
+      },
+      "name": "registered-workflows"
     }
   ],
   "fallbackResourceIds": [
