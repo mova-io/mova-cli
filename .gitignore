@@ -95,3 +95,4 @@ deva-onboarding.pptx
 # LibreOffice / OpenOffice lock files (e.g. when an .xlsx is open).
 .~lock.*#
 infra/azure/temporal-vm/.env
+infra/azure/langfuse-vm/.env
