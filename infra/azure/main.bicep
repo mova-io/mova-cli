@@ -301,6 +301,19 @@ BYOK seam (ADR 054 D5).
 ''')
 param enableTemporal bool = false
 
+@description('''
+External self-hosted Temporal frontend endpoint (``host:port``) to point the
+api/worker/temporal-worker at, INSTEAD of the in-environment ACA Temporal app.
+Set this when Temporal runs outside the Container Apps Environment — e.g. the
+VM + docker-compose deployment in ``infra/azure/temporal-vm/`` (ADR 078
+follow-on), which exists because ACA raw-TCP internal ingress proved
+chronically unreachable for the frontend (2026-06-08). When non-empty it WINS
+over ``temporal.outputs.temporalHost`` for the consuming apps — so a redeploy no
+longer reverts TEMPORAL_HOST back to the (dead) ACA temporal FQDN. Leave empty
+to use the in-CAE ACA Temporal app (legacy / when its ingress is healthy).
+''')
+param externalTemporalHost string = ''
+
 @description('Temporal auto-setup image (ADR 078). PIN a tag — never :latest — so schema setup is reproducible.')
 param temporalImage string = 'temporalio/auto-setup:1.25.2'
 
@@ -633,6 +646,14 @@ var effectiveTraceSink = deployLangfuse && appInsightsExportEnabled
   ? 'both'
   : (appInsightsExportEnabled ? 'otlp' : (deployLangfuse ? 'langfuse' : ''))
 
+// TEMPORAL_HOST the consuming apps (api / worker / temporal-worker) get:
+// an explicit external endpoint (e.g. the VM in infra/azure/temporal-vm/) WINS,
+// else the in-CAE ACA Temporal app's FQDN, else '' (runtime:temporal fails loud).
+// This makes the external-host choice survive redeploys (anti-regression).
+var effectiveTemporalHost = !empty(externalTemporalHost)
+  ? externalTemporalHost
+  : (enableTemporal ? temporal!.outputs.temporalHost : '')
+
 // ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
@@ -879,7 +900,7 @@ module api 'modules/containerapp-api.bicep' = if (enableApiWorker) {
     // → no TEMPORAL_* env emitted → selecting runtime:temporal fails loud
     // (ADR 055 D6), never a silent downgrade. The API needs this to signal a
     // durable run's handle from the resume endpoint (ADR 062 D2).
-    temporalHost: enableTemporal ? temporal!.outputs.temporalHost : ''
+    temporalHost: effectiveTemporalHost
     // 'otlp' + the collector endpoint are gated on the SAME condition
     // (appInsightsExportEnabled) so the otlp sink always has an endpoint to
     // ship to — movate's fail-loud OtelTracer can't raise TraceSinkError.
@@ -917,7 +938,7 @@ module worker 'modules/containerapp-worker.bicep' = if (enableApiWorker) {
     agentsStorageName: useAzureFiles ? 'agents-vol' : ''
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
     // Self-hosted Temporal frontend (ADR 078) — empty when off (see api above).
-    temporalHost: enableTemporal ? temporal!.outputs.temporalHost : ''
+    temporalHost: effectiveTemporalHost
     // 'otlp' + the collector endpoint gated on the SAME condition — see the
     // api module above for why pairing them keeps the fail-loud OtelTracer
     // safe, and why the endpoint is the bare https://<fqdn> (no port).
@@ -1020,7 +1041,7 @@ module temporalWorker 'modules/containerapp-temporal-worker.bicep' = if (enableT
     postgresFqdn: pg.outputs.serverFqdn
     postgresDatabase: pg.outputs.databaseName
     postgresAdminUsername: pg.outputs.adminUsername
-    temporalHost: temporal!.outputs.temporalHost
+    temporalHost: effectiveTemporalHost
     userAssignedIdentityId: workerUai.id
     langfuseHost: deployLangfuse ? langfuse!.outputs.publicUrl : ''
     traceSink: effectiveTraceSink
