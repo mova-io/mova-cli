@@ -120,6 +120,13 @@ METRIC_DB_POOL_IN_USE = "mdk.db.pool.in_use"
 METRIC_DB_POOL_WAITING = "mdk.db.pool.waiting"
 METRIC_DB_POOL_MAX = "mdk.db.pool.max"
 
+# #784 — how many runtime:temporal workflows this temporal worker registered at
+# startup. An observable gauge (constant for the worker's life), tagged with the
+# build version. A value of 0 means the worker connected but hosts nothing — the
+# silent drift that broke the refund-approval demo (the image shipped without
+# workflows/). A Grafana panel can alert at 0; the worker also logs it loudly.
+METRIC_TEMPORAL_REGISTERED_WORKFLOWS = "mdk.temporal.worker.registered_workflows"
+
 # ADR 035 D3 — number of SSE subscribers currently holding open a
 # ``GET /api/v1/events/stream`` connection. UpDownCounter (not a gauge):
 # incremented when a connection opens, decremented when it closes — the
@@ -153,6 +160,7 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_RUN_COST_USD,
         METRIC_WORKFLOW_COMPLETED,
         METRIC_WORKFLOW_DURATION_MS,
+        METRIC_TEMPORAL_REGISTERED_WORKFLOWS,
         METRIC_DB_POOL_SIZE,
         METRIC_DB_POOL_IDLE,
         METRIC_DB_POOL_IN_USE,
@@ -201,6 +209,7 @@ class _State:
     # ``init_metrics``, because they need a callback that reads the live pool.
     # The flag makes that registration idempotent (a re-register is a no-op).
     pool_gauges_registered: bool = False
+    temporal_worker_gauge_registered: bool = False
 
 
 _state = _State()
@@ -539,6 +548,50 @@ def register_pool_metrics(stats_callback: PoolStatsCallback) -> None:
         description="Configured per-pod pool ceiling (create_pool max_size); saturation denom.",
     )
     _state.pool_gauges_registered = True
+
+
+def register_temporal_worker_metrics(*, registered: int, build: str) -> None:
+    """Register the temporal-worker 'registered workflows' observable gauge (#784).
+
+    Called once at the ``mdk worker --backend temporal`` edge AFTER
+    ``init_metrics()`` with the count of ``runtime: temporal`` workflows this
+    worker registered + the build version. The value is constant for the
+    worker's life, so the gauge is a tiny closure over ``registered``; OTel
+    reads it each collection cycle. ``build`` rides as an attribute so a Grafana
+    panel can show which image is hosting (and alert when the count hits 0 — the
+    silent 'worker connected but hosts nothing' drift).
+
+    Idempotent + fail-soft: a no-op when metrics aren't initialised (OTel absent
+    / sink off) or already registered. Never raises — observability must not
+    break the worker.
+    """
+    if _state.temporal_worker_gauge_registered:
+        return
+    meter = _state.meter
+    if meter is None:
+        _state.temporal_worker_gauge_registered = True
+        return
+    try:
+        from opentelemetry.metrics import Observation  # noqa: PLC0415
+    except Exception:  # pragma: no cover - OTel present if meter is not None
+        _state.temporal_worker_gauge_registered = True
+        return
+
+    attrs = {"build": build}
+
+    def _observe(_options: Any) -> list[Any]:
+        return [Observation(registered, attrs)]
+
+    meter.create_observable_gauge(
+        METRIC_TEMPORAL_REGISTERED_WORKFLOWS,
+        callbacks=[_observe],
+        unit="1",
+        description=(
+            "runtime:temporal workflows this temporal worker registered at "
+            "startup (0 = connected but hosts nothing — alert on this)."
+        ),
+    )
+    _state.temporal_worker_gauge_registered = True
 
 
 # ---------------------------------------------------------------------------

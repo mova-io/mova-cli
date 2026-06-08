@@ -147,8 +147,14 @@ _POOL_METRICS = {
 
 # ADR 082 (+ follow-on) — the Temporal operational workbook is built on the
 # durable-workflow completion counter plus its latency companion
-# ``mdk.workflow.duration_ms`` (per-run timing still lives in the Temporal Web UI).
-_TEMPORAL_METRICS = {"mdk.workflow.completed", "mdk.workflow.duration_ms"}
+# ``mdk.workflow.duration_ms`` (per-run timing still lives in the Temporal Web UI),
+# plus the #784 worker-health gauge ``mdk.temporal.worker.registered_workflows``
+# (0 = the worker connected but hosts nothing — the silent-drift alert).
+_TEMPORAL_METRICS = {
+    "mdk.workflow.completed",
+    "mdk.workflow.duration_ms",
+    "mdk.temporal.worker.registered_workflows",
+}
 
 _CASES = [
     pytest.param(_GRAFANA, "json", _ALL_FIVE | _POOL_METRICS, id="grafana"),

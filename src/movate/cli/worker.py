@@ -425,6 +425,22 @@ async def _run_temporal_worker(
             f"[bold]runtime: temporal[/bold] to a workflow.yaml to register it."
         )
 
+    # #784 — structured, greppable worker-health line + an observable gauge, so
+    # the silent "connected but hosts 0 workflows" drift (the image that shipped
+    # without workflows/) is catchable by log search, a Grafana panel, and
+    # `mdk demo doctor`. The count rides the gauge; a 0 is logged at error level.
+    import movate  # noqa: PLC0415
+    from movate.tracing.metrics import register_temporal_worker_metrics  # noqa: PLC0415
+
+    _build = getattr(movate, "__version__", "unknown")
+    _names = ",".join(sorted(temporal_wfs)) or "<none>"
+    register_temporal_worker_metrics(registered=len(temporal_wfs), build=_build)
+    _level = "ERROR" if not temporal_wfs else "OK"
+    err.print(
+        f"[dim]mdk_temporal_worker_health: status={_level} "
+        f"registered_workflows={len(temporal_wfs)} build={_build} names={_names}[/dim]"
+    )
+
     stop_event = asyncio.Event()
 
     def _handle_signal(*_: object) -> None:
