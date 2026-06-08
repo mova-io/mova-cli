@@ -10,6 +10,10 @@ Two passes:
    joins, conditional edges, and non-agent node types. Lives in its own
    function so v1.1 can substitute richer validators without touching
    the compiler.
+3. :func:`validate_dag` (ADR 092 Phase 1) — semantic gate for a canonical
+   fan-out/fan-in DAG (the diamond). :func:`validate_graph` dispatches to it
+   for graphs that declare a parallel edge, and to :func:`validate_linear`
+   (unchanged) for every other graph.
 """
 
 from __future__ import annotations
@@ -238,12 +242,22 @@ def compile_workflow(
             raise WorkflowCompileError(
                 f"edge {es.from_id!r}→{es.to_id!r}: unknown kind {es.resolved_kind!r}"
             ) from None
+        edge_metadata: dict[str, Any] = {}
+        # Carry the fan-in merge strategy (ADR 092 D2) onto the edge so the
+        # runner's join step reads it without re-parsing the spec. Only stamped
+        # on fan-in edges (the spec validator already guards that join/join_key
+        # are fan-in-only), so every other edge's metadata stays empty.
+        if edge_kind is EdgeKind.PARALLEL_FAN_IN:
+            edge_metadata["join"] = es.join or "last_wins"
+            if es.join_key:
+                edge_metadata["join_key"] = es.join_key
         edges.append(
             WorkflowEdge(
                 from_id=es.from_id,
                 to_id=es.to_id,
                 kind=edge_kind,
                 condition=es.when,
+                metadata=edge_metadata,
             )
         )
 
@@ -469,3 +483,182 @@ def validate_linear(graph: WorkflowGraph) -> None:
                 f"v0.3 workflows must have exactly one sink node; got {len(sinks)}: "
                 f"{', '.join(sinks) or '(none)'}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Pass 2 (DAG) — fan-out/fan-in phase gate (ADR 092 Phase 1)
+# ---------------------------------------------------------------------------
+
+# Governance cap (ADR 092 D5, default form): the maximum number of concurrent
+# branches a single fan-out node may spawn. A small default is the runaway
+# backstop; the per-workflow declarative cap lands in Phase 4.
+DEFAULT_MAX_FANOUT = 16
+
+
+def declares_parallel(graph: WorkflowGraph) -> bool:
+    """True iff the graph declares any fan-out/fan-in edge (ADR 092).
+
+    The dispatch point (:func:`validate_graph`) uses this to route a graph to
+    the DAG validator instead of the linear gate. A graph with no fan-out/fan-in
+    edge is — by construction — unchanged from before ADR 092 and stays on
+    :func:`validate_linear`.
+    """
+    return any(e.kind in (EdgeKind.PARALLEL_FAN_OUT, EdgeKind.PARALLEL_FAN_IN) for e in graph.edges)
+
+
+def validate_graph(graph: WorkflowGraph) -> None:
+    """Phase-gate dispatcher: DAG validator for parallel graphs, else linear.
+
+    A graph that declares a fan-out/fan-in edge is validated as a (canonical
+    diamond) DAG (:func:`validate_dag`); every other graph takes the unchanged
+    :func:`validate_linear` gate. This is the single seam ADR 092 adds — the
+    linear path is byte-for-byte identical (same validator, same errors).
+    """
+    if declares_parallel(graph):
+        validate_dag(graph)
+    else:
+        validate_linear(graph)
+
+
+def validate_dag(graph: WorkflowGraph, *, max_fanout: int = DEFAULT_MAX_FANOUT) -> None:
+    """Semantic gate for a canonical fan-out/fan-in DAG (ADR 092 Phase 1).
+
+    Accepts the **canonical diamond**: a single ``entrypoint`` linear stretch
+    into a fan-out node whose N>1 fan-out edges open N parallel branches that
+    reconverge on exactly one fan-in (join) node, optionally followed by a
+    linear tail to a single sink. Branches are agent-only linear sub-chains
+    (no nested fan-out, judge/router/human inside a branch — those land in a
+    later phase).
+
+    Rejects (with a phase-aware message): non-agent node types, mixed edge
+    kinds out of/into a parallel node, a fan-out wider than ``max_fanout``,
+    branches that don't reconverge on one join, joins fed by non-fan-in edges,
+    and (via :func:`compile_workflow`'s topological check) cycles.
+
+    The native runner's block executor (:class:`WorkflowRunner`) relies on the
+    shape this gate guarantees, so a graph that passes here is guaranteed to be
+    runnable as a diamond on the native backend.
+    """
+    # 1. Node types — Phase 1 parallel graphs are agent-only. Judge / router /
+    #    human / tool / function inside a parallel graph land in a later phase.
+    bad_types = sorted(n.id for n in graph.nodes.values() if n.type is not NodeType.AGENT)
+    if bad_types:
+        raise WorkflowCompileError(
+            f"parallel (fan-out/fan-in) workflows support only type=agent nodes in "
+            f"Phase 1; offenders: {', '.join(bad_types)}. Routers/judges/human gates "
+            f"inside a parallel block land in a later phase."
+        )
+
+    # 2. Per-node edge-kind homogeneity + branch/join shape.
+    fan_out_nodes: list[str] = []
+    fan_in_nodes: list[str] = []
+    for nid in graph.nodes:
+        out_edges = graph.successors(nid)
+        out_kinds = {e.kind for e in out_edges}
+        if EdgeKind.PARALLEL_FAN_OUT in out_kinds:
+            if out_kinds != {EdgeKind.PARALLEL_FAN_OUT}:
+                raise WorkflowCompileError(
+                    f"node {nid!r} mixes fan-out with other edge kinds "
+                    f"({', '.join(sorted(k.value for k in out_kinds))}); a fan-out "
+                    f"node's outbound edges must all be 'fan_out'."
+                )
+            if len(out_edges) <= 1:
+                raise WorkflowCompileError(
+                    f"node {nid!r} declares a fan-out but has only {len(out_edges)} "
+                    f"successor; fan-out needs >1 branch."
+                )
+            if len(out_edges) > max_fanout:
+                raise WorkflowCompileError(
+                    f"node {nid!r} fans out to {len(out_edges)} branches; the cap is "
+                    f"max_fanout={max_fanout} (ADR 092 D5)."
+                )
+            fan_out_nodes.append(nid)
+
+        in_edges = graph.predecessors(nid)
+        in_kinds = {e.kind for e in in_edges}
+        if EdgeKind.PARALLEL_FAN_IN in in_kinds:
+            if in_kinds != {EdgeKind.PARALLEL_FAN_IN}:
+                raise WorkflowCompileError(
+                    f"join node {nid!r} mixes fan-in with other edge kinds "
+                    f"({', '.join(sorted(k.value for k in in_kinds))}); a join node's "
+                    f"inbound edges must all be 'fan_in'."
+                )
+            if len(in_edges) <= 1:
+                raise WorkflowCompileError(
+                    f"join node {nid!r} declares a fan-in but has only {len(in_edges)} "
+                    f"predecessor; fan-in needs >1 branch."
+                )
+            fan_in_nodes.append(nid)
+
+    if not fan_out_nodes:
+        # A graph with fan-in edges but no fan-out is malformed.
+        raise WorkflowCompileError(
+            "graph declares a fan-in but no fan-out node; a parallel block needs a "
+            "fan-out node opening the branches."
+        )
+
+    # 3. Diamond closure — every fan-out's branches must reconverge on exactly
+    #    one join node, and each branch interior must be a single-successor
+    #    agent sub-chain (no nested fan-out before the join).
+    for fo in fan_out_nodes:
+        branch_starts = [e.to_id for e in graph.successors(fo)]
+        joins: set[str] = set()
+        for start in branch_starts:
+            join = _trace_branch_to_join(graph, start)
+            if join is None:
+                raise WorkflowCompileError(
+                    f"fan-out node {fo!r}: branch starting at {start!r} never reaches a "
+                    f"fan-in (join) node; every branch must reconverge."
+                )
+            joins.add(join)
+        if len(joins) != 1:
+            raise WorkflowCompileError(
+                f"fan-out node {fo!r}: branches reconverge on {len(joins)} different "
+                f"join nodes ({', '.join(sorted(joins))}); Phase 1 supports the "
+                f"canonical diamond (one fan-out → N branches → one fan-in)."
+            )
+
+    # 4. Single source = entrypoint; single sink (the diamond reconverges).
+    sources = graph.sources()
+    if len(sources) != 1 or sources[0] != graph.entrypoint:
+        raise WorkflowCompileError(
+            f"parallel workflows must have exactly one source node equal to the "
+            f"entrypoint {graph.entrypoint!r}; got sources: {', '.join(sources) or '(none)'}"
+        )
+    sinks = graph.sinks()
+    if len(sinks) != 1:
+        raise WorkflowCompileError(
+            f"parallel (canonical-diamond) workflows must have exactly one sink node; "
+            f"got {len(sinks)}: {', '.join(sinks) or '(none)'}"
+        )
+
+
+def _trace_branch_to_join(graph: WorkflowGraph, start: str) -> str | None:
+    """Follow a branch's single-successor agent sub-chain to its join node.
+
+    Returns the id of the fan-in (join) node the branch reaches, or ``None`` if
+    the branch ends without one. Raises :class:`WorkflowCompileError` if the
+    branch interior itself fans out (nested parallelism is a later phase) or has
+    an ambiguous (>1 sequential) successor.
+    """
+    cur: str | None = start
+    seen: set[str] = set()
+    while cur is not None and cur not in seen:
+        seen.add(cur)
+        # A fan-in edge out of ``cur`` closes the branch onto its join node.
+        fan_in = [e for e in graph.successors(cur) if e.kind is EdgeKind.PARALLEL_FAN_IN]
+        if fan_in:
+            return fan_in[0].to_id
+        nxt = [e for e in graph.successors(cur) if e.kind is EdgeKind.SEQUENTIAL]
+        if any(e.kind is EdgeKind.PARALLEL_FAN_OUT for e in graph.successors(cur)):
+            raise WorkflowCompileError(
+                f"branch node {cur!r} nests a fan-out; nested parallelism lands in a "
+                f"later phase (Phase 1 is the canonical diamond)."
+            )
+        if len(nxt) > 1:
+            raise WorkflowCompileError(
+                f"branch node {cur!r} has {len(nxt)} sequential successors; a branch "
+                f"interior must be a single-successor sub-chain."
+            )
+        cur = nxt[0].to_id if nxt else None
+    return None
