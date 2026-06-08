@@ -240,6 +240,37 @@ resource temporal 'Microsoft.App/containerApps@2024-03-01' = {
           ]
           probes: [
             {
+              // Startup: don't mark the container "started" until the gRPC port
+              // accepts. First boot runs schema setup against Postgres, so allow
+              // a generous window (up to ~5min) before liveness/readiness apply.
+              type: 'Startup'
+              tcpSocket: {
+                port: 7233
+              }
+              initialDelaySeconds: 15
+              periodSeconds: 10
+              failureThreshold: 30
+              timeoutSeconds: 5
+            }
+            {
+              // Readiness: ACA only adds this replica to the INTERNAL TCP ingress
+              // (envoy) upstream pool while :7233 is accepting. Without an explicit
+              // readiness probe, a re-roll can leave the TCP ingress backend pool
+              // empty — clients (worker, UI) then get "dial tcp <ingress-ip>:7233:
+              // i/o timeout" even though the frontend container is healthy and
+              // bound (observed 2026-06-08 after a full-stack redeploy; a restart,
+              // re-roll, and ingress disable/enable did NOT repopulate the pool —
+              // only an explicit readiness gate does). This is the durable fix.
+              type: 'Readiness'
+              tcpSocket: {
+                port: 7233
+              }
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 3
+              timeoutSeconds: 5
+            }
+            {
               // TCP socket on the frontend gRPC port. Generous initial delay —
               // the first boot runs schema setup against Postgres.
               type: 'Liveness'
