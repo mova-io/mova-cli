@@ -26,7 +26,7 @@ import pytest
 import yaml
 
 from movate.core.loader import load_agent
-from movate.core.workflow.compiler import compile_workflow, validate_linear
+from movate.core.workflow.compiler import compile_workflow, validate_graph
 from movate.core.workflow.spec import load_workflow_spec
 from movate.templates import (
     PATTERN_TEMPLATES,
@@ -102,11 +102,13 @@ def test_chatbot_scaffolds_and_loads(tmp_path: Path) -> None:
 @pytest.mark.unit
 @pytest.mark.parametrize("name", WORKFLOW_PATTERNS)
 def test_workflow_pattern_compiles_and_validates(name: str) -> None:
-    """Each workflow pattern loads, compiles, and passes validate_linear —
-    i.e. it composes via the EXISTING ADR 017 primitives."""
+    """Each workflow pattern loads, compiles, and passes the phase gate —
+    i.e. it composes via the governed primitives. ``validate_graph`` routes the
+    linear patterns to ``validate_linear`` and the fan-out diamond
+    (task-oriented, ADR 092) to ``validate_dag``."""
     spec, wf_dir = load_workflow_spec(get_pattern_path(name))
     graph = compile_workflow(spec, wf_dir)
-    validate_linear(graph)  # must not raise
+    validate_graph(graph)  # must not raise
     assert graph.entrypoint in graph.nodes
     assert len(graph.nodes) >= 3  # multi-node bundle
 
