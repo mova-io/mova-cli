@@ -26,7 +26,7 @@ services:
     depends_on:
       clickhouse: {condition: service_healthy}
       redis: {condition: service_healthy}
-      minio: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
     ports:
       - "3000:3000"
     environment: &langfuse-env
@@ -67,7 +67,7 @@ services:
     depends_on:
       clickhouse: {condition: service_healthy}
       redis: {condition: service_healthy}
-      minio: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
     environment: *langfuse-env
 
   clickhouse:
@@ -114,6 +114,22 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # One-shot: create the S3 bucket langfuse-web/worker upload raw events to.
+  # MinIO starts empty and does NOT auto-create buckets, so without this the
+  # server logs "Failed to upload JSON to S3" and traces never reach ClickHouse
+  # (observed 2026-06-08). web/worker gate on this completing.
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio: {condition: service_healthy}
+    environment:
+      MINIO_PASSWORD: ${MINIO_PASSWORD:?set in .env}
+    entrypoint:
+      - sh
+      - -c
+      - "mc alias set m http://minio:9000 minio \"$$MINIO_PASSWORD\" && mc mb -p m/langfuse && echo bucket-ready"
+    restart: "no"
 
 volumes:
   clickhouse_data:
