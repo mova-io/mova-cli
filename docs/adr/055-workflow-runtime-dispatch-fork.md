@@ -1,7 +1,8 @@
 # ADR 055 — Workflow runtime selection: one dispatch fork behind the runner seam (native · LangGraph · Temporal)
 
-**Status:** Proposed
-**Date:** 2026-05-30
+**Status:** Accepted — shipped (the dispatch fork + `resolve_effective_runtime`;
+`runtime: auto` default added by ADR 091; cross-backend conformance tests per D7).
+**Date:** 2026-05-30 _(status reconciled to shipped reality 2026-06-08)_
 **Deciders:** Engineering (orchestration/runtime) — **the `langgraph` /
 `temporalio` dependency adoptions this fork selects into remain gated on Deva
 sign-off per CLAUDE.md §8 / ADR 001 / ADR 017 D4. This ADR adds no new

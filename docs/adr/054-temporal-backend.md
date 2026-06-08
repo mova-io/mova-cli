@@ -1,7 +1,10 @@
 # ADR 054 — Temporal as a deterministic, durable workflow backend (behind the runner Protocol, opt-in)
 
-**Status:** Proposed
-**Date:** 2026-05-30
+**Status:** Accepted — shipped (Phase 1 compiler + worker; the **default**
+runtime via ADR 091; durable HITL via ADR 062; parallel fan-out via ADR 092).
+Remaining operational polish (per-node retry/timeout policy, deeper
+Temporal-Web linking) tracked in ADR 080/082.
+**Date:** 2026-05-30 _(status reconciled to shipped reality 2026-06-08)_
 **Deciders:** Engineering (orchestration/runtime) — **`temporalio` dependency
 adoption requires Deva sign-off per CLAUDE.md §8 / ADR 001 / ADR 017 D4**
 **Builds on / composes with (changes nothing in any of them):**

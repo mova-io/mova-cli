@@ -1,7 +1,8 @@
 # ADR 056 — `JUDGE` as a first-class workflow node (verdict-gated branching + reflection, across all backends)
 
-**Status:** Proposed
-**Date:** 2026-05-30
+**Status:** Accepted — shipped (`JUDGE` node + verdict-gated branching +
+bounded reflection loop on the native runner and the Temporal backend).
+**Date:** 2026-05-30 _(status reconciled to shipped reality 2026-06-08)_
 **Deciders:** Engineering (orchestration/runtime)
 **Context window:** make eval-gated and reflection workflows first-class —
 elevate "judge" from an overloaded `intent-router` (and a Phase-1 state
