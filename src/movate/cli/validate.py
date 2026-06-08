@@ -1212,17 +1212,56 @@ def _validate_workflow(path: Path) -> None:
     console.print(f"  topology:    {chain}")
 
     # Backend-aware parallel lint (ADR 092 D6). A fan-out/fan-in graph runs
-    # concurrently on the native runner (Phase 1). On the Temporal backend the
-    # durable parallel emission (D3) lands in Phase 2 — until then a
-    # ``runtime: temporal`` fan-out workflow would not get durable parallel
-    # orchestration, so warn at author time rather than at run time.
+    # concurrently on the native runner (Phase 1) and, as of Phase 2 (D3), on
+    # the Temporal backend too — the canonical single-node-branch diamond
+    # compiles to durable ``asyncio.gather`` parallelism. Multi-node branches on
+    # Temporal land in a later phase. With ``runtime: auto`` (ADR 091, the
+    # default) a single-node diamond prefers Temporal where available and falls
+    # back to native for richer shapes; explicit ``runtime: temporal`` fails loud
+    # on an unsupported shape. Surface all of that here at author time.
     if declares_parallel(graph):
-        console.print("[green]✓[/green] parallel (fan-out/fan-in) workflow [dim](native)[/dim]")
-        if getattr(graph, "runtime", "native") == "temporal":
+        rt = getattr(graph, "runtime", "auto")
+        if rt in ("temporal", "auto"):
+            from movate.core.workflow.compilers.temporal import (  # noqa: PLC0415
+                TemporalCompiler,
+            )
+
+            try:
+                TemporalCompiler().compile(graph)
+                where = (
+                    "temporal"
+                    if rt == "temporal"
+                    else "auto → temporal where available, else native"
+                )
+                console.print(
+                    f"[green]✓[/green] parallel (fan-out/fan-in) workflow "
+                    f"[dim]({where} — durable asyncio.gather, ADR 092 Phase 2)[/dim]"
+                )
+            except WorkflowCompileError as exc:
+                if rt == "temporal":
+                    # Explicit temporal + unsupported shape → fail loud.
+                    console.print(
+                        f"[yellow]![/yellow] parallel fan-out on runtime: temporal: {exc} "
+                        "Use runtime: native (or auto) for this shape today."
+                    )
+                else:
+                    # auto routes this richer shape to native — no error.
+                    console.print(
+                        "[green]✓[/green] parallel (fan-out/fan-in) workflow "
+                        "[dim](auto → native; not a single-node diamond, so it runs "
+                        "on the native backend)[/dim]"
+                    )
+            except RuntimeError:
+                # The [temporal] extra isn't installed — can't compile-check here.
+                console.print(
+                    "[green]✓[/green] parallel (fan-out/fan-in) workflow "
+                    "[dim](native — concurrent; install mdk[temporal] to check the "
+                    "temporal lowering)[/dim]"
+                )
+        else:
             console.print(
-                "[yellow]![/yellow] parallel fan-out on runtime: temporal is not yet "
-                "wired (ADR 092 Phase 2); it runs but without durable parallel "
-                "orchestration. Use runtime: native for parallel today."
+                "[green]✓[/green] parallel (fan-out/fan-in) workflow "
+                "[dim](native — concurrent)[/dim]"
             )
 
     # Temporal determinism feedback (ADR 054 D5). For a ``runtime: temporal``

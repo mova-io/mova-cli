@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from movate.core.workflow.compiler import compile_workflow
+from movate.core.workflow.compiler import WorkflowCompileError, compile_workflow
 from movate.core.workflow.compilers.temporal import (
     LINT_NONDETERMINISTIC_SKILL,
     LINT_NONDETERMINISTIC_TIME,
@@ -32,6 +32,7 @@ from movate.core.workflow.compilers.temporal import (
     supports_spec,
 )
 from movate.core.workflow.ir import (
+    EdgeKind,
     NodeType,
     WorkflowEdge,
     WorkflowGraph,
@@ -466,3 +467,91 @@ def test_judge_node_emits_live_judge_activity() -> None:
     # And the workflow gates on terminate.
     assert "get('terminate')" in src
     assert "return state" in src
+
+
+# ---------------------------------------------------------------------------
+# Fan-out diamond (ADR 092 Phase 2 / D3) — the Temporal compiler lowers a
+# canonical single-node-branch diamond to native `asyncio.gather` parallelism,
+# joining by the declared strategy and advancing to the fan-in node.
+# ---------------------------------------------------------------------------
+
+
+def _diamond_graph(
+    *, strategy: str | None = None, join_key: str | None = None, multi_node: bool = False
+) -> WorkflowGraph:
+    """start ⇉ {a, b} ⇉ merge (canonical diamond). ``multi_node`` makes branch
+    ``a`` two nodes (a → a2 → merge) to exercise the Phase-2 single-node guard."""
+    fan_in_meta: dict[str, Any] = {}
+    if strategy is not None:
+        fan_in_meta["join"] = strategy
+    if join_key is not None:
+        fan_in_meta["join_key"] = join_key
+    if multi_node:
+        nodes = [
+            _make_node("start"),
+            _make_node("a"),
+            _make_node("a2"),
+            _make_node("b"),
+            _make_node("merge"),
+        ]
+        edges = [
+            WorkflowEdge("start", "a", EdgeKind.PARALLEL_FAN_OUT),
+            WorkflowEdge("start", "b", EdgeKind.PARALLEL_FAN_OUT),
+            WorkflowEdge("a", "a2", EdgeKind.SEQUENTIAL),
+            WorkflowEdge("a2", "merge", EdgeKind.PARALLEL_FAN_IN, metadata=dict(fan_in_meta)),
+            WorkflowEdge("b", "merge", EdgeKind.PARALLEL_FAN_IN, metadata=dict(fan_in_meta)),
+        ]
+    else:
+        nodes = [_make_node("start"), _make_node("a"), _make_node("b"), _make_node("merge")]
+        edges = [
+            WorkflowEdge("start", "a", EdgeKind.PARALLEL_FAN_OUT),
+            WorkflowEdge("start", "b", EdgeKind.PARALLEL_FAN_OUT),
+            WorkflowEdge("a", "merge", EdgeKind.PARALLEL_FAN_IN, metadata=dict(fan_in_meta)),
+            WorkflowEdge("b", "merge", EdgeKind.PARALLEL_FAN_IN, metadata=dict(fan_in_meta)),
+        ]
+    return _make_graph(nodes, edges, entrypoint="start")
+
+
+@pytest.mark.unit
+def test_compile_fan_out_diamond_last_wins() -> None:
+    src = TemporalCompiler().compile(_diamond_graph()).module_source
+    compile(src, "<emitted-fanout>", "exec")  # valid Python
+    # The fan-out node runs its own agent, then gathers the branches concurrently.
+    assert "start_branches = await asyncio.gather(" in src
+    assert src.count("call_agent_activity,") >= 4  # start + a + b + merge
+    # last-wins join + advance to the fan-in node.
+    assert "for _b in start_branches:" in src
+    assert "state.update(_b)" in src
+    assert "current = 'merge'" in src
+    # Branch nodes are emitted INSIDE the gather, not as standalone dispatch arms.
+    assert "current == 'a'" not in src
+    assert "current == 'b'" not in src
+    # The join node is a normal dispatch arm.
+    assert "current == 'merge'" in src
+
+
+@pytest.mark.unit
+def test_compile_fan_out_join_by_key() -> None:
+    src = TemporalCompiler().compile(_diamond_graph(strategy="by_key")).module_source
+    compile(src, "<emitted-fanout-bykey>", "exec")
+    assert "state['a'] = dict(start_branches[0])" in src
+    assert "state['b'] = dict(start_branches[1])" in src
+
+
+@pytest.mark.unit
+def test_compile_fan_out_join_collect() -> None:
+    src = (
+        TemporalCompiler()
+        .compile(_diamond_graph(strategy="collect", join_key="results"))
+        .module_source
+    )
+    compile(src, "<emitted-fanout-collect>", "exec")
+    assert "state['results'] = [_b.get('results') for _b in start_branches]" in src
+
+
+@pytest.mark.unit
+def test_compile_fan_out_multi_node_branch_rejected() -> None:
+    """A multi-node fan-out branch fails loud on Temporal (Phase 2 = single-node
+    canonical diamond); the author is pointed at runtime: native."""
+    with pytest.raises(WorkflowCompileError, match="single-node"):
+        TemporalCompiler().compile(_diamond_graph(multi_node=True))

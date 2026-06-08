@@ -59,7 +59,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from movate.core.workflow.ir import NodeType, WorkflowGraph
+from movate.core.workflow.compiler import WorkflowCompileError
+from movate.core.workflow.ir import EdgeKind, NodeType, WorkflowGraph
 from movate.core.workflow.spec import WorkflowSpec
 
 # ---------------------------------------------------------------------------
@@ -499,8 +500,22 @@ class TemporalCompiler:
         # its branch and indent the body uniformly. Topological order only
         # affects the file layout (operator-friendly) — the loop dispatches by
         # id, so any order is correct.
+        # Branch-interior nodes of a fan-out diamond (ADR 092 Phase 2) are
+        # emitted *inside* their fan-out node's dispatch branch (the
+        # `asyncio.gather`), not as standalone `elif current == <branch>:`
+        # arms — so skip them here. The fan-out node and the join node are
+        # emitted normally.
+        fan_out_branch_nodes: set[str] = {
+            e.to_id
+            for n in order
+            for e in spec.successors(n)
+            if e.kind is EdgeKind.PARALLEL_FAN_OUT
+        }
+
         first = True
         for nid in order:
+            if nid in fan_out_branch_nodes:
+                continue
             node = spec.nodes[nid]
             stmts, used = self._emit_node(nid, node, spec)
             keyword = "if" if first else "elif"
@@ -581,6 +596,13 @@ class TemporalCompiler:
         the dispatch loop's ``if/elif current == <id>:`` branch and indents.
         """
         node_type = node.type
+        # Fan-out diamond (ADR 092 Phase 2 / D3) — an AGENT node that opens
+        # parallel branches. Detected by an outbound fan-out edge; emits the
+        # node's own activity + a concurrent `asyncio.gather` over the branches
+        # + the join, then advances to the fan-in node. Takes precedence over
+        # the plain AGENT path.
+        if any(e.kind is EdgeKind.PARALLEL_FAN_OUT for e in spec.successors(nid)):
+            return self._emit_fan_out_node(nid, node, spec)
         if node_type is NodeType.AGENT:
             return self._emit_agent_node(nid, node, spec)
         if node_type is NodeType.INTENT_ROUTER:
@@ -640,6 +662,108 @@ class TemporalCompiler:
             f"state.update({method}_result)",
             f"current = {nxt!r}",
         ]
+        return body, {"call_agent_activity"}
+
+    def _fan_out_plan(
+        self, spec: WorkflowGraph, fanout_id: str
+    ) -> tuple[list[str], str, str, str | None]:
+        """Resolve a fan-out node's branches + join node (ADR 092 Phase 2).
+
+        Phase 2 lowers the **canonical diamond with single-node branches** to
+        Temporal-native parallelism. Returns
+        ``(branch_node_ids, join_id, join_strategy, join_key)``.
+
+        Raises :class:`WorkflowCompileError` when a branch is multi-node or the
+        branches don't reconverge on exactly one join — those richer shapes run
+        on the native backend today (author with ``runtime: native``), so we
+        fail loud at compile time rather than emit a workflow that diverges from
+        native semantics.
+        """
+        branch_starts = [
+            e.to_id for e in spec.successors(fanout_id) if e.kind is EdgeKind.PARALLEL_FAN_OUT
+        ]
+        joins: set[str] = set()
+        for start in branch_starts:
+            succ = spec.successors(start)
+            fan_in = [e for e in succ if e.kind is EdgeKind.PARALLEL_FAN_IN]
+            other = [e for e in succ if e.kind is not EdgeKind.PARALLEL_FAN_IN]
+            if not fan_in or other:
+                raise WorkflowCompileError(
+                    f"fan-out node {fanout_id!r}: branch {start!r} is not a single-node "
+                    f"branch. Temporal Phase 2 (ADR 092 D3) supports the single-node "
+                    f"canonical diamond; use single-node branches or runtime: native."
+                )
+            joins.add(fan_in[0].to_id)
+        if len(joins) != 1:
+            raise WorkflowCompileError(
+                f"fan-out node {fanout_id!r}: branches must reconverge on exactly one "
+                f"join node; got {sorted(joins)}."
+            )
+        join_id = joins.pop()
+        strategy = "last_wins"
+        join_key: str | None = None
+        for edge in spec.predecessors(join_id):
+            if edge.kind is EdgeKind.PARALLEL_FAN_IN:
+                strategy = str(edge.metadata.get("join", "last_wins"))
+                join_key = edge.metadata.get("join_key")
+                break
+        return branch_starts, join_id, strategy, join_key
+
+    def _emit_fan_out_node(
+        self, nid: str, node: Any, spec: WorkflowGraph
+    ) -> tuple[list[str], set[str]]:
+        """AGENT + fan-out diamond → run-node, ``asyncio.gather`` branches, join.
+
+        Lowers the canonical diamond (ADR 092 Phase 2 / D3) to Temporal's native
+        parallelism: the fan-out node's own agent activity runs first and merges
+        into ``state``; the N branch agents then run **concurrently** under
+        ``asyncio.gather`` (each from a snapshot of ``state``); their results are
+        joined by the declared strategy — byte-for-byte the native runner's
+        :meth:`WorkflowRunner._merge_branch_outcomes` — and control advances to
+        the fan-in (join) node. With ``runtime: auto`` (ADR 091) a fan-out
+        workflow then prefers Temporal, where parallel orchestration is durable.
+        """
+        branch_starts, join_id, strategy, join_key = self._fan_out_plan(spec, nid)
+        method = _safe_method_name(nid)
+        body = [
+            f"# node {nid!r} — AGENT + fan-out diamond (ADR 092 Phase 2 / D3)",
+            "# Run the fan-out node's agent, then its branches concurrently",
+            "# (Temporal-native durable parallelism), then join at the fan-in node.",
+            f"{method}_result = await workflow.execute_activity(",
+            "    call_agent_activity,",
+            f"    args=[{nid!r}, {node.ref!r}, state, run_id],",
+            "    schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+            "    heartbeat_timeout=_HEARTBEAT,",
+            "    retry_policy=_RETRY_POLICY,",
+            ")",
+            f"state.update({method}_result)",
+            f"# fan-out → {len(branch_starts)} concurrent branches → join {join_id!r}",
+            f"{method}_branches = await asyncio.gather(",
+        ]
+        for start in branch_starts:
+            bnode = spec.nodes[start]
+            body += [
+                "    workflow.execute_activity(",
+                "        call_agent_activity,",
+                f"        args=[{start!r}, {bnode.ref!r}, dict(state), run_id],",
+                "        schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+                "        heartbeat_timeout=_HEARTBEAT,",
+                "        retry_policy=_RETRY_POLICY,",
+                "    ),",
+            ]
+        body.append(")")
+        # Join strategy — mirrors WorkflowRunner._merge_branch_outcomes (D2). For
+        # single-node branches each branch's activity result IS its state delta,
+        # so these are identical to the native merge.
+        if strategy == "by_key":
+            for idx, start in enumerate(branch_starts):
+                body.append(f"state[{start!r}] = dict({method}_branches[{idx}])")
+        elif strategy == "collect" and join_key is not None:
+            body.append(f"state[{join_key!r}] = [_b.get({join_key!r}) for _b in {method}_branches]")
+        else:  # last_wins (default)
+            body.append(f"for _b in {method}_branches:")
+            body.append("    state.update(_b)")
+        body.append(f"current = {join_id!r}")
         return body, {"call_agent_activity"}
 
     def _emit_skill_node(
