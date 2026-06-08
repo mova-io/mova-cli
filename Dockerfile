@@ -83,6 +83,17 @@ COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate
 COPY agents/ /app/agents/
 ENV MOVATE_AGENTS_PATH=/app/agents
 
+# Operator-provided workflows/ directory — same pattern as agents/ above. The
+# temporal worker (`movate worker --backend temporal`) scans MOVATE_WORKFLOWS_PATH
+# for `runtime: temporal` workflow.yaml files to register; WITHOUT this the image
+# ships zero workflows and the worker logs "workflows_root_missing path=workflows
+# … workflows=0" — it connects to Temporal but hosts nothing to run (observed
+# 2026-06-08, the refund-approval durable-HITL demo never registered). Baking the
+# repo's workflows/ here ships the known catalog (e.g. refund-approval); a
+# volume-mount / --from-storage (ADR 088) deployment can still override the path.
+COPY workflows/ /app/workflows/
+ENV MOVATE_WORKFLOWS_PATH=/app/workflows
+
 # Voice demo web app — the standalone demo server (server.py) serves
 # the full browser voice experience: /ws/voice WebSocket, /tts/voices,
 # /lyzr/agents, Talk button, live activity chart, etc.
