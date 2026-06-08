@@ -1,0 +1,2 @@
+{"input": {"question": "What is the refund policy?"}, "expected": {"answer": "Our refund policy allows for refunds within 30 days of purchase.", "confidence": 0.95}}
+{"input": {"question": "How can I contact support?"}, "expected": {"answer": "You can contact support via email at support@movate.com.", "confidence": 0.9}}

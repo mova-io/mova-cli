@@ -416,16 +416,19 @@ class WorkflowSpec(BaseModel):
     description: str = ""
     owner: str = ""
 
-    runtime: Literal["native", "langgraph", "temporal"] = Field(
-        "native",
+    runtime: Literal["auto", "native", "langgraph", "temporal"] = Field(
+        "auto",
         description=(
-            "Execution backend for this workflow (ADR 055 D1). 'native' (default) "
-            "is the in-process WorkflowRunner — today's behavior, no extra. "
-            "'temporal' compiles to a Temporal workflow (opt-in mdk[temporal], "
-            "ADR 054). 'langgraph' is reserved (ADR 030; execution lands in ADR "
-            "055 step 3). Additive + default-preserving: no existing workflow.yaml "
-            "carries this key (extra='forbid'), so every current workflow stays "
-            "'native' byte-for-byte."
+            "Execution backend for this workflow (ADR 055 D1, ADR 091). 'auto' "
+            "(default) runs on Temporal when it's available (mdk[temporal] + "
+            "TEMPORAL_HOST) AND the workflow compiles there, else native — so "
+            "you get durable execution by default where it can run, with zero "
+            "breakage where it can't. 'native' forces the in-process "
+            "WorkflowRunner. 'temporal' forces a Temporal workflow (fails loud if "
+            "unavailable — an explicit durability ask never silently degrades). "
+            "'langgraph' is reserved (ADR 030). A workflow.yaml omitting this key "
+            "reads 'auto'; where Temporal is unconfigured that is byte-for-byte "
+            "the old native default."
         ),
     )
 

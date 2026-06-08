@@ -38,7 +38,12 @@ if TYPE_CHECKING:  # pragma: no cover — typing only.
     from movate.tracing.base import Tracer
 
 # Valid runtime selectors (mirrors the WorkflowSpec.runtime Literal).
-VALID_RUNTIMES = ("native", "langgraph", "temporal")
+VALID_RUNTIMES = ("auto", "native", "langgraph", "temporal")
+
+# Node types the Temporal compiler can't emit yet (raise NotImplementedError):
+# an ``auto`` workflow that uses one stays on native rather than failing (ADR 091
+# D2). Kept as bare names to avoid importing the IR enum at module scope.
+_TEMPORAL_UNSUPPORTED_NODE_TYPES = frozenset({"function", "sub_workflow"})
 
 # The task queue the local-run ephemeral worker and the compiled workflow share.
 # ``mdk worker --backend temporal`` uses the same default (one queue name keeps
@@ -56,18 +61,62 @@ class WorkflowBackendError(Exception):
 
 
 def resolve_effective_runtime(graph: WorkflowGraph, override: str | None) -> str:
-    """Return the effective runtime: override > graph.runtime > native (D3).
+    """Return the effective runtime: override > graph.runtime > auto-resolve.
 
     ``override`` is the ``--runtime`` CLI flag (read-only selection — it never
     mutates the spec/graph). ``None`` ⇒ use the workflow's declared runtime.
     Validates the value so a typo fails loud rather than silently defaulting.
+
+    ADR 091 — the default runtime is ``auto``: Temporal when it can actually run
+    (extra + ``TEMPORAL_HOST`` configured AND the graph compiles on Temporal),
+    else native. Explicit ``temporal`` / ``native`` / ``langgraph`` are returned
+    verbatim (explicit ``temporal`` still fail-loud-on-unavailable downstream).
     """
-    effective = override or getattr(graph, "runtime", "native") or "native"
+    effective = override or getattr(graph, "runtime", "auto") or "auto"
     if effective not in VALID_RUNTIMES:
         raise WorkflowBackendError(
             f"unknown runtime {effective!r}; expected one of {', '.join(VALID_RUNTIMES)}"
         )
+    if effective == "auto":
+        return _auto_runtime(graph)
     return effective
+
+
+def _temporal_available() -> bool:
+    """Non-throwing probe (ADR 091 D2): is Temporal actually usable right now?
+
+    True iff the ``[temporal]`` extra imports AND a ``TEMPORAL_HOST`` is
+    configured. Distinct from :func:`require_backend_available` (which RAISES) —
+    this drives the graceful ``auto`` fallback, so it must never throw.
+    """
+    try:
+        _require_temporal_extra()
+        _resolve_temporal_connection()
+    except Exception:
+        return False
+    return True
+
+
+def _temporal_compilable(graph: WorkflowGraph) -> bool:
+    """True iff every node in ``graph`` is one the Temporal compiler can emit.
+
+    ``FUNCTION`` / ``SUB_WORKFLOW`` nodes raise ``NotImplementedError`` on the
+    Temporal compiler today, so an ``auto`` workflow that uses one stays native
+    (ADR 091 D2) instead of failing at runtime.
+    """
+    nodes = getattr(graph, "nodes", {}) or {}
+    for node in nodes.values():
+        node_type = getattr(getattr(node, "type", None), "value", None)
+        if node_type in _TEMPORAL_UNSUPPORTED_NODE_TYPES:
+            return False
+    return True
+
+
+def _auto_runtime(graph: WorkflowGraph) -> str:
+    """Resolve ``runtime: auto`` → 'temporal' when usable, else 'native' (D2)."""
+    if _temporal_available() and _temporal_compilable(graph):
+        return "temporal"
+    return "native"
 
 
 def require_backend_available(effective_runtime: str) -> None:
@@ -573,8 +622,11 @@ async def run_temporal_worker(
     workflow_classes: list[Any] = []
     registered: list[str] = []
     for name, graph in sorted(workflows.items()):
-        if getattr(graph, "runtime", "native") != "temporal":
-            continue  # native/langgraph workflows aren't hosted by this worker.
+        # ADR 091 — resolve through the same auto-fallback logic the dispatch
+        # fork uses, so an ``auto`` workflow that resolves to Temporal is hosted
+        # here (a raw ``== "temporal"`` check would skip it).
+        if resolve_effective_runtime(graph, None) != "temporal":
+            continue  # native/langgraph (or auto→native) aren't hosted by this worker.
         compiled = compiler.compile(graph)
         workflow_classes.append(
             load_compiled_workflow_class(compiled.module_source, compiled.workflow_class_name)

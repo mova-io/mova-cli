@@ -402,8 +402,13 @@ async def _run_temporal_worker(
     register_pool_observability(rt.storage)
 
     workflows = scan_workflows(workflows_path)
+    # ADR 091 — resolve each workflow's effective runtime (auto → temporal when
+    # available + compilable, else native) so the worker hosts auto-default
+    # workflows, not only those with an explicit `runtime: temporal`.
+    from movate.runtime.workflow_backend import resolve_effective_runtime  # noqa: PLC0415
+
     temporal_wfs = {
-        name: g for name, g in workflows.items() if getattr(g, "runtime", "native") == "temporal"
+        name: g for name, g in workflows.items() if resolve_effective_runtime(g, None) == "temporal"
     }
     # ADR 088 — opt-in second source: published runtime:temporal workflows from
     # storage. Merged with the filesystem scan; filesystem wins on a name clash
