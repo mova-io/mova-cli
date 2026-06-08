@@ -52,6 +52,9 @@ _AZURE_WORKBOOK = _DASHBOARDS_DIR / "azure" / "mdk-golden-signals.workbook.json"
 # infra/azure/modules/monitor-workbooks.bicep via loadTextContent). Brought under
 # the same anti-drift guard so its mdk.* references can't go stale.
 _TEMPORAL_WORKBOOK = _REPO_ROOT / "infra" / "azure-monitor" / "workbooks" / "temporal.workbook.json"
+# Voice latency/turn dashboard (Grafana, Azure Monitor datasource) — the voice
+# metrics emit but had no dashboard until now (they were on _not_dashboarded).
+_VOICE_GRAFANA = _DASHBOARDS_DIR / "grafana" / "azure" / "mdk-voice.json"
 
 # Prometheus unit / aggregation suffixes the OTLP -> Prometheus convention
 # appends. Stripped (one layer per pass) before matching a Prometheus token
@@ -150,11 +153,22 @@ _POOL_METRICS = {
 # ``mdk.workflow.duration_ms`` (per-run timing still lives in the Temporal Web UI).
 _TEMPORAL_METRICS = {"mdk.workflow.completed", "mdk.workflow.duration_ms"}
 
+# The voice round-trip dashboard (Grafana, Azure Monitor) — STT/agent/TTS latency
+# + turn volume + barge-in. These metrics emit but had no dashboard until now
+# (they were parked on _not_dashboarded below).
+_VOICE_METRICS = {
+    "mdk.voice.responded_ms",
+    "mdk.voice.stt_final_ms",
+    "mdk.voice.tts_first_audio_ms",
+    "mdk.voice.turns",
+}
+
 _CASES = [
     pytest.param(_GRAFANA, "json", _ALL_FIVE | _POOL_METRICS, id="grafana"),
     pytest.param(_PROM_RULES, "yaml", _ALL_FIVE, id="prometheus-rules"),
     pytest.param(_AZURE_WORKBOOK, "json", _ALL_FIVE, id="azure-workbook"),
     pytest.param(_TEMPORAL_WORKBOOK, "json", _TEMPORAL_METRICS, id="temporal-workbook"),
+    pytest.param(_VOICE_GRAFANA, "json", _VOICE_METRICS, id="voice-grafana"),
 ]
 
 
@@ -233,10 +247,6 @@ def test_every_emitted_metric_appears_on_some_dashboard() -> None:
         # Voice turn latency (ADR 024/036/073) — newly bridged from the voice
         # subsystem to OTel. A dedicated voice dashboard/workbook is the
         # follow-up; the metrics ship first so data accrues before the panels.
-        "mdk.voice.responded_ms": "voice latency; voice dashboard is a follow-up",
-        "mdk.voice.stt_final_ms": "voice latency; voice dashboard is a follow-up",
-        "mdk.voice.tts_first_audio_ms": "voice latency; voice dashboard is a follow-up",
-        "mdk.voice.turns": "voice turn/barge-in counter; voice dashboard is a follow-up",
     }
 
     covered: set[str] = set()

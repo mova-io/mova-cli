@@ -1,0 +1,372 @@
+{
+  "uid": "mdk-voice",
+  "title": "MDK \u2014 Voice (latency + turns)",
+  "tags": [
+    "mdk",
+    "voice"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "id": 1,
+      "title": "Voice round-trip \u2014 STT \u2192 agent \u2192 TTS (ADR 024/036/073)",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Time-to-first-audio (avg, 24h)",
+      "description": "**The headline voice latency** (golden signal). turn start \u2192 first TTS audio frame. The number the Cartesia/streaming path drives down.",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 6,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.voice.responded_ms\"\n| where TimeGenerated > ago(24h)\n| summarize AvgMs = round(sum(Sum) / sum(ItemCount), 0)",
+            "resultFormat": "table"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "STT endpoint latency (avg, 24h)",
+      "description": "turn start \u2192 STT final transcript. The speech-to-text half of the round-trip.",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 1,
+        "w": 6,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.voice.stt_final_ms\"\n| where TimeGenerated > ago(24h)\n| summarize AvgMs = round(sum(Sum) / sum(ItemCount), 0)",
+            "resultFormat": "table"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "TTS first-audio latency (avg, 24h)",
+      "description": "turn start \u2192 first TTS audio frame. The text-to-speech half (streaming TTS shrinks this).",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 6,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.voice.tts_first_audio_ms\"\n| where TimeGenerated > ago(24h)\n| summarize AvgMs = round(sum(Sum) / sum(ItemCount), 0)",
+            "resultFormat": "table"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "Voice turns (24h)",
+      "description": "**Traffic** (golden signal). Completed voice turns in the last 24h.",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 1,
+        "w": 6,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.voice.turns\"\n| where TimeGenerated > ago(24h)\n| summarize Turns = sum(Sum)",
+            "resultFormat": "table"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "Barge-in rate % (24h)",
+      "description": "Share of turns the user interrupted (barge-in). High = users cutting the agent off \u2014 a UX signal.",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 1,
+        "w": 6,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.voice.turns\"\n| where TimeGenerated > ago(24h)\n| extend interrupted = tostring(Properties[\"interrupted\"])\n| summarize Total = sum(Sum), Barged = sumif(Sum, interrupted == \"true\")\n| extend BargePct = iff(Total == 0, 0.0, round(100.0 * Barged / Total, 1))\n| project BargePct",
+            "resultFormat": "table"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 7,
+      "title": "Time-to-first-audio over time (avg / 5m)",
+      "description": "The latency trend \u2014 watch this fall when the streaming STT/TTS path is keyed (vs the OpenAI fallback).",
+      "datasource": {
+        "type": "grafana-azure-monitor-datasource",
+        "uid": "ffnrfwjnew5xcc"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 24,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-azure-monitor-datasource",
+            "uid": "ffnrfwjnew5xcc"
+          },
+          "queryType": "Azure Log Analytics",
+          "subscription": "8fab0f8f-b577-45d7-a485-ec32f73b22be",
+          "azureLogAnalytics": {
+            "resources": [
+              "/subscriptions/8fab0f8f-b577-45d7-a485-ec32f73b22be/resourceGroups/movate-dev-rg/providers/Microsoft.OperationalInsights/workspaces/movate-dev-logs"
+            ],
+            "query": "AppMetrics\n| where Name == \"mdk.voice.responded_ms\"\n| where TimeGenerated > ago(6h)\n| summarize AvgMs = round(sum(Sum) / sum(ItemCount), 0) by bin(TimeGenerated, 5m)\n| order by TimeGenerated asc",
+            "resultFormat": "table"
+          }
+        }
+      ]
+    }
+  ]
+}
