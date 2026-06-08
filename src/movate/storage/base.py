@@ -37,6 +37,7 @@ from movate.core.events import Event
 from movate.core.job_retry import ReclaimResult
 from movate.core.models import (
     AgentBundleRecord,
+    AgentRuntimeState,
     ApiKeyRecord,
     AuditRecord,
     BatchRecord,
@@ -1408,6 +1409,37 @@ class StorageProvider(Protocol):
         Tenant-scoped in WHERE so a caller can't delete another tenant's
         agents by guessing names — a cross-tenant or unknown name deletes
         nothing and returns ``0``.
+        """
+
+    # ------------------------------------------------------------------
+    # Agent runtime state (ADR 090 D1/D2) — mutable operational lifecycle.
+    #
+    # UNLIKE the immutable agent-bundle surface above, this is a single
+    # MUTABLE row per ``(tenant_id, name)`` carrying the agent's current
+    # operational status (active / deprecated / disabled). A missing row is
+    # treated as ACTIVE by every caller, so the surface is additive with no
+    # backfill — old agents read active. This is the seam a future per-agent
+    # ACA reconciler (ADR 090 Tier 2) consumes, mapping status to scale intent.
+    # ------------------------------------------------------------------
+
+    async def get_agent_state(self, name: str, *, tenant_id: str) -> AgentRuntimeState | None:
+        """Fetch the operational state for one agent ``name``, scoped to
+        ``tenant_id``. Returns ``None`` when no row exists (⇒ treat as
+        ACTIVE) or the agent belongs to another tenant (no-leak contract).
+        """
+
+    async def set_agent_state(self, state: AgentRuntimeState) -> None:
+        """Upsert the operational state for ``(state.tenant_id, state.name)``.
+
+        One current row per agent — re-setting overwrites status / updated_at /
+        updated_by / note. (Contrast :meth:`save_agent_bundle`, which is an
+        immutable append.)
+        """
+
+    async def list_agent_states(self, *, tenant_id: str) -> list[AgentRuntimeState]:
+        """List all agents with an explicit state row for ``tenant_id``,
+        ordered by name. Agents with no row (the ACTIVE default) do not
+        appear — the caller overlays these onto the agent catalog.
         """
 
     # ------------------------------------------------------------------

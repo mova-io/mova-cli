@@ -22,6 +22,8 @@ from movate.core.models import (
     _DEFAULT_PROJECT_NAME,
     _TENANT_SYSTEM_PRINCIPAL,
     AgentBundleRecord,
+    AgentRuntimeState,
+    AgentStatus,
     ApiKeyEnv,
     ApiKeyRecord,
     AuditFinding,
@@ -448,6 +450,22 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_agent_bundles_name ON agent_bundles(tenant_id, name)",
     "CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created "
     "ON agent_bundles(tenant_id, name, created_at DESC)",
+    # ADR 090 D1: agent operational lifecycle state. UNLIKE agent_bundles
+    # (immutable, one row per version), this is a MUTABLE row keyed on
+    # (tenant_id, name) — one current status per agent across all versions.
+    # An absent row ⇒ ACTIVE, so this is additive with no backfill. Additive,
+    # idempotent CREATE TABLE IF NOT EXISTS.
+    """
+    CREATE TABLE IF NOT EXISTS agent_runtime_state (
+        tenant_id   TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        status      TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        updated_by  TEXT,
+        note        TEXT,
+        PRIMARY KEY (tenant_id, name)
+    )
+    """,
     # ADR 060 D1: durable skills registry. Mirrors agent_bundles row-for-row
     # so the API CRUD/version surface is symmetric with agents. One immutable
     # (name, version) row per publish, tenant-scoped; ``files`` is JSON-encoded
@@ -2382,6 +2400,45 @@ class SqliteProvider:
         cur = await self._db.execute(sql, params)
         await self._db.commit()
         return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Agent runtime state (ADR 090 D1/D2) — mutable per-(tenant, name) status.
+    # Upsert semantics (one current row per agent); absent ⇒ ACTIVE upstream.
+    # ------------------------------------------------------------------
+
+    async def get_agent_state(self, name: str, *, tenant_id: str) -> AgentRuntimeState | None:
+        async with self._db.execute(
+            "SELECT * FROM agent_runtime_state WHERE name = ? AND tenant_id = ? LIMIT 1",
+            (name, tenant_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_agent_state(row) if row else None
+
+    async def set_agent_state(self, state: AgentRuntimeState) -> None:
+        await self._db.execute(
+            "INSERT INTO agent_runtime_state (tenant_id, name, status, updated_at, "
+            "updated_by, note) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(tenant_id, name) DO UPDATE SET "
+            "status = excluded.status, updated_at = excluded.updated_at, "
+            "updated_by = excluded.updated_by, note = excluded.note",
+            (
+                state.tenant_id,
+                state.name,
+                state.status.value,
+                state.updated_at.isoformat(),
+                state.updated_by,
+                state.note,
+            ),
+        )
+        await self._db.commit()
+
+    async def list_agent_states(self, *, tenant_id: str) -> list[AgentRuntimeState]:
+        async with self._db.execute(
+            "SELECT * FROM agent_runtime_state WHERE tenant_id = ? ORDER BY name",
+            (tenant_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_agent_state(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Skills registry (ADR 060 D1) — mirrors save/get/list/delete agent bundle.
@@ -5634,6 +5691,17 @@ def _row_to_agent_bundle(row: aiosqlite.Row) -> AgentBundleRecord:
         content_hash=row["content_hash"],
         files=json.loads(row["files"]),
         created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+def _row_to_agent_state(row: aiosqlite.Row) -> AgentRuntimeState:
+    return AgentRuntimeState(
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        status=AgentStatus(row["status"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        updated_by=row["updated_by"],
+        note=row["note"],
     )
 
 

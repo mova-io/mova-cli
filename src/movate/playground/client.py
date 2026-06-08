@@ -269,11 +269,26 @@ class PlaygroundClient:
             error=last_exc,
         )
 
-    async def list_agents(self) -> list[dict[str, Any]]:
+    async def list_agents(
+        self, *, only_active: bool = True, with_health: bool = False
+    ) -> list[dict[str, Any]]:
         """Return the runtime's agent catalog as a list of
-        ``{name, version, description, input_schema, output_schema}``
-        dicts. Reads ``GET /api/v1/agents``."""
-        resp = await self._client.get("/api/v1/agents", headers=self._rid_headers())
+        ``{name, version, description, status, health, ...}`` dicts. Reads
+        ``GET /api/v1/agents``.
+
+        ADR 090: ``only_active`` server-side-filters to ``status=active`` so
+        the playground picker never lists a deprecated/disabled agent;
+        ``with_health`` adds ``?health=1`` so each item carries a live
+        ``health`` ('healthy'/'unhealthy') the caller can filter on. Both query
+        params are ignored by an older runtime (graceful degrade → all agents)."""
+        params: dict[str, str] = {}
+        if only_active:
+            params["status"] = "active"
+        if with_health:
+            params["health"] = "1"
+        resp = await self._client.get(
+            "/api/v1/agents", params=params or None, headers=self._rid_headers()
+        )
         resp.raise_for_status()
         data = resp.json()
         # The /api/v1/agents endpoint returns

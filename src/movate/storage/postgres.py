@@ -40,6 +40,8 @@ from movate.core.models import (
     _DEFAULT_PROJECT_NAME,
     _TENANT_SYSTEM_PRINCIPAL,
     AgentBundleRecord,
+    AgentRuntimeState,
+    AgentStatus,
     ApiKeyEnv,
     ApiKeyRecord,
     AuditFinding,
@@ -542,6 +544,20 @@ CREATE INDEX IF NOT EXISTS idx_agent_bundles_name
 -- Latest-version-per-name + history ordering scan.
 CREATE INDEX IF NOT EXISTS idx_agent_bundles_name_created
     ON agent_bundles(tenant_id, name, created_at DESC);
+
+-- ADR 090 D1: agent operational lifecycle state. UNLIKE agent_bundles
+-- (immutable, one row per version), a MUTABLE row keyed (tenant_id, name)
+-- holds the agent's current status across all versions. Absent row ⇒ ACTIVE,
+-- so additive with no backfill. CREATE TABLE IF NOT EXISTS — idempotent, no ALTER.
+CREATE TABLE IF NOT EXISTS agent_runtime_state (
+    tenant_id   TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL,
+    updated_by  TEXT,
+    note        TEXT,
+    PRIMARY KEY (tenant_id, name)
+);
 
 -- ADR 060 D1: durable skills registry. Skill analogue of agent_bundles —
 -- one immutable (name, version) row per publish, tenant-scoped; ``files`` is
@@ -2771,6 +2787,45 @@ class PostgresProvider:
             )
         # asyncpg returns a command tag like "DELETE <n>".
         return int(status.split()[-1])
+
+    # ------------------------------------------------------------------
+    # Agent runtime state (ADR 090 D1/D2) — mutable per-(tenant, name) status.
+    # ------------------------------------------------------------------
+
+    async def get_agent_state(self, name: str, *, tenant_id: str) -> AgentRuntimeState | None:
+        row = await self._db.fetchrow(
+            "SELECT * FROM agent_runtime_state WHERE name = $1 AND tenant_id = $2",
+            name,
+            tenant_id,
+        )
+        return _row_to_agent_state(row) if row else None
+
+    async def set_agent_state(self, state: AgentRuntimeState) -> None:
+        await self._db.execute(
+            """
+            INSERT INTO agent_runtime_state (
+                tenant_id, name, status, updated_at, updated_by, note
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (tenant_id, name) DO UPDATE SET
+                status = EXCLUDED.status,
+                updated_at = EXCLUDED.updated_at,
+                updated_by = EXCLUDED.updated_by,
+                note = EXCLUDED.note
+            """,
+            state.tenant_id,
+            state.name,
+            state.status.value,
+            state.updated_at,
+            state.updated_by,
+            state.note,
+        )
+
+    async def list_agent_states(self, *, tenant_id: str) -> list[AgentRuntimeState]:
+        rows = await self._db.fetch(
+            "SELECT * FROM agent_runtime_state WHERE tenant_id = $1 ORDER BY name",
+            tenant_id,
+        )
+        return [_row_to_agent_state(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Skills registry (ADR 060 D1) — mirrors the agent-bundle surface.
@@ -5874,6 +5929,17 @@ def _row_to_agent_bundle(row: asyncpg.Record) -> AgentBundleRecord:
         content_hash=row["content_hash"],
         files=dict(row["files"]),
         created_at=row["created_at"],
+    )
+
+
+def _row_to_agent_state(row: asyncpg.Record) -> AgentRuntimeState:
+    return AgentRuntimeState(
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        status=AgentStatus(row["status"]),
+        updated_at=row["updated_at"],
+        updated_by=row["updated_by"],
+        note=row["note"],
     )
 
 
