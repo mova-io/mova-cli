@@ -94,11 +94,6 @@ ENV MOVATE_AGENTS_PATH=/app/agents
 COPY workflows/ /app/workflows/
 ENV MOVATE_WORKFLOWS_PATH=/app/workflows
 
-# Voice demo web app — the standalone demo server (server.py) serves
-# the full browser voice experience: /ws/voice WebSocket, /tts/voices,
-# /lyzr/agents, Talk button, live activity chart, etc.
-COPY examples/web_demo/ /app/web_demo/
-
 # Default tracer goes to stdout — Container Apps captures stdout to
 # Log Analytics. Operators flip MOVATE_TRACER=otel via env to switch
 # to OTLP.
@@ -174,11 +169,6 @@ COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate
 # path don't trip; the playground command never reads it.
 COPY agents/ /app/agents/
 ENV MOVATE_AGENTS_PATH=/app/agents
-
-# Voice demo web app (same COPY as the runtime/app stage — the default
-# build target is this playground stage, and ACA overrides CMD to
-# `mdk serve`, so the runtime serves this HTML at GET /).
-COPY examples/web_demo/ /app/web_demo/
 
 # Non-root user (defense in depth — matches the runtime/worker stages).
 RUN useradd --create-home --home-dir /home/movate --shell /bin/bash movate \

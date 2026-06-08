@@ -51,7 +51,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import movate
 from movate.core.auth import (
@@ -5052,7 +5052,7 @@ def _load_sample_cases(bundle: AgentBundle, *, limit: int = 3) -> list[dict[str,
     return rows
 
 
-def build_app(  # noqa: PLR0912
+def build_app(
     storage: StorageProvider,
     *,
     agents: list[AgentBundle] | None = None,
@@ -17661,63 +17661,6 @@ def build_app(  # noqa: PLR0912
             "voices": {"openai": _OPENAI_VOICES, "cartesia": cart_voices},
             "cartesia_live": bool(_cartesia_cache),
         }
-
-    # ------------------------------------------------------------------
-    # GET / — Serve the voice demo app (examples/web_demo/index.html).
-    # The file is baked into the image at /app/web_demo/index.html by the
-    # Dockerfile.  Falls back to a project-root lookup for local dev.
-    # ------------------------------------------------------------------
-    # Eagerly load the voice demo HTML at startup so the GET / route
-    # never hits a file-not-found at request time.
-    _demo_html: str = ""
-    _demo_candidates = [
-        "/app/web_demo/index.html",
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..",
-            "..",
-            "examples",
-            "web_demo",
-            "index.html",
-        ),
-        os.path.join(
-            os.environ.get("MOVATE_AGENTS_PATH", "/app/agents"), "..", "web_demo", "index.html"
-        ),
-    ]
-    for _p in _demo_candidates:
-        _p = os.path.normpath(_p)
-        if os.path.isfile(_p):
-            with open(_p) as _f:
-                _demo_html = _f.read()
-            logger.info("Voice demo HTML loaded from %s (%d bytes)", _p, len(_demo_html))
-            break
-    else:
-        logger.warning("Voice demo HTML not found; checked: %s", _demo_candidates)
-
-    # Mount /static for voice demo assets (logos, etc.).
-    _static_candidates = [
-        "/app/web_demo/static",
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "web_demo", "static"
-        ),
-    ]
-    for _sp in _static_candidates:
-        _sp = os.path.normpath(_sp)
-        if os.path.isdir(_sp):
-            from starlette.staticfiles import StaticFiles  # noqa: PLC0415
-
-            app.mount("/static", StaticFiles(directory=_sp), name="demo-static")
-            logger.info("Mounted /static from %s", _sp)
-            break
-
-    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-    async def _voice_demo() -> HTMLResponse:
-        if not _demo_html:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Voice demo HTML not found. Checked: {_demo_candidates}",
-            )
-        return HTMLResponse(_demo_html)
 
     # ------------------------------------------------------------------
     # Typed exception → HTTP code translator. AgentCreationError carries
