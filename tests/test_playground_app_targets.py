@@ -182,7 +182,7 @@ async def test_start_auth_error_is_friendly(monkeypatch: pytest.MonkeyPatch) -> 
         async def get_capabilities(self) -> None:
             return None
 
-        async def list_agents(self) -> list[dict[str, object]]:
+        async def list_agents(self, **_kw: object) -> list[dict[str, object]]:
             raise _AuthError("unauthorized")
 
     monkeypatch.setattr(app, "_client_from_target", lambda target: _FakeClient())
