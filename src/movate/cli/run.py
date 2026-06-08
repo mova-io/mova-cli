@@ -42,7 +42,7 @@ from movate.core.workflow import (
     WorkflowRunner,
     compile_workflow,
     load_workflow_spec,
-    validate_linear,
+    validate_graph,
 )
 from movate.core.workflow.spec import WorkflowSpecLoadError
 
@@ -918,7 +918,7 @@ def _dispatch_workflow(
     try:
         graph = compile_workflow(spec, parent, allow_cycles=has_judge)
         if not has_judge:
-            validate_linear(graph)
+            validate_graph(graph)
     except WorkflowCompileError as exc:
         console.print(f"[red]✗ workflow validation failed:[/red] {exc}")
         raise typer.Exit(code=2) from None

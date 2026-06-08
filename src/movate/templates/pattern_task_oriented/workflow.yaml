@@ -20,12 +20,13 @@ kind: Workflow
 #     workflow-root span and nests each node under it (full interaction trace).
 #   * EVAL-GATE: the evals: stanza below gates the whole workflow at CI time.
 #
-# Topology note: the native runner (ADR 017) walks a linear DAG and
-# validate_linear rejects true parallel fan-out edges (those land in a later
-# phase). We therefore model the bounded fan-out as a linear
-# supervisor → task-a → task-b → collector chain: the cap (two task nodes) and
-# the collect step are real and reviewable; the branches execute in sequence
-# rather than concurrently. The GOVERNANCE is identical either way.
+# Topology note: as of ADR 092 Phase 1 the native runner executes true parallel
+# fan-out/fan-in (the canonical diamond) concurrently — declare it with
+# `kind: fan_out` edges out of the supervisor and `kind: fan_in` edges into the
+# collector (optionally `join: collect`). This template ships the *sequential*
+# supervisor → task-a → task-b → collector chain as the conservative default
+# (identical GOVERNANCE: the two-branch cap and the collect step are real and
+# reviewable); flip the edges to fan_out/fan_in to run the branches in parallel.
 
 name: task-oriented
 version: 0.1.0

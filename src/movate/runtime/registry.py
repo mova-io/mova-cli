@@ -26,7 +26,7 @@ from movate.core.workflow import (
     WorkflowGraph,
     compile_workflow,
     load_workflow_spec,
-    validate_linear,
+    validate_graph,
 )
 from movate.core.workflow.spec import WorkflowSpecLoadError
 
@@ -107,7 +107,7 @@ def scan_workflows(root: Path) -> dict[str, WorkflowGraph]:
         try:
             spec, parent = load_workflow_spec(entry)
             graph = compile_workflow(spec, parent)
-            validate_linear(graph)
+            validate_graph(graph)
         except (WorkflowSpecLoadError, WorkflowCompileError) as exc:
             logger.warning("workflow_load_skipped path=%s reason=%s", entry, exc)
             continue

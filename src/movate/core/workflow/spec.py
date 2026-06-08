@@ -354,6 +354,25 @@ class EdgeSpec(BaseModel):
         None,
         description="Explicit edge kind for parallel/conditional graphs; omitted ⇒ sequential",
     )
+    join: Literal["last_wins", "by_key", "collect"] | None = Field(
+        None,
+        description=(
+            "Branch-state merge strategy for a fan-in edge (ADR 092 D2). Only valid "
+            "on a ``kind: fan_in`` edge. ``last_wins`` (default) shallow-merges each "
+            "branch's output into parent state in branch order; ``by_key`` namespaces "
+            "each branch's output under its start-node id (no clobber); ``collect`` "
+            "gathers each branch's value at ``join_key`` into a list. Omitted ⇒ "
+            "``last_wins``."
+        ),
+    )
+    join_key: str | None = Field(
+        None,
+        description=(
+            "State key for the ``collect`` join strategy (ADR 092 D2): each branch's "
+            "value at this key is gathered into a list under it. Required for "
+            "``join: collect``; ignored otherwise."
+        ),
+    )
 
     @field_validator("when")
     @classmethod
@@ -371,6 +390,17 @@ class EdgeSpec(BaseModel):
             raise ValueError(
                 f"edge {self.from_id!r}→{self.to_id!r}: 'when' is only valid on a "
                 f"conditional edge, but kind={self.kind!r} was declared"
+            )
+        # ``join``/``join_key`` only make sense on a fan-in merge edge (ADR 092).
+        if (self.join is not None or self.join_key is not None) and self.kind != "fan_in":
+            raise ValueError(
+                f"edge {self.from_id!r}→{self.to_id!r}: 'join'/'join_key' are only valid "
+                f"on a 'fan_in' edge, but kind={self.kind!r} was declared"
+            )
+        if self.join == "collect" and not (self.join_key and self.join_key.strip()):
+            raise ValueError(
+                f"edge {self.from_id!r}→{self.to_id!r}: join='collect' requires a "
+                f"non-empty 'join_key'"
             )
         return self
 

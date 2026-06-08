@@ -39,12 +39,24 @@ HITL resume (ADR 017 D5, PR 2):
   free. The terminal/paused record is persisted under the SAME
   ``workflow_run_id`` (``save_workflow_run`` upserts on the id).
 
+Parallel fan-out (ADR 092 Phase 1):
+
+* The walker stays a single-successor advance for linear stretches. When an
+  agent node opens a parallel block (its successors are ``fan_out`` edges) the
+  runner runs the N branches concurrently (``asyncio.gather``), each a normal
+  agent-only sub-walk from a snapshot of the current state, then joins them at
+  the matching ``fan_in`` (join) node by the declared strategy (``last_wins`` /
+  ``by_key`` / ``collect``) and resumes the walk at the join. A graph with no
+  fan-out edge takes the unchanged linear path (byte-for-byte). The DAG shape
+  is guaranteed by :func:`movate.core.workflow.compiler.validate_dag`.
+
 Explicit ``inputs:`` / ``outputs:`` mappings are deliberately deferred to
 v0.4 — easy to add when real workflows demand finer control.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -64,7 +76,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
-from movate.core.workflow.ir import NodeType, WorkflowGraph
+from movate.core.workflow.ir import EdgeKind, NodeType, WorkflowGraph, WorkflowNode
 from movate.core.workflow.judge import (
     build_judge_state_value,
     derive_terminate,
@@ -114,6 +126,22 @@ class WorkflowResult:
     @property
     def duration_ms(self) -> int:
         return max(0, int((self.finished_at - self.started_at) * 1000))
+
+
+@dataclass
+class _BranchOutcome:
+    """One fan-out branch's result (ADR 092 D2 — internal to the runner).
+
+    ``delta`` is the set of state keys this branch changed vs the shared
+    pre-fan-out snapshot (so a join merge never reapplies a stale base value).
+    ``error``/``error_node_id`` are set iff a branch agent failed.
+    """
+
+    start_id: str
+    delta: dict[str, Any]
+    runs: list[RunRecord]
+    error_node_id: str | None = None
+    error: ErrorInfo | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -493,44 +521,7 @@ class WorkflowRunner:
                 )
 
             # --- agent node --------------------------------------------------
-            # Load agent — runner-level error if the bundle won't parse.
-            try:
-                bundle = load_agent(node.ref)
-            except AgentLoadError as exc:
-                raise WorkflowRunError(
-                    f"node {node_id!r}: agent at {node.ref} failed to load: {exc}"
-                ) from exc
-
-            # Build the agent's input by projecting state onto its schema.
-            agent_input = _project_state(state, bundle)
-
-            # Run through the executor with the workflow context so the
-            # persisted RunRecord carries workflow_run_id + node_id without
-            # the runner needing a second save. Pass tenant_id_override so
-            # multi-tenant workers stamp the right tenant on each node's
-            # RunRecord (executor default may be a different tenant).
-            response: RunResponse = await self._executor.execute(
-                bundle,
-                RunRequest(agent=bundle.spec.name, input=agent_input),
-                workflow_run_id=wf_id,
-                node_id=node_id,
-                parent_span=wf_span,
-                tenant_id_override=self._tenant_id,
-            )
-
-            # Python-level summary for the WorkflowResult.runs view.
-            # NOT persisted on success — the executor already wrote a row
-            # with workflow_run_id+node_id stamped on it. On failure the
-            # executor only writes a FailureRecord, so we save one
-            # ERROR-status RunRecord here so per-node failures show up in
-            # ``list_runs(workflow_run_id=…)`` joins.
-            summary = _summarize_run(
-                response,
-                tenant_id=self._tenant_id,
-                bundle=bundle,
-                wf_id=wf_id,
-                node_id=node_id,
-            )
+            response, summary = await self._run_one_agent(node, node_id, state, wf_id, wf_span)
             runs.append(summary)
             if response.status != "success":
                 await self._storage.save_run(summary)
@@ -565,6 +556,56 @@ class WorkflowRunner:
 
             # Merge agent output into state.
             state.update(response.data)
+
+            # --- fan-out block (ADR 092 Phase 1) -----------------------------
+            # If this node opens a parallel block (fan-out edges), run the N
+            # branches concurrently, join their state at the matching fan-in
+            # node, then resume the linear walk from that join. A node with no
+            # fan-out edge takes the unchanged single-successor advance below,
+            # so the linear path is byte-for-byte identical.
+            fan_out = [e for e in graph.successors(node_id) if e.kind is EdgeKind.PARALLEL_FAN_OUT]
+            if fan_out:
+                block = await self._run_fan_out_block(
+                    graph,
+                    fanout_id=node_id,
+                    fan_out_edges=fan_out,
+                    state=state,
+                    wf_id=wf_id,
+                    wf_span=wf_span,
+                )
+                if isinstance(block, WorkflowResult):
+                    # A branch failed — persist + propagate the partial failure.
+                    finished = time.monotonic()
+                    await self._storage.save_workflow_run(
+                        WorkflowRunRecord(
+                            workflow_run_id=wf_id,
+                            tenant_id=self._tenant_id,
+                            workflow=graph.name,
+                            workflow_version=graph.version,
+                            status=WorkflowStatus.ERROR,
+                            initial_state=initial_state,
+                            final_state=state,
+                            error_node_id=block.error_node_id,
+                            error=block.error,
+                        )
+                    )
+                    return WorkflowResult(
+                        workflow_run_id=wf_id,
+                        status=WorkflowStatus.ERROR,
+                        initial_state=initial_state,
+                        final_state=state,
+                        runs=runs + block.runs,
+                        error_node_id=block.error_node_id,
+                        error=block.error,
+                        started_at=started,
+                        finished_at=finished,
+                    )
+                join_id, block_runs = block
+                runs.extend(block_runs)
+                # The join node is itself an agent node; resume the walk *at* it
+                # so it runs against the merged branch state.
+                current_id = join_id
+                continue
 
             # Advance: follow the single sequential successor (or None at sink).
             current_id = self._sequential_successor(graph, node_id)
@@ -603,6 +644,211 @@ class WorkflowRunner:
         """
         seq = [e.to_id for e in graph.successors(node_id) if not e.metadata.get("synthetic")]
         return seq[0] if seq else None
+
+    # ------------------------------------------------------------- agent node
+
+    async def _run_one_agent(
+        self,
+        node: WorkflowNode,
+        node_id: str,
+        state: dict[str, Any],
+        wf_id: str,
+        wf_span: SpanCtx,
+    ) -> tuple[RunResponse, RunRecord]:
+        """Load + execute a single AGENT node; return ``(response, summary)``.
+
+        Shared by the main walk and the fan-out branch executor (ADR 092) so
+        per-node cost / tracing / retry / fallback behavior is identical in both
+        paths. Pure: it does NOT mutate ``state`` or persist anything — the
+        caller owns the state-merge and any failure-record write. Raises
+        :class:`WorkflowRunError` only when the agent bundle won't load.
+        """
+        try:
+            bundle = load_agent(node.ref)
+        except AgentLoadError as exc:
+            raise WorkflowRunError(
+                f"node {node_id!r}: agent at {node.ref} failed to load: {exc}"
+            ) from exc
+
+        # Build the agent's input by projecting state onto its schema.
+        agent_input = _project_state(state, bundle)
+
+        # Run through the executor with the workflow context so the persisted
+        # RunRecord carries workflow_run_id + node_id without a second save.
+        response: RunResponse = await self._executor.execute(
+            bundle,
+            RunRequest(agent=bundle.spec.name, input=agent_input),
+            workflow_run_id=wf_id,
+            node_id=node_id,
+            parent_span=wf_span,
+            tenant_id_override=self._tenant_id,
+        )
+        summary = _summarize_run(
+            response,
+            tenant_id=self._tenant_id,
+            bundle=bundle,
+            wf_id=wf_id,
+            node_id=node_id,
+        )
+        return response, summary
+
+    # ----------------------------------------------------------- fan-out block
+
+    async def _run_fan_out_block(
+        self,
+        graph: WorkflowGraph,
+        *,
+        fanout_id: str,
+        fan_out_edges: list[Any],
+        state: dict[str, Any],
+        wf_id: str,
+        wf_span: SpanCtx,
+    ) -> tuple[str, list[RunRecord]] | WorkflowResult:
+        """Run a canonical-diamond fan-out block concurrently (ADR 092 D2).
+
+        Each fan-out edge opens a branch: an agent-only single-successor
+        sub-chain that runs from a *snapshot* of ``state`` and reconverges at
+        one fan-in (join) node. Branches run via :func:`asyncio.gather`; on
+        success their per-branch state deltas are merged into ``state`` by the
+        join edge's declared strategy (``last_wins`` / ``by_key`` / ``collect``)
+        and the join node id is returned (the walk resumes *at* it). On a branch
+        agent failure, returns a :class:`WorkflowResult` (ERROR) carrying the
+        failing node id + every branch's runs so the caller can propagate the
+        partial failure.
+
+        The validator (:func:`validate_dag`) has already guaranteed the diamond
+        shape, so branch tracing here is total.
+        """
+        branch_starts = [e.to_id for e in fan_out_edges]
+        join_id, join_strategy, join_key = self._resolve_join(graph, branch_starts)
+        base = dict(state)
+
+        async def run_branch(start_id: str) -> _BranchOutcome:
+            branch_state = dict(base)
+            branch_runs: list[RunRecord] = []
+            cur: str | None = start_id
+            while cur is not None and cur != join_id:
+                node = graph.nodes[cur]
+                if node.type is not NodeType.AGENT:
+                    raise WorkflowRunError(
+                        f"fan-out branch node {cur!r} is type {node.type.value!r}; "
+                        f"Phase 1 branches are agent-only."
+                    )
+                response, summary = await self._run_one_agent(
+                    node, cur, branch_state, wf_id, wf_span
+                )
+                branch_runs.append(summary)
+                if response.status != "success":
+                    # Persist the failing branch node's ERROR row so it shows up
+                    # in list_runs(workflow_run_id=…) joins (parity with the
+                    # linear path's failure write).
+                    await self._storage.save_run(summary)
+                    return _BranchOutcome(
+                        start_id=start_id,
+                        delta={},
+                        runs=branch_runs,
+                        error_node_id=cur,
+                        error=response.error,
+                    )
+                branch_state.update(response.data)
+                cur = self._branch_successor(graph, cur)
+            # Only the keys this branch actually changed vs the shared snapshot —
+            # so a last-wins merge doesn't clobber a sibling's write with a stale
+            # base value.
+            delta = {k: v for k, v in branch_state.items() if k not in base or base[k] != v}
+            return _BranchOutcome(start_id=start_id, delta=delta, runs=branch_runs)
+
+        outcomes = await asyncio.gather(*(run_branch(s) for s in branch_starts))
+        all_runs: list[RunRecord] = [r for o in outcomes for r in o.runs]
+        for outcome in outcomes:
+            if outcome.error is not None:
+                return WorkflowResult(
+                    workflow_run_id=wf_id,
+                    status=WorkflowStatus.ERROR,
+                    initial_state={},  # unused by the caller (it owns initial_state)
+                    final_state=state,
+                    runs=all_runs,
+                    error_node_id=outcome.error_node_id,
+                    error=outcome.error,
+                )
+
+        self._merge_branch_outcomes(state, list(outcomes), join_strategy, join_key)
+        return join_id, all_runs
+
+    @staticmethod
+    def _branch_successor(graph: WorkflowGraph, node_id: str) -> str | None:
+        """Next node inside a fan-out branch: a sequential or fan-in successor.
+
+        A branch is a single-successor agent sub-chain; its terminal node's
+        outbound edge is the ``fan_in`` edge onto the join node. Returning the
+        join id lets the branch loop stop on ``cur == join_id``.
+        """
+        for edge in graph.successors(node_id):
+            if edge.kind in (EdgeKind.SEQUENTIAL, EdgeKind.PARALLEL_FAN_IN):
+                return edge.to_id
+        return None
+
+    @staticmethod
+    def _resolve_join(
+        graph: WorkflowGraph, branch_starts: list[str]
+    ) -> tuple[str, str, str | None]:
+        """Resolve the diamond's single join node + its merge strategy.
+
+        Traces each branch to the fan-in node it reaches; all branches must
+        agree (the validator guarantees this). Reads the ``join`` / ``join_key``
+        strategy off any one of the join's fan-in edges (the spec validator
+        keeps them consistent). Returns ``(join_id, strategy, join_key)``.
+        """
+        joins: set[str] = set()
+        for start in branch_starts:
+            cur: str | None = start
+            seen: set[str] = set()
+            while cur is not None and cur not in seen:
+                seen.add(cur)
+                fan_in = [e for e in graph.successors(cur) if e.kind is EdgeKind.PARALLEL_FAN_IN]
+                if fan_in:
+                    joins.add(fan_in[0].to_id)
+                    break
+                nxt = [e.to_id for e in graph.successors(cur) if e.kind is EdgeKind.SEQUENTIAL]
+                cur = nxt[0] if nxt else None
+        if len(joins) != 1:
+            raise WorkflowRunError(
+                f"fan-out branches do not reconverge on one join node: {sorted(joins)}"
+            )
+        join_id = joins.pop()
+        strategy = "last_wins"
+        join_key: str | None = None
+        for edge in graph.predecessors(join_id):
+            if edge.kind is EdgeKind.PARALLEL_FAN_IN:
+                strategy = str(edge.metadata.get("join", "last_wins"))
+                join_key = edge.metadata.get("join_key")
+                break
+        return join_id, strategy, join_key
+
+    @staticmethod
+    def _merge_branch_outcomes(
+        state: dict[str, Any],
+        outcomes: list[_BranchOutcome],
+        strategy: str,
+        join_key: str | None,
+    ) -> None:
+        """Merge branch state deltas into ``state`` per the join strategy.
+
+        * ``last_wins`` (default): shallow-merge each branch's delta in branch
+          declaration order; later branches overwrite same-named keys.
+        * ``by_key``: namespace each branch's delta under its start-node id so
+          concurrent writes never clobber.
+        * ``collect``: gather each branch's value at ``join_key`` into a list
+          (branch order) under ``join_key``.
+        """
+        if strategy == "by_key":
+            for outcome in outcomes:
+                state[outcome.start_id] = dict(outcome.delta)
+        elif strategy == "collect" and join_key is not None:
+            state[join_key] = [outcome.delta.get(join_key) for outcome in outcomes]
+        else:  # last_wins
+            for outcome in outcomes:
+                state.update(outcome.delta)
 
     async def _run_judge(
         self,

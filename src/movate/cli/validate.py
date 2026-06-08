@@ -39,8 +39,9 @@ from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
     WorkflowCompileError,
     compile_workflow,
+    declares_parallel,
     load_workflow_spec,
-    validate_linear,
+    validate_graph,
 )
 from movate.core.workflow.spec import WorkflowSpecLoadError
 from movate.providers.pricing import load_pricing
@@ -1195,7 +1196,7 @@ def _validate_workflow(path: Path) -> None:
         raise typer.Exit(code=2) from None
     try:
         graph = compile_workflow(spec, parent)
-        validate_linear(graph)
+        validate_graph(graph)
     except WorkflowCompileError as exc:
         console.print(f"[red]✗ workflow validation failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
@@ -1209,6 +1210,20 @@ def _validate_workflow(path: Path) -> None:
     console.print(f"  edges:       {len(graph.edges)}")
     chain = " → ".join(graph.topological_order())
     console.print(f"  topology:    {chain}")
+
+    # Backend-aware parallel lint (ADR 092 D6). A fan-out/fan-in graph runs
+    # concurrently on the native runner (Phase 1). On the Temporal backend the
+    # durable parallel emission (D3) lands in Phase 2 — until then a
+    # ``runtime: temporal`` fan-out workflow would not get durable parallel
+    # orchestration, so warn at author time rather than at run time.
+    if declares_parallel(graph):
+        console.print("[green]✓[/green] parallel (fan-out/fan-in) workflow [dim](native)[/dim]")
+        if getattr(graph, "runtime", "native") == "temporal":
+            console.print(
+                "[yellow]![/yellow] parallel fan-out on runtime: temporal is not yet "
+                "wired (ADR 092 Phase 2); it runs but without durable parallel "
+                "orchestration. Use runtime: native for parallel today."
+            )
 
     # Temporal determinism feedback (ADR 054 D5). For a ``runtime: temporal``
     # workflow, surface the compiler's determinism lint right here in the
