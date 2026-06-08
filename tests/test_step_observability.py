@@ -315,6 +315,37 @@ async def test_single_turn_no_skill_one_turn_record_and_cost_unchanged(
     assert run.metrics.cost_usd == pytest.approx(turn.cost_usd)
 
 
+@pytest.mark.unit
+async def test_langfuse_session_grouping_and_operational_tags(
+    tmp_path: Path, storage: Any, pricing: PricingTable
+) -> None:
+    """#788 — the root ``agent.execute`` span carries Langfuse session + tag
+    facets so multi-turn conversations group into one trace tree and traces are
+    filterable by tenant/agent (not just the bundle's authored tags).
+
+    * ``_session_id`` falls back to the ``thread_id`` when the request has no
+      explicit ``session_id`` → a conversation is one Langfuse session.
+    * ``_tags`` includes ``agent:<name>`` + ``tenant:<tenant_id>`` on top of the
+      agent's own marketplace tags.
+    """
+    tracer = _CapturingTracer()
+    agent_dir = _write_agent(tmp_path, name="vanilla")
+    bundle = load_agent(agent_dir)
+    ex = _executor(storage, pricing, tracer)
+
+    # No session_id on the request, but a thread_id (a multi-turn conversation).
+    await ex.execute(
+        bundle, RunRequest(agent="vanilla", input={"question": "hi"}), thread_id="conv-123"
+    )
+
+    root = tracer.root().attributes
+    # Session grouping: fell back to thread_id.
+    assert root["_session_id"] == "conv-123"
+    # Operational tag facets present (filterable by tenant/agent in Langfuse).
+    assert "agent:vanilla" in root["_tags"]
+    assert "tenant:local" in root["_tags"]
+
+
 # ---------------------------------------------------------------------------
 # Case 2 — multi-turn tool run: per-turn + per-skill cost retained + summed
 # ---------------------------------------------------------------------------
