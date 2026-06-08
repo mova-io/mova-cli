@@ -1058,25 +1058,41 @@ class Session:
     def _build_stt(self) -> FailoverSTT:
         """Build the STT chain honoring the current ``hedge_stt`` flag (B2)
         and any BYOK user-supplied keys (each chain member gets its right key).
+
+        Deepgram (streaming, lowest-latency) is only added when a Deepgram key
+        is actually present (env or BYOK) — otherwise its streaming WS 401s on
+        every turn before failing over. With OpenAI-only credentials the chain
+        is just Whisper, which uses OPENAI_API_KEY and Just Works.
         """
+        members = []
+        if os.environ.get("DEEPGRAM_API_KEY") or self.user_keys.get("deepgram"):
+            members.append(_KeyedSTT(self._fault_stt, api_key=self.user_keys.get("deepgram")))
+        members.append(_KeyedSTT(OpenAIWhisperSTT(), api_key=self.user_keys.get("openai")))
         return FailoverSTT(
-            [
-                _KeyedSTT(self._fault_stt, api_key=self.user_keys.get("deepgram")),
-                _KeyedSTT(OpenAIWhisperSTT(), api_key=self.user_keys.get("openai")),
-            ],
+            members,
             observer=self.observer,
             call_timeout=15.0,
             connect_timeout=8.0,
-            hedge=self.hedge_stt,
+            hedge=self.hedge_stt and len(members) > 1,
         )
 
     def _build_tts(self) -> FailoverTTS:
         """Build a fresh TTS chain putting the chosen tier first (B2-aware,
-        BYOK-aware — each member is wrapped with its specific user key)."""
-        cart = _KeyedTTS(self._fault_tts_cartesia, api_key=self.user_keys.get("cartesia"))
+        BYOK-aware — each member is wrapped with its specific user key).
+
+        Cartesia (streaming, lowest-latency) is only added when a Cartesia key
+        is present (env or BYOK); otherwise OpenAI TTS is the sole provider and
+        uses OPENAI_API_KEY — no failing Cartesia attempt on every turn.
+        """
         oa = _KeyedTTS(self._fault_tts_openai, api_key=self.user_keys.get("openai"))
-        chain = [cart, oa] if self.tts_tier == "cartesia" else [oa, cart]
-        return FailoverTTS(chain, observer=self.observer, cache=self.cache, hedge=self.hedge_tts)
+        if os.environ.get("CARTESIA_API_KEY") or self.user_keys.get("cartesia"):
+            cart = _KeyedTTS(self._fault_tts_cartesia, api_key=self.user_keys.get("cartesia"))
+            chain = [cart, oa] if self.tts_tier == "cartesia" else [oa, cart]
+        else:
+            chain = [oa]
+        return FailoverTTS(
+            chain, observer=self.observer, cache=self.cache, hedge=self.hedge_tts and len(chain) > 1
+        )
 
     def set_voice_id(self, voice_id: str) -> str:
         """Pick a specific TTS voice for the next turn ("" = adapter default)."""
