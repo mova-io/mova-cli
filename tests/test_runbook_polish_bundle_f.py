@@ -176,15 +176,19 @@ class TestAuthStatusNotifications:
             "TEMPORAL_NAMESPACE",
             "TEMPORAL_TLS_CERT",
             "TEMPORAL_TLS_KEY",
+            "LIVEKIT_URL",
+            "LIVEKIT_API_KEY",
+            "LIVEKIT_API_SECRET",
         ):
             monkeypatch.delenv(key, raising=False)
         result = runner.invoke(app, ["auth", "status"], env={"COLUMNS": "200"})
         assert result.exit_code == 0
         # 5 provider env vars + 3 notification env vars + 2 voice env vars
         # (Azure Speech key + region, ADR 048/049) + 4 temporal env vars
-        # (TEMPORAL_HOST/NAMESPACE/TLS_CERT/TLS_KEY, ADR 054) = 14 unset.
+        # (TEMPORAL_HOST/NAMESPACE/TLS_CERT/TLS_KEY, ADR 054) + 3 LiveKit env
+        # vars (LIVEKIT_URL/API_KEY/API_SECRET, ADR 074) = 17 unset.
         assert "set=0" in result.stdout
-        assert "unset=14" in result.stdout
+        assert "unset=17" in result.stdout
 
 
 # ---------------------------------------------------------------------------

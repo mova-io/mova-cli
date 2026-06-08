@@ -50,6 +50,16 @@
       "key": "eval_id",
       "value": "",
       "type": "string"
+    },
+    {
+      "key": "skill_name",
+      "value": "web-search",
+      "type": "string"
+    },
+    {
+      "key": "context_name",
+      "value": "product-tone",
+      "type": "string"
     }
   ],
   "item": [
@@ -1942,6 +1952,315 @@
               }
             }
           ]
+        }
+      ]
+    },
+    {
+      "name": "Skills (manage) \u2014 ADR 060",
+      "description": "Skills as a first-class MANAGED resource (ADR 060). Step 4 in Core Flow creates a skill (multipart); these manage it over the API \u2014 list, inspect, version, and attach to an agent \u2014 backed by Postgres + tenant-scoped on a deployed runtime. Requires the ADR 060 routes.",
+      "item": [
+        {
+          "name": "Sk1. List skills \u2014 mdk skills list --target",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/skills",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "skills"
+              ]
+            },
+            "description": "CLI: `mdk skills list --target <url>`. Tenant-scoped registry inventory. Scope: `read`."
+          },
+          "response": []
+        },
+        {
+          "name": "Sk2. Get skill \u2014 mdk skills show --target",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/skills/{{skill_name}}",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "skills",
+                "{{skill_name}}"
+              ]
+            },
+            "description": "CLI: `mdk skills show <name> --target`. The latest version's record. Scope: `read`."
+          },
+          "response": []
+        },
+        {
+          "name": "Sk3. Skill versions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/skills/{{skill_name}}/versions",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "skills",
+                "{{skill_name}}",
+                "versions"
+              ]
+            },
+            "description": "CLI: `mdk skills versions <name> --target`. Immutable version history (ADR 060 D1). Scope: `read`."
+          },
+          "response": []
+        },
+        {
+          "name": "Sk4. Attach skill to agent \u2014 mdk skills attach",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/skills",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "agents",
+                "{{agent_name}}",
+                "skills"
+              ]
+            },
+            "description": "CLI: `mdk skills attach <name> --agent <agent>`. Records the agent\u2192skill wiring in the agent's `skills:` list (`ref` = registry name, omit `version` for latest). Runtime resolution of the ref at execution time is ADR 060 D4 (a later PR). Scope: `admin`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ref\": \"{{skill_name}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Contexts (manage) \u2014 ADR 060",
+      "description": "Shared contexts as a first-class MANAGED resource (ADR 060). Contexts had NO API before \u2014 this is the new remote surface: create / list / get / version / attach, Postgres-backed + tenant-scoped. This is what makes 'create a context remotely on Azure' possible. Requires the ADR 060 routes.",
+      "item": [
+        {
+          "name": "Cx1. Create context \u2014 mdk contexts add --target",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/contexts",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "contexts"
+              ]
+            },
+            "description": "CLI: `mdk contexts add --target`. Creates the first version (`v1`). `body` is the markdown prepended to an agent's prompt; `name` is the registry key an `agent.yaml` `contexts:` entry references. Scope: `admin`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{context_name}}\",\n  \"description\": \"Brand voice + tone preamble.\",\n  \"body\": \"# Tone\\nBe concise, friendly, and cite sources when grounded.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('created (201)', function () { pm.expect(pm.response.code).to.eql(201); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cx2. List contexts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/contexts",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "contexts"
+              ]
+            },
+            "description": "CLI: `mdk contexts list --target`. Tenant-scoped inventory. Scope: `read`."
+          },
+          "response": []
+        },
+        {
+          "name": "Cx3. Get context",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/contexts/{{context_name}}",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "contexts",
+                "{{context_name}}"
+              ]
+            },
+            "description": "CLI: `mdk contexts show <name> --target`. Latest version. Scope: `read`."
+          },
+          "response": []
+        },
+        {
+          "name": "Cx4. Update context (new version)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/contexts/{{context_name}}",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "contexts",
+                "{{context_name}}"
+              ]
+            },
+            "description": "CLI: `mdk contexts update`. Update is a NEW immutable version \u2014 `version` is required and must not collide. Scope: `admin`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"version\": \"v2\",\n  \"description\": \"Tone preamble v2.\",\n  \"body\": \"# Tone\\nConcise, friendly, cite sources. Avoid hedging.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Cx5. Attach context to agent \u2014 mdk contexts attach",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{runtime_url}}/api/v1/agents/{{agent_name}}/contexts",
+              "host": [
+                "{{runtime_url}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "agents",
+                "{{agent_name}}",
+                "contexts"
+              ]
+            },
+            "description": "CLI: `mdk contexts attach <name> --agent <agent>`. Records the agent\u2192context wiring (`ref` = registry name, omit `version` for latest). Scope: `admin`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ref\": \"{{context_name}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
         }
       ]
     }
