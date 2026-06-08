@@ -886,6 +886,9 @@ _PROVIDERS_PROMPT_NAME = {
     # Neo4j is the opt-in graph database adapter for GraphRAG at scale.
     # Needs URI + user + password — multi-value flow like temporal.
     "neo4j": "Neo4j (graph database)",
+    # LiveKit is the telephony transport (ADR 074). Needs URL + API key +
+    # API secret. Multi-value flow like telegram / azure-speech.
+    "livekit": "LiveKit (telephony transport)",
 }
 
 _PROVIDER_TO_ENV_VAR = {
@@ -934,6 +937,10 @@ _TEMPORAL_PROVIDERS = frozenset({"temporal"})
 # same multi-value pattern as temporal. Kept out of _PROVIDER_TO_ENV_VAR
 # (single-key LLM table) for the same reason.
 _NEO4J_PROVIDERS = frozenset({"neo4j"})
+# LiveKit (ADR 074) needs THREE values (URL + API key + API secret).
+# Same multi-value pattern as telegram / azure-speech, dispatched to its own
+# code path. Kept out of ``_PROVIDER_TO_ENV_VAR`` for the same reason.
+_LIVEKIT_PROVIDERS = frozenset({"livekit"})
 
 
 @auth_app.command("login")
@@ -947,6 +954,7 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
             "[bold]deepgram[/bold], [bold]cartesia[/bold], "
             "[bold]elevenlabs[/bold], "
             "[bold]azure-speech[/bold] (voice), "
+            "[bold]livekit[/bold] (telephony transport), "
             "[bold]servicenow[/bold], [bold]msgraph[/bold], "
             "[bold]workday[/bold], [bold]salesforce[/bold], [bold]sap[/bold] (connectors), "
             "[bold]telegram[/bold], or "
@@ -1092,6 +1100,10 @@ def login(  # noqa: PLR0912 — branch count inherent to the multi-mode flow
     # multi-value path, same as temporal / azure-speech.
     if provider in _NEO4J_PROVIDERS:
         _login_neo4j(key=key, save_to=save_to)
+    # LiveKit (ADR 074) is the telephony transport — needs URL + API key +
+    # API secret. Its own multi-value path, same as azure-speech.
+    elif provider in _LIVEKIT_PROVIDERS:
+        _login_livekit(key=key, save_to=save_to)
         return
 
     if provider not in _PROVIDER_TO_ENV_VAR:
@@ -1646,6 +1658,23 @@ def status(
             counts,
             env_var=env_var,
             unset_hint="run [bold]mdk auth login azure-speech[/bold]",
+        )
+
+    # Separator + telephony transport group (ADR 074). LiveKit connection vars
+    # — URL + API key + API secret. Same confirmed-set treatment as voice.
+    table.add_row("", "", "", "")
+    table.add_row(
+        "[bold]Telephony[/bold]",
+        "",
+        "[dim]for mdk[telephony] transport (ADR 074)[/dim]",
+        "",
+    )
+    for env_var in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"):
+        _add_simple_cred_row(
+            table,
+            counts,
+            env_var=env_var,
+            unset_hint="run [bold]mdk auth login livekit[/bold]",
         )
 
     # Separator + workflow-backends group (ADR 054). Temporal connection vars
@@ -2412,6 +2441,14 @@ def _provider_is_configured(provider: str) -> bool:
         return (
             key_source("TEMPORAL_HOST") != "unset" and key_source("TEMPORAL_NAMESPACE") != "unset"
         )
+    if provider == "livekit":
+        # LiveKit needs URL + API key + API secret (ADR 074 D6). Show
+        # "configured" only when all three are set.
+        return (
+            key_source("LIVEKIT_URL") != "unset"
+            and key_source("LIVEKIT_API_KEY") != "unset"
+            and key_source("LIVEKIT_API_SECRET") != "unset"
+        )
     env_var = _PROVIDER_TO_ENV_VAR.get(provider)
     if env_var is None:
         return False
@@ -2470,12 +2507,11 @@ def _provider_status(provider: str) -> ProviderState:
     if provider == "azure-speech":
         return "verified" if _provider_is_configured("azure-speech") else "unset"
 
-    # Temporal isn't an LLM provider either (ADR 054). Same confirmed-set
-    # treatment as telegram / azure-speech: a live connection probe would need
-    # the optional ``temporalio`` SDK ([temporal] extra) and a server round
-    # trip, so the picker stays cheap.
-    if provider == "temporal":
-        return "verified" if _provider_is_configured("temporal") else "unset"
+    # Temporal (ADR 054) / LiveKit (ADR 074) aren't LLM providers. Same
+    # confirmed-set treatment as telegram / azure-speech: a live probe would
+    # need an optional SDK and a server round trip — the picker stays cheap.
+    if provider in ("temporal", "livekit"):
+        return "verified" if _provider_is_configured(provider) else "unset"
 
     if not _provider_is_configured(provider):
         return "unset"
@@ -2600,6 +2636,7 @@ def _prompt_for_provider() -> str:
         ("twilio", _PROVIDERS_PROMPT_NAME["twilio"]),
         ("temporal", _PROVIDERS_PROMPT_NAME["temporal"]),
         ("neo4j", _PROVIDERS_PROMPT_NAME["neo4j"]),
+        ("livekit", _PROVIDERS_PROMPT_NAME["livekit"]),
     ]
     stdout.print("[bold]Which provider would you like to set up?[/bold]")
     # Live-verify every configured provider in parallel BEFORE rendering
@@ -2813,6 +2850,81 @@ def _login_azure_speech(*, key: str | None, save_to: str) -> None:
         with dotenv.open("a") as fh:
             fh.write(f"AZURE_SPEECH_KEY={speech_key}\n")
             fh.write(f"AZURE_SPEECH_REGION={region}\n")
+        success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
+    else:
+        error(f"--save-to must be 'global' or 'project'; got {save_to!r}")
+        raise typer.Exit(code=2)
+
+
+def _login_livekit(*, key: str | None, save_to: str) -> None:
+    """Guided LiveKit (telephony transport) setup — ADR 074.
+
+    LiveKit needs THREE values:
+
+      * ``LIVEKIT_URL`` — the LiveKit server URL (e.g. ``wss://my-lk.example.com``).
+      * ``LIVEKIT_API_KEY`` — the API key for room provisioning.
+      * ``LIVEKIT_API_SECRET`` — the API secret for token generation.
+
+    No live verification: a verify call would need the optional LiveKit SDK
+    (``mdk[telephony]``) AND a live LiveKit instance; the transport surfaces a
+    clear error at first use if the credentials are wrong. Persists to
+    ``~/.movate/credentials`` (default) or project ``.env``.
+    """
+    from movate.credentials import CredentialsStore  # noqa: PLC0415
+
+    hint(
+        "[dim]LiveKit telephony transport setup:\n"
+        "  1. Deploy LiveKit (self-hosted or LiveKit Cloud)\n"
+        "  2. From the project settings, copy the [bold]API Key[/bold] and [bold]Secret[/bold]\n"
+        "  3. Note the server [bold]URL[/bold] (e.g. [bold]wss://my-lk.livekit.cloud[/bold])[/dim]"
+    )
+
+    livekit_url = typer.prompt("LiveKit server URL (e.g. wss://my-lk.livekit.cloud)").strip()
+    if not livekit_url:
+        error("empty URL — aborted.")
+        raise typer.Exit(code=2)
+
+    api_key = (
+        key.strip()
+        if key is not None
+        else typer.prompt("LiveKit API key", hide_input=False, confirmation_prompt=False).strip()
+    )
+    if not api_key:
+        error("empty API key — aborted.")
+        raise typer.Exit(code=2)
+
+    api_secret = typer.prompt(
+        "LiveKit API secret", hide_input=True, confirmation_prompt=False
+    ).strip()
+    if not api_secret:
+        error("empty API secret — aborted.")
+        raise typer.Exit(code=2)
+
+    save_to = save_to.lower().strip()
+    if save_to == "global":
+        store = CredentialsStore()
+        store.set("LIVEKIT_URL", livekit_url)
+        store.set("LIVEKIT_API_KEY", api_key)
+        store.set("LIVEKIT_API_SECRET", api_secret)
+        success(
+            f"saved [bold]LIVEKIT_URL[/bold] + "
+            f"[bold]LIVEKIT_API_KEY[/bold] + "
+            f"[bold]LIVEKIT_API_SECRET[/bold] to [cyan]{store.path}[/cyan] "
+            f"(mode 0600)."
+        )
+        hint(
+            "[dim]Every [bold]mdk[/bold] invocation on this machine now picks "
+            "up these for the LiveKit telephony transport. Install the SDK with "
+            "[bold]uv add 'movate-cli[telephony]'[/bold] to use it.[/dim]"
+        )
+    elif save_to == "project":
+        from pathlib import Path  # noqa: PLC0415
+
+        dotenv = Path(".env")
+        with dotenv.open("a") as fh:
+            fh.write(f"LIVEKIT_URL={livekit_url}\n")
+            fh.write(f"LIVEKIT_API_KEY={api_key}\n")
+            fh.write(f"LIVEKIT_API_SECRET={api_secret}\n")
         success(f"appended to [cyan]{dotenv.resolve()}[/cyan].")
     else:
         error(f"--save-to must be 'global' or 'project'; got {save_to!r}")

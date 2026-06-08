@@ -920,40 +920,76 @@ def voice_call(
     agent: Annotated[str, typer.Argument(help="Agent name to connect the call to.")],
     to: Annotated[
         str,
-        typer.Option("--to", help="Phone number to call (E.164, e.g. +12175551234)."),
-    ],
+        typer.Option("--to", help="(twilio) Phone number to call (E.164, e.g. +12175551234)."),
+    ] = "",
     from_number: Annotated[
         str,
         typer.Option(
             "--from",
-            help="Your Twilio phone number (E.164). Defaults to TWILIO_PHONE_NUMBER env var.",
+            help="(twilio) Your Twilio phone number (E.164). Defaults to TWILIO_PHONE_NUMBER.",
         ),
     ] = "",
     target: Annotated[
         str | None,
         typer.Option("--target", "-t", help="Runtime URL (defaults to local dev)."),
     ] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option("--api-key", help="(livekit) Bearer key for the runtime (falls back to env)."),
+    ] = None,
     transport: Annotated[
         str,
-        typer.Option("--transport", help="Telephony transport to use."),
+        typer.Option("--transport", help="Telephony transport: 'twilio' (default) or 'livekit'."),
     ] = "twilio",
 ) -> None:
-    """Initiate an outbound phone call and connect it to an mdk voice agent.
+    """Connect an mdk voice agent to a phone/WebRTC call (ADR 074 D9).
 
-    For testing: calls ``--to`` from your Twilio number and bridges the call
-    to the agent via the Twilio Media Stream. Requires the ``[telephony]``
-    extra and ``TWILIO_ACCOUNT_SID`` / ``TWILIO_AUTH_TOKEN`` env vars.
+    Two transports, selected with ``--transport``:
 
-    [bold]Example:[/bold]
+    * ``twilio`` (default) — outbound PSTN test call: dials ``--to`` from your
+      Twilio number and bridges it to the agent via a Twilio Media Stream.
+      Needs ``TWILIO_ACCOUNT_SID`` / ``TWILIO_AUTH_TOKEN`` (``mdk auth login twilio``).
+    * ``livekit`` — provisions a LiveKit room via
+      ``POST /api/v1/agents/{name}/call`` and joins it from this terminal over
+      WebRTC (local mic + speaker). Needs ``mdk auth login livekit``.
 
-      [dim]$ mdk voice call support-agent --to +12175551234 --from +12179195393[/dim]
+    Both require the ``[telephony]`` extra.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Twilio outbound test call[/dim]
+      $ mdk voice call support-agent --to +12175551234 --from +12179195393
+
+      [dim]# LiveKit WebRTC call from the terminal[/dim]
+      $ mdk voice call support-agent --transport livekit
     """
     import os  # noqa: PLC0415
 
     _require_telephony_extra()
 
+    if transport == "livekit":
+        # WebRTC path: provision a room via the runtime API, then join it from
+        # the terminal using the local mic/speaker (needs the [voice] extra for
+        # sounddevice I/O). All the heavy lifting is in _voice_call_async.
+        import asyncio  # noqa: PLC0415
+
+        _require_voice_extra()
+        base_url = _resolve_target_url(target)
+        key = _resolve_api_key(api_key)
+        asyncio.run(
+            _voice_call_async(agent=agent, base_url=base_url, api_key=key, transport=transport)
+        )
+        return
+
     if transport != "twilio":
-        err.print(f"[red]✗[/red] unsupported transport: {transport!r} (only 'twilio' for now)")
+        err.print(
+            f"[red]✗[/red] unsupported transport: {transport!r} (expected 'twilio' or 'livekit')"
+        )
+        raise typer.Exit(code=1)
+
+    # Twilio outbound path.
+    if not to:
+        err.print("[red]✗[/red] --to is required for the twilio transport (E.164 phone number).")
         raise typer.Exit(code=1)
 
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
@@ -1226,3 +1262,123 @@ def _render_bench_table(report: object) -> None:
                 str(len(tr.items)),
             )
         err.print(table)
+
+
+# ---------------------------------------------------------------------------
+# ``mdk voice call --transport livekit`` — WebRTC terminal join (ADR 074 D9)
+# ---------------------------------------------------------------------------
+
+
+async def _voice_call_async(
+    *,
+    agent: str,
+    base_url: str,
+    api_key: str | None,
+    transport: str,
+) -> None:
+    """Async core of ``mdk voice call --transport livekit``.
+
+    1. Calls ``POST /api/v1/agents/{name}/call`` to provision the LiveKit room.
+    2. Joins the room with the returned credentials.
+    3. Streams local mic audio to the room and plays received audio.
+    """
+    import json  # noqa: PLC0415
+
+    import httpx  # noqa: PLC0415
+
+    # Step 1: Provision the session via the runtime API.
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        resp = await http.post(
+            f"{base_url}/api/v1/agents/{agent}/call",
+            json={"transport": transport},
+            headers=headers,
+        )
+        if resp.status_code != httpx.codes.OK:
+            detail = ""
+            try:
+                body = resp.json()
+                detail = json.dumps(body.get("detail", body), indent=2)
+            except Exception:
+                detail = resp.text
+            err.print(
+                f"[red]✗[/red] POST /api/v1/agents/{agent}/call returned "
+                f"{resp.status_code}:\n{detail}"
+            )
+            raise typer.Exit(code=1)
+        session = resp.json()
+
+    room_name = session["room_name"]
+    participant_token = session["participant_token"]
+    livekit_url = session["livekit_url"]
+
+    err.print(f"[bold green]session provisioned[/bold green]: room={room_name}")
+    err.print(f"[dim]connecting to {livekit_url}...[/dim]")
+
+    # Step 2: Join the room and stream audio.
+    from movate.voice.transports.livekit import LiveKitTransport  # noqa: PLC0415
+
+    transport_inst = LiveKitTransport()
+    audio_in = await transport_inst.connect(
+        {
+            "livekit_url": livekit_url,
+            # main's LiveKitTransport.connect expects the room access token under
+            # the ``token`` key (ADR 074 D2); the /call endpoint returns it as
+            # ``participant_token``.
+            "token": participant_token,
+            "room_name": room_name,
+        }
+    )
+
+    err.print("[bold green]connected[/bold green] — speak to the agent (Ctrl-C to end)")
+
+    # Step 3: Capture mic audio and publish to the room, while playing received
+    # audio. Uses sounddevice (from the [voice] extra) for I/O.
+    import asyncio as _asyncio  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+    import sounddevice as sd  # noqa: PLC0415
+
+    from movate.voice.base import AudioChunk  # noqa: PLC0415
+
+    sample_rate = 16_000
+    block_size = 1600  # 100ms at 16kHz
+
+    mic_queue: _asyncio.Queue[bytes] = _asyncio.Queue()
+
+    def _mic_callback(indata: np.ndarray, frames: int, time_info: object, status: object) -> None:
+        mic_queue.put_nowait(indata.tobytes())
+
+    async def _mic_sender() -> None:
+        with sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=block_size,
+            callback=_mic_callback,
+        ):
+            while True:
+                data = await mic_queue.get()
+                chunk = AudioChunk(data=data, codec="pcm16", sample_rate=sample_rate)
+                await transport_inst.publish(chunk)
+
+    async def _audio_player() -> None:
+        async for chunk in audio_in:
+            try:
+                arr = np.frombuffer(chunk.data, dtype=np.int16)
+                sd.play(arr, samplerate=chunk.sample_rate, blocking=False)
+            except Exception:
+                pass
+
+    try:
+        mic_task = _asyncio.create_task(_mic_sender())
+        play_task = _asyncio.create_task(_audio_player())
+        await _asyncio.gather(mic_task, play_task)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await transport_inst.disconnect()
+        err.print("\n[bold yellow]voice call ended (Ctrl-C)[/bold yellow]")

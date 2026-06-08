@@ -136,6 +136,7 @@ from movate.voice.telephony import (
     telephony_inbound,
     telephony_outbound,
 )
+from movate.voice.transports import AudioStream, TelephonyTransport
 from movate.voice.turn_detection import (
     HeuristicTurnDetector,
     NullTurnDetector,
@@ -160,6 +161,7 @@ __all__ = [
     "AudioCodec",
     "AudioRetentionManager",
     "AudioRingBuffer",
+    "AudioStream",
     "AzureNeuralTTS",
     "AzureOpenAIRealtime",
     "AzureSpeechSTT",
@@ -209,6 +211,7 @@ __all__ = [
     "StageTimeoutResult",
     "StageTimeouts",
     "StderrObserver",
+    "TelephonyTransport",
     "TextToSpeechProvider",
     "TranscriptChunk",
     "TurnDetector",

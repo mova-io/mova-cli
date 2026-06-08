@@ -691,5 +691,6 @@ markers = [
     "temporal: Temporal integration tests requiring `temporal server start-dev` (opt-in, run with pytest -m temporal)",
     "voice_bench: voice eval/regression harness tests (ADR 049 D5)",
     "neo4j: Neo4j integration tests requiring a running Neo4j instance (opt-in, run with pytest -m neo4j)",
+    "livekit: LiveKit transport tests requiring the [telephony] extra (skip by default, run with pytest -m livekit)",
 ]
 addopts = "-ra --strict-markers"

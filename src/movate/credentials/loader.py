@@ -81,13 +81,18 @@ VOICE_KEY_ENV_VARS: tuple[str, ...] = (
 )
 
 # Telephony-provider env vars (ADR 074, the ``[telephony]`` extra). Set via
-# ``mdk auth login twilio`` (or by hand) and consumed by the Twilio transport
-# in ``movate.voice.transports.twilio``. Kept SEPARATE from VOICE_KEY_ENV_VARS
-# because telephony is a transport concern, not a speech-adapter concern --
-# but they need the same autoload-from-credentials-file treatment.
+# ``mdk auth login twilio`` / ``mdk auth login livekit`` (or by hand) and
+# consumed by the telephony transports in ``movate.voice.transports`` (Twilio +
+# LiveKit). Kept SEPARATE from VOICE_KEY_ENV_VARS because these are transport-
+# level credentials (PSTN account / room provisioning / SIP), not speech-adapter
+# keys -- but they need the same autoload-from-credentials-file treatment so
+# operators don't re-export each shell.
 TELEPHONY_KEY_ENV_VARS: tuple[str, ...] = (
     "TWILIO_ACCOUNT_SID",
     "TWILIO_AUTH_TOKEN",
+    "LIVEKIT_URL",
+    "LIVEKIT_API_KEY",
+    "LIVEKIT_API_SECRET",
 )
 
 # Enterprise connector env vars (ADR 052 Phase 1 — Action Fabric).
