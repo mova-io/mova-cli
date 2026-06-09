@@ -20,13 +20,13 @@ kind: Workflow
 #     workflow-root span and nests each node under it (full interaction trace).
 #   * EVAL-GATE: the evals: stanza below gates the whole workflow at CI time.
 #
-# Topology note: as of ADR 092 Phase 1 the native runner executes true parallel
-# fan-out/fan-in (the canonical diamond) concurrently — declare it with
-# `kind: fan_out` edges out of the supervisor and `kind: fan_in` edges into the
-# collector (optionally `join: collect`). This template ships the *sequential*
-# supervisor → task-a → task-b → collector chain as the conservative default
-# (identical GOVERNANCE: the two-branch cap and the collect step are real and
-# reviewable); flip the edges to fan_out/fan_in to run the branches in parallel.
+# Topology: a real fan-out DIAMOND (ADR 092). The supervisor fans out to the
+# two task branches with `kind: fan_out`; they reconverge on the collector with
+# `kind: fan_in`. Both backends run the branches in parallel — durably on
+# Temporal (`asyncio.gather`, ADR 092 Phase 2), concurrently on native (Phase 1).
+# The two-branch cap is the fan-out roster; the collector is the join. With
+# `runtime: auto` (ADR 091) this prefers Temporal, where the parallelism is
+# durable + replayable.
 
 name: task-oriented
 version: 0.1.0
@@ -65,12 +65,26 @@ nodes:
     ref: ./agents/collector
 
 edges:
+  # Bounded fan-out (ADR 092): the supervisor opens its FIXED roster of two
+  # task branches CONCURRENTLY. task-a and task-b each read {plan, request} from
+  # the post-supervisor state snapshot (neither depends on the other), so they
+  # run in parallel — durably on Temporal (asyncio.gather), concurrently on
+  # native. The cap is structural: exactly two fan_out edges.
   - from: supervisor
     to: task-a
-  - from: task-a
+    kind: fan_out
+  - from: supervisor
     to: task-b
+    kind: fan_out
+  # Fan-in: both branches reconverge on the collector. Their outputs
+  # (task_a_result / task_b_result) are disjoint, so the default last_wins join
+  # merges both into state before the collector aggregates them.
+  - from: task-a
+    to: collector
+    kind: fan_in
   - from: task-b
     to: collector
+    kind: fan_in
 
 evals:
   dataset: ./evals/dataset.jsonl

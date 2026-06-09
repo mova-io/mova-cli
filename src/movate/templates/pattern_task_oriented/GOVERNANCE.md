@@ -24,11 +24,14 @@ with a structural branch cap and a summed budget ceiling.
 
 ## Topology note
 
-The native runner (ADR 017) walks a linear DAG; true concurrent fan-out edges
-land in a later phase. We model the bounded fan-out as a linear
-`supervisor → task-a → task-b → collector` chain — the cap (two task nodes) and
-the collect step are real and reviewable; the branches execute in sequence
-rather than concurrently. The governance contract is identical either way.
+A real fan-out **diamond** (ADR 092): `supervisor ⇉ {task-a, task-b} ⇉ collector`.
+The supervisor fans out to its fixed roster of two task branches with
+`kind: fan_out`; they reconverge on the collector with `kind: fan_in`. The
+branches run **in parallel** — durably on Temporal (`asyncio.gather`, ADR 092
+Phase 2), concurrently on the native runner (Phase 1). The cap (two task nodes)
+is the fan-out roster and the collector is the join — both structural and
+reviewable. With `runtime: auto` (ADR 091) this prefers Temporal, where the
+parallelism is durable + replayable.
 
 ## Run it
 

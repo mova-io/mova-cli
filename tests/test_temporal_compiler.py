@@ -555,3 +555,37 @@ def test_compile_fan_out_multi_node_branch_rejected() -> None:
     canonical diamond); the author is pointed at runtime: native."""
     with pytest.raises(WorkflowCompileError, match="single-node"):
         TemporalCompiler().compile(_diamond_graph(multi_node=True))
+
+
+# ---------------------------------------------------------------------------
+# Pattern → Temporal parity sweep (ADR 092). Every shipped governed pattern
+# lowers to a valid, durable Temporal @workflow.defn — so picking a pattern
+# gives you a Temporal-ready workflow. The task-oriented pattern specifically
+# lowers to real parallel fan-out (the diamond upgrade).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", sorted(PATTERN_FIXTURES))
+def test_every_governed_pattern_lowers_to_temporal(name: str) -> None:
+    """Each governed pattern template compiles to a valid Temporal workflow
+    module (parses as Python, defines an ``@workflow.defn`` class, calls the
+    agent activity). This is the 'patterns are wired to Temporal' guarantee."""
+    graph = _load_graph(name)
+    compiled = TemporalCompiler().compile(graph)
+    ast.parse(compiled.module_source)  # valid Python
+    assert "@workflow.defn" in compiled.module_source
+    assert "call_agent_activity" in compiled.activity_names
+
+
+@pytest.mark.unit
+def test_task_oriented_pattern_lowers_to_parallel_fan_out() -> None:
+    """The task-oriented pattern is a real fan-out diamond: its Temporal lowering
+    runs the two task branches under ``asyncio.gather`` and joins at the
+    collector — not a sequential chain."""
+    src = TemporalCompiler().compile(_load_graph("task_oriented")).module_source
+    assert "asyncio.gather(" in src  # branches run in parallel
+    assert "current = 'collector'" in src  # join at the collector
+    # The branches are emitted inside the gather, not as standalone dispatch arms.
+    assert "current == 'task-a'" not in src
+    assert "current == 'task-b'" not in src
