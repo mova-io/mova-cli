@@ -1,7 +1,15 @@
 # ADR 093 — A unified governance layer: one policy model, one enforcement seam, one audit spine
 
-Status: Proposed
+Status: Accepted
 Date: 2026-06-08
+Accepted: 2026-06-09 — approved by Jeremy (with Deva's prior sign-off on
+governance-as-default direction). Phase 1 (the enforcement seam:
+`GovernancePolicy` + `Gate` + `GovernanceEngine` + audit) shipped in #808;
+Phase 2 (existing controls re-expressed as conformance-pinned gates —
+MODEL/RUNTIME/SKILL in #811, COST + the first stateful QUOTA gate in #812)
+follows. Default-empty across both: zero behavior change until gates are
+registered and a policy is declared (Phase 2 PR 3 wires the engine in at the
+executor edge in `warn` mode, legacy checks staying authoritative).
 Deciders: Engineering + Deva (Movate) — **governance is a product-direction +
 compliance surface; the unified model + the "enforce" rollout posture require
 Deva sign-off** (per CLAUDE.md §1 + the ADR 018 / ADR 036 precedent).
