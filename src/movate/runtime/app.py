@@ -6136,6 +6136,43 @@ def build_app(
 
         return AgentCatalogView(agents=items, count=len(items))
 
+    @v1.get(
+        "/workflow-agents",
+        tags=["agents-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflow_agents(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """List agents bundled INSIDE workflow templates, grouped by workflow.
+
+        Standalone agents live in the ``agents/`` catalog (``GET /agents``, a
+        deliberately one-level scan). Workflow templates ship their own agents
+        under ``<workflows>/<wf>/agents/<name>/`` — real, runnable agents that
+        the standalone catalog never surfaces. This read-only endpoint exposes
+        them so the Agent Control Plane (ADR 090) can show EVERY agent in the
+        deployment, including each test/template workflow's bundled agents.
+        """
+        from movate.runtime.registry import scan_workflow_agents  # noqa: PLC0415
+
+        workflows_path: Path | None = request.app.state.workflows_path
+        items: list[dict[str, Any]] = []
+        if workflows_path is not None:
+            for wf_name, bundle in scan_workflow_agents(workflows_path):
+                spec = bundle.spec
+                items.append(
+                    {
+                        "workflow": wf_name,
+                        "name": spec.name,
+                        "version": spec.version,
+                        "description": spec.description,
+                        "role": getattr(spec, "role", None),
+                        "model": getattr(getattr(spec, "model", None), "provider", None),
+                    }
+                )
+        return {"workflow_agents": items, "count": len(items)}
+
     @v1.patch(
         "/agents/{name}/status",
         response_model=AgentStatusView,

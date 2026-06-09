@@ -82,8 +82,8 @@
       <h2>🧪 Chainlit Playground</h2><p>Structured-input UI — drive task agents (ticket-triager, resume-screener) with typed fields + voice.</p>
       <span class="tag">public</span></a>
     <a class="card" href="#control-plane">
-      <h2>🎛️ Agent Control Plane</h2><p>Enable / deprecate / disable agents and health-check them live (ADR 090). Tames the agent picker.</p>
-      <span class="tag">admin key</span></a>
+      <h2>🎛️ Agent Control Plane</h2><p>See every agent — standalone + each workflow's bundled agents — and enable / deprecate / disable + health-check them live (ADR 090).</p>
+      <span class="tag">login: __CP_USER__ / __CP_PASS__</span></a>
     <a class="card" href="__API_URL__/docs" target="_blank">
       <h2>⚙️ Runtime API</h2><p>The OpenAPI surface — agents, skills, contexts, KB, eval, voice.</p>
       <span class="tag">bearer-auth</span></a>
@@ -100,7 +100,7 @@
   <div class="note">
     <b>Postman demo:</b> import <code>postman/movate-core-flow.postman_collection.json</code>, set <code>runtime_url</code> to the Runtime API host and <code>bearer_token</code> to Deva's key — run the folder top to bottom: project → agent → skill → context → KB → validate → eval → voice.
   </div>
-  <p class="foot">Ephemeral demo environment · movate-dev · East US 2</p>
+  <p class="foot">Ephemeral demo environment · movate-dev · East US 2 · <span id="deployInfo" title="last landing-page deploy (UTC): __DEPLOYED_AT__">deployed __DEPLOYED_AT__</span></p>
 </div>
 
 <!-- ===================== AGENT CONTROL PLANE (ADR 090) ===================== -->
@@ -110,60 +110,127 @@
     <a class="back" href="#">← back to demo</a>
   </div>
   <p class="sub" style="margin-bottom:18px">Operational lifecycle for the runtime's agents (ADR 090). <span class="muted">active</span> = served + in pickers · <span class="muted">deprecated</span> = served but hidden from pickers · <span class="muted">disabled</span> = not served (runs 409). Reversible — unlike delete.</p>
-  <div class="bar">
-    <input id="tok" type="password" placeholder="Admin bearer token (stored in this browser only)" autocomplete="off"/>
-    <button class="btn" id="save">Save token</button>
+  <div class="bar" id="cpLogin">
+    <input id="cpUser" type="text" placeholder="username" autocomplete="username"/>
+    <input id="cpPass" type="password" placeholder="password" autocomplete="current-password"/>
+    <button class="btn" id="login">Sign in</button>
+    <span class="muted">login: __CP_USER__ / __CP_PASS__</span>
+  </div>
+  <div class="bar" id="cpControls" style="display:none">
+    <span class="muted">✅ Signed in.</span>
     <button class="btn" id="refresh">↻ Refresh</button>
+    <button class="btn" id="logout">Sign out</button>
   </div>
   <div class="msg" id="msg"></div>
+
+  <h2 style="margin:18px 0 6px">Standalone agents</h2>
   <table>
     <thead><tr><th>Agent</th><th>Version</th><th>Role</th><th>Status</th><th>Health</th><th>Actions</th></tr></thead>
-    <tbody id="rows"><tr><td colspan="6" class="muted">Enter an admin token and Refresh to load agents.</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="6" class="muted">Sign in to load agents.</td></tr></tbody>
   </table>
-  <p class="foot">API: <code id="apiUrl">__API_URL__</code> · status changes call <code>PATCH /api/v1/agents/{name}/status</code>; health is <code>GET …/health?probe=run</code>.</p>
+
+  <h2 style="margin:24px 0 6px">Workflow-bundled agents <span class="muted" style="font-weight:400">— the agents each workflow template ships with</span></h2>
+  <table>
+    <thead><tr><th>Workflow</th><th>Agent</th><th>Version</th><th>Role / model</th><th>Description</th></tr></thead>
+    <tbody id="wfRows"><tr><td colspan="5" class="muted">Sign in to load workflow agents.</td></tr></tbody>
+  </table>
+
+  <p class="foot">API: <code id="apiUrl">__API_URL__</code> · standalone <code>GET /api/v1/agents</code> · workflow-bundled <code>GET /api/v1/workflow-agents</code> · status changes <code>PATCH /api/v1/agents/{name}/status</code>.</p>
 </div>
 
 <script>
   var API_BASE = "__API_URL__".replace(/\/$/, "");
-  var TOK_KEY = "mdk_cp_token";
+  var CP_TOKEN = "__CP_TOKEN__";
+  var CP_USER = "__CP_USER__";
+  var CP_PASS = "__CP_PASS__";
+  var DEPLOYED_AT = "__DEPLOYED_AT__";
+  var AUTH_KEY = "mdk_cp_authed";
   var home = document.getElementById("home");
   var cp = document.getElementById("cp");
   var rows = document.getElementById("rows");
+  var wfRows = document.getElementById("wfRows");
   var msgEl = document.getElementById("msg");
-  var tokEl = document.getElementById("tok");
+  var loginBar = document.getElementById("cpLogin");
+  var controlsBar = document.getElementById("cpControls");
 
-  function token(){ return localStorage.getItem(TOK_KEY) || ""; }
-  function headers(){ var h = {"Content-Type":"application/json"}; var t = token(); if(t) h["Authorization"] = "Bearer " + t; return h; }
+  function authed(){ return localStorage.getItem(AUTH_KEY) === "1"; }
+  function headers(){ return {"Content-Type":"application/json", "Authorization":"Bearer " + CP_TOKEN}; }
   function msg(text, kind){ msgEl.textContent = text; msgEl.className = "msg " + (kind||""); }
   function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]; }); }
+
+  // ----- deploy date + live "time since" (footer) -----
+  function relTime(iso){
+    var t = Date.parse(iso); if(isNaN(t)) return "";
+    var s = Math.max(0, Math.floor((Date.now()-t)/1000));
+    var d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
+    var parts=[]; if(d) parts.push(d+"d"); if(h) parts.push(h+"h"); if(d===0) parts.push(m+"m");
+    return (parts.join(" ")||"0m") + " ago";
+  }
+  function tickDeploy(){
+    var el=document.getElementById("deployInfo"); if(!el || DEPLOYED_AT.indexOf("__")===0) return;
+    var d=DEPLOYED_AT.replace("T"," ").replace("Z","").replace(/:\d\d$/,"");
+    el.textContent = "deployed " + d + " UTC · " + relTime(DEPLOYED_AT);
+  }
+  tickDeploy(); setInterval(tickDeploy, 60000);
+
+  function showAuth(on){
+    loginBar.style.display = on ? "none" : "flex";
+    controlsBar.style.display = on ? "flex" : "none";
+  }
 
   function route(){
     if(location.hash === "#control-plane"){
       home.style.display = "none"; cp.style.display = "block";
-      if(token() && rows.children.length <= 1) load();
+      showAuth(authed());
+      if(authed() && rows.children.length <= 1) loadAll();
     } else {
       home.style.display = "block"; cp.style.display = "none";
     }
   }
   window.addEventListener("hashchange", route);
 
+  function doLogin(){
+    var u=document.getElementById("cpUser").value.trim();
+    var p=document.getElementById("cpPass").value;
+    if(u===CP_USER && p===CP_PASS){ localStorage.setItem(AUTH_KEY,"1"); showAuth(true); msg("Signed in.","ok"); loadAll(); }
+    else { msg("Invalid username or password.","err"); }
+  }
+  function doLogout(){
+    localStorage.removeItem(AUTH_KEY); showAuth(false);
+    rows.innerHTML='<tr><td colspan="6" class="muted">Sign in to load agents.</td></tr>';
+    wfRows.innerHTML='<tr><td colspan="5" class="muted">Sign in to load workflow agents.</td></tr>';
+    msg("Signed out.","ok");
+  }
+
+  async function loadAll(){ await load(); await loadWorkflowAgents(); }
+
   async function load(){
-    if(!token()){ msg("Enter an admin bearer token, then Save.", "err"); return; }
+    if(!authed()){ return; }
     msg("Loading agents…", "ok");
     try{
       var r = await fetch(API_BASE + "/api/v1/agents?health=1", {headers: headers()});
-      if(!r.ok){ throw new Error("HTTP " + r.status + " — " + (r.status===401||r.status===403 ? "token missing/insufficient (needs read)" : await r.text())); }
+      if(!r.ok){ throw new Error("HTTP " + r.status + " — " + (r.status===401||r.status===403 ? "auth rejected" : await r.text())); }
       var data = await r.json();
       render(data.agents || []);
-      msg((data.agents||[]).length + " agents · health probed", "ok");
-    }catch(e){ rows.innerHTML = ""; msg("Failed to load: " + e.message + " (check token + that the API allows this origin via MDK_CORS_ALLOWED_ORIGINS)", "err"); }
+      msg((data.agents||[]).length + " standalone agents · health probed", "ok");
+    }catch(e){ rows.innerHTML = ""; msg("Failed to load: " + e.message + " (check the API allows this origin via MDK_CORS_ALLOWED_ORIGINS)", "err"); }
+  }
+
+  async function loadWorkflowAgents(){
+    if(!authed()){ return; }
+    try{
+      var r = await fetch(API_BASE + "/api/v1/workflow-agents", {headers: headers()});
+      if(!r.ok){ wfRows.innerHTML = '<tr><td colspan="5" class="muted">workflow-agents endpoint unavailable (HTTP '+r.status+')</td></tr>'; return; }
+      var data = await r.json();
+      renderWf(data.workflow_agents || []);
+    }catch(e){ wfRows.innerHTML = '<tr><td colspan="5" class="muted">Failed: '+esc(e.message)+'</td></tr>'; }
   }
 
   function statusPill(s){ return '<span class="pill ' + esc(s) + '">' + esc(s) + '</span>'; }
   function healthPill(h){ return '<span class="pill ' + esc(h) + '">' + esc(h) + '</span>'; }
 
   function render(agents){
-    if(!agents.length){ rows.innerHTML = '<tr><td colspan="6" class="muted">No agents.</td></tr>'; return; }
+    if(!agents.length){ rows.innerHTML = '<tr><td colspan="6" class="muted">No standalone agents.</td></tr>'; return; }
     rows.innerHTML = agents.map(function(a){
       var n = esc(a.name), st = a.status || "active", hl = a.health || "unknown";
       function b(label, target){ var on = st===target ? " on" : ""; return '<button class="btn sm'+on+'" data-act="status" data-name="'+n+'" data-status="'+target+'">'+label+'</button>'; }
@@ -179,12 +246,25 @@
     }).join("");
   }
 
+  function renderWf(items){
+    if(!items.length){ wfRows.innerHTML = '<tr><td colspan="5" class="muted">No workflow-bundled agents yet.</td></tr>'; return; }
+    wfRows.innerHTML = items.map(function(a){
+      return '<tr>'
+        + '<td><b>'+esc(a.workflow)+'</b></td>'
+        + '<td>'+esc(a.name)+'</td>'
+        + '<td class="muted">'+esc(a.version)+'</td>'
+        + '<td class="muted">'+esc(a.role||a.model||"—")+'</td>'
+        + '<td class="muted">'+esc(a.description||"—")+'</td>'
+        + '</tr>';
+    }).join("");
+  }
+
   async function setStatus(name, status){
     msg("Setting " + name + " → " + status + "…", "ok");
     try{
       var r = await fetch(API_BASE + "/api/v1/agents/" + encodeURIComponent(name) + "/status",
         {method:"PATCH", headers: headers(), body: JSON.stringify({status: status})});
-      if(!r.ok){ throw new Error("HTTP " + r.status + " — " + (r.status===403 ? "token needs admin scope" : await r.text())); }
+      if(!r.ok){ throw new Error("HTTP " + r.status + " — " + (r.status===403 ? "key lacks admin scope" : await r.text())); }
       msg(name + " is now " + status, "ok");
       await load();
     }catch(e){ msg("Failed: " + e.message, "err"); }
@@ -200,10 +280,10 @@
     }catch(e){ msg("Failed: " + e.message, "err"); }
   }
 
-  document.getElementById("save").addEventListener("click", function(){
-    localStorage.setItem(TOK_KEY, tokEl.value.trim()); msg("Token saved to this browser.", "ok"); load();
-  });
-  document.getElementById("refresh").addEventListener("click", load);
+  document.getElementById("login").addEventListener("click", doLogin);
+  document.getElementById("cpPass").addEventListener("keydown", function(e){ if(e.key==="Enter") doLogin(); });
+  document.getElementById("logout").addEventListener("click", doLogout);
+  document.getElementById("refresh").addEventListener("click", loadAll);
   rows.addEventListener("click", function(ev){
     var t = ev.target; if(t.tagName !== "BUTTON") return;
     var name = t.getAttribute("data-name");
@@ -211,7 +291,6 @@
     else if(t.getAttribute("data-act") === "test") testHealth(name);
   });
 
-  tokEl.value = token();
   route();
 </script>
 </body>
