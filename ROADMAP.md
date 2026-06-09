@@ -33,6 +33,7 @@ Generated from `roadmap.yaml` (intent) + `shipped.jsonl` (CalVer-keyed ship ledg
 
 ### In progress
 
+- `adr-093-governance-layer` — Unified governance layer — policy model + gate seam + audit/metrics, run in warn-mode shadow at the executor & admission edges (warn→enforce rollout pending) (ADR 093)
 - `judge-node-impl` — JUDGE node implementation — verdict-gated branching at runtime (ADR 056)
 
 ### Planned
