@@ -7,6 +7,7 @@ Auto-detects: a path with ``workflow.yaml`` validates as a workflow (compile
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -38,6 +39,7 @@ from movate.core.models import AgentRuntime, AgentSpec, SkillImplementationKind,
 from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
     WorkflowCompileError,
+    WorkflowGraph,
     compile_workflow,
     declares_parallel,
     load_workflow_spec,
@@ -1235,6 +1237,68 @@ def _print_workflow_governance(graph: object) -> None:
             console.print(line)
 
 
+def _lint_state_threading(graph: WorkflowGraph) -> None:
+    """Advisory lint: flag chained-agent state-threading gaps (authoring slice 1).
+
+    Workflow nodes share one state dict, threaded in topological order. A node
+    whose **required input** key is neither an external initial-state input nor
+    produced by an **upstream** node receives nothing at runtime — the silent
+    data-loss the audit flagged. We walk the DAG in topo order, accumulate each
+    AGENT node's produced output keys, and warn on any required input that isn't
+    yet available. High-confidence by construction: a key declared in the state
+    schema that *some* node produces is treated as available only AFTER its
+    producer (so it also catches ordering bugs), while keys nobody produces are
+    assumed external inputs (always available). Non-agent nodes (gate/judge/
+    human/fan-out) carry no I/O schema and are pass-through here.
+    """
+    from movate.core.workflow.ir import NodeType  # noqa: PLC0415
+
+    state_props = set((getattr(graph, "state_schema", {}) or {}).get("properties", {}).keys())
+
+    # Pass 1: per-node (required-inputs, produced-outputs) + the global set of
+    # keys SOME node produces (everything else must arrive as external input).
+    schemas: dict[str, tuple[set[str], set[str]]] = {}
+    produced_by_any: set[str] = set()
+    for nid, node in graph.nodes.items():
+        if node.type is not NodeType.AGENT or not node.ref:
+            continue
+        try:
+            bundle = load_agent(node.ref)
+        except Exception:
+            continue  # compile_workflow already validated refs; skip on any load issue
+        required_in = set(bundle.input_schema.get("required", []))
+        produced = set(bundle.output_schema.get("properties", {}).keys())
+        schemas[nid] = (required_in, produced)
+        produced_by_any |= produced
+
+    # Pass 2: thread availability through the topological order.
+    available = state_props - produced_by_any  # external initial inputs
+    issues: list[str] = []
+    for nid in graph.topological_order():
+        required_in, produced = schemas.get(nid, (set(), set()))
+        missing = required_in - available
+        if missing:
+            avail_show = ", ".join(sorted(available)) or "∅"
+            issues.append(
+                f"node {nid!r} requires input {sorted(missing)} — not produced by any "
+                f"upstream node and not a declared initial-state input "
+                f"(available here: {avail_show})"
+            )
+        available |= produced
+
+    if issues:
+        console.print(
+            "[yellow]![/yellow] state-threading [dim](advisory — a chained agent "
+            "may receive empty inputs at runtime)[/dim]"
+        )
+        for issue in issues:
+            console.print(f"  [yellow]·[/yellow] {issue}")
+        console.print(
+            "[dim]  fix: have an upstream node output the key, declare it in the "
+            "workflow state_schema as an initial input, or rename to match.[/dim]"
+        )
+
+
 def _validate_workflow(path: Path) -> None:
     try:
         spec, parent = load_workflow_spec(path)
@@ -1259,6 +1323,15 @@ def _validate_workflow(path: Path) -> None:
     console.print(f"  topology:    {chain}")
 
     _print_workflow_governance(graph)
+
+    # State-threading lint (authoring composer, slice 1). Chained agents share
+    # one state dict; the silent footgun is a node whose required INPUT key is
+    # neither an external initial-state input nor produced by any UPSTREAM node
+    # — at runtime it just receives nothing. Catch it at author time. Advisory
+    # (not exit-2): it's heuristic over declared schemas, so it warns rather
+    # than blocks. Best-effort — never break validate.
+    with contextlib.suppress(Exception):  # a lint must never break validation
+        _lint_state_threading(graph)
 
     # Backend-aware parallel lint (ADR 092 D6). A fan-out/fan-in graph runs
     # concurrently on the native runner (Phase 1) and, as of Phase 2 (D3), on
