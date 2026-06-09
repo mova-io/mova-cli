@@ -1,6 +1,6 @@
 # ADR 057 — Alert routing: telemetry signals → notification sinks (one seam, opt-in)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (alert routing; core/alerts + core/alert_emit). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-30
 **Deciders:** Engineering (observability/runtime)
 **Context window:** turn the observability we already emit (drift, dead-letter,

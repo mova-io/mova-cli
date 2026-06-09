@@ -1,6 +1,6 @@
 # ADR 052 — Shared tool registry: a control-plane catalog of tool *descriptors*, with execution staying in the runtime's `SkillBackend`
 
-**Status:** Proposed
+**Status:** Accepted — shipped (shared tool registry; core/tool_registry). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-30
 **Deciders:** Engineering + Deva (Movate)
 **Builds on / composes with (changes nothing in any of them):**

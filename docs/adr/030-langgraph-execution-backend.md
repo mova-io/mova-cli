@@ -1,6 +1,6 @@
 # ADR 030 — LangGraph as a first-class *optional* execution backend
 
-**Status:** Proposed
+**Status:** Accepted — shipped (LangGraph export/runtime backend; runtime/langgraph_backend.py). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-27
 **Deciders:** Engineering (orchestration/runtime) — **`langgraph` dependency
 adoption requires Deva sign-off per ADR 001 / ADR 017 D4**

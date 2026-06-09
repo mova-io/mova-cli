@@ -1,6 +1,6 @@
 # ADR 048 — Voice agents: speech adapter seams + a streaming transport that plug voice into ANY existing agent
 
-**Status:** Proposed
+**Status:** Accepted — shipped (voice pipeline + WS/realtime + telephony transports; movate.voice). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-28
 **Deciders:** Engineering + Deva (Movate)
 **Builds on / depends on:**
