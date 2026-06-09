@@ -1041,9 +1041,50 @@ async def _run_local_workflow(
         _emit_workflow_json(result)
     else:
         _emit_workflow_text(result)
+        # After a durable run, point the user at its timeline — the
+        # multi-activity trace view that the trace-context propagation (the
+        # interceptor on the client) now renders as one connected trace.
+        if effective == "temporal":
+            _print_temporal_trace_hints(result)
 
     if result.status is WorkflowStatus.ERROR:
         raise typer.Exit(code=1)
+
+
+def _print_temporal_trace_hints(result: WorkflowResult) -> None:
+    """Point the user at a durable run's Temporal Web timeline (its per-activity
+    trace view).
+
+    The run id IS the Temporal workflow id (ADR 054 D6), so ``mdk workflow web``
+    deep-links straight to it. Always print the command (works regardless of
+    env); add the resolved URL when a UI base is configured. Best-effort — a
+    hint must never break the run, so any resolution failure is swallowed.
+    """
+    run_id = result.workflow_run_id
+    console.print(
+        f"[dim]↳ durable timeline + per-activity trace:[/dim] "
+        f"[cyan]mdk workflow web {run_id} --open[/cyan]"
+    )
+    try:
+        from movate.cli.workflow_cmd import (  # noqa: PLC0415
+            _resolve_temporal_ui_base,
+            _temporal_web_url,
+        )
+
+        base = _resolve_temporal_ui_base()
+        if not base:
+            return
+        try:
+            from movate.runtime.workflow_backend import (  # noqa: PLC0415
+                _resolve_temporal_connection,
+            )
+
+            namespace = _resolve_temporal_connection().namespace
+        except Exception:
+            namespace = "default"
+        console.print(f"[dim]  {_temporal_web_url(base, namespace, run_id)}[/dim]")
+    except Exception:  # pragma: no cover — a hint never breaks a run
+        pass
 
 
 def _emit_workflow_json(result: WorkflowResult) -> None:
