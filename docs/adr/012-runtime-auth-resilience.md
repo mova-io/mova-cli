@@ -1,6 +1,6 @@
 # ADR 012 — Run-side authentication resilience (401 recovery, durable key storage, optional OIDC)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (runtime auth resilience: runtime-key refresh + autoload). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-22
 **Deciders:** Engineering (auth/security change — Deva sign-off required for the optional OIDC client dependency, per ADR 001)
 **Context window:** v1.0 Azure operability — "make auth to deployed agents better"

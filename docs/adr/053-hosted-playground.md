@@ -1,6 +1,6 @@
 # ADR 053 — Hosted playground: an Azure-hosted, Entra-gated shared testing portal
 
-**Status:** Proposed
+**Status:** Accepted — shipped (hosted playground; movate.playground). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-29
 **Deciders:** Engineering + Deva (Movate)
 **Builds on / composes with (changes nothing in any of them):**

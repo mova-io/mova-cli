@@ -1,6 +1,6 @@
 # ADR 003 — Microsoft Teams as a self-serve front door for non-technical users
 
-**Status:** Proposed
+**Status:** Accepted — shipped (Teams bot integration; movate.teams_bot). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-13
 **Deciders:** Engineering + Movate CEO + Sales leadership
 **Context window:** v0.7 → v0.8 design horizon

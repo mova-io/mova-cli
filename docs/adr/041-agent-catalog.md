@@ -1,6 +1,6 @@
 # ADR 041 — Agent catalog: Movate-curated, tenant-private, community-ready
 
-**Status:** Proposed
+**Status:** Accepted — shipped (agent catalog; /api/v1 catalog). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-28
 **Deciders:** Engineering + Deva (Movate)
 **Context window:** v1.x productization — grow the bundled-template gallery

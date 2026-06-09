@@ -1,6 +1,6 @@
 # ADR 040 — Projects as a first-class cloud entity
 
-**Status:** Proposed
+**Status:** Accepted — shipped (projects as a cloud entity; /api/v1 projects). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-28
 **Deciders:** Engineering + Deva (Movate)
 **Context window:** v1.x — close the "what is a Project" gap between the
