@@ -55,6 +55,8 @@ _TEMPORAL_WORKBOOK = _REPO_ROOT / "infra" / "azure-monitor" / "workbooks" / "tem
 # Voice latency/turn dashboard (Grafana, Azure Monitor datasource) — the voice
 # metrics emit but had no dashboard until now (they were on _not_dashboarded).
 _VOICE_GRAFANA = _DASHBOARDS_DIR / "grafana" / "azure" / "mdk-voice.json"
+# ADR 093 — the governance decisions dashboard (warn->enforce rollout signal).
+_GOVERNANCE_GRAFANA = _DASHBOARDS_DIR / "grafana" / "mdk-governance.json"
 
 # Prometheus unit / aggregation suffixes the OTLP -> Prometheus convention
 # appends. Stripped (one layer per pass) before matching a Prometheus token
@@ -175,6 +177,9 @@ _CASES = [
     pytest.param(_AZURE_WORKBOOK, "json", _ALL_FIVE, id="azure-workbook"),
     pytest.param(_TEMPORAL_WORKBOOK, "json", _TEMPORAL_METRICS, id="temporal-workbook"),
     pytest.param(_VOICE_GRAFANA, "json", _VOICE_METRICS, id="voice-grafana"),
+    pytest.param(
+        _GOVERNANCE_GRAFANA, "json", {"mdk.governance.decisions"}, id="governance-grafana"
+    ),
 ]
 
 

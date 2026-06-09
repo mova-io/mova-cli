@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+import movate.tracing.metrics as metrics_mod
 from movate.governance import (
     Decision,
     Effect,
@@ -230,3 +231,41 @@ def test_engine_only_runs_matching_kind() -> None:
     )
     # A check for a DIFFERENT kind sees no gates ⇒ ALLOW.
     assert engine.check(GateKind.MODEL, _CTX).effect is Effect.ALLOW
+
+
+# ---------------------------------------------------------------------------
+# GovernanceEngine — the mdk.governance.decisions metric (ADR 093)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_engine_emits_decision_metric(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        metrics_mod,
+        "record_governance_decision",
+        lambda **kw: calls.append(kw),
+    )
+
+    # WARN-mode deny ⇒ the metric carries the *resolved* effect (warn) + mode.
+    deny_gate = _FixedGate(GateKind.COST, Decision.deny(GateKind.COST, "over budget"))
+    GovernanceEngine(gates=[deny_gate]).check(GateKind.COST, _CTX)
+    assert calls == [{"kind": "cost", "effect": "warn", "mode": "warn", "tenant_id": "t1"}]
+
+    # ENFORCE-mode deny ⇒ effect=deny, mode=enforce.
+    calls.clear()
+    GovernanceEngine(
+        GovernancePolicy(modes={GateKind.COST: Mode.ENFORCE}), gates=[deny_gate]
+    ).check(GateKind.COST, _CTX)
+    assert calls == [{"kind": "cost", "effect": "deny", "mode": "enforce", "tenant_id": "t1"}]
+
+
+@pytest.mark.unit
+def test_engine_does_not_meter_ungoverned_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, str]] = []
+    monkeypatch.setattr(metrics_mod, "record_governance_decision", lambda **kw: calls.append(kw))
+    # A check for a kind with no registered gate is a pure no-op — no datapoint
+    # (so an ungoverned edge never pollutes the deny-rate denominator).
+    engine = GovernanceEngine(gates=[_FixedGate(GateKind.COST, Decision.allow())])
+    engine.check(GateKind.MODEL, _CTX)
+    assert calls == []
