@@ -14,11 +14,14 @@ is not on ``$PATH`` (see ``conftest.py``).
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
 # temporalio is an opt-in extra. Import it at module scope (guarded) so the
 # workflow classes below can be defined at MODULE level — temporalio's
@@ -33,6 +36,104 @@ from temporalio import activity, workflow
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 pytestmark = pytest.mark.temporal
+
+
+# -- Scaffold a real text → step1 → step2 two-agent workflow bundle on disk --
+
+
+def _make_agent(agent_dir: Path, *, name: str, input_key: str, output_key: str) -> None:
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "schema").mkdir(exist_ok=True)
+    (agent_dir / "evals").mkdir(exist_ok=True)
+    (agent_dir / "agent.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "api_version": "movate/v1",
+                "kind": "Agent",
+                "name": name,
+                "version": "0.1.0",
+                "description": f"reads {input_key}, writes {output_key}",
+                "model": {
+                    "provider": "openai/gpt-4o-mini-2024-07-18",
+                    "params": {"temperature": 0.0},
+                },
+                "prompt": "./prompt.md",
+                "schema": {"input": "./schema/input.json", "output": "./schema/output.json"},
+                "evals": {"dataset": "./evals/dataset.jsonl"},
+            }
+        )
+    )
+    (agent_dir / "prompt.md").write_text("echo {{ input." + input_key + " }} as " + output_key)
+    (agent_dir / "schema" / "input.json").write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [input_key],
+                "properties": {input_key: {"type": "string", "minLength": 1}},
+            }
+        )
+    )
+    (agent_dir / "schema" / "output.json").write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [output_key],
+                "properties": {output_key: {"type": "string"}},
+            }
+        )
+    )
+    (agent_dir / "evals" / "dataset.jsonl").write_text(
+        json.dumps({"input": {input_key: "x"}, "expected": {output_key: "x"}}) + "\n"
+    )
+
+
+def _scaffold_linear_workflow(root: Path, *, name: str) -> Path:
+    """Write a ``text → step1 → step2`` Temporal workflow bundle under ``root/<name>``."""
+    workflow_dir = root / name
+    _make_agent(
+        workflow_dir / "agents" / "first", name="first-agent", input_key="text", output_key="step1"
+    )
+    _make_agent(
+        workflow_dir / "agents" / "second",
+        name="second-agent",
+        input_key="step1",
+        output_key="step2",
+    )
+    workflow_dir.mkdir(parents=True, exist_ok=True)
+    (workflow_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    "text": {"type": "string"},
+                    "step1": {"type": "string"},
+                    "step2": {"type": "string"},
+                },
+            }
+        )
+    )
+    (workflow_dir / "workflow.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "api_version": "movate/v1",
+                "kind": "Workflow",
+                "name": name,
+                "version": "0.1.0",
+                "state_schema": "./state.json",
+                "entrypoint": "first",
+                "runtime": "temporal",
+                "nodes": [
+                    {"id": "first", "type": "agent", "ref": "./agents/first"},
+                    {"id": "second", "type": "agent", "ref": "./agents/second"},
+                ],
+                "edges": [{"from": "first", "to": "second"}],
+            }
+        )
+    )
+    return workflow_dir
 
 
 # -- A trivial activity that stands in for call_agent_activity --------------
@@ -197,3 +298,111 @@ async def test_mdk_activity_wiring_via_startdev(temporal_client: Any) -> None:
     assert isinstance(result, dict)
     assert result["answer"] == "mocked-answer"
     assert result["user_input"] == "hello"
+
+
+# -- A REAL compiled workflow run end-to-end on the live server -------------
+
+
+from movate.providers.base import BaseLLMProvider  # noqa: E402
+
+
+class _StateAwareProvider(BaseLLMProvider):
+    """Deterministic offline provider (mirrors test_workflow_replay_cli.py) so
+    the live run needs no LLM key / network — just the durable machinery."""
+
+    name = "state_aware"
+    version = "0.0.1"
+
+    async def complete(self, request: Any) -> Any:
+        from movate.providers.base import CompletionResponse  # noqa: PLC0415
+
+        body = request.messages[0].content
+        if "step1" in body and "step2" not in body:
+            return CompletionResponse(text='{"step1": "alpha"}')
+        return CompletionResponse(text='{"step2": "beta"}')
+
+    async def stream(self, request: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    async def embed(self, text: str, *, model: str) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+
+@pytest.mark.timeout(120)
+async def test_compiled_workflow_end_to_end_via_startdev(
+    temporal_client: Any, tmp_path: Any
+) -> None:
+    """The load-bearing live smoke: a REAL ``workflow.yaml`` → ``TemporalCompiler``
+    → loaded ``@workflow.defn`` class, run end-to-end on a live dev server through
+    the **full** activity set + the terminal persist activity — the closest test
+    to production short of a real LLM.
+
+    The hand-written workflow classes above prove connectivity + activity wiring;
+    this proves the *compiler's emitted control flow* (dispatch loop, state merge,
+    terminal persist) executes durably on a real server, against the same
+    activity registration ``run_temporal_worker`` uses.
+    """
+    from temporalio.worker import UnsandboxedWorkflowRunner, Worker  # noqa: PLC0415
+
+    from movate.core.workflow import compile_workflow, load_workflow_spec  # noqa: PLC0415
+    from movate.core.workflow.compilers.temporal import TemporalCompiler  # noqa: PLC0415
+    from movate.core.workflow.temporal_activities import (  # noqa: PLC0415
+        call_agent_activity,
+        call_gate_activity,
+        call_human_activity,
+        call_judge_activity,
+        call_skill_activity,
+        configure_activities,
+        persist_workflow_result_activity,
+    )
+    from movate.providers.pricing import load_pricing  # noqa: PLC0415
+    from movate.runtime.workflow_backend import load_compiled_workflow_class  # noqa: PLC0415
+    from movate.testing import InMemoryStorage, NullTracer  # noqa: PLC0415
+
+    # Scaffold a real text → step1 → step2 two-agent workflow on disk.
+    _scaffold_linear_workflow(tmp_path, name="live-wf")
+    spec, parent = load_workflow_spec(tmp_path / "live-wf" / "workflow.yaml")
+    graph = compile_workflow(spec, parent)
+
+    storage = InMemoryStorage()
+    await storage.init()
+    configure_activities(
+        storage=storage,
+        pricing=load_pricing(),
+        tracer=NullTracer(),
+        provider=_StateAwareProvider(),
+        tenant_id="local",
+    )
+
+    compiled = TemporalCompiler().compile(graph)
+    workflow_cls = load_compiled_workflow_class(
+        compiled.module_source, compiled.workflow_class_name
+    )
+
+    task_queue = "test-compiled-live"
+    async with Worker(
+        temporal_client,
+        task_queue=task_queue,
+        workflows=[workflow_cls],
+        # The SAME activity set run_temporal_worker registers (workflow_backend.py).
+        activities=[
+            call_agent_activity,
+            call_skill_activity,
+            call_gate_activity,
+            call_judge_activity,
+            call_human_activity,
+            persist_workflow_result_activity,
+        ],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+    ):
+        result = await temporal_client.execute_workflow(
+            workflow_cls.run,
+            {"text": "hello", "tenant_id": "local"},
+            id="test-compiled-live-1",
+            task_queue=task_queue,
+        )
+
+    # The deterministic provider drives step1=alpha → step2=beta; the compiled
+    # control flow must thread both through state to completion.
+    assert result["step1"] == "alpha"
+    assert result["step2"] == "beta"
