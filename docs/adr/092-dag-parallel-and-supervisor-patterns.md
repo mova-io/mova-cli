@@ -104,7 +104,11 @@ the *resolved* backend (e.g. a fan-out on `runtime: native` before D2 lands, or 
   `manager` agent delegating to a FIXED `specialists` allowlist, bounded by
   `max_delegations`) + the native runner's internal delegation loop. The
   delegation loop is internal to the one node, so the graph stays acyclic/linear.
-  *Phase 3b (Temporal lowering) pending.*
+  *Phase 3b (Temporal) shipped:* the Temporal compiler lowers it to a
+  deterministic `for _ in range(max_delegations)` loop calling the manager +
+  allowlisted-specialist activities; a cross-backend conformance test asserts
+  native ≡ Temporal final state. `auto` now prefers Temporal for supervisor
+  workflows.
 - **Phase 4 — governance-contract unification (D5):** uniform caps + enforcement
   (incl. the supervisor's per-delegation cost/token budget).
 

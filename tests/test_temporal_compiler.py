@@ -39,6 +39,7 @@ from movate.core.workflow.ir import (
     WorkflowNode,
 )
 from movate.core.workflow.spec import load_workflow_spec
+from movate.runtime.workflow_backend import _TEMPORAL_UNSUPPORTED_NODE_TYPES
 
 # ---------------------------------------------------------------------------
 # Test fixtures — point at the real shipped pattern templates so we cover
@@ -589,3 +590,44 @@ def test_task_oriented_pattern_lowers_to_parallel_fan_out() -> None:
     # The branches are emitted inside the gather, not as standalone dispatch arms.
     assert "current == 'task-a'" not in src
     assert "current == 'task-b'" not in src
+
+
+# ---------------------------------------------------------------------------
+# SUPERVISOR (ADR 092 D4 / Phase 3b) — the Temporal compiler lowers the bounded
+# managerial delegation loop to a deterministic `for _ in range(N)` loop that
+# calls the manager + (allowlisted) specialist activities.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_compile_supervisor_node_bounded_loop() -> None:
+    sup = WorkflowNode(
+        id="orchestrate",
+        type=NodeType.SUPERVISOR,
+        ref="/agents/manager",
+        metadata={
+            "manager": "/agents/manager",
+            "specialists": {"researcher": "/agents/researcher"},
+            "max_delegations": 3,
+            "decision_field": "next",
+        },
+    )
+    tail = WorkflowNode(id="finalize", type=NodeType.AGENT, ref="/agents/finalize")
+    graph = _make_graph(
+        [sup, tail], [WorkflowEdge("orchestrate", "finalize")], entrypoint="orchestrate"
+    )
+    result = TemporalCompiler().compile(graph)
+    src = result.module_source
+    compile(src, "<supervisor>", "exec")  # valid Python
+    assert "for _ in range(3):" in src  # the bounded delegation cap
+    assert "orchestrate_specialists = {'researcher': '/agents/researcher'}" in src
+    assert "orchestrate_mgr.get('next'" in src  # reads the decision field
+    assert "orchestrate_specialists[orchestrate_choice]" in src  # allowlist select
+    assert "current = 'finalize'" in src  # advances after the loop
+    assert "call_agent_activity" in result.activity_names
+
+
+@pytest.mark.unit
+def test_supervisor_no_longer_temporal_unsupported() -> None:
+    """With Phase 3b, an `auto` supervisor workflow prefers Temporal."""
+    assert "supervisor" not in _TEMPORAL_UNSUPPORTED_NODE_TYPES
