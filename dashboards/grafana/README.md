@@ -36,6 +36,7 @@ YAML file (see `dashboards/README.md` → "Import — Grafana + Prometheus").
 | 3 | `mdk-cost.json` | Per-agent / per-tenant cost breakdown |
 | 4 | `mdk-runtime-overview.json` | Queue depth, DB pool saturation, pod autoscale |
 | 5 | `mdk-dead-letter.json` | Dead-letter rate / share / backlog (operate with `mdk jobs dead-letter`) |
+| 6 | `mdk-certification.json` | Certification matrix: pass/fail of the platform capabilities the `certification/` suite asserts (durable-execution, governance, hitl, tracing, retries, cost, audit, side-effects), driven by `mdk.certification.scenario` |
 
 Open exec-summary first for the leadership "one screen", then drill down via
 the top-right links.
