@@ -76,6 +76,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.workflow.decision import _evaluate_decision_traced
 from movate.core.workflow.ir import EdgeKind, NodeType, WorkflowGraph, WorkflowNode
 from movate.core.workflow.judge import (
     build_judge_state_value,
@@ -454,6 +455,16 @@ class WorkflowRunner:
                 chosen_next, router_runs = result
                 runs.extend(router_runs)
                 current_id = chosen_next
+                continue
+
+            if node.type is NodeType.DECISION:
+                # --- DECISION dispatch (ADR 094) ------------------------------
+                # Deterministic value routing: no agent runs (no RunRecord), no
+                # failure path (closed operator set + fail-soft helper). Just
+                # compute the route from state and advance.
+                current_id = self._run_decision(
+                    node_id=node_id, node=node, state=state, wf_span=wf_span
+                )
                 continue
 
             if node.type is NodeType.SUPERVISOR:
@@ -1252,6 +1263,40 @@ class WorkflowRunner:
         chosen_node = routes.get(str(chosen_label), fallback)
 
         return chosen_node, clf_runs
+
+    def _run_decision(
+        self,
+        *,
+        node_id: str,
+        node: WorkflowNode,
+        state: dict[str, Any],
+        wf_span: SpanCtx,
+    ) -> str | None:
+        """Route a DECISION node (ADR 094) deterministically from state.
+
+        No agent runs, so no :class:`RunRecord` is produced. A ``workflow.decision``
+        span (nested under the workflow root) records which case matched and the
+        chosen route, so the branch is visible in Langfuse / Grafana traces even
+        though the node makes no model call. The routing itself goes through the
+        one shared :func:`~movate.core.workflow.decision._evaluate_decision_traced`
+        so native and Temporal can never disagree.
+        """
+        cases: list[dict[str, Any]] = node.metadata["cases"]
+        default: str = node.metadata["default"]
+        span = self._executor.tracer.start_span(
+            "workflow.decision",
+            {"workflow.node_id": node_id},
+            parent=wf_span,
+        )
+        try:
+            chosen, matched_idx = _evaluate_decision_traced(cases, default, state)
+            self._executor.tracer.set_attribute(
+                span, "decision.matched", "default" if matched_idx is None else str(matched_idx)
+            )
+            self._executor.tracer.set_attribute(span, "decision.route", chosen)
+            return chosen
+        finally:
+            self._executor.tracer.end_span(span)
 
 
 # ---------------------------------------------------------------------------

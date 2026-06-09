@@ -1275,6 +1275,24 @@ def _lint_state_threading(graph: WorkflowGraph) -> None:
     available = state_props - produced_by_any  # external initial inputs
     issues: list[str] = []
     for nid in graph.topological_order():
+        node = graph.nodes[nid]
+        # A DECISION node (ADR 094) reads state fields to route — same silent-gap
+        # risk as a chained agent's required input. Warn if a routed field's root
+        # is neither an external initial input nor produced upstream.
+        if node.type is NodeType.DECISION:
+            roots = {
+                str(c.get("when", {}).get("field", "")).split(".")[0]
+                for c in node.metadata.get("cases", [])
+            }
+            d_missing = {r for r in roots if r} - available
+            if d_missing:
+                avail_show = ", ".join(sorted(available)) or "∅"
+                issues.append(
+                    f"decision node {nid!r} routes on field(s) {sorted(d_missing)} — not "
+                    f"produced by any upstream node and not a declared initial-state input "
+                    f"(available here: {avail_show})"
+                )
+            continue
         required_in, produced = schemas.get(nid, (set(), set()))
         missing = required_in - available
         if missing:
