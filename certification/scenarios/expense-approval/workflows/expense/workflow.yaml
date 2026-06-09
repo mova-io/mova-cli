@@ -1,0 +1,52 @@
+api_version: movate/v1
+kind: Workflow
+name: expense-approval
+version: 0.1.0
+description: >
+  Tiered expense approval. CERTIFICATION FINDINGS (the authoring tax to express
+  one standard enterprise workflow): (1) #47 no value routing — the AMOUNT tier
+  needs an LLM intent-router; (2) HUMAN nodes can't route — each approve/reject
+  needs a SECOND LLM intent-router; (3) no joins/fan-in — the three approval
+  paths can't share one `post-erp`/`finalize`, so each is DUPLICATED. Net: a
+  3-tier approval+ERP flow becomes ~14 nodes incl. 3 LLM classifiers + 3 copies
+  of the ERP-submit node. The runtime (durable HITL) is fine; the authoring is not.
+state_schema: ../../state.json
+entrypoint: classify
+nodes:
+  - id: classify
+    type: intent-router
+    classifier_agent: ../../agents/tier-classifier
+    input_field: expense_text
+    routes: {auto: post-erp-auto, manager: manager-approval, director: director-approval}
+    fallback: manager-approval
+  # --- auto tier (no approval) ---
+  - {id: post-erp-auto, type: agent, ref: ../../agents/erp-poster}
+  - {id: finalize-auto, type: agent, ref: ../../agents/finalize}
+  # --- manager tier ---
+  - {id: manager-approval, type: human, prompt: "Approve (manager)?", output_contract: [decision]}
+  - id: manager-decision
+    type: intent-router
+    classifier_agent: ../../agents/decision-classifier
+    input_field: decision
+    routes: {approve: post-erp-mgr, reject: rejected-mgr}
+    fallback: rejected-mgr
+  - {id: post-erp-mgr, type: agent, ref: ../../agents/erp-poster}
+  - {id: finalize-mgr, type: agent, ref: ../../agents/finalize}
+  - {id: rejected-mgr, type: agent, ref: ../../agents/rejected}
+  # --- director tier ---
+  - {id: director-approval, type: human, prompt: "Approve (director, >$5000)?", output_contract: [decision]}
+  - id: director-decision
+    type: intent-router
+    classifier_agent: ../../agents/decision-classifier
+    input_field: decision
+    routes: {approve: post-erp-dir, reject: rejected-dir}
+    fallback: rejected-dir
+  - {id: post-erp-dir, type: agent, ref: ../../agents/erp-poster}
+  - {id: finalize-dir, type: agent, ref: ../../agents/finalize}
+  - {id: rejected-dir, type: agent, ref: ../../agents/rejected}
+edges:
+  - {from: post-erp-auto, to: finalize-auto}
+  - {from: manager-approval, to: manager-decision}
+  - {from: post-erp-mgr, to: finalize-mgr}
+  - {from: director-approval, to: director-decision}
+  - {from: post-erp-dir, to: finalize-dir}

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["verdict"],"properties":{"verdict":{"type":"string"}}}

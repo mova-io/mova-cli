@@ -212,72 +212,72 @@ def reset() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-system facades — also usable as mdk `kind: python` skill entrypoints.
-# A skill entrypoint receives the agent's tool-call args dict and returns a
-# JSON-serialisable result. ``run_id`` rides in the args so each side-effect is
-# attributable to its workflow run (the scenario stamps it into state).
+# Per-system facades — valid mdk `kind: python` skill entrypoints.
+# The skill contract is ``func(input_payload: dict, ctx) -> dict`` (the validated
+# skill input + a SkillExecutionContext). ``ctx`` is optional here so the same
+# functions are callable directly in harness tests. ``run_id`` rides in the
+# payload so each side-effect is attributable to its workflow run.
 # ---------------------------------------------------------------------------
 
 
-def sim_email(args: dict[str, Any]) -> dict[str, Any]:
+def sim_email(input_payload: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
     """Simulate sending an email (records to/subject/body)."""
+    p = input_payload
     return record(
         "email",
         "send",
-        {"to": args.get("to"), "subject": args.get("subject"), "body": args.get("body")},
-        run_id=str(args.get("run_id", "")),
+        {"to": p.get("to"), "subject": p.get("subject"), "body": p.get("body")},
+        run_id=str(p.get("run_id", "")),
     )
 
 
-def sim_sms(args: dict[str, Any]) -> dict[str, Any]:
+def sim_sms(input_payload: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
     """Simulate sending an SMS."""
+    p = input_payload
     return record(
-        "sms",
-        "send",
-        {"to": args.get("to"), "text": args.get("text")},
-        run_id=str(args.get("run_id", "")),
+        "sms", "send", {"to": p.get("to"), "text": p.get("text")}, run_id=str(p.get("run_id", ""))
     )
 
 
-def sim_erp_submit(args: dict[str, Any]) -> dict[str, Any]:
+def sim_erp_submit(input_payload: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
     """Simulate an ERP/finance submission (e.g. SAP expense posting)."""
+    p = input_payload
     return record(
         "erp",
         "submit",
-        {
-            "document": args.get("document"),
-            "amount": args.get("amount"),
-            "approver": args.get("approver"),
-        },
-        run_id=str(args.get("run_id", "")),
+        {"document": p.get("document"), "amount": p.get("amount"), "approver": p.get("approver")},
+        run_id=str(p.get("run_id", "")),
     )
 
 
-def sim_servicenow(args: dict[str, Any]) -> dict[str, Any]:
+def sim_servicenow(input_payload: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
     """Simulate creating a ServiceNow ticket."""
+    p = input_payload
     return record(
         "servicenow",
         "create_ticket",
-        {"short_description": args.get("short_description"), "priority": args.get("priority")},
-        run_id=str(args.get("run_id", "")),
+        {"short_description": p.get("short_description"), "priority": p.get("priority")},
+        run_id=str(p.get("run_id", "")),
     )
 
 
-def sim_slack(args: dict[str, Any]) -> dict[str, Any]:
+def sim_slack(input_payload: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
     """Simulate posting a Slack message."""
+    p = input_payload
     return record(
         "slack",
         "post",
-        {"channel": args.get("channel"), "text": args.get("text")},
-        run_id=str(args.get("run_id", "")),
+        {"channel": p.get("channel"), "text": p.get("text")},
+        run_id=str(p.get("run_id", "")),
     )
 
 
-def sim_provision_account(args: dict[str, Any]) -> dict[str, Any]:
+def sim_provision_account(input_payload: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
     """Simulate provisioning an account in an identity system (AD/Okta)."""
+    p = input_payload
     return record(
         "identity",
         "provision",
-        {"user": args.get("user"), "system": args.get("system")},
-        run_id=str(args.get("run_id", "")),
+        {"user": p.get("user"), "system": p.get("system")},
+        run_id=str(p.get("run_id", "")),
     )
