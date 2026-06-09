@@ -68,6 +68,8 @@ from movate.core.models import (
 from movate.core.provider_keys import ProviderKeyResolver
 from movate.core.reflection import build_revision_prompt, call_judge
 from movate.core.retry import RetryExhaustedError, run_with_retries
+from movate.governance.engine import GovernanceEngine
+from movate.governance.gate import GateKind, GovernanceContext
 from movate.guardrails import check_input as _guardrails_check_input
 from movate.guardrails import check_output as _guardrails_check_output
 from movate.providers.base import (
@@ -177,6 +179,74 @@ class Executor:
         # when there's no tenant key (default-on shared fallback) — the
         # no-config path stays byte-for-byte unchanged.
         self._provider_key_resolver: ProviderKeyResolver | None = None
+        # ADR 093 Phase 2 (PR 3) — the governance engine, run in *shadow*.
+        # Built once from the same ModelPolicy/RuntimePolicy/SkillPolicy this
+        # executor already holds, so it can never disagree with the legacy
+        # checks by construction. It runs ALONGSIDE those checks at each edge
+        # (model / runtime / skill / cost) purely to emit the uniform
+        # governance audit trail; the default rollout Mode is WARN, so a
+        # would-be deny is recorded, never enforced — the legacy
+        # ``PolicyViolationError`` raises remain authoritative. ``None`` when
+        # every policy is permissive ⇒ the hot path is byte-for-byte unchanged.
+        self._governance: GovernanceEngine | None = self._build_governance_shadow()
+
+    def _build_governance_shadow(self) -> GovernanceEngine | None:
+        """Build the shadow :class:`GovernanceEngine` from the executor's
+        policies, or ``None`` when nothing is configured.
+
+        Lazy import (CLAUDE.md §6): ``governance.adapters`` imports ``core``, so
+        importing it here — not at module load — keeps the ``core → governance
+        → core`` cycle off the import graph. The pure seam does not import
+        ``core``, but the *builders* live in ``adapters``, hence the local
+        import.
+        """
+        if (
+            self._policy.is_permissive()
+            and self._runtime_policy.is_permissive()
+            and self._skill_policy.is_permissive()
+        ):
+            return None
+        try:
+            from movate.governance.adapters import (  # noqa: PLC0415
+                cost_gate_from_model_policy,
+                model_gate_from_policy,
+                runtime_gate_from_policy,
+                skill_gate_from_policy,
+            )
+
+            return GovernanceEngine(
+                gates=[
+                    model_gate_from_policy(self._policy),
+                    cost_gate_from_model_policy(self._policy),
+                    runtime_gate_from_policy(self._runtime_policy),
+                    skill_gate_from_policy(self._skill_policy),
+                ]
+            )
+        except Exception:  # pragma: no cover — shadow must never break boot
+            log.debug("governance shadow engine unavailable", exc_info=True)
+            return None
+
+    def _govern_shadow(self, kind: GateKind, spec: AgentSpec, **attributes: object) -> None:
+        """Emit one shadow governance check (warn-mode ⇒ never blocks).
+
+        Strictly additive: any failure is swallowed so the shadow can never
+        affect a run (the failure-mode rule — observability must not become a
+        new crash surface). The legacy check at the call site stays
+        authoritative.
+        """
+        if self._governance is None:
+            return
+        try:
+            self._governance.check(
+                kind,
+                GovernanceContext(
+                    tenant_id=self._tenant_id or "local",
+                    agent=spec.name,
+                    attributes=dict(attributes),
+                ),
+            )
+        except Exception:  # pragma: no cover — shadow is best-effort
+            log.debug("governance shadow check failed for %s", kind, exc_info=True)
 
     @property
     def tracer(self) -> Tracer:
@@ -301,6 +371,9 @@ class Executor:
             # runtime (e.g. movate.yaml: runtime.allowed: [litellm]),
             # surface as PolicyViolationError so the failure trail
             # matches model-policy violations.
+            # Governance shadow (ADR 093 Phase 2 / warn-mode): record the
+            # RUNTIME decision before the authoritative legacy check below.
+            self._govern_shadow(GateKind.RUNTIME, spec, runtime=spec.runtime)
             runtime_violation = self._runtime_policy.check_agent(spec)
             if runtime_violation is not None:
                 raise PolicyViolationError(runtime_violation)
@@ -311,6 +384,14 @@ class Executor:
             # shape as runtime_policy: ``mdk validate`` catches this
             # statically, but bundles loaded over HTTP (worker) can
             # skip validate, so we re-check here.
+            if self._governance is not None:  # governance shadow (per-skill)
+                for skill in bundle.skills:
+                    self._govern_shadow(
+                        GateKind.SKILL,
+                        spec,
+                        side_effects=skill.spec.side_effects,
+                        skill_name=skill.spec.name,
+                    )
             if not self._skill_policy.is_permissive():
                 skill_violations = self._skill_policy.check_agent_skills(bundle.skills)
                 if skill_violations:
@@ -1896,6 +1977,12 @@ class Executor:
         fallback it might try; for ``bench`` (model_override=True) the
         fallback chain is disabled, so we only check the override.
         """
+        # Governance shadow (ADR 093 Phase 2 / warn-mode): record the MODEL +
+        # COST decisions before the authoritative legacy checks below.
+        self._govern_shadow(GateKind.MODEL, spec, model=effective_model.provider)
+        self._govern_shadow(
+            GateKind.COST, spec, max_cost_usd_per_run=spec.budget.max_cost_usd_per_run
+        )
         violations: list[str] = []
         if err := self._policy.check_model(effective_model.provider):
             violations.append(f"primary model: {err}")
