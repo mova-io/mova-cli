@@ -6,6 +6,10 @@ response into exactly one of the allowed labels.
 Approver response: {{ input.text }}
 Allowed labels: {{ input.labels }}
 
-Return the single label that best matches the approver's intent. If they clearly
-approve, return "approve"; if they clearly decline, return "reject". When the
-response is ambiguous, prefer "reject" (fail safe).
+Return a JSON object with exactly one key:
+- `label`: the single allowed label that best matches the approver's intent. If
+  they clearly approve, use "approve"; if they decline, use "reject"; when
+  ambiguous, prefer "reject" (fail safe).
+
+Example output:
+{"label": "approve"}
