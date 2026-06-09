@@ -1,6 +1,6 @@
 # ADR 019 — Distributed trace-context propagation across the async job queue
 
-**Status:** Proposed
+**Status:** Accepted — shipped (trace-context propagation; tracing/log_correlation). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-24
 **Deciders:** Engineering (observability + runtime)
 **Context window:** v1.0 Azure operability — one distributed trace for an async run

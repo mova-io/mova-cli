@@ -1,6 +1,6 @@
 # ADR 018 — Per-tenant provider keys (BYOK): each tenant manages its own OpenAI/Anthropic keys
 
-**Status:** Proposed
+**Status:** Accepted — shipped (per-tenant BYOK provider keys; core/provider_keys + /api/v1). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-24
 **Deciders:** Engineering (security/runtime — Deva sign-off for any cloud-KMS/Key-Vault dependency, per ADR 001)
 **Context window:** v1.0 multi-tenant operability — provider-credential isolation + cost attribution

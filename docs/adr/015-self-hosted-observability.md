@@ -1,6 +1,6 @@
 # ADR 015 — Self-hosted observability on Azure (off Langfuse Cloud)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (self-hosted OTel collector + Grafana/Prometheus stack; infra/). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-23
 **Deciders:** Engineering (observability + infra — Deva sign-off for the infra footprint / data-residency posture)
 **Context window:** v1.0 Azure operability — keep trace data in-tenant

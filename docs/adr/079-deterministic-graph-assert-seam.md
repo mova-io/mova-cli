@@ -1,6 +1,6 @@
 # ADR 079 — Deterministic graph-assert seam (guarantee high-value nodes without waiting on LLM extraction)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (deterministic graph-assert seam; /api/v1 graph assert). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-06-05
 **Deciders:** Engineering (kb / storage / runtime) — **no new shipped
 dependency; no new storage Protocol method** (reuses the `upsert_entity` /

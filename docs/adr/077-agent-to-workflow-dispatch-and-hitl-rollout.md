@@ -1,6 +1,6 @@
 # ADR 077 — Agent→workflow dispatch seam + durable-HITL rollout (voice front-door hands off to the durable engine)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (agent→workflow dispatch + HITL signal endpoint). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-06-05
 **Deciders:** Engineering (orchestration/runtime) — **no new shipped dependency;
 builds on the already-adopted `temporalio` opt-in (ADR 054/065)**

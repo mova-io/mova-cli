@@ -1,6 +1,6 @@
 # ADR 022 — Runtime-bearer keys: `~/.movate/credentials` is authoritative, not the shell
 
-**Status:** Proposed
+**Status:** Accepted — shipped (runtime key precedence + autoload). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-25
 **Deciders:** Engineering (auth / credentials resolution)
 **Context window:** v1.0 inner loop — kill the single most common operator auth

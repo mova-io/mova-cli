@@ -1,6 +1,6 @@
 # ADR 046 — Knowledge Graph surface: store, query API, growth stream, and sigma.js visualization
 
-**Status:** Proposed
+**Status:** Accepted — shipped (knowledge-graph surface; /api/v1 graph). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-28
 **Deciders:** Engineering + Deva (Movate)
 **Context window:** v1.x — GraphRAG **extraction** is wired (entities + typed

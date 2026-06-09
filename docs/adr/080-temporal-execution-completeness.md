@@ -1,6 +1,6 @@
 # ADR 080 — Temporal execution completeness: deployed worker + terminal-state sync (and the durable-workflow rollout backlog)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (Temporal execution completeness: terminal persistence + replay). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-06-06
 **Deciders:** Engineering (runtime / infra) — **no new shipped dependency; builds
 on the already-adopted `temporalio` opt-in (ADR 054/065).**
