@@ -230,7 +230,44 @@ async def get_temporal_client() -> Any:
         from pathlib import Path as _Path  # noqa: PLC0415
 
         tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
-    return await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
+    return await Client.connect(
+        conn.host,
+        namespace=conn.namespace,
+        tls=tls,
+        interceptors=_tracing_interceptors(),
+    )
+
+
+def _tracing_interceptors() -> list[Any]:
+    """The Temporal OTel **tracing** interceptor — the trace companion to
+    :func:`_build_temporal_metrics_runtime`'s metrics runtime.
+
+    Without this, a ``runtime: temporal`` workflow's activity spans are *orphan
+    traces*: each ``call_*_activity`` runs the Executor in a fresh root span with
+    no link back to the workflow, so a multi-agent run shows up as N disconnected
+    traces instead of one (the native job path already propagates context via
+    ``dispatch.py``'s ``continue_trace_context``). ``temporalio.contrib.
+    opentelemetry.TracingInterceptor`` fixes this the idiomatic way: attached to
+    the client, it injects the W3C trace context into Temporal headers at
+    workflow/activity start and re-extracts it on the worker side, so the
+    interceptor's StartWorkflow → RunWorkflow → RunActivity spans — and the mdk
+    Executor spans nested inside each activity — form ONE connected trace.
+
+    Gated on the same OTLP-sink condition the metrics runtime uses (so an
+    operator who turned the sink off doesn't pay for it), and fully fail-soft:
+    returns ``[]`` when the ``otel`` extra is absent, the sink is off, or
+    anything errors — observability must never stop a workflow from running.
+    """
+    try:
+        from movate.tracing.metrics import _otlp_metrics_enabled  # noqa: PLC0415
+
+        if not _otlp_metrics_enabled():
+            return []
+        from temporalio.contrib.opentelemetry import TracingInterceptor  # noqa: PLC0415
+
+        return [TracingInterceptor()]
+    except Exception:  # pragma: no cover - fail-soft; tracing never blocks a run
+        return []
 
 
 def _build_temporal_metrics_runtime() -> Any | None:
@@ -410,7 +447,12 @@ async def run_temporal_workflow(
 
         tls = TLSConfig(server_root_ca_cert=_Path(conn.tls_cert_path).read_bytes())
 
-    client = await Client.connect(conn.host, namespace=conn.namespace, tls=tls)
+    client = await Client.connect(
+        conn.host,
+        namespace=conn.namespace,
+        tls=tls,
+        interceptors=_tracing_interceptors(),
+    )
 
     # Stamp tenant + mock into the initial state so the activities resolve the
     # right Executor per attempt (mirrors dispatch.py's per-job handling).
@@ -656,7 +698,13 @@ async def run_temporal_worker(
     # follow-on) when an OTLP endpoint is configured — one Runtime for this
     # long-lived worker process; None → temporalio's default Runtime (unchanged).
     metrics_runtime = _build_temporal_metrics_runtime()
-    connect_kwargs: dict[str, Any] = {"namespace": conn.namespace, "tls": tls}
+    connect_kwargs: dict[str, Any] = {
+        "namespace": conn.namespace,
+        "tls": tls,
+        # Trace-context propagation across the workflow→activity boundary so a
+        # multi-agent durable run is ONE connected trace, not N orphan spans.
+        "interceptors": _tracing_interceptors(),
+    }
     if metrics_runtime is not None:
         connect_kwargs["runtime"] = metrics_runtime
     client = await Client.connect(conn.host, **connect_kwargs)
