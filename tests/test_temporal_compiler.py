@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from movate.core.workflow.compiler import WorkflowCompileError, compile_workflow
 from movate.core.workflow.compilers.temporal import (
@@ -38,7 +39,7 @@ from movate.core.workflow.ir import (
     WorkflowGraph,
     WorkflowNode,
 )
-from movate.core.workflow.spec import load_workflow_spec
+from movate.core.workflow.spec import AgentNodeSpec, load_workflow_spec
 
 # ---------------------------------------------------------------------------
 # Test fixtures — point at the real shipped pattern templates so we cover
@@ -555,3 +556,69 @@ def test_compile_fan_out_multi_node_branch_rejected() -> None:
     canonical diamond); the author is pointed at runtime: native."""
     with pytest.raises(WorkflowCompileError, match="single-node"):
         TemporalCompiler().compile(_diamond_graph(multi_node=True))
+
+
+# ---------------------------------------------------------------------------
+# Per-node activity policy (ADR 054 D9). A node may override the global
+# schedule-to-close / retry / heartbeat bounds; the emitter inlines the
+# override and leaves un-annotated nodes on the module-global defaults.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_per_node_activity_policy_emits_inline_bounds() -> None:
+    slow = _make_node("slow", activity_policy={"timeout": 900, "retries": 5, "heartbeat": 120})
+    fast = _make_node("fast")
+    graph = _make_graph([slow, fast], [WorkflowEdge("slow", "fast")], entrypoint="slow")
+    src = TemporalCompiler().compile(graph).module_source
+    compile(src, "<policy>", "exec")  # valid Python
+    assert "timedelta(seconds=900)" in src  # per-node schedule-to-close
+    assert "RetryPolicy(maximum_attempts=5)" in src  # per-node retries
+    assert "timedelta(seconds=120)" in src  # per-node heartbeat
+    # The un-annotated node keeps the module-global defaults.
+    assert "_SCHEDULE_TO_CLOSE" in src
+    assert "_RETRY_POLICY" in src
+
+
+@pytest.mark.unit
+def test_per_node_activity_policy_partial_override() -> None:
+    """Only the keys an author sets are overridden; the rest stay global."""
+    only_timeout = _make_node("only_to", activity_policy={"timeout": 600})
+    tail = _make_node("tail")
+    graph = _make_graph(
+        [only_timeout, tail], [WorkflowEdge("only_to", "tail")], entrypoint="only_to"
+    )
+    src = TemporalCompiler().compile(graph).module_source
+    assert "timedelta(seconds=600)" in src  # overridden
+    assert "_HEARTBEAT" in src  # left global
+    assert "_RETRY_POLICY" in src  # left global
+
+
+@pytest.mark.unit
+def test_fan_out_branch_honors_per_node_policy() -> None:
+    """A fan-out branch agent's per-node policy is inlined inside the gather."""
+    start = _make_node("start")
+    a = _make_node("a", activity_policy={"timeout": 777})
+    b = _make_node("b")
+    merge = _make_node("merge")
+    graph = _make_graph(
+        [start, a, b, merge],
+        [
+            WorkflowEdge("start", "a", EdgeKind.PARALLEL_FAN_OUT),
+            WorkflowEdge("start", "b", EdgeKind.PARALLEL_FAN_OUT),
+            WorkflowEdge("a", "merge", EdgeKind.PARALLEL_FAN_IN),
+            WorkflowEdge("b", "merge", EdgeKind.PARALLEL_FAN_IN),
+        ],
+        entrypoint="start",
+    )
+    src = TemporalCompiler().compile(graph).module_source
+    compile(src, "<fanout-policy>", "exec")
+    assert "timedelta(seconds=777)" in src  # branch 'a' override, inside the gather
+
+
+@pytest.mark.unit
+def test_agent_node_spec_rejects_non_positive_policy() -> None:
+    AgentNodeSpec(id="ok", ref="./a", timeout=1, retries=1, heartbeat=1)  # valid
+    for bad in ("timeout", "retries", "heartbeat"):
+        with pytest.raises(ValidationError):
+            AgentNodeSpec(id="bad", ref="./a", **{bad: 0})

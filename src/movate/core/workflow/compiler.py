@@ -90,10 +90,26 @@ def compile_workflow(
                 raise WorkflowCompileError(
                     f"node {ns.id!r}: ref path does not exist: {resolved_ref}"
                 )
+            # Per-node Temporal activity policy (ADR 054 D9) — only stamped when
+            # an author sets it, so a plain agent node's metadata stays empty and
+            # the native runner (which ignores it) is unaffected.
+            agent_metadata: dict[str, Any] = {}
+            activity_policy = {
+                k: v
+                for k, v in (
+                    ("timeout", ns.timeout),
+                    ("retries", ns.retries),
+                    ("heartbeat", ns.heartbeat),
+                )
+                if v is not None
+            }
+            if activity_policy:
+                agent_metadata["activity_policy"] = activity_policy
             nodes[ns.id] = WorkflowNode(
                 id=ns.id,
                 type=NodeType.AGENT,
                 ref=str(resolved_ref),
+                metadata=agent_metadata,
             )
         elif isinstance(ns, IntentRouterNodeSpec):
             # intent-router nodes don't have a file-system ref — they carry

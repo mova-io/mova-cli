@@ -637,6 +637,40 @@ class TemporalCompiler:
         ]
         return lines, set()
 
+    @staticmethod
+    def _activity_policy_lines(node: Any, indent: int) -> list[str]:
+        """The per-activity policy lines (schedule-to-close / heartbeat / retry).
+
+        Uses per-node overrides from ``node.metadata['activity_policy']``
+        (ADR 054 D9) when an author set ``timeout``/``retries``/``heartbeat`` on
+        the node; otherwise the module-global ``_SCHEDULE_TO_CLOSE`` /
+        ``_HEARTBEAT`` / ``_RETRY_POLICY`` defaults. ``timedelta`` + ``RetryPolicy``
+        are already imported in the emitted module header. ``indent`` is the
+        leading-space count (4 for a top-level call, 8 inside a gather list).
+        """
+        policy = (getattr(node, "metadata", None) or {}).get("activity_policy", {})
+        sc = (
+            f"timedelta(seconds={int(policy['timeout'])})"
+            if "timeout" in policy
+            else "_SCHEDULE_TO_CLOSE"
+        )
+        hb = (
+            f"timedelta(seconds={int(policy['heartbeat'])})"
+            if "heartbeat" in policy
+            else "_HEARTBEAT"
+        )
+        rp = (
+            f"RetryPolicy(maximum_attempts={int(policy['retries'])})"
+            if "retries" in policy
+            else "_RETRY_POLICY"
+        )
+        pad = " " * indent
+        return [
+            f"{pad}schedule_to_close_timeout={sc},",
+            f"{pad}heartbeat_timeout={hb},",
+            f"{pad}retry_policy={rp},",
+        ]
+
     def _emit_agent_node(
         self, nid: str, node: Any, spec: WorkflowGraph
     ) -> tuple[list[str], set[str]]:
@@ -645,7 +679,8 @@ class TemporalCompiler:
         Per ADR 054 D4: each agent call lowers to a single activity call; the
         node then advances to its sequential successor (the native runner's
         ``_sequential_successor`` rule). Per D11: metering wraps the activity,
-        so retries don't over-meter.
+        so retries don't over-meter. Per-node activity policy (ADR 054 D9) is
+        applied via :meth:`_activity_policy_lines`.
         """
         method = _safe_method_name(nid)
         nxt = self._sequential_successor(spec, nid)
@@ -655,9 +690,7 @@ class TemporalCompiler:
             f"{method}_result = await workflow.execute_activity(",
             "    call_agent_activity,",
             f"    args=[{nid!r}, {node.ref!r}, state, run_id],",
-            "    schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
-            "    heartbeat_timeout=_HEARTBEAT,",
-            "    retry_policy=_RETRY_POLICY,",
+            *self._activity_policy_lines(node, 4),
             ")",
             f"state.update({method}_result)",
             f"current = {nxt!r}",
@@ -732,9 +765,7 @@ class TemporalCompiler:
             f"{method}_result = await workflow.execute_activity(",
             "    call_agent_activity,",
             f"    args=[{nid!r}, {node.ref!r}, state, run_id],",
-            "    schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
-            "    heartbeat_timeout=_HEARTBEAT,",
-            "    retry_policy=_RETRY_POLICY,",
+            *self._activity_policy_lines(node, 4),
             ")",
             f"state.update({method}_result)",
             f"# fan-out → {len(branch_starts)} concurrent branches → join {join_id!r}",
@@ -746,9 +777,7 @@ class TemporalCompiler:
                 "    workflow.execute_activity(",
                 "        call_agent_activity,",
                 f"        args=[{start!r}, {bnode.ref!r}, dict(state), run_id],",
-                "        schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
-                "        heartbeat_timeout=_HEARTBEAT,",
-                "        retry_policy=_RETRY_POLICY,",
+                *self._activity_policy_lines(bnode, 8),
                 "    ),",
             ]
         body.append(")")

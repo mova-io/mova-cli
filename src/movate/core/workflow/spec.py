@@ -81,6 +81,39 @@ class AgentNodeSpec(BaseModel):
     type: Literal["agent"] = "agent"
     ref: str = Field(..., description="Path to agent dir, relative to workflow.yaml")
 
+    # --- per-node activity policy (ADR 054 D9, additive) ------------------
+    # Optional per-node overrides for the Temporal activity bounds. Omitted ⇒
+    # the compiler's safe global defaults (5-min schedule-to-close, 3 attempts,
+    # 30s heartbeat), so every existing workflow.yaml is byte-for-byte unchanged.
+    # Honored by the Temporal backend; the native runner uses the Executor's own
+    # retry/budget (these are activity-orchestration bounds, not agent bounds).
+    timeout: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Per-node schedule-to-close timeout in seconds for the Temporal "
+            "activity (ADR 054 D9). Raise it for slow LLM/tool calls. Omit for "
+            "the global default (300s)."
+        ),
+    )
+    retries: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Per-node maximum activity attempts on the Temporal backend "
+            "(ADR 054 D9). 1 = no retry. Omit for the global default (3)."
+        ),
+    )
+    heartbeat: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Per-node heartbeat timeout in seconds for the Temporal activity "
+            "(ADR 054 D9) — liveness for long calls. Omit for the global "
+            "default (30s)."
+        ),
+    )
+
     @field_validator("id")
     @classmethod
     def _validate_id(cls, v: str) -> str:
