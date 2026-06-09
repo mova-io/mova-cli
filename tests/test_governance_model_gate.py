@@ -152,3 +152,174 @@ def test_skill_gate_conforms_to_skill_policy(
     )
     legacy = policy.check_skill("lookup", side_effects)
     assert (decision.effect is Effect.DENY) == (legacy is not None) == expect_deny
+
+
+# ---------------------------------------------------------------------------
+# COST gate — conformant with ModelPolicy's per-run budget ceiling.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass  # noqa: E402
+
+from movate.core.quotas import (  # noqa: E402
+    QuotaConfig,
+    QuotaMode,
+    TenantQuota,
+    check_quota,
+)
+from movate.core.reporting import Usage, UsageRollup  # noqa: E402
+from movate.governance.adapters import (  # noqa: E402
+    cost_gate_from_model_policy,
+    quota_gate_from_config,
+)
+
+
+@dataclass
+class _Budget:
+    max_cost_usd_per_run: float
+
+
+@dataclass
+class _ModelRef:
+    provider: str
+    fallback: list[_ModelRef]
+
+
+@dataclass
+class _Spec:
+    """Minimal stand-in for AgentSpec's budget/model surface (the only fields
+    ModelPolicy.check_agent reads). Keeps the conformance test independent of
+    the full AgentSpec constructor."""
+
+    budget: _Budget
+    model: _ModelRef
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("max_cost_per_run_usd", "declared", "expect_deny"),
+    [
+        (None, 5.00, False),  # no ceiling → permissive
+        (0.50, 0.25, False),  # under cap
+        (0.50, 0.50, False),  # exactly at cap (legacy boundary is strict >)
+        (0.50, 0.51, True),  # over cap
+        (1.00, 5.00, True),  # well over
+    ],
+)
+def test_cost_gate_conforms_to_model_policy_budget(
+    max_cost_per_run_usd: float | None, declared: float, expect_deny: bool
+) -> None:
+    policy = ModelPolicy(max_cost_per_run_usd=max_cost_per_run_usd)
+    gate = cost_gate_from_model_policy(policy)
+    decision = gate.evaluate(GovernanceContext(attributes={"max_cost_usd_per_run": declared}))
+    # The legacy check_agent budget portion: a violation string mentioning the
+    # budget iff the declared per-run cost exceeds the ceiling.
+    spec = _Spec(budget=_Budget(max_cost_usd_per_run=declared), model=_ModelRef("openai", []))
+    legacy_violations = policy.check_agent(spec)  # type: ignore[arg-type]
+    legacy_budget_violation = any("budget.max_cost_usd_per_run" in v for v in legacy_violations)
+    assert (decision.effect is Effect.DENY) == legacy_budget_violation == expect_deny
+
+
+@pytest.mark.unit
+def test_cost_gate_missing_declared_budget_allows() -> None:
+    # No declared budget in context → nothing to compare → allow (the gate
+    # only denies a concrete budget it's told about).
+    gate = cost_gate_from_model_policy(ModelPolicy(max_cost_per_run_usd=0.10))
+    assert gate.evaluate(GovernanceContext()).effect is Effect.ALLOW
+
+
+# ---------------------------------------------------------------------------
+# QUOTA gate — the first STATEFUL gate (Plane 2 preview, D10). Conformant with
+# check_quota run in DENY mode (where `allow` reflects the raw breach).
+# ---------------------------------------------------------------------------
+
+
+def _usage(
+    tenant_id: str, *, tokens_in: int, tokens_out: int, requests: int, cost_usd: float
+) -> Usage:
+    return Usage(
+        tenant_id=tenant_id,
+        window_days=1,
+        agent_filter=None,
+        totals=UsageRollup(
+            key=tenant_id,
+            requests=requests,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        ),
+        by_agent=[],
+        by_provider=[],
+    )
+
+
+# (limits, usage counters, is_admin, expect_deny). Limits: (tokens, requests, cost).
+_QUOTA_CASES = [
+    # no row for tenant → allow (handled separately; see no-row test)
+    ((1000, 100, 5.0), (500, 50, 2.0), False, False),  # all under
+    ((1000, 100, 5.0), (1000, 50, 2.0), False, True),  # tokens at ceiling (>=)
+    ((1000, 100, 5.0), (1200, 50, 2.0), False, True),  # tokens over
+    ((1000, 100, 5.0), (500, 100, 2.0), False, True),  # requests at ceiling
+    ((1000, 100, 5.0), (500, 50, 5.0), False, True),  # cost at ceiling
+    ((1000, 100, 5.0), (5000, 500, 50.0), True, False),  # admin bypass despite all over
+    ((None, None, 5.0), (9999, 9999, 2.0), False, False),  # only cost configured, under
+    ((None, None, 5.0), (9999, 9999, 6.0), False, True),  # only cost configured, over
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("limits", "usage", "is_admin", "expect_deny"), _QUOTA_CASES)
+def test_quota_gate_conforms_to_check_quota(
+    limits: tuple[int | None, int | None, float | None],
+    usage: tuple[int, int, float],
+    is_admin: bool,
+    expect_deny: bool,
+) -> None:
+    tokens_limit, requests_limit, cost_limit = limits
+    tokens_used, requests_used, cost_used = usage
+    tenant_id = "acme"
+
+    row = TenantQuota(
+        tenant_id=tenant_id,
+        daily_token_limit=tokens_limit,
+        daily_request_limit=requests_limit,
+        monthly_cost_usd_limit=cost_limit,
+        mode=QuotaMode.DENY,  # DENY mode ⇒ check_quota.allow reflects the raw breach
+    )
+    config = QuotaConfig(tenants=[row], admin_tenant_ids=[tenant_id] if is_admin else [])
+    gate = quota_gate_from_config(config)
+
+    # The gate reads raw accumulated counters from the context (Plane 2 preview).
+    ctx = GovernanceContext(
+        tenant_id=tenant_id,
+        attributes={
+            "daily_tokens": tokens_used,
+            "daily_requests": requests_used,
+            "monthly_cost_usd": cost_used,
+        },
+    )
+    decision = gate.evaluate(ctx)
+
+    # The legacy reducer over the same usage, split into daily + monthly windows.
+    daily = _usage(
+        tenant_id, tokens_in=tokens_used, tokens_out=0, requests=requests_used, cost_usd=0.0
+    )
+    monthly = _usage(tenant_id, tokens_in=0, tokens_out=0, requests=0, cost_usd=cost_used)
+    legacy = check_quota(row, daily_usage=daily, monthly_usage=monthly, is_admin=is_admin)
+
+    # Gate raw-DENY ⇔ legacy (deny-mode) blocks ⇔ expectation.
+    assert decision.blocked == (not legacy.allow) == expect_deny
+
+
+@pytest.mark.unit
+def test_quota_gate_no_row_for_tenant_allows() -> None:
+    # A tenant with no configured row is never blocked — exactly check_quota's
+    # `quota=None` short-circuit.
+    config = QuotaConfig(tenants=[TenantQuota(tenant_id="other", daily_token_limit=1)])
+    gate = quota_gate_from_config(config)
+    ctx = GovernanceContext(tenant_id="acme", attributes={"daily_tokens": 9999})
+    assert gate.evaluate(ctx).effect is Effect.ALLOW
+    assert check_quota(
+        None,
+        daily_usage=_usage("acme", tokens_in=9999, tokens_out=0, requests=0, cost_usd=0.0),
+        monthly_usage=_usage("acme", tokens_in=0, tokens_out=0, requests=0, cost_usd=0.0),
+    ).allow
