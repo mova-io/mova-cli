@@ -1188,6 +1188,53 @@ def _render_lint_issues(issues: list[LintIssue]) -> None:
             console.print(f"    [dim]hint: {issue.hint}[/dim]")
 
 
+def _print_workflow_governance(graph: object) -> None:
+    """Surface the governance contract (ADR 092 D5) for parallel/delegation
+    workflows: the declarative bounds an author + reviewer can SEE at validate
+    time. Renders nothing for a plain linear workflow (no bounds to show)."""
+    from movate.core.workflow.compiler import DEFAULT_MAX_FANOUT  # noqa: PLC0415
+    from movate.core.workflow.ir import EdgeKind, NodeType  # noqa: PLC0415
+
+    nodes = getattr(graph, "nodes", {})
+    edges = getattr(graph, "edges", [])
+    lines: list[str] = []
+
+    # Fan-out blocks: the branch count + the max_fanout cap.
+    for nid in nodes:
+        fan_out = [e for e in edges if e.from_id == nid and e.kind is EdgeKind.PARALLEL_FAN_OUT]
+        if fan_out:
+            lines.append(
+                f"    fan-out [bold]{nid}[/bold]: {len(fan_out)} branch(es) "
+                f"[dim](cap max_fanout={DEFAULT_MAX_FANOUT})[/dim]"
+            )
+
+    # Supervisor blocks: the roster + the delegation cap + the optional budget.
+    for nid, node in nodes.items():
+        if getattr(node, "type", None) is not NodeType.SUPERVISOR:
+            continue
+        meta = getattr(node, "metadata", {}) or {}
+        roster = list((meta.get("specialists") or {}).keys())
+        bits = [
+            f"max_delegations={meta.get('max_delegations')}",
+            f"specialists={len(roster)} ({', '.join(roster)})",
+        ]
+        if meta.get("budget") is not None:
+            bits.append(f"budget=${meta['budget']:.2f}")
+        lines.append(f"    supervisor [bold]{nid}[/bold]: " + ", ".join(bits))
+
+    # Per-node Temporal activity policy (ADR 054 D9) — declared bounds, if any.
+    for nid, node in nodes.items():
+        policy = (getattr(node, "metadata", {}) or {}).get("activity_policy")
+        if policy:
+            shown = ", ".join(f"{k}={v}" for k, v in policy.items())
+            lines.append(f"    activity-policy [bold]{nid}[/bold]: {shown}")
+
+    if lines:
+        console.print("  [bold]governance[/bold] [dim](ADR 092 D5)[/dim]:")
+        for line in lines:
+            console.print(line)
+
+
 def _validate_workflow(path: Path) -> None:
     try:
         spec, parent = load_workflow_spec(path)
@@ -1210,6 +1257,8 @@ def _validate_workflow(path: Path) -> None:
     console.print(f"  edges:       {len(graph.edges)}")
     chain = " → ".join(graph.topological_order())
     console.print(f"  topology:    {chain}")
+
+    _print_workflow_governance(graph)
 
     # Backend-aware parallel lint (ADR 092 D6). A fan-out/fan-in graph runs
     # concurrently on the native runner (Phase 1) and, as of Phase 2 (D3), on

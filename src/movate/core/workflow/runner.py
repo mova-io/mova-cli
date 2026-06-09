@@ -1078,6 +1078,10 @@ class WorkflowRunner:
         specialists: dict[str, str] = meta.get("specialists", {})
         max_delegations: int = int(meta.get("max_delegations", 4) or 4)
         decision_field: str = meta.get("decision_field", "next")
+        # The aggregate cost ceiling across the whole delegation loop (ADR 092
+        # D5 / Phase 4 governance contract). None ⇒ no aggregate cap (the
+        # per-run agent budget still applies via the Executor on every call).
+        budget_usd: float | None = meta.get("budget")
 
         seq_next = self._sequential_successor(graph, node_id)
         runs: list[RunRecord] = []
@@ -1088,13 +1092,21 @@ class WorkflowRunner:
             return seq_next, runs
 
         manager_node = WorkflowNode(id=node_id, type=NodeType.AGENT, ref=manager_ref)
+        spent_usd = 0.0
 
         for _ in range(max_delegations):
+            # Governance: stop before the next delegation once the aggregate
+            # budget is spent (ADR 092 D5) — the loop terminates with what it
+            # has, like the max_delegations cap. The bound is the point.
+            if budget_usd is not None and spent_usd >= budget_usd:
+                break
+
             # 1. The manager decides who to delegate to next (or "done").
             m_resp, m_summary = await self._run_one_agent(
                 manager_node, node_id, state, wf_id, wf_span
             )
             runs.append(m_summary)
+            spent_usd += m_resp.metrics.cost_usd
             if m_resp.status != "success":
                 await self._storage.save_run(m_summary)
                 return self._supervisor_error(wf_id, node_id, state, runs, m_resp.error)
@@ -1113,6 +1125,7 @@ class WorkflowRunner:
                 spec_node, spec_node_id, state, wf_id, wf_span
             )
             runs.append(s_summary)
+            spent_usd += s_resp.metrics.cost_usd
             if s_resp.status != "success":
                 await self._storage.save_run(s_summary)
                 return self._supervisor_error(wf_id, spec_node_id, state, runs, s_resp.error)

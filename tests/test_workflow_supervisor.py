@@ -21,8 +21,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+from movate.cli.validate import _print_workflow_governance
 from movate.core.executor import Executor
-from movate.core.models import WorkflowStatus
+from movate.core.models import TokenUsage, WorkflowStatus
 from movate.core.workflow import (
     WorkflowCompileError,
     WorkflowRunner,
@@ -109,6 +110,7 @@ def _write_supervisor_workflow(
     max_delegations: int = 4,
     manager_ref: str = "./agents/manager",
     with_finalize: bool = True,
+    budget: float | None = None,
 ) -> Path:
     wf = tmp_path / "wf"
     _make_agent(wf / "agents" / "manager", name="mgr", input_key="task", output_key="next")
@@ -116,15 +118,16 @@ def _write_supervisor_workflow(
     _make_agent(wf / "agents" / "finalize", name="fin", input_key="findings", output_key="answer")
     wf.mkdir(parents=True, exist_ok=True)
     (wf / "state.json").write_text(json.dumps(_STATE_SCHEMA))
-    nodes: list[dict] = [
-        {
-            "id": "orchestrate",
-            "type": "supervisor",
-            "manager": manager_ref,
-            "specialists": specialists or {"researcher": "./agents/researcher"},
-            "max_delegations": max_delegations,
-        }
-    ]
+    supervisor: dict = {
+        "id": "orchestrate",
+        "type": "supervisor",
+        "manager": manager_ref,
+        "specialists": specialists or {"researcher": "./agents/researcher"},
+        "max_delegations": max_delegations,
+    }
+    if budget is not None:
+        supervisor["budget"] = budget
+    nodes: list[dict] = [supervisor]
     edges: list[dict] = []
     if with_finalize:
         nodes.append({"id": "finalize", "type": "agent", "ref": "./agents/finalize"})
@@ -310,3 +313,70 @@ async def test_supervisor_specialist_failure_is_partial_error(
     )
     assert result.status is WorkflowStatus.ERROR
     assert result.error_node_id == "orchestrate/researcher"
+
+
+# ---------------------------------------------------------------------------
+# Governance contract (ADR 092 D5 / Phase 4) — aggregate budget enforcement +
+# the `mdk validate` governance surface.
+# ---------------------------------------------------------------------------
+
+
+class _CostingSupervisorProvider(_SupervisorProvider):
+    """Like the deterministic provider, but reports output tokens so each run
+    carries a real (priced) cost — lets the aggregate-budget cap actually fire."""
+
+    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        resp = await super().complete(request)
+        return CompletionResponse(text=resp.text, tokens=TokenUsage(output=1_000_000))
+
+
+@pytest.mark.unit
+def test_supervisor_budget_stamped_only_when_set(tmp_path: Path) -> None:
+    # set
+    spec, parent = load_workflow_spec(_write_supervisor_workflow(tmp_path, budget=2.5))
+    assert compile_workflow(spec, parent).nodes["orchestrate"].metadata["budget"] == 2.5
+    # unset → absent (metadata unchanged)
+    spec2, parent2 = load_workflow_spec(_write_supervisor_workflow(tmp_path / "b"))
+    assert "budget" not in compile_workflow(spec2, parent2).nodes["orchestrate"].metadata
+
+
+@pytest.mark.unit
+def test_supervisor_budget_rejects_negative(tmp_path: Path) -> None:
+    with pytest.raises(WorkflowSpecLoadError):
+        load_workflow_spec(_write_supervisor_workflow(tmp_path, budget=-1.0))
+
+
+@pytest.mark.unit
+async def test_supervisor_budget_stops_loop_early(
+    tmp_path: Path, pricing: PricingTable, storage: InMemoryStorage
+) -> None:
+    """A never-done manager + costing runs + a tiny aggregate budget: the loop
+    stops on the budget, well before max_delegations."""
+    spec, parent = load_workflow_spec(
+        _write_supervisor_workflow(tmp_path, max_delegations=5, with_finalize=False, budget=0.01)
+    )
+    graph = compile_workflow(spec, parent)
+    result = await _runner(
+        _CostingSupervisorProvider(manager_always="researcher"), storage, pricing
+    ).run(graph, initial_state={"task": "x"})
+    assert result.status is WorkflowStatus.SUCCESS
+    # Round 1 (manager + specialist) spends past $0.01, so round 2's budget gate
+    # breaks the loop → exactly 2 runs, not the 10 that 5 delegations would give.
+    assert len(result.runs) == 2
+
+
+@pytest.mark.unit
+def test_validate_surfaces_supervisor_governance(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    spec, parent = load_workflow_spec(
+        _write_supervisor_workflow(tmp_path, max_delegations=6, budget=3.0)
+    )
+    graph = compile_workflow(spec, parent)
+    _print_workflow_governance(graph)
+    out = capsys.readouterr().out
+    assert "governance" in out
+    assert "supervisor" in out and "orchestrate" in out
+    assert "max_delegations=6" in out
+    assert "budget=$3.00" in out
+    assert "researcher" in out  # the specialist roster is shown

@@ -356,6 +356,17 @@ class SupervisorNodeSpec(BaseModel):
             "decision — the anti-runaway bound."
         ),
     )
+    budget: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional aggregate cost ceiling (USD) across the whole delegation "
+            "loop (ADR 092 D5). When the summed cost of the manager + specialist "
+            "runs reaches it, the loop terminates — the governance moat on top of "
+            "the per-run agent budget. Omit for no aggregate cap. (Native-enforced "
+            "today; Temporal enforces the per-run agent budget on every call.)"
+        ),
+    )
     decision_field: str = Field(
         "next",
         description=(
