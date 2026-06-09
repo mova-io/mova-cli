@@ -100,7 +100,13 @@ the *resolved* backend (e.g. a fan-out on `runtime: native` before D2 lands, or 
   ADR 091, a fan-out `runtime: auto` then prefers Temporal where parallel
   orchestration is durable.)*
 - **Phase 3 — bounded supervisor (D4):** the managerial primitive, both backends.
-- **Phase 4 — governance-contract unification (D5):** uniform caps + enforcement.
+  *Phase 3a (native) shipped:* `NodeType.SUPERVISOR` + `SupervisorNodeSpec` (a
+  `manager` agent delegating to a FIXED `specialists` allowlist, bounded by
+  `max_delegations`) + the native runner's internal delegation loop. The
+  delegation loop is internal to the one node, so the graph stays acyclic/linear.
+  *Phase 3b (Temporal lowering) pending.*
+- **Phase 4 — governance-contract unification (D5):** uniform caps + enforcement
+  (incl. the supervisor's per-delegation cost/token budget).
 
 ## Consequences
 
