@@ -58,6 +58,7 @@ reads it. An activity invoked before configuration raises a clear
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -151,6 +152,18 @@ class ActivityContext:
     into :func:`load_agent` resolution (project-level model defaults). ``None``
     (the default) lets the loader read project config itself, matching every
     other library caller."""
+    policy: Any = None
+    """Project ``ModelPolicy`` (model allowlist / deny / per-run cost cap)."""
+    runtime_policy: Any = None
+    """Project ``RuntimePolicy`` (allowed AgentRuntime backends)."""
+    skill_policy: Any = None
+    """Project ``SkillPolicy`` (allowed skill side-effect classes).
+
+    These three are threaded into the per-activity Executor (see
+    :func:`_executor_for`) so the executor's policy enforcement **and** the
+    ADR 093 governance shadow are active on the Temporal backend — exactly as
+    ``build_local_runtime`` wires them for the local/native path. Without them
+    the durable backend ran fully permissive (governance silently dormant)."""
 
 
 _CONTEXT: ActivityContext | None = None
@@ -164,6 +177,9 @@ def configure_activities(
     provider: BaseLLMProvider | None = None,
     tenant_id: str = "local",
     defaults: Any = None,
+    policy: Any = None,
+    runtime_policy: Any = None,
+    skill_policy: Any = None,
 ) -> None:
     """Install the :class:`ActivityContext` the four activities read.
 
@@ -189,6 +205,22 @@ def configure_activities(
 
         provider = LiteLLMProvider()
 
+    # Resolve project-level governance/enforcement policies from the worker's
+    # project config when not passed explicitly — mirrors build_local_runtime's
+    # Executor wiring so the durable backend enforces policy + runs the ADR 093
+    # governance shadow exactly as the native path does. Graceful + permissive:
+    # load_project_config() returns a permissive ProjectConfig() when no config
+    # is on disk, so a deployment without a project config is byte-for-byte
+    # unchanged. Explicit args win (the test escape hatch, like ``defaults``).
+    if policy is None or runtime_policy is None or skill_policy is None:
+        with contextlib.suppress(Exception):
+            from movate.core.config import load_project_config  # noqa: PLC0415
+
+            cfg = load_project_config()
+            policy = policy if policy is not None else cfg.policy
+            runtime_policy = runtime_policy if runtime_policy is not None else cfg.runtime
+            skill_policy = skill_policy if skill_policy is not None else cfg.skills
+
     global _CONTEXT  # noqa: PLW0603 — module-global DI registry, set once at worker startup.
     _CONTEXT = ActivityContext(
         storage=storage,
@@ -197,6 +229,9 @@ def configure_activities(
         provider=provider,
         tenant_id=tenant_id,
         defaults=defaults,
+        policy=policy,
+        runtime_policy=runtime_policy,
+        skill_policy=skill_policy,
     )
 
 
@@ -251,6 +286,12 @@ def _executor_for(ctx: ActivityContext, state: dict[str, Any]) -> Any:
         storage=ctx.storage,
         tracer=ctx.tracer,
         tenant_id=_resolve_tenant_id(ctx, state),
+        # Thread the project policies so the durable backend enforces policy +
+        # runs the governance shadow (ADR 093) — None ⇒ Executor's permissive
+        # default (the deployed-without-config / native-parity behavior).
+        policy=ctx.policy,
+        runtime_policy=ctx.runtime_policy,
+        skill_policy=ctx.skill_policy,
     )
 
 
