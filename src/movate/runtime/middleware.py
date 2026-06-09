@@ -31,7 +31,10 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
+
+if TYPE_CHECKING:
+    from movate.governance.engine import GovernanceEngine
 
 from fastapi import Depends, Header, HTTPException, Request, Response
 
@@ -565,6 +568,13 @@ def make_quota_dependency(
     """
     effective_ttl = ttl_s if ttl_s is not None else QUOTA_CACHE_TTL_S
     quota_cache = cache if cache is not None else _QuotaCache(ttl_s=effective_ttl)
+    # ADR 093 Phase 2 (PR 4) — the governance QUOTA gate, run in *shadow*.
+    # Built once from the same QuotaConfig this dependency already enforces, so
+    # it can never disagree with ``check_quota`` by construction. It emits the
+    # uniform ``governance.quota`` audit trail (warn-mode ⇒ records, never
+    # blocks) at the admission edge, while the legacy 429 path stays
+    # authoritative. ``None`` when quotas are unconfigured ⇒ pure pass-through.
+    governance = _build_quota_shadow(config)
 
     def make_for(route_class: RouteClass) -> Callable[..., Awaitable[None]]:
         async def quota_dependency(
@@ -597,6 +607,7 @@ def make_quota_dependency(
                     storage,
                     tenant_id=tenant_id,
                     quota=quota_row,
+                    governance=governance,
                 )
                 quota_cache.set(tenant_id, route_class, decision)
 
@@ -628,11 +639,67 @@ def make_quota_dependency(
     return make_for
 
 
+def _build_quota_shadow(config: QuotaConfig | None) -> GovernanceEngine | None:
+    """Build the shadow QUOTA :class:`GovernanceEngine` from ``config``, or
+    ``None`` when quotas are unconfigured.
+
+    Lazy import (mirrors :func:`_compute_decision`'s ``core.reporting`` import):
+    ``governance.adapters`` imports ``core``, so importing it here — not at
+    module load — keeps the ``runtime → governance → core`` cycle off the import
+    graph. The pure seam does not import ``core``.
+    """
+    if config is None:
+        return None
+    try:
+        from movate.governance.adapters import quota_gate_from_config  # noqa: PLC0415
+        from movate.governance.engine import GovernanceEngine  # noqa: PLC0415
+
+        return GovernanceEngine(gates=[quota_gate_from_config(config)])
+    except Exception:  # pragma: no cover — shadow must never break boot
+        logger.debug("governance quota shadow engine unavailable", exc_info=True)
+        return None
+
+
+def _emit_quota_shadow(
+    governance: GovernanceEngine,
+    *,
+    tenant_id: str,
+    daily: Usage,
+    monthly: Usage,
+) -> None:
+    """Emit one shadow QUOTA check from the same usage rollups ``check_quota``
+    consumes (warn-mode ⇒ never blocks).
+
+    Strictly additive: any failure is swallowed so the shadow can never affect
+    admission (the failure-mode rule — the legacy 429 path stays authoritative).
+    Fired only on a cache *miss* (where the rollups are freshly computed), which
+    is exactly when the real decision is recomputed — so the audit cadence
+    mirrors the decision cadence rather than every cached request.
+    """
+    try:
+        from movate.governance.gate import GateKind, GovernanceContext  # noqa: PLC0415
+
+        governance.check(
+            GateKind.QUOTA,
+            GovernanceContext(
+                tenant_id=tenant_id,
+                attributes={
+                    "daily_tokens": daily.totals.tokens_in + daily.totals.tokens_out,
+                    "daily_requests": daily.totals.requests,
+                    "monthly_cost_usd": monthly.totals.cost_usd,
+                },
+            ),
+        )
+    except Exception:  # pragma: no cover — shadow is best-effort
+        logger.debug("governance quota shadow check failed", exc_info=True)
+
+
 async def _compute_decision(
     storage: StorageProvider,
     *,
     tenant_id: str,
     quota: TenantQuota,
+    governance: GovernanceEngine | None = None,
 ) -> QuotaDecision:
     """Run the per-tenant aggregation + decision.
 
@@ -683,6 +750,11 @@ async def _compute_decision(
         include_by_agent=False,
         include_by_provider=False,
     )
+
+    # Governance shadow (ADR 093 Phase 2 / warn-mode): record the QUOTA
+    # decision from the same rollups before the authoritative legacy check.
+    if governance is not None:
+        _emit_quota_shadow(governance, tenant_id=tenant_id, daily=daily, monthly=monthly)
 
     return check_quota(quota, daily_usage=daily, monthly_usage=monthly)
 
