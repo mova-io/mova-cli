@@ -1,0 +1,170 @@
+{
+  "__inputs": [],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "postgres", "name": "PostgreSQL", "version": "1.0.0"},
+    {"type": "datasource", "id": "grafana-clickhouse-datasource", "name": "ClickHouse", "version": "4.0.0"}
+  ],
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "description": "ADR 095 — unified observability: one Grafana pane over the centralized stores. TELEMETRY (traces/metrics/logs) lives in ClickHouse (the OTel collector's clickhouse exporter); the BUSINESS OF RECORD (runs, cost ledger, governance) lives in Postgres. The two are correlated by trace_id (ADR 095 D4) — the cross-store table joins the authoritative cost/outcome (Postgres) with high-cardinality span volume (ClickHouse). Prototype for the unified-observability migration (ADR 095 D6 steps 1-2).",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "text",
+      "id": 500,
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 0},
+      "title": "mdk - unified observability (ADR 095)",
+      "options": {
+        "mode": "markdown",
+        "content": "## One pane, two centralized stores\n\n**Telemetry → ClickHouse** (traces + metrics + logs, written by the OTel collector's `clickhouse` exporter). **Business of record → Postgres** (`workflow_runs`, cost ledger, governance — authoritative + transactional). The panels below read **both datasources in one dashboard**, and the bottom table is the **cross-store join on `trace_id`** — the authoritative cost/outcome from Postgres alongside the span volume from ClickHouse.\n\n**Centralizing principle (ADR 095 D1):** the OTel collector is the single ingestion hub; Grafana is the single query pane. Each signal keeps a fit-for-purpose store — we do NOT force traces into Postgres. `trace_id` (D4) is what makes this *unified*, not merely co-located.\n\n_Local demo note:_ the cross-store join lights up with real correlated traffic (a run stamps the same `trace_id` on its Postgres run record AND its ClickHouse spans). With only the seeded Postgres rows, the Postgres panels populate and the ClickHouse panels fill as OTLP arrives."
+      }
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "postgres-bor"},
+      "description": "Authoritative spend from the business of record (Postgres). Source: workflow_runs.cost_usd.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "bars", "fillOpacity": 70}, "unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 6},
+      "id": 1,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "postgres-bor"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT workflow, tier, sum(cost_usd) AS cost_usd FROM workflow_runs GROUP BY workflow, tier ORDER BY cost_usd DESC;",
+          "refId": "A"
+        }
+      ],
+      "title": "Run cost by workflow / tier (Postgres · business of record)",
+      "type": "barchart"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "postgres-bor"},
+      "description": "Workflow outcomes from the business of record. Source: workflow_runs.status.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 6},
+      "id": 2,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value"]}, "pieType": "donut", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "postgres-bor"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT status, count(*) AS runs FROM workflow_runs GROUP BY status ORDER BY runs DESC;",
+          "refId": "A"
+        }
+      ],
+      "title": "Runs by status (Postgres)",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "postgres-bor"},
+      "description": "Governance decisions from the audit store (Postgres). Source: governance_decisions.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 6},
+      "id": 3,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "values": ["value"]}, "pieType": "donut", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "postgres-bor"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT effect, count(*) AS decisions FROM governance_decisions GROUP BY effect ORDER BY decisions DESC;",
+          "refId": "A"
+        }
+      ],
+      "title": "Governance decisions by effect (Postgres)",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse-otel"},
+      "description": "Span ingest volume from the unified telemetry store (ClickHouse). Source: otel.otel_traces — written by the collector's clickhouse exporter.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "id": 4,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["sum"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse-otel"},
+          "rawSql": "SELECT toStartOfMinute(Timestamp) AS time, ServiceName AS service, count() AS spans FROM otel.otel_traces WHERE $__timeFilter(Timestamp) GROUP BY time, service ORDER BY time",
+          "refId": "A",
+          "format": 1,
+          "queryType": "sql"
+        }
+      ],
+      "title": "Span volume by service (ClickHouse · telemetry)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse-otel"},
+      "description": "Slowest recent traces from the unified telemetry store (ClickHouse). Source: otel.otel_traces aggregated by TraceId.",
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}, "unit": "ns"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "id": 5,
+      "options": {"showHeader": true, "sortBy": [{"desc": true, "displayName": "duration"}]},
+      "targets": [
+        {
+          "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse-otel"},
+          "rawSql": "SELECT TraceId AS trace_id, any(ServiceName) AS service, count() AS spans, max(Duration) AS duration FROM otel.otel_traces WHERE $__timeFilter(Timestamp) GROUP BY TraceId ORDER BY duration DESC LIMIT 20",
+          "refId": "A",
+          "format": 1,
+          "queryType": "sql"
+        }
+      ],
+      "title": "Top traces by duration (ClickHouse)",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "datasource", "uid": "-- Mixed --"},
+      "description": "THE cross-store pivot (ADR 095 D4): each workflow run's authoritative cost/outcome from Postgres, JOINED on trace_id with its span volume from ClickHouse. Query A = Postgres (business of record); Query B = ClickHouse (telemetry); joined by the `trace_id` field transformation. Populates fully once real runs flow (the run's trace_id matches its spans).",
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}}, "unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "cost_usd"}, "properties": [{"id": "unit", "value": "currencyUSD"}]},
+          {"matcher": {"id": "byName", "options": "status"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "mappings", "value": [{"type": "value", "options": {"success": {"color": "green"}, "error": {"color": "red"}, "paused": {"color": "yellow"}}}]}]}
+        ]
+      },
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 22},
+      "id": 6,
+      "options": {"showHeader": true, "sortBy": [{"desc": true, "displayName": "cost_usd"}]},
+      "targets": [
+        {
+          "datasource": {"type": "postgres", "uid": "postgres-bor"},
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT trace_id, workflow, tier, status, cost_usd FROM workflow_runs ORDER BY created_at DESC;",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "grafana-clickhouse-datasource", "uid": "clickhouse-otel"},
+          "rawSql": "SELECT TraceId AS trace_id, count() AS spans, max(Duration) AS duration_ns FROM otel.otel_traces GROUP BY TraceId",
+          "refId": "B",
+          "format": 1,
+          "queryType": "sql"
+        }
+      ],
+      "transformations": [
+        {"id": "joinByField", "options": {"byField": "trace_id", "mode": "outer"}},
+        {"id": "organize", "options": {"indexByName": {"workflow": 0, "tier": 1, "status": 2, "cost_usd": 3, "trace_id": 4, "spans": 5, "duration_ns": 6}}}
+      ],
+      "title": "Cross-store: run cost/outcome (Postgres) ⨯ span volume (ClickHouse), joined on trace_id",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["mdk", "movate", "observability", "unified", "clickhouse", "postgres", "adr-095"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - unified observability",
+  "uid": "mdk-unified-observability",
+  "version": 1,
+  "weekStart": ""
+}

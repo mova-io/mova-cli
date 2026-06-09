@@ -1,0 +1,21 @@
+# ADR 095 — the unified TELEMETRY datasource. Grafana's ClickHouse plugin reads
+# the traces / metrics / logs the OTel collector's clickhouse exporter writes
+# into the `otel` database (otel_traces / otel_metrics_* / otel_logs).
+#
+# uid "clickhouse-otel" is referenced by dashboards/grafana/mdk-unified-observability.json.
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    uid: clickhouse-otel
+    editable: false
+    jsonData:
+      host: clickhouse
+      port: 9000
+      protocol: native
+      username: default
+      defaultDatabase: otel
+    secureJsonData:
+      password: ""
