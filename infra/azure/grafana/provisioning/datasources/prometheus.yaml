@@ -1,0 +1,33 @@
+# Auto-provisioned Prometheus datasource for the movate-dev Grafana (ADR 087).
+#
+# The repo ships a complete PromQL surface (golden-signals / cost / queue-and-pool
+# / runtime-overview / exec-summary / dead-letter), but in the cloud those
+# dashboards rendered NOTHING because there was no Prometheus datasource — the
+# gap ADR 087 calls out ("the most polished dashboards we own render nothing").
+# This provisions it so they light up when the self-hosted Prometheus Container
+# App is deployed (enablePrometheus=true — already the dev default).
+#
+# The uid is PINNED to the value deploy.sh rewrites the PromQL dashboards'
+# ${DS_PROMETHEUS} placeholder to, so the provisioned dashboards bind on first
+# load with no "pick a datasource" step (same approach as the Azure Monitor
+# datasource's pinned uid ffnrfwjnew5xcc).
+#
+# The URL is the internal FQDN of the Prometheus Container App (same Container
+# Apps environment as Grafana). deploy.sh discovers it and sets PROMETHEUS_URL
+# on the Grafana container app; Grafana expands ${PROMETHEUS_URL} here at
+# provisioning time. When Prometheus is NOT deployed, PROMETHEUS_URL is empty and
+# the datasource simply shows as unconfigured — no other dashboard is affected.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: mdkpromds00001
+    type: prometheus
+    access: proxy
+    orgId: 1
+    url: ${PROMETHEUS_URL}
+    isDefault: false
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 30s

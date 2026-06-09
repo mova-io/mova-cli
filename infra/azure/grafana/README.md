@@ -7,6 +7,14 @@ full set. This makes Grafana **reproducible**: a custom image bakes the Azure
 Monitor datasource + the in-repo `dashboards/grafana/azure/*.json` in via file
 provisioning, so a deploy always shows them under the **MDK** folder.
 
+As of ADR 087 it also provisions a **Prometheus** datasource + the in-repo
+**PromQL** dashboards (`dashboards/grafana/mdk-*.json`: golden-signals, cost,
+queue-and-pool, runtime-overview, exec-summary, dead-letter) under a separate
+**MDK · Prometheus** folder. These are the highest-resolution real-time views we
+own; they previously rendered nothing in the cloud because there was no
+Prometheus datasource. They light up when the self-hosted Prometheus Container
+App is deployed (`enablePrometheus=true` — the dev default).
+
 ## Files
 - `Dockerfile` — `FROM grafana/grafana-oss:11.3.0`; copies the provisioning YAML
   to `/etc/grafana/provisioning/` and the azure dashboards to

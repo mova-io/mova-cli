@@ -19,3 +19,19 @@ providers:
     options:
       path: /var/lib/grafana/dashboards/mdk
       foldersFromFilesStructure: false
+
+  # The PromQL dashboards (ADR 087) get their own folder so an operator can tell
+  # the real-time Prometheus views apart from the Azure-Monitor (KQL) ones. They
+  # bind to the pinned Prometheus datasource uid (deploy.sh rewrites their
+  # ${DS_PROMETHEUS} placeholder); only meaningful when Prometheus is deployed.
+  - name: mdk-prometheus
+    orgId: 1
+    folder: "MDK · Prometheus"
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards/prometheus
+      foldersFromFilesStructure: false
