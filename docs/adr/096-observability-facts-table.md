@@ -1,7 +1,12 @@
 # ADR 096 — `observability_facts`: one relational summary table for platform integration
 
-Status: Proposed
+Status: Accepted
 Date: 2026-06-09
+Accepted: 2026-06-09 — locked in by Jeremy with the explicit framing that the
+polyglot stores are kept BY DESIGN (each retains full fidelity); Postgres
+`observability_facts` is the unified reporting/integration surface; durability
+hardening (ClickHouse persistence + TTL, Temporal retention window, Langfuse VM
+volumes) is the companion work, and facts retention is effectively forever.
 Deciders: Engineering + Deva (Movate) — this is the integration contract the
 mova-io platform builds on; the shape is a public-ish surface once the platform
 reads it, so it needs product sign-off.

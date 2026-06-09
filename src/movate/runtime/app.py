@@ -356,6 +356,8 @@ from movate.runtime.schemas import (
     ModelCatalogView,
     ModelInfoView,
     NodeDetailView,
+    ObservabilityFactListView,
+    ObservabilityFactView,
     ObservabilityHealthView,
     ObservabilityInsightListView,
     ObservabilityInsightView,
@@ -15432,6 +15434,52 @@ def build_app(
             anomaly_count=len(latest.anomalies),
             has_insight=True,
         )
+
+    @v1.get(
+        "/observability/facts",
+        response_model=ObservabilityFactListView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_facts(
+        request: Request,
+        kind: str | None = Query(default=None, description="run | workflow_run"),
+        workflow: str | None = Query(default=None),
+        agent: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        since: datetime | None = Query(
+            default=None, description="ISO 8601 timestamp; created_at >= since."
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ObservabilityFactListView:
+        """List this tenant's derived observability facts, newest-first (ADR 096 D5).
+
+        The platform integration surface: one denormalized row per terminal
+        execution event (agent run completed; workflow run terminal/paused),
+        flat scalar columns the reader never has to re-derive from
+        ``runs.metrics`` / ``workflow_runs``. Deep-links out (ClickHouse /
+        Langfuse / Temporal Web) are constructed client-side from
+        ``trace_id`` + ``source_id`` — never stored. Filters AND together;
+        ``limit`` is capped at 500 to keep the response bounded. Pure read,
+        always tenant-scoped (``read`` scope).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_observability_facts(
+            tenant_id=ctx.tenant_id,
+            kind=kind,
+            workflow=workflow,
+            agent=agent,
+            status=status,
+            since=since,
+            limit=limit,
+        )
+        views = [ObservabilityFactView.from_record(r) for r in rows]
+        return ObservabilityFactListView(facts=views, count=len(views))
 
     @v1.post(
         "/observability/ask",
