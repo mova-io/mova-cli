@@ -171,7 +171,67 @@ set, mapped to the edge it fires at:
   supersede their decisions. Each existing control keeps its behavior until it
   is adapted behind the seam (D2) and, separately, flipped to `enforce` (D4).
 
+### D9 — Governance runs on four planes, not one (the scope)
+
+D1–D8 describe a **synchronous, per-request** decision: a `Gate` evaluating one
+`GovernanceContext` at a point in time. That is necessary but it is only *one
+plane* of governance — a single request context structurally cannot see
+accumulated facts, out-of-band events, or the artifacts that ran before any
+request. A complete governance layer invokes the **same `Decision` / audit
+primitive (D2/D5) from four trigger planes**:
+
+1. **Synchronous / per-request** *(D1–D8 — the seam)*. Pure function of one
+   request: model/skill allowlist, input guardrails, per-call cost cap.
+2. **Stateful / aggregate.** Decisions that require *memory across requests* — a
+   per-request context cannot hold them: cumulative tenant spend
+   (`TenantBudgetExceeded`), rate/concurrency over a window (`quotas.py`),
+   session budgets, rolling quality, cost-drift anomaly (already detected in the
+   executor). These are **stateful gates** — still `Gate`s, still `Decision`s,
+   but they read/update a governance store (D10).
+3. **Asynchronous / continuous.** Not request-triggered at all: a scheduled
+   **reconciler** (the ADR 090 control-plane pattern) that scans every agent's
+   *effective* policy against the org baseline and flags drift; eval-regression
+   monitors (ADR 056); the **warn-mode rollup** that tells you a gate is safe to
+   flip `warn → enforce`; attestation + compliance-report generation. The output
+   is a **posture**, not a per-call verdict.
+4. **Artifact / lifecycle / supply-chain.** Govern the *things* before they run a
+   request — triggered by `publish` / `deploy` / `ingest` / a CI PR, not an
+   inbound call: bundle provenance + signing, prompt/model version pinning +
+   approval-to-deploy, deprecation (ADR 090 `AgentStatus`), skill/**context**
+   registration policy, dependency-license gate (`check_licenses`), data
+   residency at ingestion. This is where `mdk governance lint --strict`
+   (policy-as-code in CI) and a deploy-time gate live.
+
+Plus **Plane 0 — meta-governance**: the layer must govern *itself* — policy as
+versioned, **signed** code; separation of duties (the author of an agent ≠ the
+approver of an org cap); and an **audit of policy changes**. Without it,
+governance is theater (anyone who can edit the policy can erase the controls).
+
+**Data governance** is the cross-cut that proves the model: lineage, retention,
+residency, PII, KB-ingestion policy flow across requests and the whole pipeline,
+so they surface on *every* plane at once — a per-call `redact_pii` obligation
+(1), a retention window (2), a lineage attestation (3), residency-at-ingest (4).
+
+The primitive does not change across planes. What changes is the **trigger** and
+the **consumer**: a request returns a `Decision`; a schedule produces a posture;
+a lifecycle event gates an artifact — all landing in **one audit spine**.
+
+### D10 — A `GovernanceState` seam for stateful gates (unlocks Plane 2)
+
+Add a `GovernanceState` Protocol behind the `StorageProvider` Protocol so a gate
+can read accumulated facts (spend-this-window, request-count, last-eval-score)
+and the engine can record post-decision counters — without coupling `core` to a
+concrete store (CLAUDE.md §6). This is the single architectural addition that
+turns the existing per-tenant budget/quota machinery into **stateful gates**
+behind the one engine, rather than a parallel enforcement path. Pure gates
+(Plane 1) ignore it; stateful gates (Plane 2) depend on the Protocol, never a
+backend.
+
 ## Phasing (each independently shippable; warn-first)
+
+The sync seam (Phases 1–5 below) ships first; the further planes (D9) are
+**additive follow-ons that reuse the same `Decision`/audit primitive** and are
+sequenced after the existing checks are consolidated behind it:
 
 1. **Seam, no behavior change.** `GovernancePolicy` + `PolicyResolver` (D1),
    `Gate`/`Decision`/`GovernanceEngine` (D2/D3), `warn`/`enforce` modes (D4).
@@ -188,6 +248,19 @@ set, mapped to the edge it fires at:
 5. **Flip to enforce.** Per-gate, per-tenant, once the warn-mode audit says the
    blast radius is acceptable. This is a config + Deva decision, not a code
    change.
+
+Then the further planes (D9), in leverage order — each additive, each `warn`-first:
+
+6. **Plane 2 — stateful gates.** The `GovernanceState` seam (D10) + re-express
+   tenant budget / quota as stateful gates behind the one engine. Highest
+   leverage; reuses storage; consolidates real fragmentation.
+7. **Plane 4 — lifecycle gates.** Deploy/publish/ingest gates + `mdk governance
+   lint` in CI. Reuses the control plane (ADR 090) + `check_licenses`; most
+   *enterprise* value (approval-to-deploy, provenance, residency-at-ingest).
+8. **Plane 3 — reconciler + posture.** The scheduled policy/drift scan +
+   compliance reporting, once warn-mode audit data is rich enough to drive it.
+9. **Plane 0 — meta-governance.** Signed policy + change audit + separation of
+   duties — added when `enforce` goes live, because that is when tampering matters.
 
 ## Consequences
 
