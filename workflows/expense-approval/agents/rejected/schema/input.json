@@ -1,1 +1,1 @@
-{"type":"object","additionalProperties":true,"required":["tier"],"properties":{"tier":{"type":"string"}}}
+{"type":"object","additionalProperties":true,"properties":{"expense_text":{"type":"string"},"decision":{"type":"string"}}}

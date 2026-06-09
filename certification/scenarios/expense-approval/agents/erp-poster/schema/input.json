@@ -1,1 +1,1 @@
-{"type":"object","additionalProperties":true,"required":["amount"],"properties":{"amount":{"type":"string"}}}
+{"type":"object","additionalProperties":true,"properties":{"expense_text":{"type":"string"},"amount":{"type":"number"}}}

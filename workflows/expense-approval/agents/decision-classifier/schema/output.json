@@ -1,1 +1,1 @@
-{"type":"object","additionalProperties":true,"required":["verdict"],"properties":{"verdict":{"type":"string"}}}
+{"type":"object","additionalProperties":true,"required":["label"],"properties":{"label":{"type":"string"}}}

@@ -2,11 +2,10 @@ api_version: movate/v1
 kind: Agent
 name: erp-poster
 version: 0.1.0
-description: erp-poster
+description: Posts an approved expense to the finance/ERP system and returns a confirmation.
 model:
   provider: openai/gpt-4o-mini
   params: {temperature: 0.0}
 prompt: ./prompt.md
 schema: {input: ./schema/input.json, output: ./schema/output.json}
 evals: {dataset: ./evals/dataset.jsonl}
-skills: [sim-erp]

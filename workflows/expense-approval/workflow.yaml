@@ -21,7 +21,7 @@ nodes:
     cases:
       - when: {field: amount, op: gt, value: 5000}
         to: director-approval
-      - when: {field: amount, op: gt, value: 0}
+      - when: {field: amount, op: gt, value: 100}
         to: manager-approval
     default: post-erp-auto
   # --- auto tier (no approval) ---

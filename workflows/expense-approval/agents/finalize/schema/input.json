@@ -1,1 +1,1 @@
-{"type":"object","additionalProperties":true,"required":["erp_result"],"properties":{"erp_result":{"type":"string"}}}
+{"type":"object","additionalProperties":true,"properties":{"erp_result":{"type":"string"},"expense_text":{"type":"string"}}}
