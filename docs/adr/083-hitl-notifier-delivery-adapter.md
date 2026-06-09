@@ -1,6 +1,6 @@
 # ADR 083 — HITL Notifier delivery adapter (the escalation hand-off)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (HITL notifier delivery adapter incl. the Slack sink; core/notifier_sinks). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-06-06
 **Deciders:** Engineering (Movate)
 **Implements:** ADR 077 D3 (the "delivery adapter" the durable-HITL rollout named

@@ -1,6 +1,6 @@
 # ADR 020 — OTel Collector → Azure Monitor (in-cluster App Insights export)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (OTel collector → Azure Monitor metrics pipeline; infra/otel-collector + tracing/dual_export). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-24
 **Deciders:** Engineering (observability + infra)
 **Context window:** v1.0 Azure operability — get the runtime's OTLP traces into Application Insights on live ACA

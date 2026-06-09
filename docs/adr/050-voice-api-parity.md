@@ -1,6 +1,6 @@
 # ADR 050 — Voice API surface & CLI parity: voice is an I/O modality on the existing run/agent/session resources, not a parallel API
 
-**Status:** Proposed
+**Status:** Accepted — shipped (voice API + CLI parity; `mdk voice`). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-29
 **Deciders:** Engineering + Deva (Movate)
 **Builds on / composes with (changes nothing in any of them):**

@@ -1,6 +1,6 @@
 # ADR 060 — Skills & Contexts as first-class managed resources (full API + CLI parity)
 
-**Status:** Proposed
+**Status:** Accepted — shipped (skills/contexts as managed resources; #652 D4 managed-ref resolution). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-05-31
 **Deciders:** Engineering (control-plane / API)
 **Context window:** close the last real CLI↔API parity gaps — promote skills and

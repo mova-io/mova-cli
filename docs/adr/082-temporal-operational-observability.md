@@ -1,6 +1,6 @@
 # ADR 082 — Temporal operational observability: runtime-tagged completion metric + workbook
 
-**Status:** Proposed
+**Status:** Accepted — shipped (Temporal operational observability: worker metrics gauge + Web UI). _(status reconciled to shipped reality 2026-06-08)_
 **Date:** 2026-06-06
 **Deciders:** Engineering (Movate)
 **Builds on / composes with (changes nothing in their wire contracts):**
