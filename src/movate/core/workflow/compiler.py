@@ -197,16 +197,22 @@ def compile_workflow(
                         f"not exist: {resolved_sref}"
                     )
                 resolved_specialists[sid] = str(resolved_sref)
+            supervisor_metadata: dict[str, Any] = {
+                "manager": str(resolved_manager),
+                "specialists": resolved_specialists,
+                "max_delegations": ns.max_delegations,
+                "decision_field": ns.decision_field,
+            }
+            # Aggregate budget (ADR 092 D5 / Phase 4) — only stamped when set, so
+            # a plain supervisor's metadata is unchanged and the runner skips the
+            # cost accounting when there's no cap.
+            if ns.budget is not None:
+                supervisor_metadata["budget"] = ns.budget
             nodes[ns.id] = WorkflowNode(
                 id=ns.id,
                 type=NodeType.SUPERVISOR,
                 ref=str(resolved_manager),  # the manager agent (the delegator)
-                metadata={
-                    "manager": str(resolved_manager),
-                    "specialists": resolved_specialists,
-                    "max_delegations": ns.max_delegations,
-                    "decision_field": ns.decision_field,
-                },
+                metadata=supervisor_metadata,
             )
         else:
             raise WorkflowCompileError(f"node {ns.id!r}: unknown node type {ns.type!r}")
