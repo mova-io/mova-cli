@@ -540,6 +540,157 @@ async def test_temporal_fan_out_matches_native(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SUPERVISOR parity (ADR 092 D4 / Phase 3b) — the bounded managerial delegation
+# loop reaches the SAME final state on Temporal (a durable bounded loop) as on
+# the native runner.
+# ---------------------------------------------------------------------------
+
+
+class _SupervisorProvider(BaseLLMProvider):
+    """Manager delegates to ``researcher`` once, then says ``done``; the
+    researcher writes ``findings``; finalize writes ``answer``. Stateful so the
+    manager's decision flips after the first round — deterministic per backend
+    (each backend gets a fresh instance)."""
+
+    name = "supervisor"
+    version = "0.0.1"
+
+    def __init__(self) -> None:
+        self._manager_calls = 0
+
+    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        body = request.messages[0].content
+        if "as next" in body:
+            self._manager_calls += 1
+            choice = "researcher" if self._manager_calls == 1 else "done"
+            return CompletionResponse(text=json.dumps({"next": choice}))
+        if "as findings" in body:
+            return CompletionResponse(text=json.dumps({"findings": "data"}))
+        if "as answer" in body:
+            return CompletionResponse(text=json.dumps({"answer": "final"}))
+        return CompletionResponse(text="{}")  # pragma: no cover
+
+    async def stream(self, request: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    async def embed(self, text: str, *, model: str) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+
+def _scaffold_supervisor(tmp_path: Path) -> Path:
+    """``orchestrate (supervisor: manager → researcher) → finalize`` (temporal)."""
+    wf = tmp_path / "wf"
+    _make_agent(wf / "agents" / "manager", name="mgr", input_key="task", output_key="next")
+    _make_agent(wf / "agents" / "researcher", name="rsr", input_key="task", output_key="findings")
+    _make_agent(wf / "agents" / "finalize", name="fin", input_key="findings", output_key="answer")
+    wf.mkdir(parents=True, exist_ok=True)
+    (wf / "state.json").write_text(
+        json.dumps(
+            {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {"task": {"type": "string"}},
+            }
+        )
+    )
+    (wf / "workflow.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "api_version": "movate/v1",
+                "kind": "Workflow",
+                "name": "supervisor-demo",
+                "version": "0.1.0",
+                "runtime": "temporal",
+                "state_schema": "./state.json",
+                "entrypoint": "orchestrate",
+                "nodes": [
+                    {
+                        "id": "orchestrate",
+                        "type": "supervisor",
+                        "manager": "./agents/manager",
+                        "specialists": {"researcher": "./agents/researcher"},
+                        "max_delegations": 4,
+                    },
+                    {"id": "finalize", "type": "agent", "ref": "./agents/finalize"},
+                ],
+                "edges": [{"from": "orchestrate", "to": "finalize"}],
+            }
+        )
+    )
+    return wf / "workflow.yaml"
+
+
+@pytest.mark.smoke
+async def test_temporal_supervisor_matches_native(tmp_path: Path) -> None:
+    """A bounded SUPERVISOR reaches the SAME joined state on Temporal (a durable
+    bounded delegation loop) as on the native runner."""
+    pricing = load_pricing()
+    initial_state = {"task": "investigate"}
+    graph = _load_graph(_scaffold_supervisor(tmp_path))
+
+    native_storage = InMemoryStorage()
+    await native_storage.init()
+    native_runner = WorkflowRunner(
+        executor=Executor(
+            provider=_SupervisorProvider(),
+            pricing=pricing,
+            storage=native_storage,
+            tracer=NullTracer(),
+        ),
+        storage=native_storage,
+    )
+    native_result = await native_runner.run(graph, initial_state=dict(initial_state))
+    assert native_result.status is WorkflowStatus.SUCCESS
+    assert native_result.final_state == {
+        "task": "investigate",
+        "next": "done",
+        "findings": "data",
+        "answer": "final",
+    }
+
+    temporal_storage = InMemoryStorage()
+    await temporal_storage.init()
+    configure_activities(
+        storage=temporal_storage,
+        pricing=pricing,
+        tracer=NullTracer(),
+        provider=_SupervisorProvider(),
+        tenant_id="local",
+    )
+    compiled = TemporalCompiler().compile(graph)
+    workflow_cls = load_compiled_workflow_class(
+        compiled.module_source, compiled.workflow_class_name
+    )
+    env = await WorkflowEnvironment.start_time_skipping()
+    async with (
+        env,
+        Worker(
+            env.client,
+            task_queue=DEFAULT_TASK_QUEUE,
+            workflows=[workflow_cls],
+            activities=[
+                call_agent_activity,
+                call_skill_activity,
+                call_gate_activity,
+                call_judge_activity,
+                persist_workflow_result_activity,
+            ],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ),
+    ):
+        temporal_final = await env.client.execute_workflow(
+            workflow_cls.run,
+            {**initial_state, "tenant_id": "local"},
+            id="conformance-supervisor-1",
+            task_queue=DEFAULT_TASK_QUEUE,
+        )
+
+    temporal_final.pop("tenant_id", None)
+    assert temporal_final == native_result.final_state
+
+
+# ---------------------------------------------------------------------------
 # Durable HITL (ADR 062) — HUMAN node pauses durably + resumes on a signal,
 # matching the native runner's pause/resume final state (D7 parity), plus the
 # Temporal-only durable timeout route (D4).

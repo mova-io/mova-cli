@@ -38,7 +38,9 @@ reproduces them):
 * SKILL      → ``await workflow.execute_activity(call_skill_activity, ...)``
 * GATE / INTENT_ROUTER → activity returns a routing decision; workflow branches.
 * JUDGE      → activity returns ``{terminate, verdict}``; workflow gates.
-* SUPERVISOR → Python-level orchestration in the workflow body.
+* SUPERVISOR → a bounded ``for _ in range(max_delegations)`` delegation loop
+  (ADR 092 D4): the manager activity decides, an allowlisted specialist activity
+  runs, repeat — deterministic + anti-runaway.
 * HUMAN      → durable HITL (ADR 062): a ``call_human_activity`` persists the
   awaiting-human pause record, then the workflow parks on
   ``workflow.wait_condition`` until a ``human_response`` signal arrives (or an
@@ -609,6 +611,8 @@ class TemporalCompiler:
             return self._emit_gate_node(nid, node, spec)
         if node_type is NodeType.JUDGE:
             return self._emit_judge_node(nid, node, spec)
+        if node_type is NodeType.SUPERVISOR:
+            return self._emit_supervisor_node(nid, node, spec)
         if node_type is NodeType.HUMAN:
             return self._emit_human_node(nid, node, spec)
         if node_type is NodeType.TOOL:
@@ -896,6 +900,59 @@ class TemporalCompiler:
             "            return state",
         ]
         return body, {"call_judge_activity"}
+
+    def _emit_supervisor_node(
+        self, nid: str, node: Any, spec: WorkflowGraph
+    ) -> tuple[list[str], set[str]]:
+        """SUPERVISOR → a bounded managerial delegation loop (ADR 092 D4 / Phase 3b).
+
+        Lowers the native ``_run_supervisor`` loop to deterministic Temporal
+        code: a ``for _ in range(max_delegations)`` loop (a *bounded* loop — the
+        determinism + anti-runaway requirement) that runs the manager activity,
+        reads its ``decision_field`` output, and — for a specialist id in the
+        FIXED allowlist — runs that specialist activity, merging each result into
+        ``state``. ``"done"`` or an out-of-allowlist choice breaks the loop. The
+        chosen specialist's ref is selected at runtime from an emitted dict
+        literal, so the manager may delegate ONLY within its roster — byte-for-byte
+        the native semantics, so the conformance test passes.
+        """
+        meta = node.metadata
+        manager_ref: str = meta["manager"]
+        specialists: dict[str, str] = meta.get("specialists", {})
+        max_delegations: int = int(meta.get("max_delegations", 4) or 4)
+        decision_field: str = meta.get("decision_field", "next")
+        nxt = self._sequential_successor(spec, nid)
+        var = _safe_method_name(nid)
+        specialists_literal = "{" + ", ".join(f"{k!r}: {v!r}" for k, v in specialists.items()) + "}"
+        body = [
+            f"# node {nid!r} — SUPERVISOR (ADR 092 D4): bounded managerial delegation",
+            f"{var}_specialists = {specialists_literal}",
+            f"for _ in range({max_delegations}):  # max_delegations — anti-runaway cap",
+            f"    {var}_mgr = await workflow.execute_activity(",
+            "        call_agent_activity,",
+            f"        args=[{nid!r}, {manager_ref!r}, state, run_id],",
+            "        schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+            "        heartbeat_timeout=_HEARTBEAT,",
+            "        retry_policy=_RETRY_POLICY,",
+            "    )",
+            f"    state.update({var}_mgr)",
+            f"    {var}_choice = str({var}_mgr.get({decision_field!r}, '')).strip()",
+            f"    if {var}_choice == 'done' or {var}_choice not in {var}_specialists:",
+            "        break",
+            f"    {var}_spec = await workflow.execute_activity(",
+            "        call_agent_activity,",
+            (
+                f"        args=[{nid!r} + '/' + {var}_choice, "
+                f"{var}_specialists[{var}_choice], state, run_id],"
+            ),
+            "        schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
+            "        heartbeat_timeout=_HEARTBEAT,",
+            "        retry_policy=_RETRY_POLICY,",
+            "    )",
+            f"    state.update({var}_spec)",
+            f"current = {nxt!r}",
+        ]
+        return body, {"call_agent_activity"}
 
     def _emit_human_node(
         self, nid: str, node: Any, spec: WorkflowGraph
