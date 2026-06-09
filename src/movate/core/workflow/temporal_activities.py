@@ -157,13 +157,16 @@ class ActivityContext:
     runtime_policy: Any = None
     """Project ``RuntimePolicy`` (allowed AgentRuntime backends)."""
     skill_policy: Any = None
-    """Project ``SkillPolicy`` (allowed skill side-effect classes).
+    """Project ``SkillPolicy`` (allowed skill side-effect classes)."""
+    guardrails: Any = None
+    """Project ``GuardrailsConfig`` (PII / topic / content safety).
 
-    These three are threaded into the per-activity Executor (see
-    :func:`_executor_for`) so the executor's policy enforcement **and** the
-    ADR 093 governance shadow are active on the Temporal backend — exactly as
+    These are threaded into the per-activity Executor (see :func:`_executor_for`)
+    so the executor's policy enforcement, the ADR 093 governance shadow, **and
+    the safety guardrails** are active on the Temporal backend — exactly as
     ``build_local_runtime`` wires them for the local/native path. Without them
-    the durable backend ran fully permissive (governance silently dormant)."""
+    the durable backend ran fully permissive (governance + guardrails silently
+    dormant — PII/content checks did not fire on Temporal runs)."""
 
 
 _CONTEXT: ActivityContext | None = None
@@ -180,6 +183,7 @@ def configure_activities(
     policy: Any = None,
     runtime_policy: Any = None,
     skill_policy: Any = None,
+    guardrails: Any = None,
 ) -> None:
     """Install the :class:`ActivityContext` the four activities read.
 
@@ -212,7 +216,7 @@ def configure_activities(
     # load_project_config() returns a permissive ProjectConfig() when no config
     # is on disk, so a deployment without a project config is byte-for-byte
     # unchanged. Explicit args win (the test escape hatch, like ``defaults``).
-    if policy is None or runtime_policy is None or skill_policy is None:
+    if policy is None or runtime_policy is None or skill_policy is None or guardrails is None:
         with contextlib.suppress(Exception):
             from movate.core.config import load_project_config  # noqa: PLC0415
 
@@ -220,6 +224,7 @@ def configure_activities(
             policy = policy if policy is not None else cfg.policy
             runtime_policy = runtime_policy if runtime_policy is not None else cfg.runtime
             skill_policy = skill_policy if skill_policy is not None else cfg.skills
+            guardrails = guardrails if guardrails is not None else cfg.guardrails
 
     global _CONTEXT  # noqa: PLW0603 — module-global DI registry, set once at worker startup.
     _CONTEXT = ActivityContext(
@@ -232,6 +237,7 @@ def configure_activities(
         policy=policy,
         runtime_policy=runtime_policy,
         skill_policy=skill_policy,
+        guardrails=guardrails,
     )
 
 
@@ -286,12 +292,14 @@ def _executor_for(ctx: ActivityContext, state: dict[str, Any]) -> Any:
         storage=ctx.storage,
         tracer=ctx.tracer,
         tenant_id=_resolve_tenant_id(ctx, state),
-        # Thread the project policies so the durable backend enforces policy +
-        # runs the governance shadow (ADR 093) — None ⇒ Executor's permissive
+        # Thread the project policies + guardrails so the durable backend
+        # enforces policy, runs the governance shadow (ADR 093), AND applies the
+        # PII/topic/content safety guardrails — None ⇒ Executor's permissive
         # default (the deployed-without-config / native-parity behavior).
         policy=ctx.policy,
         runtime_policy=ctx.runtime_policy,
         skill_policy=ctx.skill_policy,
+        guardrails=ctx.guardrails,
     )
 
 
