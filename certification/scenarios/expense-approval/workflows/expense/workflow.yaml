@@ -4,21 +4,26 @@ name: expense-approval
 version: 0.1.0
 description: >
   Tiered expense approval. CERTIFICATION FINDINGS (the authoring tax to express
-  one standard enterprise workflow): (1) #47 no value routing — the AMOUNT tier
-  needs an LLM intent-router; (2) HUMAN nodes can't route — each approve/reject
-  needs a SECOND LLM intent-router; (3) no joins/fan-in — the three approval
-  paths can't share one `post-erp`/`finalize`, so each is DUPLICATED. Net: a
-  3-tier approval+ERP flow becomes ~14 nodes incl. 3 LLM classifiers + 3 copies
-  of the ERP-submit node. The runtime (durable HITL) is fine; the authoring is not.
+  one standard enterprise workflow): (1) #47 CLOSED — the AMOUNT tier now routes
+  on a deterministic `decision` node (ADR 094), no LLM; (2) HUMAN nodes can't
+  route — each approve/reject still needs an LLM intent-router (#48); (3) no
+  joins/fan-in — the three approval paths can't share one `post-erp`/`finalize`,
+  so each is DUPLICATED (#49). Net after #47: 12 nodes, 2 LLM classifiers (down
+  from 3) + 3 copies of the ERP-submit node. The runtime (durable HITL) is fine;
+  the remaining authoring tax is #48/#49.
 state_schema: ../../state.json
 entrypoint: classify
 nodes:
+  # #47 CLOSED: deterministic value routing on the expense amount — no LLM, and
+  # on Temporal no activity (ADR 094). Replaces the old LLM tier-classifier.
   - id: classify
-    type: intent-router
-    classifier_agent: ../../agents/tier-classifier
-    input_field: expense_text
-    routes: {auto: post-erp-auto, manager: manager-approval, director: director-approval}
-    fallback: manager-approval
+    type: decision
+    cases:
+      - when: {field: amount, op: gt, value: 5000}
+        to: director-approval
+      - when: {field: amount, op: gt, value: 0}
+        to: manager-approval
+    default: post-erp-auto
   # --- auto tier (no approval) ---
   - {id: post-erp-auto, type: agent, ref: ../../agents/erp-poster}
   - {id: finalize-auto, type: agent, ref: ../../agents/finalize}
