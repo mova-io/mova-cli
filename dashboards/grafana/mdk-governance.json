@@ -1,0 +1,187 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "mdk governance view (ADR 093): every gate decision the GovernanceEngine makes, from mdk.governance.decisions{kind,effect,mode,tenant}. The rollout story lives here - while a gate is mode=warn (shadow), a would-be deny is recorded as effect=warn; that warn-rate per kind is the parity evidence that gates the warn->enforce flip. Once a gate is mode=enforce, effect=deny is a real block.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "text",
+      "id": 400,
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 0},
+      "title": "mdk - governance: warn -> enforce rollout",
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - governance decisions (ADR 093)\n\n**What this shows.** Every gate evaluation the `GovernanceEngine` makes, from `mdk.governance.decisions{kind,effect,mode,tenant}`. `kind` = the dimension (model / runtime / skill / cost / quota). `effect` = the resolved outcome. `mode` = the rollout posture.\n\n**The rollout signal.** While a gate is `mode=warn` (shadow), a would-be deny is **downgraded to `effect=warn`** - recorded, never blocked. The **warn-rate per kind** is your parity evidence: it tells you what *would* be denied if you flipped that gate to `enforce`.\n\n**How to use it.**\n\n- `warn-rate ~0 for a kind` -> nothing trips that gate in practice; flipping it to `enforce` is low-risk.\n- `warn-rate non-zero` -> inspect *which* tenants/decisions before flipping (you'd start blocking them). Pair with the `governance.*` audit log for the specific reasons.\n- After flipping a gate to `mode=enforce`, its blocks appear as `effect=deny, mode=enforce` (the bottom-right panel) - real 4xx/PolicyViolationError.\n\n**Note.** `effect=allow` is the common case and is intentionally not audited (logs stay signal-dense); it is still counted here so rates have a denominator."
+      }
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "THE rollout panel: would-be denials while in shadow. In warn mode a gate's deny is recorded as effect=warn. A flat ~0 line for a kind means flipping it to enforce is low-risk. Source: mdk.governance.decisions{effect=warn, mode=warn}.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 7},
+      "id": 1,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (kind) (rate(mdk_governance_decisions_total{effect=\"warn\", mode=\"warn\", tenant=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Would-be-deny rate by kind, in shadow (warn mode) - the flip-readiness signal",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Decision mix across all gates: allow vs warn vs deny. The denominator context for the would-be-deny rate. Source: mdk.governance.decisions by effect.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "stacking": {"mode": "normal", "group": "A"}},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "id": 2,
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (effect) (rate(mdk_governance_decisions_total{tenant=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{effect}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Decision mix by effect (allow / warn / deny)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "ENFORCED denials: real blocks (PolicyViolationError / 4xx), by kind. Non-zero only after a gate is flipped to mode=enforce. Source: mdk.governance.decisions{effect=deny, mode=enforce}.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "showPoints": "never", "thresholdsStyle": {"mode": "line+area"}},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "orange", "value": 0.01}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
+      "id": 3,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (kind) (rate(mdk_governance_decisions_total{effect=\"deny\", mode=\"enforce\", tenant=~\"$tenant\"}[5m]))",
+          "legendFormat": "{{kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Enforced denials by kind (real blocks)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "governance", "adr-093", "policy"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": ".*"},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(mdk_governance_decisions_total, tenant)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "tenant",
+        "multi": true,
+        "name": "tenant",
+        "options": [],
+        "query": {"query": "label_values(mdk_governance_decisions_total, tenant)", "refId": "StandardVariableQuery"},
+        "refresh": 2,
+        "regex": "",
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - governance",
+  "uid": "mdk-governance",
+  "version": 1,
+  "weekStart": ""
+}
