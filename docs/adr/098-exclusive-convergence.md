@@ -1,7 +1,8 @@
 # ADR 098 — Exclusive convergence (OR-merge): shared sinks for mutually exclusive branches
 
-Status: Proposed
+Status: Accepted
 Date: 2026-06-09
+Accepted: 2026-06-09 — approved by Jeremy. Ratified incl. clause (b) exclusive tails + bundled on_timeout validation fix.
 Deciders: Engineering — validator-only relaxation behind the existing
 `validate_linear` phase gate (CLAUDE.md §6/§7: validators are layered on the IR;
 the IR and both runtimes are untouched).
