@@ -28,3 +28,11 @@ approver's free-text decision and routes approve→ERP-post or reject.
 - Edit the thresholds in the `classify` node's `cases` (e.g. company approval limits).
 - Swap the approval chain: add/remove HUMAN tiers + their `*-decision` routers.
 - Point `erp-poster` at your real finance system (today it returns a synthetic posting ref).
+
+## Budget
+
+Per-run LLM spend is bounded: the workflow makes at most 3 model calls on any
+path (one `*-decision` classifier + ERP-post + finalize/rejected — the amount
+tier itself is deterministic, zero-cost). Cap absolute spend with the agent
+`budget.max_cost_usd_per_run` field or a governance COST gate (ADR 093); the
+eval-gate below is the quality budget.
