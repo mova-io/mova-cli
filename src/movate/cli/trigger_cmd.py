@@ -85,6 +85,31 @@ def create_trigger(
         help="Default job payload merged UNDER the event body: JSON object, file, or '-'. "
         "Default: {}.",
     ),
+    event_key: str | None = typer.Option(
+        None,
+        "--event-key",
+        help="Nest the raw event body under this single state key (e.g. 'event') "
+        "instead of merging it at top level (ADR 100 D2).",
+    ),
+    input_map_arg: str | None = typer.Option(
+        None,
+        "--input-map",
+        help="JSON object mapping output state key -> dotted path into the event body, "
+        'e.g. \'{"work_item_id": "resource.id"}\'. Missing paths are omitted (ADR 100 D2).',
+    ),
+    dedup_key: str | None = typer.Option(
+        None,
+        "--dedup-key",
+        help="Dotted path into the event body used as the delivery id when the "
+        "X-Movate-Delivery-Id header is absent (ADR 100 D2).",
+    ),
+    auth_mode: str = typer.Option(
+        "hmac",
+        "--auth-mode",
+        help="Fire-endpoint auth: hmac (default; body-bound X-Movate-Signature, "
+        "X-Hub-Signature-256 accepted as an alias) or token (static "
+        "X-Movate-Trigger-Token header — weaker, pair with --dedup-key) (ADR 100 D3).",
+    ),
     disabled: bool = typer.Option(
         False, "--disabled", help="Create the trigger but leave it dormant (won't fire)."
     ),
@@ -104,6 +129,12 @@ def create_trigger(
 
       [dim]# A disabled (dormant) workflow trigger[/dim]
       $ mdk trigger create returns-pipeline -k workflow --disabled
+
+      [dim]# ADO work-item triage: static-token auth + body-id dedup +[/dim]
+      [dim]# declared event mapping (ADR 100 D2/D3)[/dim]
+      $ mdk trigger create work-item-triage -k workflow --name ado-work-items \\
+          --auth-mode token --dedup-key id --event-key event \\
+          --input-map '{"work_item_id": "resource.id", "event_type": "eventType"}'
     """
     if kind not in (JobKind.AGENT, JobKind.WORKFLOW):
         err_console.print(
@@ -111,12 +142,33 @@ def create_trigger(
             "(eval has its own scheduler: mdk eval-schedule)"
         )
         raise typer.Exit(code=2)
+    if auth_mode not in ("hmac", "token"):
+        err_console.print(f"[red]✗[/red] --auth-mode must be hmac|token, got {auth_mode!r}")
+        raise typer.Exit(code=2)
 
     try:
         defaults = _coerce_input(input_defaults_arg) if input_defaults_arg is not None else {}
     except ValueError as exc:
         err_console.print(f"[red]✗[/red] {exc}")
         raise typer.Exit(code=2) from None
+
+    input_map: dict[str, str] | None = None
+    if input_map_arg is not None:
+        try:
+            input_map = _coerce_input_map(input_map_arg)
+        except ValueError as exc:
+            err_console.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(code=2) from None
+
+    if auth_mode == "token":
+        # ADR 100 D3: token mode is explicitly weaker — the secret travels
+        # on the wire (TLS-protected) and a captured request is replayable
+        # until rotation. Warn, and push the dedup pairing.
+        err_console.print(
+            "[yellow]⚠ --auth-mode token is weaker than hmac:[/yellow] the secret travels "
+            "on the wire and a captured request is replayable until rotation. "
+            "Pair it with --dedup-key so a replay can at worst re-run what already ran once."
+        )
 
     target_name = _resolve_target_name(target)
     trigger_name = name or target_name
@@ -127,6 +179,10 @@ def create_trigger(
         kind=kind,
         target=target_name,
         input_defaults=defaults,
+        event_key=event_key,
+        input_map=input_map,
+        dedup_key=dedup_key,
+        auth_mode=auth_mode,
         enabled=not disabled,
     )
     asyncio.run(_save(minted.record))
@@ -141,6 +197,10 @@ def create_trigger(
                 "name": minted.record.name,
                 "kind": minted.record.kind.value,
                 "target": minted.record.target,
+                "event_key": minted.record.event_key,
+                "input_map": minted.record.input_map,
+                "dedup_key": minted.record.dedup_key,
+                "auth_mode": minted.record.auth_mode,
                 "enabled": minted.record.enabled,
                 "webhook_path": webhook_path,
                 "secret": minted.secret,
@@ -200,6 +260,10 @@ def list_triggers(
                     "target": t.target,
                     "enabled": t.enabled,
                     "input_defaults": t.input_defaults,
+                    "event_key": t.event_key,
+                    "input_map": t.input_map,
+                    "dedup_key": t.dedup_key,
+                    "auth_mode": t.auth_mode,
                     "last_fired_at": t.last_fired_at.isoformat() if t.last_fired_at else None,
                 }
                 for t in triggers
@@ -289,6 +353,24 @@ def _ensure_dict(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"--input-defaults must be a JSON object, got {type(value).__name__}")
     return value
+
+
+def _coerce_input_map(arg: str) -> dict[str, str]:
+    """Parse ``--input-map`` — a JSON object of state key → dotted body path."""
+    import json  # noqa: PLC0415
+
+    try:
+        parsed = json.loads(arg)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--input-map must be a JSON object: {exc}") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+    ):
+        raise ValueError(
+            "--input-map must be a JSON object of string -> dotted path, e.g. "
+            '\'{"work_item_id": "resource.id"}\''
+        )
+    return parsed
 
 
 def _resolve_target_name(target: str) -> str:

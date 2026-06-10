@@ -95,3 +95,40 @@ def test_mint_rejects_eval_kind() -> None:
             kind=JobKind.EVAL,
             target="agent",
         )
+
+
+# ---------------------------------------------------------------------------
+# ADR 100 D2/D3 — event mapping + auth-mode fields
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_adr100_fields_default_off() -> None:
+    """Back-compat: every pre-ADR-100 trigger reads back with the defaults
+    (verbatim merge / header-only dedup / hmac)."""
+    t = Trigger(**_kwargs())
+    assert t.event_key is None
+    assert t.input_map is None
+    assert t.dedup_key is None
+    assert t.auth_mode == "hmac"
+
+
+@pytest.mark.unit
+def test_adr100_fields_round_trip() -> None:
+    t = Trigger(
+        **_kwargs(),
+        event_key="event",
+        input_map={"work_item_id": "resource.id"},
+        dedup_key="id",
+        auth_mode="token",
+    )
+    assert t.event_key == "event"
+    assert t.input_map == {"work_item_id": "resource.id"}
+    assert t.dedup_key == "id"
+    assert t.auth_mode == "token"
+
+
+@pytest.mark.unit
+def test_auth_mode_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError):
+        Trigger(**_kwargs(), auth_mode="basic")

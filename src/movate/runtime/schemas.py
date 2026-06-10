@@ -1361,6 +1361,21 @@ class TriggerCreateRequest(BaseModel):
     input_defaults: dict[str, Any] = Field(default_factory=dict)
     """Baseline job payload, merged UNDER the inbound event body (the event
     body wins on key collisions)."""
+    event_key: str | None = Field(None)
+    """ADR 100 D2: nest the raw event body under this single state key
+    instead of merging it at top level. ``None`` → verbatim merge (today's
+    behavior, unless ``input_map`` is set)."""
+    input_map: dict[str, str] | None = Field(None)
+    """ADR 100 D2: output state key → dotted path into the event body.
+    Missing path → key omitted (fail-soft), never an error."""
+    dedup_key: str | None = Field(None)
+    """ADR 100 D2: dotted path into the event body used as the delivery id
+    when the ``X-Movate-Delivery-Id`` header is absent."""
+    auth_mode: Literal["hmac", "token"] = Field("hmac")
+    """ADR 100 D3: fire-endpoint auth. ``hmac`` (default — body-bound
+    ``X-Movate-Signature``, with GitHub's ``X-Hub-Signature-256`` as an
+    alias) or ``token`` (static ``X-Movate-Trigger-Token`` header — weaker,
+    replayable until rotation; pair with ``dedup_key``)."""
     enabled: bool = Field(True)
 
     @field_validator("kind")
@@ -1393,6 +1408,15 @@ class TriggerView(BaseModel):
     kind: JobKind
     target: str
     input_defaults: dict[str, Any]
+    event_key: str | None = None
+    """ADR 100 D2 event-body nesting key — ``None`` on every pre-ADR-100
+    trigger (verbatim-merge behavior)."""
+    input_map: dict[str, str] | None = None
+    """ADR 100 D2 declared field extraction — ``None`` when unset."""
+    dedup_key: str | None = None
+    """ADR 100 D2 body-sourced delivery-id path — ``None`` when unset."""
+    auth_mode: Literal["hmac", "token"] = "hmac"
+    """ADR 100 D3 fire-endpoint auth mode."""
     enabled: bool
     last_fired_at: str | None = None
     created_at: str

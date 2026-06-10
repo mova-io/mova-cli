@@ -126,10 +126,10 @@ from movate.core.reporting import (
 from movate.core.triggers import (
     DELIVERY_ID_HEADER,
     DELIVERY_ID_MAX_LEN,
-    SIGNATURE_HEADER,
     build_triggered_job,
     mint_trigger,
-    verify_signature,
+    resolve_body_delivery_id,
+    verify_fire_auth,
 )
 from movate.core.webhooks import (
     WebhookAttemptListView,
@@ -12097,6 +12097,10 @@ def build_app(
             kind=t.kind,
             target=t.target,
             input_defaults=t.input_defaults,
+            event_key=t.event_key,
+            input_map=t.input_map,
+            dedup_key=t.dedup_key,
+            auth_mode=t.auth_mode,
             enabled=t.enabled,
             last_fired_at=t.last_fired_at.isoformat() if t.last_fired_at else None,
             created_at=t.created_at.isoformat(),
@@ -12142,6 +12146,10 @@ def build_app(
             kind=body.kind,
             target=body.target,
             input_defaults=body.input_defaults,
+            event_key=body.event_key,
+            input_map=body.input_map,
+            dedup_key=body.dedup_key,
+            auth_mode=body.auth_mode,
             enabled=body.enabled,
             created_by=ctx.api_key_id,
         )
@@ -12250,11 +12258,19 @@ def build_app(
         api-key auth dependency — the external caller has no ``mvt_*`` key,
         and the secret never travels on the wire (only a body-bound HMAC).
         The raw body is the event payload (a JSON object); it is merged OVER
-        the trigger's ``input_defaults`` to form the job input, and a
-        ``JobKind.AGENT``/``WORKFLOW`` job is enqueued scoped to the
-        **trigger's** tenant. The enqueued job is the same shape ``POST /run``
-        produces, so it runs through the existing dispatch with no new branch,
-        and is observable + retryable as a normal job.
+        the trigger's ``input_defaults`` to form the job input — or, when the
+        trigger declares ``event_key``/``input_map`` (ADR 100 D2), nested
+        under ``event_key`` and/or extracted via the declared dotted paths —
+        and a ``JobKind.AGENT``/``WORKFLOW`` job is enqueued scoped to the
+        **trigger's** tenant. A trigger with ``auth_mode: "token"``
+        (ADR 100 D3) authenticates via ``X-Movate-Trigger-Token`` instead of
+        the HMAC signature; in HMAC mode GitHub's ``X-Hub-Signature-256`` is
+        accepted as an alias when ``X-Movate-Signature`` is absent. A
+        ``dedup_key`` dotted path sources the delivery id from the body when
+        the ``X-Movate-Delivery-Id`` header is absent. The enqueued job is
+        the same shape ``POST /run`` produces, so it runs through the
+        existing dispatch with no new branch, and is observable + retryable
+        as a normal job.
 
         Returns **202** ``{job_id, status, deduplicated}`` (mirrors
         ``RunAccepted``).
@@ -12290,11 +12306,14 @@ def build_app(
         if trigger is None or not trigger.enabled:
             raise not_found("trigger", trigger_id)
 
-        # Per-trigger-secret auth: recompute the body-bound HMAC from the
-        # stored secret_hash and constant-time compare against the presented
-        # X-Movate-Signature. No normal API key is accepted here.
-        presented = request.headers.get(SIGNATURE_HEADER)
-        if not verify_signature(trigger, raw_body, presented):
+        # Per-trigger-secret auth (ADR 100 D3). No normal API key is
+        # accepted here. Dispatches on the trigger's auth_mode: "hmac"
+        # (default — body-bound X-Movate-Signature, with GitHub's
+        # X-Hub-Signature-256 as an alias when the movate header is absent)
+        # or "token" (static X-Movate-Trigger-Token, constant-time-compared
+        # against the stored hash — for senders that cannot HMAC, e.g. ADO
+        # Service Hooks; weaker, replayable until rotation).
+        if not verify_fire_auth(trigger, raw_body, request.headers):
             raise auth_required()
 
         # The event body becomes the job input (merged over input_defaults).
@@ -12327,6 +12346,15 @@ def build_app(
         delivery_id = raw_delivery_id.strip() if raw_delivery_id else None
         if not delivery_id or len(delivery_id) > DELIVERY_ID_MAX_LEN:
             delivery_id = None
+
+        # ADR 100 D2 — body-sourced dedup. When the header is absent and the
+        # trigger declares a dedup_key dotted path, the event body supplies
+        # the delivery id (ADO carries its event id at body path `id` and
+        # cannot send custom headers). Header wins when both are present;
+        # unresolvable path / no dedup_key → None → today's always-enqueue
+        # behavior. From here the id flows through the existing
+        # insert-or-ignore dedup path unchanged.
+        delivery_id = delivery_id or resolve_body_delivery_id(trigger, event_body)
 
         if delivery_id is not None:
             # A prior delivery of this id for this trigger → return the SAME

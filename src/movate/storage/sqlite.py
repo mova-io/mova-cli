@@ -1249,6 +1249,16 @@ _MIGRATIONS = [
     # NOT-NULL migration / table rebuild.
     "ALTER TABLE job_schedules ADD COLUMN cron TEXT",
     "ALTER TABLE job_schedules ADD COLUMN timezone TEXT",
+    # ADR 100 D2/D3: trigger event→state mapping (event_key/input_map,
+    # input_map JSON-encoded like input_defaults), body-sourced dedup
+    # (dedup_key), and the fire-auth mode. Additive nullable columns — NULL
+    # on every pre-ADR-100 row, which keeps the verbatim-merge /
+    # header-only-dedup / HMAC behavior byte-for-byte (auth_mode NULL reads
+    # back as the "hmac" model default).
+    "ALTER TABLE triggers ADD COLUMN event_key TEXT",
+    "ALTER TABLE triggers ADD COLUMN input_map TEXT",
+    "ALTER TABLE triggers ADD COLUMN dedup_key TEXT",
+    "ALTER TABLE triggers ADD COLUMN auth_mode TEXT",
 ]
 
 
@@ -2013,10 +2023,17 @@ class SqliteProvider:
     # ------------------------------------------------------------------
 
     async def save_trigger(self, trigger: Trigger) -> None:
-        # Upsert on the (tenant_id, name) management key.
+        # Upsert on the (tenant_id, name) management key. Columns are named
+        # explicitly (not positional VALUES) because the ADR 100 columns were
+        # ALTERed in after the table's creation — positional order isn't
+        # stable across fresh-vs-migrated databases.
         await self._db.execute(
             """
-            INSERT INTO triggers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO triggers (
+                tenant_id, name, trigger_id, kind, target, secret_hash, salt,
+                input_defaults, enabled, created_by, created_at, last_fired_at,
+                event_key, input_map, dedup_key, auth_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id, name) DO UPDATE SET
                 trigger_id = excluded.trigger_id,
                 kind = excluded.kind,
@@ -2027,7 +2044,11 @@ class SqliteProvider:
                 enabled = excluded.enabled,
                 created_by = excluded.created_by,
                 created_at = excluded.created_at,
-                last_fired_at = excluded.last_fired_at
+                last_fired_at = excluded.last_fired_at,
+                event_key = excluded.event_key,
+                input_map = excluded.input_map,
+                dedup_key = excluded.dedup_key,
+                auth_mode = excluded.auth_mode
             """,
             (
                 trigger.tenant_id,
@@ -2042,6 +2063,10 @@ class SqliteProvider:
                 trigger.created_by,
                 trigger.created_at.isoformat(),
                 trigger.last_fired_at.isoformat() if trigger.last_fired_at else None,
+                trigger.event_key,
+                json.dumps(trigger.input_map) if trigger.input_map is not None else None,
+                trigger.dedup_key,
+                trigger.auth_mode,
             ),
         )
         await self._db.commit()
@@ -5913,6 +5938,12 @@ def _row_to_canary_config(row: aiosqlite.Row) -> CanaryConfig:
 
 
 def _row_to_trigger(row: aiosqlite.Row) -> Trigger:
+    # ADR 100 D2/D3 columns. init() has run the ALTERs by the time we read
+    # here; .get() stays defensive against a row predating the migration —
+    # such a row is a verbatim-merge / header-only-dedup / HMAC trigger,
+    # which is exactly the None / "hmac" defaults.
+    as_dict = dict(row)
+    input_map_raw = as_dict.get("input_map")
     return Trigger(
         tenant_id=row["tenant_id"],
         name=row["name"],
@@ -5922,6 +5953,10 @@ def _row_to_trigger(row: aiosqlite.Row) -> Trigger:
         secret_hash=row["secret_hash"],
         salt=row["salt"],
         input_defaults=json.loads(row["input_defaults"]),
+        event_key=as_dict.get("event_key"),
+        input_map=json.loads(input_map_raw) if input_map_raw else None,
+        dedup_key=as_dict.get("dedup_key"),
+        auth_mode=as_dict.get("auth_mode") or "hmac",
         enabled=bool(row["enabled"]),
         created_by=row["created_by"],
         created_at=datetime.fromisoformat(row["created_at"]),

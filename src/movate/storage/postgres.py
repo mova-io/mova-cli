@@ -700,6 +700,16 @@ CREATE TABLE IF NOT EXISTS triggers (
     PRIMARY KEY (tenant_id, name)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_trigger_id ON triggers(trigger_id);
+-- ADR 100 D2/D3: event→state mapping (event_key/input_map), body-sourced
+-- dedup (dedup_key), and the fire-auth mode. Additive nullable columns —
+-- NULL on every pre-ADR-100 row, which keeps the verbatim-merge /
+-- header-only-dedup / HMAC behavior byte-for-byte (auth_mode NULL reads
+-- back as the "hmac" model default). ADD COLUMN IF NOT EXISTS keeps init()
+-- idempotent on long-lived databases.
+ALTER TABLE triggers ADD COLUMN IF NOT EXISTS event_key TEXT;
+ALTER TABLE triggers ADD COLUMN IF NOT EXISTS input_map JSONB;
+ALTER TABLE triggers ADD COLUMN IF NOT EXISTS dedup_key TEXT;
+ALTER TABLE triggers ADD COLUMN IF NOT EXISTS auth_mode TEXT;
 
 -- item 23: trigger replay / idempotency (ADR 017 D2 follow-up). One row per
 -- (trigger_id, delivery_id) recording the job_id the FIRST delivery enqueued,
@@ -2398,9 +2408,11 @@ class PostgresProvider:
             """
             INSERT INTO triggers (
                 tenant_id, name, trigger_id, kind, target, secret_hash, salt,
-                input_defaults, enabled, created_by, created_at, last_fired_at
+                input_defaults, enabled, created_by, created_at, last_fired_at,
+                event_key, input_map, dedup_key, auth_mode
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16
             )
             ON CONFLICT (tenant_id, name) DO UPDATE SET
                 trigger_id = EXCLUDED.trigger_id,
@@ -2412,7 +2424,11 @@ class PostgresProvider:
                 enabled = EXCLUDED.enabled,
                 created_by = EXCLUDED.created_by,
                 created_at = EXCLUDED.created_at,
-                last_fired_at = EXCLUDED.last_fired_at
+                last_fired_at = EXCLUDED.last_fired_at,
+                event_key = EXCLUDED.event_key,
+                input_map = EXCLUDED.input_map,
+                dedup_key = EXCLUDED.dedup_key,
+                auth_mode = EXCLUDED.auth_mode
             """,
             trigger.tenant_id,
             trigger.name,
@@ -2426,6 +2442,10 @@ class PostgresProvider:
             trigger.created_by,
             trigger.created_at,
             trigger.last_fired_at,
+            trigger.event_key,
+            trigger.input_map,
+            trigger.dedup_key,
+            trigger.auth_mode,
         )
 
     async def get_trigger(self, name: str, *, tenant_id: str) -> Trigger | None:
@@ -5920,6 +5940,14 @@ def _row_to_trigger(row: asyncpg.Record) -> Trigger:
         secret_hash=row["secret_hash"],
         salt=row["salt"],
         input_defaults=dict(row["input_defaults"]),
+        # ADR 100 D2/D3: event mapping + dedup + auth mode. init() has run
+        # the ALTERs by the time we read here; NULL (every pre-ADR-100 row)
+        # → None / the "hmac" default → verbatim-merge / header-only-dedup /
+        # HMAC behavior, byte-for-byte the prior path.
+        event_key=row["event_key"],
+        input_map=dict(row["input_map"]) if row["input_map"] is not None else None,
+        dedup_key=row["dedup_key"],
+        auth_mode=row["auth_mode"] or "hmac",
         enabled=row["enabled"],
         created_by=row["created_by"],
         created_at=row["created_at"],

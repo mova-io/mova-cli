@@ -3643,6 +3643,39 @@ class Trigger(BaseModel):
     the enqueued job's ``input`` (the event body wins on key collisions).
     Lets an operator pin fixed fields (e.g. ``{"source": "zendesk"}``) while
     the event supplies the per-event payload."""
+    event_key: str | None = None
+    """ADR 100 D2: nest the raw event body under this single state key
+    (e.g. ``event``) instead of merging it at top level — the cheapest safe
+    default for "give the workflow the whole payload" without state-key
+    collisions. ``None`` (every pre-ADR-100 trigger) → the verbatim
+    top-level merge, byte-for-byte today's behavior (unless ``input_map``
+    is also unset)."""
+    input_map: dict[str, str] | None = None
+    """ADR 100 D2: declared field extraction — output state key → dotted
+    path into the event body (e.g. ``{"work_item_id": "resource.id"}``),
+    resolved with the same fail-soft semantics as the decision node's
+    ``_read_field`` (ADR 094): a missing path means the key is **omitted**
+    (the workflow's state schema then reports exactly what's missing),
+    never an exception. No templates, no expressions, no eval. ``None`` →
+    no extraction."""
+    dedup_key: str | None = None
+    """ADR 100 D2: dotted path into the event body used as the delivery id
+    when the ``X-Movate-Delivery-Id`` header is absent — what makes ADO
+    Service Hooks replays safe (they carry their event id at body path
+    ``id`` and cannot send custom per-event headers). The resolved value is
+    stringified and capped at ``DELIVERY_ID_MAX_LEN``; unresolvable → no
+    dedup (today's behavior). ``None`` → header-only dedup."""
+    auth_mode: Literal["hmac", "token"] = "hmac"
+    """ADR 100 D3: how the fire endpoint authenticates the caller.
+    ``"hmac"`` (the default — today's behavior) verifies the body-bound
+    ``X-Movate-Signature`` HMAC, with ``X-Hub-Signature-256`` accepted as a
+    GitHub-compat alias when the movate header is absent. ``"token"``
+    verifies a static ``X-Movate-Trigger-Token: <secret>`` header
+    (recomputing ``hash_secret(token, salt)`` + constant-time compare
+    against the stored ``secret_hash``) — for senders that cannot HMAC (ADO
+    Service Hooks' static-header support). Explicitly weaker: the secret
+    travels on the wire (TLS-protected) and a captured request is
+    replayable until rotation — pair it with ``dedup_key``."""
     enabled: bool = True
     """Soft on/off. A disabled trigger is retained (history + quick
     re-enable) but the fire endpoint treats it as absent (404, no existence
