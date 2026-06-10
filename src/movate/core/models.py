@@ -3373,6 +3373,17 @@ class JobRecord(BaseModel):
     :func:`movate.tracing.continue_trace_context` before starting the job's
     root span (ADR 019, item 32). Additive + JSONB/TEXT column: pre-R2 rows
     read back as ``{}``."""
+    origin: str | None = None
+    """Job provenance (ADR 100 D4): ``"schedule:<name>"`` for a job the
+    scheduler tick enqueued (the schedule's per-tenant handle) or
+    ``"trigger:<trigger_id>"`` for a job the fire endpoint enqueued (the
+    trigger's stable public id — what the deliveries view and webhook URL
+    key off). Stamped by ``build_scheduled_job`` / ``build_triggered_job``;
+    ``None`` (the overwhelming common case) for every manual submit —
+    byte-for-byte the pre-ADR-100 path. Lets ``mdk jobs`` / ``/api/v1/jobs``
+    / Grafana slice trigger-started vs scheduled vs manual runs, and lets an
+    operator walk a dead-lettered job back to what started it. Additive +
+    nullable: pre-ADR-100 rows read back as ``None``."""
 
 
 class BatchRecord(BaseModel):

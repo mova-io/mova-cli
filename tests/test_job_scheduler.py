@@ -292,6 +292,14 @@ def test_build_scheduled_job_workflow() -> None:
     assert job.input == {"state": 1}
 
 
+@pytest.mark.unit
+def test_build_scheduled_job_stamps_origin() -> None:
+    """ADR 100 D4: a scheduled job carries provenance back to its schedule
+    handle; a manually-built JobRecord defaults to None."""
+    job = build_scheduled_job(_job_schedule(name="nightly-returns"))
+    assert job.origin == "schedule:nightly-returns"
+
+
 # ---------------------------------------------------------------------------
 # run_job_scheduler_tick
 # ---------------------------------------------------------------------------

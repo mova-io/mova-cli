@@ -117,6 +117,9 @@ class JobView(BaseModel):
     claimed_at: datetime | None = None
     completed_at: datetime | None = None
     notify_email: str | None = None
+    origin: str | None = None
+    """ADR 100 D4 provenance: ``"schedule:<name>"`` / ``"trigger:<id>"``,
+    ``None`` for manual submits and pre-ADR-100 jobs (additive field)."""
 
     @classmethod
     def from_record(cls, record: JobRecord) -> JobView:
@@ -132,6 +135,7 @@ class JobView(BaseModel):
             claimed_at=record.claimed_at,
             completed_at=record.completed_at,
             notify_email=record.notify_email,
+            origin=record.origin,
         )
 
 
@@ -1448,6 +1452,30 @@ class TriggerListView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     triggers: list[TriggerView]
+    count: int
+
+
+class TriggerDeliveryView(BaseModel):
+    """One delivery row in the per-trigger ledger (ADR 100 D4).
+
+    ``job_status`` is the joined job's status at read time — ``None`` when
+    the job row is gone (the delivery record is the durable fact).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    delivery_id: str
+    job_id: str
+    job_status: str | None = None
+    created_at: str
+
+
+class TriggerDeliveryListView(BaseModel):
+    """``GET /api/v1/triggers/{trigger_id}/deliveries`` response (ADR 100 D4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deliveries: list[TriggerDeliveryView]
     count: int
 
 

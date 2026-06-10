@@ -683,3 +683,98 @@ def test_fire_movate_signature_takes_precedence_over_alias(client: TestClient, a
         },
     )
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# ADR 100 D4 — provenance + the deliveries view
+# ---------------------------------------------------------------------------
+
+
+def test_fired_job_carries_trigger_origin(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    header, _ = auth_setup
+    created = _create(client, header, name="zendesk")
+    raw = b'{"ticket": 1}'
+    assert _fire(client, created, raw).status_code == 202
+    assert storage.jobs[0].origin == f"trigger:{created['trigger_id']}"
+
+
+def test_deliveries_view_lists_with_job_status(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """The ledger: deliveries list newest-first with the enqueued job's id +
+    current status; fires without a delivery id are not recorded."""
+    header, _ = auth_setup
+    created = _create(client, header, name="ado", dedup_key="id")
+
+    first = _fire(client, created, json.dumps({"id": "evt-1"}).encode())
+    second = _fire(client, created, json.dumps({"id": "evt-2"}).encode())
+    # A fire with NO delivery id (header or body) doesn't land in the ledger.
+    _fire(client, created, json.dumps({"no_id": True}).encode())
+
+    r = client.get(f"/api/v1/triggers/{created['trigger_id']}/deliveries", headers=header)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] == 2
+    by_id = {d["delivery_id"]: d for d in body["deliveries"]}
+    assert by_id["evt-1"]["job_id"] == first.json()["job_id"]
+    assert by_id["evt-2"]["job_id"] == second.json()["job_id"]
+    assert by_id["evt-1"]["job_status"] == JobStatus.QUEUED.value
+    assert by_id["evt-1"]["created_at"]
+
+
+def test_deliveries_view_dedup_replay_stays_one_row(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    header, _ = auth_setup
+    created = _create(client, header, name="ado", dedup_key="id")
+    raw = json.dumps({"id": "evt-1"}).encode()
+    _fire(client, created, raw)
+    _fire(client, created, raw)  # replay → same delivery row
+    r = client.get(f"/api/v1/triggers/{created['trigger_id']}/deliveries", headers=header)
+    assert r.json()["count"] == 1
+
+
+async def test_deliveries_view_is_tenant_scoped(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """Another tenant's key gets a 404 for this trigger's deliveries —
+    no existence leak."""
+    header, _ = auth_setup
+    created = _create(client, header, name="ado", dedup_key="id")
+    _fire(client, created, json.dumps({"id": "evt-1"}).encode())
+
+    other = mint_api_key(
+        tenant_id=uuid4().hex, env=ApiKeyEnv.LIVE, label="other", scopes=list(ALL_SCOPES)
+    )
+    await storage.save_api_key(other.record)
+    other_header = {"Authorization": f"Bearer {other.full_key}"}
+    r = client.get(f"/api/v1/triggers/{created['trigger_id']}/deliveries", headers=other_header)
+    assert r.status_code == 404
+    # The owning tenant still sees it.
+    ok = client.get(f"/api/v1/triggers/{created['trigger_id']}/deliveries", headers=header)
+    assert ok.status_code == 200 and ok.json()["count"] == 1
+
+
+def test_deliveries_view_unknown_trigger_404(client: TestClient, auth_setup) -> None:
+    header, _ = auth_setup
+    r = client.get("/api/v1/triggers/no-such-trigger/deliveries", headers=header)
+    assert r.status_code == 404
+
+
+async def test_deliveries_view_allows_read_scope(
+    client: TestClient, auth_setup, storage: InMemoryStorage
+) -> None:
+    """The ledger is observational — a read-only key (same tenant) can list."""
+    header, tenant_id = auth_setup
+    created = _create(client, header, name="ado", dedup_key="id")
+    _fire(client, created, json.dumps({"id": "evt-1"}).encode())
+    ro = mint_api_key(
+        tenant_id=tenant_id, env=ApiKeyEnv.LIVE, label="read-only", scopes=[SCOPE_READ]
+    )
+    await storage.save_api_key(ro.record)
+    ro_header = {"Authorization": f"Bearer {ro.full_key}"}
+    r = client.get(f"/api/v1/triggers/{created['trigger_id']}/deliveries", headers=ro_header)
+    assert r.status_code == 200
+    assert r.json()["count"] == 1

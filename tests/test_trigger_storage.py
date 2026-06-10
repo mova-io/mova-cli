@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from movate.core.models import JobKind, Trigger
+from movate.core.models import JobKind, JobRecord, JobStatus, Trigger
 
 
 def _make_trigger(
@@ -275,3 +275,43 @@ async def test_adr100_fields_upsert_clears_on_resave(storage) -> None:
     assert got.event_key is None
     assert got.dedup_key is None
     assert got.auth_mode == "hmac"
+
+
+# ---------------------------------------------------------------------------
+# Deliveries ledger (ADR 100 D4) — list_trigger_deliveries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_list_trigger_deliveries_joins_job_status(storage) -> None:
+    await storage.save_job(
+        JobRecord(
+            job_id="job-1",
+            tenant_id="tenant-a",
+            kind=JobKind.AGENT,
+            target="triage-agent",
+            input={},
+        )
+    )
+    assert await storage.record_trigger_delivery("trig-1", "evt-1", "job-1") is True
+    # A delivery whose job row is GONE still lists, with a None status.
+    assert await storage.record_trigger_delivery("trig-1", "evt-2", "job-gone") is True
+    # Another trigger's deliveries never leak in.
+    assert await storage.record_trigger_delivery("trig-other", "evt-3", "job-x") is True
+
+    rows = await storage.list_trigger_deliveries("trig-1")
+    assert len(rows) == 2
+    by_id = {r.delivery_id: r for r in rows}
+    assert by_id["evt-1"].job_id == "job-1"
+    assert by_id["evt-1"].job_status == JobStatus.QUEUED.value
+    assert by_id["evt-1"].created_at is not None
+    assert by_id["evt-2"].job_status is None
+
+
+@pytest.mark.unit
+async def test_list_trigger_deliveries_empty_and_limit(storage) -> None:
+    assert await storage.list_trigger_deliveries("trig-none") == []
+    for i in range(5):
+        await storage.record_trigger_delivery("trig-many", f"evt-{i}", f"job-{i}")
+    rows = await storage.list_trigger_deliveries("trig-many", limit=3)
+    assert len(rows) == 3

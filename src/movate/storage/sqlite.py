@@ -79,7 +79,7 @@ from movate.core.observability.models import ObservabilityInsight
 from movate.core.webhooks import WebhookAttempt, WebhookSubscription
 
 if TYPE_CHECKING:
-    from movate.storage.base import RunSubmissionRecord
+    from movate.storage.base import RunSubmissionRecord, TriggerDeliveryRecord
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -1259,6 +1259,10 @@ _MIGRATIONS = [
     "ALTER TABLE triggers ADD COLUMN input_map TEXT",
     "ALTER TABLE triggers ADD COLUMN dedup_key TEXT",
     "ALTER TABLE triggers ADD COLUMN auth_mode TEXT",
+    # ADR 100 D4: job provenance ("schedule:<name>" / "trigger:<trigger_id>").
+    # Additive nullable column — NULL on every manual submit and every
+    # pre-ADR-100 row, byte-for-byte the prior behavior.
+    "ALTER TABLE jobs ADD COLUMN origin TEXT",
 ]
 
 
@@ -2140,6 +2144,36 @@ class SqliteProvider:
         )
         await self._db.commit()
         return cur.rowcount > 0
+
+    async def list_trigger_deliveries(
+        self, trigger_id: str, *, limit: int = 50
+    ) -> list[TriggerDeliveryRecord]:
+        from movate.storage.base import TriggerDeliveryRecord  # noqa: PLC0415
+
+        # ADR 100 D4: the per-trigger delivery ledger. LEFT JOIN so a
+        # delivery whose job row is gone (pruned) still lists, with a NULL
+        # status — the delivery record is the durable fact.
+        async with self._db.execute(
+            """
+            SELECT d.delivery_id, d.job_id, d.created_at, j.status AS job_status
+            FROM trigger_deliveries d
+            LEFT JOIN jobs j ON j.job_id = d.job_id
+            WHERE d.trigger_id = ?
+            ORDER BY d.created_at DESC
+            LIMIT ?
+            """,
+            (trigger_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            TriggerDeliveryRecord(
+                delivery_id=r["delivery_id"],
+                job_id=r["job_id"],
+                created_at=datetime.fromisoformat(r["created_at"]),
+                job_status=r["job_status"],
+            )
+            for r in rows
+        ]
 
     async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
         async with self._db.execute(
@@ -3582,8 +3616,8 @@ class SqliteProvider:
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
                 target_version, resume_workflow_run_id, batch_id,
-                trace_context, cancel_requested
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                trace_context, cancel_requested, origin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -3613,6 +3647,8 @@ class SqliteProvider:
                 # pre-cancelled); set later by request_job_cancel for a RUNNING
                 # job.
                 int(job.cancel_requested),
+                # ADR 100 D4: provenance. NULL for manual submits.
+                job.origin,
             ),
         )
         await self._db.commit()
@@ -6093,6 +6129,10 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         # defensive against a row predating the migration (NULL/missing → 0 →
         # False), which is exactly a never-cancelled job.
         cancel_requested=bool(dict(row).get("cancel_requested") or 0),
+        # ADR 100 D4: provenance. .get() stays defensive against a row
+        # predating the migration — such a row is a manual submit, which is
+        # exactly None.
+        origin=dict(row).get("origin"),
     )
 
 

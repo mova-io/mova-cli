@@ -200,6 +200,9 @@ def build_scheduled_job(schedule: JobSchedule) -> JobRecord:
         target=schedule.target,
         input=schedule.input,
         notify_email=schedule.notify_email,
+        # ADR 100 D4 provenance: walk the job back to the schedule that
+        # enqueued it (the per-tenant handle). Manual submits carry None.
+        origin=f"schedule:{schedule.name}",
     )
 
 

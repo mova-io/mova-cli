@@ -401,6 +401,8 @@ from movate.runtime.schemas import (
     ThreadView,
     TriggerCreatedView,
     TriggerCreateRequest,
+    TriggerDeliveryListView,
+    TriggerDeliveryView,
     TriggerListView,
     TriggerView,
     TroubleshootRequest,
@@ -12237,6 +12239,56 @@ def build_app(
         store: StorageProvider = request.app.state.storage
         await store.delete_trigger(name, tenant_id=ctx.tenant_id)
         return Response(status_code=204)
+
+    @v1.get(
+        "/triggers/{trigger_id}/deliveries",
+        response_model=TriggerDeliveryListView,
+        tags=["triggers"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_trigger_deliveries(
+        trigger_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int = 50,
+    ) -> TriggerDeliveryListView:
+        """Recent deliveries for one trigger, joined to job status (ADR 100 D4).
+
+        The per-trigger delivery ledger: every fire that carried a delivery
+        id (the ``X-Movate-Delivery-Id`` header, or the trigger's
+        ``dedup_key`` body path) lists here with the ``job_id`` it enqueued
+        and that job's current status — "did my webhook fire, and what
+        happened to the run it started". Keyed by the public ``trigger_id``
+        (the same id in the webhook URL), newest first, ``limit`` capped at
+        200.
+
+        Tenant-scoped: another tenant's trigger 404s (no existence leak).
+        Fires without a delivery id (no header, no resolvable ``dedup_key``)
+        are not recorded and do not list here — ``last_fired_at`` on the
+        trigger remains the cheap liveness signal.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **404** — no trigger with this id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        trigger = await store.get_trigger_by_id(trigger_id)
+        if trigger is None or trigger.tenant_id != ctx.tenant_id:
+            raise not_found("trigger", trigger_id)
+        capped_limit = max(1, min(limit, 200))
+        rows = await store.list_trigger_deliveries(trigger_id, limit=capped_limit)
+        views = [
+            TriggerDeliveryView(
+                delivery_id=r.delivery_id,
+                job_id=r.job_id,
+                job_status=r.job_status,
+                created_at=r.created_at.isoformat(),
+            )
+            for r in rows
+        ]
+        return TriggerDeliveryListView(deliveries=views, count=len(views))
 
     @v1.post(
         "/triggers/{trigger_id}/events",

@@ -206,6 +206,10 @@ def build_triggered_job(trigger: Trigger, event_body: dict[str, Any]) -> JobReco
         kind=trigger.kind,
         target=trigger.target,
         input=merged,
+        # ADR 100 D4 provenance: walk the job back to the trigger that fired
+        # it (the stable public id the deliveries view + webhook URL key
+        # off). Manual submits carry None.
+        origin=f"trigger:{trigger.trigger_id}",
     )
 
 

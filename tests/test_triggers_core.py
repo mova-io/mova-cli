@@ -255,3 +255,16 @@ def test_mint_trigger_mapping_fields_default_off() -> None:
     assert minted.record.input_map is None
     assert minted.record.dedup_key is None
     assert minted.record.auth_mode == "hmac"
+
+
+# ---------------------------------------------------------------------------
+# Provenance (ADR 100 D4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_build_job_stamps_trigger_origin() -> None:
+    """A triggered job carries provenance back to its trigger's public id."""
+    minted = _minted()
+    job = build_triggered_job(minted.record, {"x": 1})
+    assert job.origin == f"trigger:{minted.record.trigger_id}"

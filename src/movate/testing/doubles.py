@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from movate.storage.base import RunSubmissionRecord
+    from movate.storage.base import RunSubmissionRecord, TriggerDeliveryRecord
 
 from movate.core.dr_backup import ImportResult
 from movate.core.events import Event
@@ -129,6 +129,10 @@ class InMemoryStorage:
         # item 23: trigger delivery dedup, keyed by (trigger_id, delivery_id)
         # → the job_id the first delivery enqueued.
         self.trigger_deliveries: dict[tuple[str, str], str] = {}
+        # ADR 100 D4: insertion timestamps for the deliveries ledger view —
+        # kept in a parallel dict so the dedup mapping above stays the
+        # simple shape existing tests assert against.
+        self.trigger_delivery_times: dict[tuple[str, str], datetime] = {}
         # item 37: submission idempotency, keyed by (tenant_id, idempotency_key)
         # → the job_id the first async submit enqueued.
         # (tenant_id, idempotency_key) -> (job_id, request_hash). The
@@ -480,7 +484,30 @@ class InMemoryStorage:
         if key in self.trigger_deliveries:
             return False
         self.trigger_deliveries[key] = job_id
+        self.trigger_delivery_times[key] = datetime.now(UTC)
         return True
+
+    async def list_trigger_deliveries(
+        self, trigger_id: str, *, limit: int = 50
+    ) -> list[TriggerDeliveryRecord]:
+        from movate.storage.base import TriggerDeliveryRecord  # noqa: PLC0415
+
+        # ADR 100 D4: the per-trigger delivery ledger, joined to the job's
+        # current status (None when the job row is gone — mirrors the SQL
+        # backends' LEFT JOIN).
+        job_status = {j.job_id: j.status.value for j in self.jobs}
+        records = [
+            TriggerDeliveryRecord(
+                delivery_id=did,
+                job_id=job_id,
+                created_at=self.trigger_delivery_times.get((tid, did), datetime.now(UTC)),
+                job_status=job_status.get(job_id),
+            )
+            for (tid, did), job_id in self.trigger_deliveries.items()
+            if tid == trigger_id
+        ]
+        records.sort(key=lambda r: r.created_at, reverse=True)
+        return records[:limit]
 
     async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
         row = self.run_submissions.get((tenant_id, idempotency_key))
