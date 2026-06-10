@@ -46,6 +46,7 @@ mkdir -p "${STAGE}/dashboards-prom"
 for f in "${ROOT}/dashboards/grafana/"mdk-*.json; do
   sed -e "s/\${DS_PROMETHEUS}/${PROM_DS_UID}/g" \
       -e "s/\${DS_INSIGHTS}/${INSIGHTS_DS_UID}/g" \
+      -e "s/postgres-bor/postgres-movate/g" \
       "${f}" > "${STAGE}/dashboards-prom/$(basename "${f}")"
 done
 echo "→ staged $(ls "${STAGE}/dashboards" | wc -l | tr -d ' ') azure + $(ls "${STAGE}/dashboards-prom" | wc -l | tr -d ' ') promQL dashboard(s) + provisioning"
@@ -67,10 +68,23 @@ fi
 echo "→ building ${REF}"
 az acr build -r "${ACR}" -t "${IMAGE}:${TAG}" -f "${STAGE}/Dockerfile" "${STAGE}"
 
+# ADR 095/096 — the provisioned Postgres (movate) datasource reads its password
+# from ${GF_PG_PASSWORD}. Mirror the workers' pg-password secret onto this app
+# and bind the env to it (skipped, with a warning, if unreadable).
+PGPW="$(az containerapp secret show -g "${RG}" -n movate-dev-worker --secret-name pg-password --query value -o tsv 2>/dev/null || true)"
+if [ -n "${PGPW}" ]; then
+  az containerapp secret set -n "${APP}" -g "${RG}" --secrets "pg-password=${PGPW}" -o none
+  PG_ENV_ARGS=(--set-env-vars "PROMETHEUS_URL=${PROM_URL}" "GF_PG_PASSWORD=secretref:pg-password")
+  echo "→ Postgres datasource password wired (secretref:pg-password)"
+else
+  PG_ENV_ARGS=(--set-env-vars "PROMETHEUS_URL=${PROM_URL}")
+  echo "⚠ could not read pg-password — Postgres datasource will provision unauthenticated (fix manually)"
+fi
+
 echo "→ rolling ${APP} to ${REF} (env GF_* preserved; PROMETHEUS_URL set)"
 az containerapp update -n "${APP}" -g "${RG}" \
   --image "${REF}" \
-  --set-env-vars "PROMETHEUS_URL=${PROM_URL}" \
+  "${PG_ENV_ARGS[@]}" \
   --query "properties.provisioningState" -o tsv
 
 FQDN="$(az containerapp show -n "${APP}" -g "${RG}" \
