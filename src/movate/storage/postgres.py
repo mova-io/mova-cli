@@ -74,6 +74,7 @@ from movate.core.models import (
     KbChunk,
     KbChunkWithScore,
     Metrics,
+    ObservabilityFact,
     Project,
     ProjectKbMode,
     ProjectMember,
@@ -1275,6 +1276,38 @@ CREATE TABLE IF NOT EXISTS tool_descriptors (
 );
 CREATE INDEX IF NOT EXISTS idx_tool_descriptors_scope_tenant
     ON tool_descriptors(scope, tenant_id);
+
+-- ADR 096 D1: observability_facts — one denormalized row per terminal
+-- execution event (agent run completing; workflow run terminal/paused).
+-- The unified reporting/integration surface the mova-io platform reads.
+-- DERIVED (D4): ``runs`` / ``workflow_runs`` stay authoritative; fact_id
+-- ("<kind>:<source_id>") is the PK so writes are idempotent upserts and the
+-- table can be rebuilt at any time. ``attributes`` is JSONB (bounded escape
+-- hatch: provider, model, pricing_version). Additive new table (CREATE TABLE
+-- IF NOT EXISTS, idempotent on every init) — no ALTER, no backfill.
+CREATE TABLE IF NOT EXISTS observability_facts (
+    fact_id           TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL,
+    source_id         TEXT NOT NULL,
+    trace_id          TEXT NOT NULL DEFAULT '',
+    tenant_id         TEXT NOT NULL,
+    workflow          TEXT,
+    agent             TEXT,
+    node_id           TEXT,
+    status            TEXT NOT NULL,
+    runtime           TEXT NOT NULL,
+    route             TEXT,
+    cost_usd          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    tokens_in         BIGINT NOT NULL DEFAULT 0,
+    tokens_out        BIGINT NOT NULL DEFAULT 0,
+    latency_ms        BIGINT NOT NULL DEFAULT 0,
+    governance_effect TEXT,
+    error_type        TEXT,
+    created_at        TIMESTAMPTZ NOT NULL,
+    attributes        JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_observability_facts_tenant_created
+    ON observability_facts(tenant_id, created_at DESC);
 """
 
 
@@ -3951,6 +3984,102 @@ class PostgresProvider:
         return [_row_to_workflow_run(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # Observability facts (ADR 096 — unified reporting surface)
+    # ------------------------------------------------------------------
+
+    async def save_observability_fact(self, fact: ObservabilityFact) -> None:
+        # Upsert on the fact_id PRIMARY KEY ("<kind>:<source_id>", ADR 096
+        # D4): a re-derived fact (paused workflow reaching terminal state,
+        # retried segment, backfill) updates its row in place — latest
+        # write wins, never a duplicate. Same posture as save_workflow_run.
+        await self._db.execute(
+            """
+            INSERT INTO observability_facts (
+                fact_id, kind, source_id, trace_id, tenant_id, workflow,
+                agent, node_id, status, runtime, route, cost_usd, tokens_in,
+                tokens_out, latency_ms, governance_effect, error_type,
+                created_at, attributes
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                      $13, $14, $15, $16, $17, $18, $19)
+            ON CONFLICT (fact_id) DO UPDATE SET
+                kind              = EXCLUDED.kind,
+                source_id         = EXCLUDED.source_id,
+                trace_id          = EXCLUDED.trace_id,
+                tenant_id         = EXCLUDED.tenant_id,
+                workflow          = EXCLUDED.workflow,
+                agent             = EXCLUDED.agent,
+                node_id           = EXCLUDED.node_id,
+                status            = EXCLUDED.status,
+                runtime           = EXCLUDED.runtime,
+                route             = EXCLUDED.route,
+                cost_usd          = EXCLUDED.cost_usd,
+                tokens_in         = EXCLUDED.tokens_in,
+                tokens_out        = EXCLUDED.tokens_out,
+                latency_ms        = EXCLUDED.latency_ms,
+                governance_effect = EXCLUDED.governance_effect,
+                error_type        = EXCLUDED.error_type,
+                created_at        = EXCLUDED.created_at,
+                attributes        = EXCLUDED.attributes
+            """,
+            fact.fact_id,
+            fact.kind,
+            fact.source_id,
+            fact.trace_id,
+            fact.tenant_id,
+            fact.workflow,
+            fact.agent,
+            fact.node_id,
+            fact.status,
+            fact.runtime,
+            fact.route,
+            fact.cost_usd,
+            fact.tokens_in,
+            fact.tokens_out,
+            fact.latency_ms,
+            fact.governance_effect,
+            fact.error_type,
+            fact.created_at,
+            fact.attributes,
+        )
+
+    async def list_observability_facts(
+        self,
+        *,
+        tenant_id: str,
+        kind: str | None = None,
+        workflow: str | None = None,
+        agent: str | None = None,
+        status: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[ObservabilityFact]:
+        params: list[Any] = [tenant_id]
+        clauses: list[str] = ["tenant_id = $1"]
+        if kind is not None:
+            params.append(kind)
+            clauses.append(f"kind = ${len(params)}")
+        if workflow is not None:
+            params.append(workflow)
+            clauses.append(f"workflow = ${len(params)}")
+        if agent is not None:
+            params.append(agent)
+            clauses.append(f"agent = ${len(params)}")
+        if status is not None:
+            params.append(status)
+            clauses.append(f"status = ${len(params)}")
+        if since is not None:
+            params.append(since)
+            clauses.append(f"created_at >= ${len(params)}")
+        params.append(limit)
+        sql = (
+            "SELECT * FROM observability_facts WHERE "
+            + " AND ".join(clauses)
+            + f" ORDER BY created_at DESC LIMIT ${len(params)}"
+        )
+        rows = await self._db.fetch(sql, *params)
+        return [_row_to_observability_fact(r) for r in rows]
+
+    # ------------------------------------------------------------------
     # Jobs
     # ------------------------------------------------------------------
 
@@ -6218,6 +6347,30 @@ def _row_to_workflow_run(row: asyncpg.Record) -> WorkflowRunRecord:
         human_task=dict(row["human_task"]) if row["human_task"] else None,
         # ADR 062 D2: backend owner. NULL on pre-migration / native rows → None.
         runtime=row["runtime"],
+    )
+
+
+def _row_to_observability_fact(row: asyncpg.Record) -> ObservabilityFact:
+    return ObservabilityFact(
+        fact_id=row["fact_id"],
+        kind=row["kind"],
+        source_id=row["source_id"],
+        trace_id=row["trace_id"],
+        tenant_id=row["tenant_id"],
+        workflow=row["workflow"],
+        agent=row["agent"],
+        node_id=row["node_id"],
+        status=row["status"],
+        runtime=row["runtime"],
+        route=row["route"],
+        cost_usd=row["cost_usd"],
+        tokens_in=row["tokens_in"],
+        tokens_out=row["tokens_out"],
+        latency_ms=row["latency_ms"],
+        governance_effect=row["governance_effect"],
+        error_type=row["error_type"],
+        created_at=row["created_at"],
+        attributes=dict(row["attributes"]) if row["attributes"] else {},
     )
 
 

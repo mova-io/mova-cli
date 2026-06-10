@@ -356,6 +356,8 @@ from movate.runtime.schemas import (
     ModelCatalogView,
     ModelInfoView,
     NodeDetailView,
+    ObservabilityFactListView,
+    ObservabilityFactView,
     ObservabilityHealthView,
     ObservabilityInsightListView,
     ObservabilityInsightView,
@@ -6137,6 +6139,69 @@ def build_app(
             )
 
         return AgentCatalogView(agents=items, count=len(items))
+
+    @v1.get(
+        "/workflow-agents",
+        tags=["agents-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflow_agents(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """List agents bundled INSIDE workflow templates, grouped by workflow.
+
+        Standalone agents live in the ``agents/`` catalog (``GET /agents``, a
+        deliberately one-level scan). Workflow templates ship their own agents
+        under ``<workflows>/<wf>/agents/<name>/`` — real, runnable agents that
+        the standalone catalog never surfaces. This read-only endpoint exposes
+        them so the Agent Control Plane (ADR 090) can show EVERY agent in the
+        deployment, including each test/template workflow's bundled agents.
+        """
+        from movate.runtime.registry import scan_workflow_agents  # noqa: PLC0415
+
+        # Resolve every candidate workflows root: the configured path (where
+        # POST /api/v1/workflows lands — usually a sibling of agents_path) AND
+        # the image-baked templates dir from the env the worker uses
+        # (MOVATE_/MDK_WORKFLOWS_PATH = /app/workflows). The API's agents_path is
+        # often a persistent volume (/home/movate/agents) whose workflows sibling
+        # is empty, so the baked templates (/app/workflows) would otherwise be
+        # invisible here. Dedupe by resolved path; scan all.
+        roots: list[Path] = []
+        seen_roots: set[str] = set()
+        candidates: list[Path | None] = [request.app.state.workflows_path]
+        for env_name in ("MDK_WORKFLOWS_PATH", "MOVATE_WORKFLOWS_PATH"):
+            val = os.environ.get(env_name, "").strip()
+            if val:
+                candidates.append(Path(val))
+        for cand in candidates:
+            if cand is None:
+                continue
+            key = str(cand.resolve()) if cand.exists() else str(cand)
+            if key in seen_roots:
+                continue
+            seen_roots.add(key)
+            roots.append(cand)
+
+        items: list[dict[str, Any]] = []
+        seen_agents: set[tuple[str, str]] = set()
+        for wf_root in roots:
+            for wf_name, bundle in scan_workflow_agents(wf_root):
+                spec = bundle.spec
+                if (wf_name, spec.name) in seen_agents:
+                    continue
+                seen_agents.add((wf_name, spec.name))
+                items.append(
+                    {
+                        "workflow": wf_name,
+                        "name": spec.name,
+                        "version": spec.version,
+                        "description": spec.description,
+                        "role": getattr(spec, "role", None),
+                        "model": getattr(getattr(spec, "model", None), "provider", None),
+                    }
+                )
+        return {"workflow_agents": items, "count": len(items)}
 
     @v1.patch(
         "/agents/{name}/status",
@@ -15516,6 +15581,52 @@ def build_app(
             anomaly_count=len(latest.anomalies),
             has_insight=True,
         )
+
+    @v1.get(
+        "/observability/facts",
+        response_model=ObservabilityFactListView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_facts(
+        request: Request,
+        kind: str | None = Query(default=None, description="run | workflow_run"),
+        workflow: str | None = Query(default=None),
+        agent: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        since: datetime | None = Query(
+            default=None, description="ISO 8601 timestamp; created_at >= since."
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ObservabilityFactListView:
+        """List this tenant's derived observability facts, newest-first (ADR 096 D5).
+
+        The platform integration surface: one denormalized row per terminal
+        execution event (agent run completed; workflow run terminal/paused),
+        flat scalar columns the reader never has to re-derive from
+        ``runs.metrics`` / ``workflow_runs``. Deep-links out (ClickHouse /
+        Langfuse / Temporal Web) are constructed client-side from
+        ``trace_id`` + ``source_id`` — never stored. Filters AND together;
+        ``limit`` is capped at 500 to keep the response bounded. Pure read,
+        always tenant-scoped (``read`` scope).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_observability_facts(
+            tenant_id=ctx.tenant_id,
+            kind=kind,
+            workflow=workflow,
+            agent=agent,
+            status=status,
+            since=since,
+            limit=limit,
+        )
+        views = [ObservabilityFactView.from_record(r) for r in rows]
+        return ObservabilityFactListView(facts=views, count=len(views))
 
     @v1.post(
         "/observability/ask",

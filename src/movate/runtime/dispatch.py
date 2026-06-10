@@ -32,6 +32,11 @@ from movate.core.notify import NotificationDispatcher
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
 from movate.runtime.agent_resolver import resolve_agent_bundle
 from movate.runtime.events import emit_event
+from movate.runtime.facts import (
+    fact_from_run_record,
+    fact_from_workflow_run,
+    write_fact_failsoft,
+)
 from movate.storage.base import StorageProvider
 from movate.tracing import continue_trace_context, record_audit_event, record_run_usage
 
@@ -223,6 +228,19 @@ class WorkerDispatch:
             tokens=_metrics.tokens.input + _metrics.tokens.output,
             cost_usd=_metrics.cost_usd,
         )
+
+        # ADR 096 D3 — derive the run's observability fact at the same
+        # metering edge, from the RunRecord the executor just persisted
+        # (the record, not the response, is the authoritative row the fact
+        # projects). Fail-soft end to end: a read or write failure logs and
+        # never touches the dispatch outcome.
+        try:
+            if response.run_id:
+                record = await self._storage.get_run(response.run_id, tenant_id=job.tenant_id)
+                if record is not None:
+                    await write_fact_failsoft(self._storage, fact_from_run_record(record))
+        except Exception:
+            logger.warning("observability_fact_derive_failed run_id=%s", response.run_id)
 
         if response.status == "success":
             return DispatchOutcome(
@@ -897,6 +915,7 @@ class WorkerDispatch:
             except Exception as exc:
                 logger.exception("workflow_resume_unhandled job_id=%s", job.job_id)
                 return _error("internal", str(exc), retryable=True)
+            await self._write_workflow_fact(result.workflow_run_id, tenant_id=job.tenant_id)
             return self._workflow_result_to_outcome(result)
 
         graph = self._workflows.get(job.target)
@@ -942,6 +961,7 @@ class WorkerDispatch:
             except Exception as exc:
                 logger.exception("workflow_execute_unhandled job_id=%s", job.job_id)
                 return _error("internal", str(exc), retryable=True)
+            await self._write_workflow_fact(result.workflow_run_id, tenant_id=job.tenant_id)
             return self._workflow_result_to_outcome(result)
 
         # temporal / langgraph — route through the backend seam (ADR 055 D2),
@@ -953,6 +973,10 @@ class WorkerDispatch:
         except Exception as exc:
             logger.exception("workflow_backend_execute_unhandled job_id=%s", job.job_id)
             return _error("internal", str(exc), retryable=True)
+        # The Temporal persist/pause activities also write the workflow fact
+        # (the detached-HITL path never returns here); the fact_id upsert
+        # makes the overlap idempotent, and this call covers langgraph.
+        await self._write_workflow_fact(result.workflow_run_id, tenant_id=job.tenant_id)
         return self._workflow_result_to_outcome(result)
 
     async def _run_workflow_on_backend(
@@ -1019,6 +1043,24 @@ class WorkerDispatch:
             mock=use_mock,
             detached=detached,
         )
+
+    async def _write_workflow_fact(self, workflow_run_id: str, *, tenant_id: str) -> None:
+        """Derive + persist the workflow's observability fact (ADR 096 D3).
+
+        Wired HERE — the dispatch edge — rather than inside the native
+        runner so ``core/workflow`` never learns about facts (the boundary
+        rule: persistence projections live at the edges). The runner has
+        already persisted the terminal/paused ``WorkflowRunRecord`` by the
+        time its result returns, so we re-read the authoritative row and
+        project it. Fail-soft end to end: a read or write failure logs and
+        never touches the dispatch outcome.
+        """
+        try:
+            record = await self._storage.get_workflow_run(workflow_run_id, tenant_id=tenant_id)
+            if record is not None:
+                await write_fact_failsoft(self._storage, fact_from_workflow_run(record))
+        except Exception:
+            logger.warning("observability_fact_derive_failed workflow_run_id=%s", workflow_run_id)
 
     @staticmethod
     def _workflow_result_to_outcome(result: Any) -> DispatchOutcome:

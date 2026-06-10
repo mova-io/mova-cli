@@ -2643,6 +2643,63 @@ class WorkflowRunRecord(BaseModel):
     (``call_human_activity``) on the Temporal path."""
 
 
+class ObservabilityFact(BaseModel):
+    """One denormalized row per terminal execution event (ADR 096 D1).
+
+    The unified reporting/integration surface the mova-io platform reads:
+    one stable, flat row per agent run completing or workflow run reaching
+    a terminal/paused state, so the platform never couples to the nested
+    ``runs.metrics`` blob or ``workflow_runs`` semantics. Facts are
+    DERIVED (ADR 096 D4): ``runs`` / ``workflow_runs`` stay authoritative;
+    ``fact_id = "<kind>:<source_id>"`` makes every write an idempotent
+    upsert, so the table can be rebuilt from the authoritative rows at any
+    time. Written fail-soft at the existing metering edges (ADR 096 D3) —
+    a fact-write failure logs and never fails the run.
+
+    ``trace_id`` is the join key out to the deep stores (ADR 096 D2):
+    ClickHouse spans, the Langfuse trace URL, and the Temporal Web
+    deep-link are all derived from it at read time — never stored here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fact_id: str
+    """Deterministic primary key: ``"<kind>:<source_id>"`` — re-saving the
+    same source row upserts in place (idempotent, ADR 096 D4)."""
+    kind: Literal["run", "workflow_run"]
+    source_id: str
+    """``run_id`` / ``workflow_run_id`` — the FK back to the authoritative
+    row in ``runs`` / ``workflow_runs``."""
+    trace_id: str = ""
+    """Universal correlation key (ADR 095 D4). Mirrors
+    ``RunRecord.metrics.trace_id``; empty when tracing is off."""
+    tenant_id: str
+    workflow: str | None = None
+    """Workflow name. ``None`` for standalone agent runs."""
+    agent: str | None = None
+    """Agent name. ``None`` for workflow-level facts."""
+    node_id: str | None = None
+    status: str
+    """``success`` / ``error`` / ``paused`` / ``safety_blocked`` / …"""
+    runtime: str
+    """Which backend owned the execution — ``native`` or ``temporal``."""
+    route: str | None = None
+    """Decision/router outcome (e.g. tier) when present in the workflow
+    state under ``tier`` / ``route``; ``None`` otherwise."""
+    cost_usd: float = 0.0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    latency_ms: int = 0
+    governance_effect: str | None = None
+    """``allow`` / ``warn`` / ``deny`` — most severe governance effect on
+    the run. Unset for now; the ADR-096 governance projector is a
+    follow-up."""
+    error_type: str | None = None
+    created_at: datetime = Field(default_factory=_now)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    """Bounded escape hatch (provider, model, pricing_version, …)."""
+
+
 class EvalRecord(BaseModel):
     """Persisted summary of one eval run (one dataset, one agent version, N cases)."""
 

@@ -1,0 +1,19 @@
+api_version: movate/v1
+kind: Skill
+name: sim-erp
+version: 0.1.0
+description: Simulate posting an approved expense to the ERP (records to the shared DB).
+schema:
+  input:
+    document: string
+    amount: number
+    approver: string
+    run_id: string
+  output:
+    ok: boolean
+implementation:
+  kind: python
+  entry: "certification.harness.sim_systems:sim_erp_submit"
+cost:
+  per_call_usd: 0.0
+side_effects: mutates-state

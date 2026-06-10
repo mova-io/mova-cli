@@ -47,6 +47,7 @@ from movate.core.models import (
     JobStatus,
     KbChunk,
     KbChunkWithScore,
+    ObservabilityFact,
     Project,
     ProjectAgent,
     ProjectKb,
@@ -186,6 +187,10 @@ class InMemoryStorage:
         # ADR 052: tool registry descriptors. Keyed by
         # (name, version, scope, tenant_id) for upsert dedup.
         self.tool_descriptors: list[Any] = []
+        # ADR 096: derived observability facts — one row per terminal
+        # execution event, upserted by fact_id (the edge writers + tests
+        # assert on this list directly).
+        self.observability_facts: list[ObservabilityFact] = []
 
     async def init(self) -> None:
         return None
@@ -250,6 +255,40 @@ class InMemoryStorage:
                 self.workflow_runs[i] = w
                 return
         self.workflow_runs.append(w)
+
+    async def save_observability_fact(self, fact: ObservabilityFact) -> None:
+        # Upsert on fact_id (the PRIMARY KEY in sqlite/postgres, ADR 096
+        # D4): a re-derived fact replaces its row in place — matching the
+        # DB providers' ON CONFLICT DO UPDATE.
+        for i, existing in enumerate(self.observability_facts):
+            if existing.fact_id == fact.fact_id:
+                self.observability_facts[i] = fact
+                return
+        self.observability_facts.append(fact)
+
+    async def list_observability_facts(
+        self,
+        *,
+        tenant_id: str,
+        kind: str | None = None,
+        workflow: str | None = None,
+        agent: str | None = None,
+        status: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[ObservabilityFact]:
+        rows = [f for f in self.observability_facts if f.tenant_id == tenant_id]
+        if kind is not None:
+            rows = [f for f in rows if f.kind == kind]
+        if workflow is not None:
+            rows = [f for f in rows if f.workflow == workflow]
+        if agent is not None:
+            rows = [f for f in rows if f.agent == agent]
+        if status is not None:
+            rows = [f for f in rows if f.status == status]
+        if since is not None:
+            rows = [f for f in rows if f.created_at >= since]
+        return sorted(rows, key=lambda f: f.created_at, reverse=True)[:limit]
 
     async def get_run(self, run_id: str, *, tenant_id: str) -> RunRecord | None:
         return next(
