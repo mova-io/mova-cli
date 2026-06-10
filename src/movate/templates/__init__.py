@@ -259,8 +259,8 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
     "expense-approval": (
         "pattern_expense_approval",
         True,
-        "Tiered expense approval (runtime: temporal). A DECISION node routes on amount (no LLM), each tier pauses durably at a HUMAN gate, then an LLM classifier routes approve/reject — all tiers converging on ONE shared ERP-post/finalize/rejected tail (ADR 094 + ADR 098).",  # noqa: E501
-        "DECISION(amount) → [HUMAN] → ROUTER(approve/reject) → shared ERP-post|reject → finalize",
+        "Tiered expense approval (runtime: temporal). A DECISION node routes on amount (no LLM), each tier pauses durably at a HUMAN gate that routes its own approve/reject decision (ADR 099) — zero LLM classifiers, all tiers converging on ONE shared ERP-post/finalize/rejected tail (ADR 094/098/099).",  # noqa: E501
+        "DECISION(amount) → [HUMAN routes approve|reject] → shared ERP-post|rejected → finalize",
     ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents

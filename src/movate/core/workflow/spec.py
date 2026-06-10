@@ -177,6 +177,31 @@ class HumanNodeSpec(BaseModel):
             "when 'timeout' is set; ignored otherwise."
         ),
     )
+    route_on: str = Field(
+        "decision",
+        min_length=1,
+        description=(
+            "State key from the human's response the gate routes on (ADR 099). "
+            "Defaults to 'decision'. Only meaningful when 'routes' is set, and "
+            "must then be listed in 'output_contract'."
+        ),
+    )
+    routes: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Decision value → target node id map (ADR 099). Matching is exact "
+            "after trim + casefold (a closed answer vocabulary — free-text "
+            "interpretation stays an intent-router's job); an unmatched value "
+            "takes 'fallback'. Omit for the plain pause/resume gate."
+        ),
+    )
+    fallback: str | None = Field(
+        default=None,
+        description=(
+            "Node id to route to when the decision value matches no route key "
+            "(ADR 099). Required when 'routes' is set."
+        ),
+    )
 
     @field_validator("id")
     @classmethod
@@ -196,6 +221,55 @@ class HumanNodeSpec(BaseModel):
                 f"human node {self.id!r}: 'on_timeout' (a node id) is required "
                 "when 'timeout' is set"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_routes(self) -> HumanNodeSpec:
+        # Decision routing (ADR 099 D1) — same fail-loud pattern as the
+        # timeout/on_timeout pair above: a malformed gate fails `mdk validate`,
+        # not the Nth production run.
+        if self.routes is None:
+            # 'fallback' / an explicit 'route_on' are meaningless without
+            # 'routes' — reject rather than silently ignoring author intent.
+            if self.fallback is not None:
+                raise ValueError(
+                    f"human node {self.id!r}: 'fallback' is only valid when 'routes' is set"
+                )
+            if "route_on" in self.model_fields_set:
+                raise ValueError(
+                    f"human node {self.id!r}: 'route_on' is only valid when 'routes' is set"
+                )
+            return self
+        if not self.routes:
+            raise ValueError(
+                f"human node {self.id!r}: 'routes' must map at least one decision "
+                f"value to a node id (or be omitted)"
+            )
+        if not (self.fallback and self.fallback.strip()):
+            raise ValueError(
+                f"human node {self.id!r}: 'fallback' (a node id) is required when 'routes' is set"
+            )
+        # The signal endpoint's existing output_contract 422 is what guarantees
+        # a delivered decision always carries the routing key (ADR 099 D1/D3) —
+        # so the key MUST be part of the contract.
+        if self.route_on not in self.output_contract:
+            raise ValueError(
+                f"human node {self.id!r}: route_on {self.route_on!r} must be "
+                f"listed in 'output_contract' (got: {self.output_contract!r})"
+            )
+        # Matching is trim+casefold (ADR 099 D1): keys colliding after
+        # normalization would silently shadow each other — reject.
+        seen: dict[str, str] = {}
+        for key in self.routes:
+            normalized = key.strip().casefold()
+            if not normalized:
+                raise ValueError(f"human node {self.id!r}: route key {key!r} is empty after trim")
+            if normalized in seen:
+                raise ValueError(
+                    f"human node {self.id!r}: route keys {seen[normalized]!r} and "
+                    f"{key!r} collide after trim+casefold matching"
+                )
+            seen[normalized] = key
         return self
 
 

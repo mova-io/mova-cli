@@ -1,1 +1,0 @@
-{"type":"object","additionalProperties":true,"required":["label"],"properties":{"label":{"type":"string"}}}

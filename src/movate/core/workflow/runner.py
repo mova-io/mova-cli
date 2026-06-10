@@ -76,7 +76,10 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
-from movate.core.workflow.decision import _evaluate_decision_traced
+from movate.core.workflow.decision import (
+    _evaluate_decision_traced,
+    _evaluate_human_route_traced,
+)
 from movate.core.workflow.ir import EdgeKind, NodeType, WorkflowGraph, WorkflowNode
 from movate.core.workflow.judge import (
     build_judge_state_value,
@@ -214,7 +217,10 @@ class WorkflowRunner:
         against the gate's ``output_contract`` and merged it into
         ``record.paused_state`` (decision wins), persisting the updated
         checkpoint. We continue the walk from the **sequential successor**
-        of ``record.paused_node_id`` with that merged state, reusing the
+        of ``record.paused_node_id`` — or, when the gate declares decision
+        ``routes`` (ADR 099), from the route chosen by the shared
+        ``evaluate_human_route`` helper over the merged decision value —
+        with that merged state, reusing the
         SAME loop as :meth:`run` via :meth:`_walk`. If the successor is
         itself a HUMAN node the walk re-pauses (a fresh PAUSED checkpoint),
         so multi-gate workflows resume one gate at a time for free.
@@ -249,9 +255,44 @@ class WorkflowRunner:
         # PAUSED record should always carry it).
         resume_state = dict(record.paused_state or {})
 
-        # Resume from the gate's single sequential successor. The gate
-        # executed nothing, so its successor is where execution continues.
-        successor = self._sequential_successor(graph, record.paused_node_id)
+        # Resume from the gate's single sequential successor — unless the gate
+        # declares decision ``routes`` (ADR 099): then the continuation start
+        # is computed from the merged decision value through the ONE shared
+        # ``evaluate_human_route`` helper (trim + casefold exact match,
+        # unmatched → fallback), so native and the Temporal-compiled workflow
+        # can never disagree on the branch. Everything else — checkpoint
+        # guards, _walk, re-pause on a successor gate — is untouched.
+        successor: str | None
+        paused_node = graph.nodes.get(record.paused_node_id)
+        routes: dict[str, str] = (
+            dict(paused_node.metadata.get("routes") or {}) if paused_node is not None else {}
+        )
+        if routes and paused_node is not None:
+            fallback = str(paused_node.metadata.get("fallback", ""))
+            route_on = str(paused_node.metadata.get("route_on", "decision"))
+            successor, matched_key = _evaluate_human_route_traced(
+                routes, fallback, resume_state.get(route_on)
+            )
+            # Observability (ADR 099 D3, mirroring the workflow.decision span):
+            # the resolved route is recorded, not silent — the matched route
+            # key (or "fallback") + the chosen node id.
+            span = self._executor.tracer.start_span(
+                "workflow.human_route",
+                {"workflow.node_id": record.paused_node_id},
+            )
+            try:
+                self._executor.tracer.set_attribute(
+                    span,
+                    "workflow.human_route",
+                    matched_key if matched_key is not None else "fallback",
+                )
+                self._executor.tracer.set_attribute(span, "human_route.route", successor)
+            finally:
+                self._executor.tracer.end_span(span)
+        else:
+            # The gate executed nothing, so its successor is where execution
+            # continues.
+            successor = self._sequential_successor(graph, record.paused_node_id)
 
         return await self._walk(
             graph,

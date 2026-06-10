@@ -144,6 +144,14 @@ def compile_workflow(
             if ns.timeout is not None:
                 human_metadata["timeout"] = ns.timeout
                 human_metadata["on_timeout"] = ns.on_timeout
+            # Decision routing (ADR 099 D1) — only stamped when set (the same
+            # only-stamp-when-set rule as the ADR 062 extras above), so an
+            # unrouted gate's metadata stays byte-for-byte the prior shape and
+            # both backends keep their sequential-successor advance.
+            if ns.routes:
+                human_metadata["routes"] = dict(ns.routes)
+                human_metadata["fallback"] = ns.fallback
+                human_metadata["route_on"] = ns.route_on
             nodes[ns.id] = WorkflowNode(
                 id=ns.id,
                 type=NodeType.HUMAN,
@@ -342,6 +350,23 @@ def compile_workflow(
                 f"is not a valid node id (known: {', '.join(sorted(nodes))})"
             )
 
+    # 3e. Validate HUMAN decision-route targets (ADR 099). Every route value +
+    # the ``fallback`` must name a valid node id — caught here at compile time,
+    # exactly like the decision-node check (step 3c). The spec validator has
+    # already guaranteed ``fallback`` is set whenever ``routes`` is.
+    for ns in spec.nodes:
+        if not isinstance(ns, HumanNodeSpec) or not ns.routes:
+            continue
+        human_targets = list(ns.routes.values())
+        if ns.fallback:
+            human_targets.append(ns.fallback)
+        for target in human_targets:
+            if target not in nodes:
+                raise WorkflowCompileError(
+                    f"human node {ns.id!r}: route target {target!r} "
+                    f"is not a valid node id (known: {', '.join(sorted(nodes))})"
+                )
+
     # 4. Edges — explicit edges must exist + no self-loops; then inject synthetic
     # CONDITIONAL edges from each intent-router to its route targets so that the
     # IR graph correctly models reachability and topological order.
@@ -478,6 +503,33 @@ def compile_workflow(
                 metadata={"synthetic": True, "source": "human-timeout"},
             )
         )
+
+    # Inject synthetic edges for HUMAN decision routes (ADR 099) — like the
+    # router/judge/decision/timeout legs above these are CONDITIONAL+synthetic,
+    # so reachability/topological order stay correct, the legs are
+    # convergence-eligible (clause (a) of the validate_linear join rule — they
+    # compose with ADR 098's OR-merge, so routes may converge on shared sinks),
+    # and the sequential-successor walk skips them on both backends.
+    seen_human_route_edges: set[tuple[str, str]] = set()
+    for ns in spec.nodes:
+        if not isinstance(ns, HumanNodeSpec) or not ns.routes:
+            continue
+        human_targets = list(ns.routes.values())
+        if ns.fallback:
+            human_targets.append(ns.fallback)
+        for target in human_targets:
+            pair = (ns.id, target)
+            if pair in seen_human_route_edges:
+                continue
+            seen_human_route_edges.add(pair)
+            edges.append(
+                WorkflowEdge(
+                    from_id=ns.id,
+                    to_id=target,
+                    kind=EdgeKind.CONDITIONAL,
+                    metadata={"synthetic": True, "source": "human-route"},
+                )
+            )
 
     # 4. State schema — load + validate.
     schema_path = (workflow_dir / spec.state_schema).resolve()
@@ -709,8 +761,9 @@ def validate_linear(graph: WorkflowGraph) -> None:
     # than one predecessor is legal iff EVERY inbound edge is a leg of a
     # mutually exclusive branch:
     #   (a) a routing leg — a compiler-injected synthetic CONDITIONAL edge
-    #       (intent-router / judge / decision route, or a HUMAN timeout route);
-    #       its source activates exactly ONE leg per visit; or
+    #       (intent-router / judge / decision route, or a HUMAN timeout or
+    #       decision route — ADR 099); its source activates exactly ONE leg
+    #       per visit; or
     #   (b) an exclusive tail — a non-synthetic SEQUENTIAL edge that is its
     #       source's ONLY non-synthetic successor (per-branch work converging
     #       after a fork inherits its branch's exclusivity).
@@ -736,8 +789,8 @@ def validate_linear(graph: WorkflowGraph) -> None:
                 f"join at node {nid!r}: inbound edge {e.from_id!r}→{nid!r} "
                 f"({e.kind.value}) is not an exclusive branch leg. Exclusive "
                 f"convergence (ADR 098) requires every inbound edge to be a "
-                f"routing leg (a router/judge/decision route or HUMAN timeout "
-                f"route) or its source's only non-synthetic sequential "
+                f"routing leg (a router/judge/decision route or HUMAN timeout/"
+                f"decision route) or its source's only non-synthetic sequential "
                 f"successor. Branches that execute in the same run need a "
                 f"barrier join — use fan_in (ADR 092)."
             )
@@ -758,14 +811,15 @@ def validate_linear(graph: WorkflowGraph) -> None:
     # Sink — for linear workflows exactly one; intent-router / judge workflows
     # may have multiple sinks (each branch target that has no successor). We
     # only enforce single-sink on pure-linear (no router / no judge) workflows.
-    # A HUMAN gate with an ``on_timeout`` leg is a branching primitive too
-    # (ADR 098): its timeout route may end in its own sink (e.g. an escalation
-    # path), so it relaxes the single-sink rule like the routers do.
+    # A HUMAN gate with an ``on_timeout`` leg (ADR 098) or decision ``routes``
+    # (ADR 099) is a branching primitive too: its legs may end in their own
+    # sinks (e.g. an escalation/rejection path), so it relaxes the single-sink
+    # rule like the routers do.
     router_nodes = {
         nid
         for nid, n in graph.nodes.items()
         if n.type in {NodeType.INTENT_ROUTER, NodeType.JUDGE, NodeType.DECISION}
-        or (n.type is NodeType.HUMAN and n.metadata.get("on_timeout"))
+        or (n.type is NodeType.HUMAN and (n.metadata.get("on_timeout") or n.metadata.get("routes")))
     }
     if not router_nodes:
         sinks = graph.sinks()
