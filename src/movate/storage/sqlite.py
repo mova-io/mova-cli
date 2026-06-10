@@ -3625,7 +3625,14 @@ class SqliteProvider:
                 tokens_in         = excluded.tokens_in,
                 tokens_out        = excluded.tokens_out,
                 latency_ms        = excluded.latency_ms,
-                governance_effect = excluded.governance_effect,
+                -- governance_effect is edge-supplied (ADR 096): a re-derive
+                -- from an edge that observed no decisions (NULL) must not
+                -- erase the effect the edge that DID run the gates recorded
+                -- (e.g. the Temporal persist activity writes it, then the
+                -- dispatch edge re-projects the same record without it).
+                governance_effect = COALESCE(
+                    excluded.governance_effect, governance_effect
+                ),
                 error_type        = excluded.error_type,
                 created_at        = excluded.created_at,
                 attributes        = excluded.attributes

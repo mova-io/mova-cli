@@ -8,6 +8,8 @@ tighten), and the warn→enforce mode application + audit emission.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 import movate.tracing.metrics as metrics_mod
@@ -20,6 +22,11 @@ from movate.governance import (
     GovernancePolicy,
     Mode,
     combine,
+    consume_run_effect,
+    governance_effect_scope,
+    most_severe,
+    peek_run_effect,
+    record_run_effect,
     resolve,
 )
 from movate.governance.gate import Gate
@@ -269,3 +276,101 @@ def test_engine_does_not_meter_ungoverned_kind(monkeypatch: pytest.MonkeyPatch) 
     engine = GovernanceEngine(gates=[_FixedGate(GateKind.COST, Decision.allow())])
     engine.check(GateKind.MODEL, _CTX)
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Per-run effect collection (ADR 096 — observability_facts.governance_effect)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_most_severe_precedence_and_none() -> None:
+    # deny > warn > allow; None / unknown strings are skipped.
+    assert most_severe() is None
+    assert most_severe(None, None) is None
+    assert most_severe("allow") == "allow"
+    assert most_severe("allow", "warn") == "warn"
+    assert most_severe("warn", "allow") == "warn"
+    assert most_severe("allow", "warn", "deny") == "deny"
+    assert most_severe("deny", "allow") == "deny"
+    assert most_severe(None, "allow", "bogus") == "allow"
+
+
+@pytest.mark.unit
+def test_scope_collects_most_severe_engine_effect() -> None:
+    allow_gate = _FixedGate(GateKind.MODEL, Decision.allow(GateKind.MODEL))
+    deny_gate = _FixedGate(GateKind.COST, Decision.deny(GateKind.COST, "over budget"))
+    engine = GovernanceEngine(gates=[allow_gate, deny_gate])
+    with governance_effect_scope() as scope:
+        engine.check(GateKind.MODEL, _CTX)  # allow
+        assert scope.effect == "allow"
+        engine.check(GateKind.COST, _CTX)  # WARN-mode deny ⇒ recorded as warn
+        assert scope.effect == "warn"
+        engine.check(GateKind.MODEL, _CTX)  # a later allow never downgrades
+        assert scope.effect == "warn"
+
+
+@pytest.mark.unit
+def test_scope_records_enforced_deny() -> None:
+    deny_gate = _FixedGate(GateKind.COST, Decision.deny(GateKind.COST, "over budget"))
+    engine = GovernanceEngine(
+        GovernancePolicy(modes={GateKind.COST: Mode.ENFORCE}), gates=[deny_gate]
+    )
+    with governance_effect_scope() as scope:
+        engine.check(GateKind.COST, _CTX)
+    assert scope.effect == "deny"
+
+
+@pytest.mark.unit
+def test_scope_is_none_when_no_gate_evaluated() -> None:
+    # An ungoverned-kind check records NOTHING (same condition as the metric):
+    # the run's governance_effect stays an honest NULL.
+    engine = GovernanceEngine(gates=[_FixedGate(GateKind.COST, Decision.allow())])
+    with governance_effect_scope() as scope:
+        engine.check(GateKind.MODEL, _CTX)
+    assert scope.effect is None
+
+
+@pytest.mark.unit
+def test_engine_check_without_active_scope_is_noop() -> None:
+    # No scope open (the engine used outside an instrumented edge) ⇒ the
+    # check is byte-for-byte unchanged — no error, no leakage into a scope
+    # opened LATER.
+    engine = GovernanceEngine(gates=[_FixedGate(GateKind.COST, Decision.deny(GateKind.COST, "x"))])
+    engine.check(GateKind.COST, _CTX)
+    with governance_effect_scope() as scope:
+        pass
+    assert scope.effect is None
+
+
+@pytest.mark.unit
+async def test_scope_visible_inside_spawned_tasks() -> None:
+    # Parallel workflow patterns run nodes in asyncio tasks: contextvars copy
+    # into child tasks and the scope OBJECT is shared, so their decisions
+    # fold into the edge's scope.
+    engine = GovernanceEngine(gates=[_FixedGate(GateKind.COST, Decision.deny(GateKind.COST, "x"))])
+
+    async def _node() -> None:
+        engine.check(GateKind.COST, _CTX)
+
+    with governance_effect_scope() as scope:
+        await asyncio.gather(asyncio.create_task(_node()), asyncio.create_task(_node()))
+    assert scope.effect == "warn"  # default WARN-mode downgrade, both tasks seen
+
+
+@pytest.mark.unit
+def test_run_effect_registry_merge_peek_consume() -> None:
+    run_id = f"wf-{id(object())}"  # unique per test run; registry is process-global
+    record_run_effect(run_id, None)  # ignored
+    record_run_effect(run_id, "bogus")  # ignored
+    assert peek_run_effect(run_id) is None
+
+    record_run_effect(run_id, "allow")
+    record_run_effect(run_id, "warn")
+    record_run_effect(run_id, "allow")  # severity never downgrades
+    assert peek_run_effect(run_id) == "warn"  # peek does NOT consume
+    assert peek_run_effect(run_id) == "warn"
+
+    assert consume_run_effect(run_id) == "warn"  # consume frees the slot
+    assert peek_run_effect(run_id) is None
+    assert consume_run_effect(run_id) is None  # idempotent on a missing run

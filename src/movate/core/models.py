@@ -2692,8 +2692,9 @@ class ObservabilityFact(BaseModel):
     latency_ms: int = 0
     governance_effect: str | None = None
     """``allow`` / ``warn`` / ``deny`` — most severe governance effect on
-    the run. Unset for now; the ADR-096 governance projector is a
-    follow-up."""
+    the run (deny > warn > allow), collected at the execution edges via
+    :mod:`movate.governance.effects`. ``None`` ⇒ no governance gate
+    evaluated for this run."""
     error_type: str | None = None
     created_at: datetime = Field(default_factory=_now)
     attributes: dict[str, Any] = Field(default_factory=dict)

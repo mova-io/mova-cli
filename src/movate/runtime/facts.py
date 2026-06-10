@@ -26,7 +26,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def fact_from_run_record(record: RunRecord) -> ObservabilityFact:
+def fact_from_run_record(
+    record: RunRecord, *, governance_effect: str | None = None
+) -> ObservabilityFact:
     """Flatten one agent :class:`RunRecord` into its fact row.
 
     The nested ``record.metrics`` blob (the thing the platform must never
@@ -35,6 +37,12 @@ def fact_from_run_record(record: RunRecord) -> ObservabilityFact:
     (the bounded escape hatch). A record persisted before metrics were
     populated simply carries the ``Metrics`` defaults (zeros, empty
     trace_id) — never an error.
+
+    ``governance_effect`` is supplied by the *edge* (the most severe effect
+    a :func:`movate.governance.effects.governance_effect_scope` collected
+    around the run) because ``runs`` stays untouched by design — the effect
+    is a facts-only projection, never a column on the authoritative record.
+    ``None`` ⇒ no gate evaluated (the column's honest NULL).
     """
     metrics = record.metrics
     attributes: dict[str, object] = {
@@ -62,13 +70,16 @@ def fact_from_run_record(record: RunRecord) -> ObservabilityFact:
         tokens_in=metrics.tokens.input,
         tokens_out=metrics.tokens.output,
         latency_ms=metrics.latency_ms,
+        governance_effect=governance_effect,
         error_type=record.error.type if record.error else None,
         created_at=record.created_at,
         attributes=attributes,
     )
 
 
-def fact_from_workflow_run(record: WorkflowRunRecord) -> ObservabilityFact:
+def fact_from_workflow_run(
+    record: WorkflowRunRecord, *, governance_effect: str | None = None
+) -> ObservabilityFact:
     """Flatten one :class:`WorkflowRunRecord` into its fact row.
 
     ``route`` surfaces a decision/router outcome when the workflow state
@@ -78,6 +89,12 @@ def fact_from_workflow_run(record: WorkflowRunRecord) -> ObservabilityFact:
     latency stay at their zero defaults: workflow-level rollups are a
     deliberate non-goal here (the per-node ``run`` facts carry the spend;
     summing is the reader's join, not a second source of truth).
+
+    ``governance_effect`` follows the same edge-supplied contract as
+    :func:`fact_from_run_record`: ``workflow_runs`` stays untouched, the
+    effect is a facts-only projection. ``None`` ⇒ no gate observed at this
+    edge — the storage upsert keeps any effect a *different* edge already
+    recorded for the same fact (NULL never overwrites non-NULL).
     """
     state = record.final_state or record.paused_state or {}
     raw_route = state.get("tier", state.get("route"))
@@ -92,6 +109,7 @@ def fact_from_workflow_run(record: WorkflowRunRecord) -> ObservabilityFact:
         status=record.status.value,
         runtime=record.runtime or "native",
         route=str(raw_route) if raw_route is not None else None,
+        governance_effect=governance_effect,
         error_type=record.error.type if record.error else None,
         created_at=record.created_at,
     )

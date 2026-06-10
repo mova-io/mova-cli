@@ -30,6 +30,12 @@ from movate.core.models import (
 )
 from movate.core.notify import NotificationDispatcher
 from movate.core.workflow import WorkflowGraph, WorkflowRunner
+from movate.governance.effects import (
+    consume_run_effect,
+    governance_effect_scope,
+    most_severe,
+    peek_run_effect,
+)
 from movate.runtime.agent_resolver import resolve_agent_bundle
 from movate.runtime.events import emit_event
 from movate.runtime.facts import (
@@ -196,17 +202,23 @@ class WorkerDispatch:
             # otherwise GET /runs/<id> from the API key's tenant context
             # returns 404 because the stored row is scoped to the wrong
             # tenant.
-            response = await self._executor.execute(
-                bundle,
-                request,
-                job_id=job.job_id,
-                tenant_id_override=job.tenant_id,
-                # Propagate the thread linkage onto the spawned run
-                # so multi-turn agents can later list this turn via
-                # list_runs_for_thread. ``None`` (the common case for
-                # standalone runs) is a no-op.
-                thread_id=job.thread_id,
-            )
+            # ADR 096 — collect the run's governance decisions at this edge.
+            # The scope is contextvar-based: the executor's governance engine
+            # records every gated decision into it with no parameter threading
+            # through core. ``scope.effect`` is the most severe effect (deny >
+            # warn > allow) or None when no gate evaluated.
+            with governance_effect_scope() as gov_scope:
+                response = await self._executor.execute(
+                    bundle,
+                    request,
+                    job_id=job.job_id,
+                    tenant_id_override=job.tenant_id,
+                    # Propagate the thread linkage onto the spawned run
+                    # so multi-turn agents can later list this turn via
+                    # list_runs_for_thread. ``None`` (the common case for
+                    # standalone runs) is a no-op.
+                    thread_id=job.thread_id,
+                )
         except Exception as exc:
             # Executor is expected to swallow MovateError into a
             # status='error' RunResponse, so an unhandled exception
@@ -238,7 +250,10 @@ class WorkerDispatch:
             if response.run_id:
                 record = await self._storage.get_run(response.run_id, tenant_id=job.tenant_id)
                 if record is not None:
-                    await write_fact_failsoft(self._storage, fact_from_run_record(record))
+                    await write_fact_failsoft(
+                        self._storage,
+                        fact_from_run_record(record, governance_effect=gov_scope.effect),
+                    )
         except Exception:
             logger.warning("observability_fact_derive_failed run_id=%s", response.run_id)
 
@@ -911,11 +926,18 @@ class WorkerDispatch:
                 tenant_id=job.tenant_id,
             )
             try:
-                result = await runner.resume(graph, record)
+                # ADR 096 — one effect scope spans the resumed segment; every
+                # node the runner executes records its gated decisions here.
+                with governance_effect_scope() as gov_scope:
+                    result = await runner.resume(graph, record)
             except Exception as exc:
                 logger.exception("workflow_resume_unhandled job_id=%s", job.job_id)
                 return _error("internal", str(exc), retryable=True)
-            await self._write_workflow_fact(result.workflow_run_id, tenant_id=job.tenant_id)
+            await self._write_workflow_fact(
+                result.workflow_run_id,
+                tenant_id=job.tenant_id,
+                governance_effect=gov_scope.effect,
+            )
             return self._workflow_result_to_outcome(result)
 
         graph = self._workflows.get(job.target)
@@ -957,17 +979,33 @@ class WorkerDispatch:
                 tenant_id=job.tenant_id,
             )
             try:
-                result = await runner.run(graph, initial_state=job.input)
+                # ADR 096 — one effect scope spans the whole native run (all
+                # nodes, incl. tasks the runner spawns for parallel patterns:
+                # contextvars copy into child tasks, the scope object is
+                # shared, so their decisions fold in too).
+                with governance_effect_scope() as gov_scope:
+                    result = await runner.run(graph, initial_state=job.input)
             except Exception as exc:
                 logger.exception("workflow_execute_unhandled job_id=%s", job.job_id)
                 return _error("internal", str(exc), retryable=True)
-            await self._write_workflow_fact(result.workflow_run_id, tenant_id=job.tenant_id)
+            await self._write_workflow_fact(
+                result.workflow_run_id,
+                tenant_id=job.tenant_id,
+                governance_effect=gov_scope.effect,
+            )
             return self._workflow_result_to_outcome(result)
 
         # temporal / langgraph — route through the backend seam (ADR 055 D2),
         # reusing this worker's Executor collaborators (ADR 054 D3).
         try:
-            result = await self._run_workflow_on_backend(job, graph, effective)
+            # ADR 096 — the scope covers the in-process executions (langgraph
+            # always; temporal when the ephemeral worker runs the activities
+            # in this process). Activities that land on a REMOTE temporal
+            # worker record their effect there instead (the persist/pause
+            # activities stamp it; the COALESCE upsert keeps it when this
+            # edge re-projects the record without one).
+            with governance_effect_scope() as gov_scope:
+                result = await self._run_workflow_on_backend(job, graph, effective)
         except WorkflowBackendError as exc:
             return _error("runtime_unavailable", str(exc), retryable=False)
         except Exception as exc:
@@ -976,7 +1014,18 @@ class WorkerDispatch:
         # The Temporal persist/pause activities also write the workflow fact
         # (the detached-HITL path never returns here); the fact_id upsert
         # makes the overlap idempotent, and this call covers langgraph.
-        await self._write_workflow_fact(result.workflow_run_id, tenant_id=job.tenant_id)
+        # Effect resolution mirrors the activities' contract: PEEK on a pause
+        # (the run resumes — the registry entry must survive for the terminal
+        # persist), CONSUME on a terminal result (free the slot).
+        if result.status == WorkflowStatus.PAUSED:
+            run_effect = peek_run_effect(result.workflow_run_id)
+        else:
+            run_effect = consume_run_effect(result.workflow_run_id)
+        await self._write_workflow_fact(
+            result.workflow_run_id,
+            tenant_id=job.tenant_id,
+            governance_effect=most_severe(gov_scope.effect, run_effect),
+        )
         return self._workflow_result_to_outcome(result)
 
     async def _run_workflow_on_backend(
@@ -1044,7 +1093,13 @@ class WorkerDispatch:
             detached=detached,
         )
 
-    async def _write_workflow_fact(self, workflow_run_id: str, *, tenant_id: str) -> None:
+    async def _write_workflow_fact(
+        self,
+        workflow_run_id: str,
+        *,
+        tenant_id: str,
+        governance_effect: str | None = None,
+    ) -> None:
         """Derive + persist the workflow's observability fact (ADR 096 D3).
 
         Wired HERE — the dispatch edge — rather than inside the native
@@ -1052,13 +1107,18 @@ class WorkerDispatch:
         rule: persistence projections live at the edges). The runner has
         already persisted the terminal/paused ``WorkflowRunRecord`` by the
         time its result returns, so we re-read the authoritative row and
-        project it. Fail-soft end to end: a read or write failure logs and
-        never touches the dispatch outcome.
+        project it. ``governance_effect`` is the most severe effect this
+        edge's scope collected (``None`` ⇒ no gate observed here; the upsert
+        keeps any effect another edge recorded). Fail-soft end to end: a
+        read or write failure logs and never touches the dispatch outcome.
         """
         try:
             record = await self._storage.get_workflow_run(workflow_run_id, tenant_id=tenant_id)
             if record is not None:
-                await write_fact_failsoft(self._storage, fact_from_workflow_run(record))
+                await write_fact_failsoft(
+                    self._storage,
+                    fact_from_workflow_run(record, governance_effect=governance_effect),
+                )
         except Exception:
             logger.warning("observability_fact_derive_failed workflow_run_id=%s", workflow_run_id)
 

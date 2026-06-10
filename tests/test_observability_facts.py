@@ -30,6 +30,7 @@ from typer.testing import CliRunner
 
 from movate.cli.main import app as cli_app
 from movate.core.auth import ALL_SCOPES, ApiKeyEnv, mint_api_key
+from movate.core.config import ModelPolicy
 from movate.core.executor import Executor
 from movate.core.models import (
     ErrorInfo,
@@ -220,6 +221,32 @@ async def test_upsert_same_fact_id_is_one_row_with_updated_values(storage) -> No
     assert rows[0].cost_usd == pytest.approx(0.5)
 
 
+async def test_upsert_null_governance_effect_keeps_recorded_value(storage) -> None:
+    """governance_effect is edge-supplied: a re-derive from an edge that saw
+    no decisions (NULL) must NOT erase the effect another edge recorded —
+    e.g. the Temporal persist activity stamps it, then the dispatch edge
+    re-projects the same record without one. A non-null re-write still wins
+    (the pause→terminal effect can escalate, e.g. allow→warn)."""
+    await storage.save_observability_fact(
+        _make_fact(fact_id="workflow_run:wf-g", kind="workflow_run", governance_effect="warn")
+    )
+    # NULL re-derive ⇒ the recorded effect survives (everything else updates).
+    await storage.save_observability_fact(
+        _make_fact(fact_id="workflow_run:wf-g", kind="workflow_run", status="error")
+    )
+    rows = await storage.list_observability_facts(tenant_id="tenant-a")
+    assert len(rows) == 1
+    assert rows[0].status == "error"
+    assert rows[0].governance_effect == "warn"
+
+    # A non-null write replaces it.
+    await storage.save_observability_fact(
+        _make_fact(fact_id="workflow_run:wf-g", kind="workflow_run", governance_effect="deny")
+    )
+    rows = await storage.list_observability_facts(tenant_id="tenant-a")
+    assert rows[0].governance_effect == "deny"
+
+
 async def test_list_is_tenant_scoped(storage) -> None:
     await storage.save_observability_fact(_make_fact(fact_id="run:a", tenant_id="tenant-a"))
     await storage.save_observability_fact(_make_fact(fact_id="run:b", tenant_id="tenant-b"))
@@ -294,7 +321,7 @@ def test_fact_from_run_record_flattens_metrics() -> None:
     assert fact.tokens_in == 100
     assert fact.tokens_out == 25
     assert fact.latency_ms == 420
-    assert fact.governance_effect is None  # ADR 096 follow-up: projector unset
+    assert fact.governance_effect is None  # edge-supplied; default = no gate evaluated
     assert fact.error_type is None
     assert fact.created_at == record.created_at
     assert fact.attributes == {
@@ -370,6 +397,21 @@ def test_fact_from_workflow_run_route_fallback_and_defaults() -> None:
         )
     )
     assert errored.error_type == "node_failed"
+
+
+@pytest.mark.unit
+def test_builders_stamp_edge_supplied_governance_effect() -> None:
+    """``governance_effect`` is edge-supplied (the run's most severe effect
+    from the governance scope) — the builders pass it through verbatim and
+    default to None (no gate evaluated). The records stay untouched: there
+    is no governance column on RunRecord / WorkflowRunRecord to read from."""
+    run_fact = fact_from_run_record(_make_run_record(), governance_effect="warn")
+    assert run_fact.governance_effect == "warn"
+    assert fact_from_run_record(_make_run_record()).governance_effect is None
+
+    wf_fact = fact_from_workflow_run(_make_workflow_run(), governance_effect="allow")
+    assert wf_fact.governance_effect == "allow"
+    assert fact_from_workflow_run(_make_workflow_run()).governance_effect is None
 
 
 @pytest.mark.unit
@@ -476,6 +518,107 @@ async def test_dispatch_survives_fact_writer_failure(
     assert outcome.status == JobStatus.SUCCESS
     assert outcome.error is None
     assert any(r.run_id == outcome.result_run_id for r in storage.runs)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch edge — governance_effect stamping (ADR 096 projector)
+# ---------------------------------------------------------------------------
+
+
+def _make_policy_dispatch(
+    storage: InMemoryStorage, agents_dir: Path, policy: ModelPolicy
+) -> WorkerDispatch:
+    """A dispatch whose Executor carries a NON-permissive ModelPolicy, so the
+    ADR 093 governance shadow is built and decisions land in the edge scope."""
+    from movate.runtime.registry import scan_agents  # noqa: PLC0415
+
+    executor = Executor(
+        provider=MockProvider(),
+        pricing=load_pricing(),
+        storage=storage,
+        tracer=NullTracer(),
+        tenant_id="local",
+        policy=policy,
+    )
+    return WorkerDispatch(storage=storage, executor=executor, agents=scan_agents(agents_dir))
+
+
+@pytest.mark.unit
+async def test_dispatch_run_fact_governance_effect_allow(
+    scaffolded_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gates evaluate and all allow ⇒ the run fact carries effect='allow'
+    (non-null proves a gate ran — the certification suite's assertion)."""
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "hi"}')
+    storage = InMemoryStorage()
+    await storage.init()
+    # Allowlist covers the scaffold's primary (openai/...) AND its anthropic
+    # fallback; the cost ceiling sits above the default 1.0 budget.
+    dispatch = _make_policy_dispatch(
+        storage,
+        scaffolded_agent,
+        ModelPolicy(allowed_providers=["openai", "anthropic"], max_cost_per_run_usd=5.0),
+    )
+    job = _make_job()
+    await storage.save_job(job)
+
+    outcome = await dispatch.execute_job(job)
+    assert outcome.status == JobStatus.SUCCESS
+
+    facts = await storage.list_observability_facts(tenant_id="tenant-a")
+    assert len(facts) == 1
+    assert facts[0].governance_effect == "allow"
+
+
+@pytest.mark.unit
+async def test_dispatch_policy_blocked_run_writes_no_fact(
+    scaffolded_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cost ceiling BELOW the agent's declared budget: the shadow COST gate
+    records a warn (the default WARN rollout downgrade of its deny), but the
+    AUTHORITATIVE legacy check raises PolicyViolationError before any
+    RunRecord exists — so the job errors and there is honestly NO fact to
+    stamp (no record ⇒ no fact derivation; the shadow never fabricates one).
+    At the agent-run edge the shadow mirrors the legacy checks by
+    construction, so a warn-while-succeeding never happens here — warn/deny
+    effects on facts come from the workflow edges (the per-node registry)."""
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "hi"}')
+    storage = InMemoryStorage()
+    await storage.init()
+    dispatch = _make_policy_dispatch(
+        storage,
+        scaffolded_agent,
+        ModelPolicy(allowed_providers=["openai", "anthropic"], max_cost_per_run_usd=0.01),
+    )
+    job = _make_job()
+    await storage.save_job(job)
+
+    outcome = await dispatch.execute_job(job)
+    assert outcome.status == JobStatus.ERROR  # PolicyViolationError is authoritative
+
+    facts = await storage.list_observability_facts(tenant_id="tenant-a")
+    assert facts == []
+
+
+@pytest.mark.unit
+async def test_dispatch_run_fact_governance_effect_null_without_policy(
+    scaffolded_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permissive executor (no policy) ⇒ no governance engine, no gates ⇒ the
+    fact's governance_effect is an honest NULL — never a fabricated 'allow'."""
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "hi"}')
+    storage = InMemoryStorage()
+    await storage.init()
+    dispatch = _make_dispatch(storage, scaffolded_agent)
+    job = _make_job()
+    await storage.save_job(job)
+
+    outcome = await dispatch.execute_job(job)
+    assert outcome.status == JobStatus.SUCCESS
+
+    facts = await storage.list_observability_facts(tenant_id="tenant-a")
+    assert len(facts) == 1
+    assert facts[0].governance_effect is None
 
 
 # ---------------------------------------------------------------------------

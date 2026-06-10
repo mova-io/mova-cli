@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Protocol, runtime_checkable
 
+from movate.governance.effects import record_scope_effect
 from movate.governance.gate import (
     Decision,
     Effect,
@@ -120,6 +121,12 @@ class GovernanceEngine:
         # resolved ``effect`` + rollout ``mode`` are the warn→enforce signal.
         if gates:
             self._record_metric(kind, decision, mode, ctx)
+            # Fold the effect into the per-run collection scope, when an
+            # execution edge opened one (ADR 096 — the governance_effect
+            # column on observability_facts). Same gating as the metric: a
+            # check for an ungoverned kind stays a pure no-op. No-op when no
+            # scope is active; never raises.
+            record_scope_effect(decision.effect.value)
 
         if audit and (decision.effect is not Effect.ALLOW or self._audit_allows):
             self._audit.emit(decision, ctx)

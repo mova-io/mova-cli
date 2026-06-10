@@ -4016,7 +4016,14 @@ class PostgresProvider:
                 tokens_in         = EXCLUDED.tokens_in,
                 tokens_out        = EXCLUDED.tokens_out,
                 latency_ms        = EXCLUDED.latency_ms,
-                governance_effect = EXCLUDED.governance_effect,
+                -- governance_effect is edge-supplied (ADR 096): a re-derive
+                -- from an edge that observed no decisions (NULL) must not
+                -- erase the effect the edge that DID run the gates recorded
+                -- (e.g. the Temporal persist activity writes it, then the
+                -- dispatch edge re-projects the same record without it).
+                governance_effect = COALESCE(
+                    EXCLUDED.governance_effect, observability_facts.governance_effect
+                ),
                 error_type        = EXCLUDED.error_type,
                 created_at        = EXCLUDED.created_at,
                 attributes        = EXCLUDED.attributes
