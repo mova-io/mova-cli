@@ -158,6 +158,14 @@ METRIC_VOICE_TURNS = "mdk.voice.turns"  # completed voice turns (attr: interrupt
 # and acceptable). Once a gate is ``mode=enforce``, ``effect=deny`` is a real
 # block. Low-cardinality attrs only (never the model string / run_id).
 METRIC_GOVERNANCE_DECISIONS = "mdk.governance.decisions"
+# MDK certification suite — one bump per scenario assertion outcome. Attrs:
+# ``scenario`` (e.g. expense-approval), ``capability`` (governance / temporal /
+# hitl / tracing / retries / parallelism / kb / evals / cost / audit), and
+# ``status`` (pass / fail). The certification Grafana dashboard derives its
+# "is the platform certified?" matrix from this — a capability is green only
+# when its scenarios emit status=pass and zero status=fail. Generated from REAL
+# scenario runs (the harness), so the matrix is earned, not drawn.
+METRIC_CERTIFICATION = "mdk.certification.scenario"
 
 #: Every OTel instrument name this module emits. The single source of truth the
 #: dashboards-as-code drift guard cross-checks against (a dashboard may only
@@ -183,6 +191,7 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_VOICE_TTS_FIRST_AUDIO_MS,
         METRIC_VOICE_TURNS,
         METRIC_GOVERNANCE_DECISIONS,
+        METRIC_CERTIFICATION,
     }
 )
 
@@ -216,6 +225,7 @@ class _State:
     voice_tts_first_audio_ms: Any = None  # Histogram[float]
     voice_turns: Any = None  # Counter[int]
     governance_decisions: Any = None  # Counter[int]  (ADR 093)
+    certification: Any = None  # Counter[int]  (MDK certification suite)
 
     # ADR 034 D3 — DB pool observable gauges are registered lazily by
     # ``register_pool_metrics`` (after storage.init at the edge), not in
@@ -394,6 +404,14 @@ def init_metrics(*, reader: Any | None = None) -> None:
             "skill/cost/quota/…), effect (allow/warn/deny), mode (warn/enforce), "
             "tenant. In warn mode a would-be deny is recorded as effect=warn — "
             "that rate per kind is the parity signal for the warn→enforce flip."
+        ),
+    )
+    _state.certification = meter.create_counter(
+        METRIC_CERTIFICATION,
+        unit="1",
+        description=(
+            "MDK certification scenario assertion outcomes (attrs: scenario, "
+            "capability, status=pass|fail). Backs the certification matrix dashboard."
         ),
     )
 
@@ -789,6 +807,16 @@ def record_governance_decision(
     )
 
 
+def record_certification_result(*, scenario: str, capability: str, status: str) -> None:
+    """Record one MDK certification assertion outcome (attrs: ``scenario``,
+    ``capability``, ``status``=pass|fail). The certification dashboard rolls these
+    up into the per-capability matrix. No-op when metrics are off / OTel absent;
+    never raises — a certification emit must not break the scenario run."""
+    if _state.certification is None:
+        return
+    _state.certification.add(1, {"scenario": scenario, "capability": capability, "status": status})
+
+
 def inc_in_flight(*, tenant_id: str) -> None:
     """Increment the in-flight job gauge (attrs: ``tenant``). No-op when off."""
     if _state.jobs_in_flight is None:
@@ -833,6 +861,7 @@ def dec_sse_connections(*, tenant_id: str) -> None:
 
 
 __all__ = [
+    "METRIC_CERTIFICATION",
     "METRIC_DB_POOL_IDLE",
     "METRIC_DB_POOL_IN_USE",
     "METRIC_DB_POOL_MAX",
@@ -858,6 +887,7 @@ __all__ = [
     "inc_in_flight",
     "inc_sse_connections",
     "init_metrics",
+    "record_certification_result",
     "record_governance_decision",
     "record_job_completed",
     "record_run_usage",

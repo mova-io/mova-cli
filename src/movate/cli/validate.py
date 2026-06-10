@@ -7,6 +7,7 @@ Auto-detects: a path with ``workflow.yaml`` validates as a workflow (compile
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -38,6 +39,7 @@ from movate.core.models import AgentRuntime, AgentSpec, SkillImplementationKind,
 from movate.core.prompt_linter import LintIssue, lint_prompt
 from movate.core.workflow import (
     WorkflowCompileError,
+    WorkflowGraph,
     compile_workflow,
     declares_parallel,
     load_workflow_spec,
@@ -1188,6 +1190,133 @@ def _render_lint_issues(issues: list[LintIssue]) -> None:
             console.print(f"    [dim]hint: {issue.hint}[/dim]")
 
 
+def _print_workflow_governance(graph: object) -> None:
+    """Surface the governance contract (ADR 092 D5) for parallel/delegation
+    workflows: the declarative bounds an author + reviewer can SEE at validate
+    time. Renders nothing for a plain linear workflow (no bounds to show)."""
+    from movate.core.workflow.compiler import DEFAULT_MAX_FANOUT  # noqa: PLC0415
+    from movate.core.workflow.ir import EdgeKind, NodeType  # noqa: PLC0415
+
+    nodes = getattr(graph, "nodes", {})
+    edges = getattr(graph, "edges", [])
+    lines: list[str] = []
+
+    # Fan-out blocks: the branch count + the max_fanout cap.
+    for nid in nodes:
+        fan_out = [e for e in edges if e.from_id == nid and e.kind is EdgeKind.PARALLEL_FAN_OUT]
+        if fan_out:
+            lines.append(
+                f"    fan-out [bold]{nid}[/bold]: {len(fan_out)} branch(es) "
+                f"[dim](cap max_fanout={DEFAULT_MAX_FANOUT})[/dim]"
+            )
+
+    # Supervisor blocks: the roster + the delegation cap + the optional budget.
+    for nid, node in nodes.items():
+        if getattr(node, "type", None) is not NodeType.SUPERVISOR:
+            continue
+        meta = getattr(node, "metadata", {}) or {}
+        roster = list((meta.get("specialists") or {}).keys())
+        bits = [
+            f"max_delegations={meta.get('max_delegations')}",
+            f"specialists={len(roster)} ({', '.join(roster)})",
+        ]
+        if meta.get("budget") is not None:
+            bits.append(f"budget=${meta['budget']:.2f}")
+        lines.append(f"    supervisor [bold]{nid}[/bold]: " + ", ".join(bits))
+
+    # Per-node Temporal activity policy (ADR 054 D9) — declared bounds, if any.
+    for nid, node in nodes.items():
+        policy = (getattr(node, "metadata", {}) or {}).get("activity_policy")
+        if policy:
+            shown = ", ".join(f"{k}={v}" for k, v in policy.items())
+            lines.append(f"    activity-policy [bold]{nid}[/bold]: {shown}")
+
+    if lines:
+        console.print("  [bold]governance[/bold] [dim](ADR 092 D5)[/dim]:")
+        for line in lines:
+            console.print(line)
+
+
+def _lint_state_threading(graph: WorkflowGraph) -> None:
+    """Advisory lint: flag chained-agent state-threading gaps (authoring slice 1).
+
+    Workflow nodes share one state dict, threaded in topological order. A node
+    whose **required input** key is neither an external initial-state input nor
+    produced by an **upstream** node receives nothing at runtime — the silent
+    data-loss the audit flagged. We walk the DAG in topo order, accumulate each
+    AGENT node's produced output keys, and warn on any required input that isn't
+    yet available. High-confidence by construction: a key declared in the state
+    schema that *some* node produces is treated as available only AFTER its
+    producer (so it also catches ordering bugs), while keys nobody produces are
+    assumed external inputs (always available). Non-agent nodes (gate/judge/
+    human/fan-out) carry no I/O schema and are pass-through here.
+    """
+    from movate.core.workflow.ir import NodeType  # noqa: PLC0415
+
+    state_props = set((getattr(graph, "state_schema", {}) or {}).get("properties", {}).keys())
+
+    # Pass 1: per-node (required-inputs, produced-outputs) + the global set of
+    # keys SOME node produces (everything else must arrive as external input).
+    schemas: dict[str, tuple[set[str], set[str]]] = {}
+    produced_by_any: set[str] = set()
+    for nid, node in graph.nodes.items():
+        if node.type is not NodeType.AGENT or not node.ref:
+            continue
+        try:
+            bundle = load_agent(node.ref)
+        except Exception:
+            continue  # compile_workflow already validated refs; skip on any load issue
+        required_in = set(bundle.input_schema.get("required", []))
+        produced = set(bundle.output_schema.get("properties", {}).keys())
+        schemas[nid] = (required_in, produced)
+        produced_by_any |= produced
+
+    # Pass 2: thread availability through the topological order.
+    available = state_props - produced_by_any  # external initial inputs
+    issues: list[str] = []
+    for nid in graph.topological_order():
+        node = graph.nodes[nid]
+        # A DECISION node (ADR 094) reads state fields to route — same silent-gap
+        # risk as a chained agent's required input. Warn if a routed field's root
+        # is neither an external initial input nor produced upstream.
+        if node.type is NodeType.DECISION:
+            roots = {
+                str(c.get("when", {}).get("field", "")).split(".")[0]
+                for c in node.metadata.get("cases", [])
+            }
+            d_missing = {r for r in roots if r} - available
+            if d_missing:
+                avail_show = ", ".join(sorted(available)) or "∅"
+                issues.append(
+                    f"decision node {nid!r} routes on field(s) {sorted(d_missing)} — not "
+                    f"produced by any upstream node and not a declared initial-state input "
+                    f"(available here: {avail_show})"
+                )
+            continue
+        required_in, produced = schemas.get(nid, (set(), set()))
+        missing = required_in - available
+        if missing:
+            avail_show = ", ".join(sorted(available)) or "∅"
+            issues.append(
+                f"node {nid!r} requires input {sorted(missing)} — not produced by any "
+                f"upstream node and not a declared initial-state input "
+                f"(available here: {avail_show})"
+            )
+        available |= produced
+
+    if issues:
+        console.print(
+            "[yellow]![/yellow] state-threading [dim](advisory — a chained agent "
+            "may receive empty inputs at runtime)[/dim]"
+        )
+        for issue in issues:
+            console.print(f"  [yellow]·[/yellow] {issue}")
+        console.print(
+            "[dim]  fix: have an upstream node output the key, declare it in the "
+            "workflow state_schema as an initial input, or rename to match.[/dim]"
+        )
+
+
 def _validate_workflow(path: Path) -> None:
     try:
         spec, parent = load_workflow_spec(path)
@@ -1210,6 +1339,17 @@ def _validate_workflow(path: Path) -> None:
     console.print(f"  edges:       {len(graph.edges)}")
     chain = " → ".join(graph.topological_order())
     console.print(f"  topology:    {chain}")
+
+    _print_workflow_governance(graph)
+
+    # State-threading lint (authoring composer, slice 1). Chained agents share
+    # one state dict; the silent footgun is a node whose required INPUT key is
+    # neither an external initial-state input nor produced by any UPSTREAM node
+    # — at runtime it just receives nothing. Catch it at author time. Advisory
+    # (not exit-2): it's heuristic over declared schemas, so it warns rather
+    # than blocks. Best-effort — never break validate.
+    with contextlib.suppress(Exception):  # a lint must never break validation
+        _lint_state_threading(graph)
 
     # Backend-aware parallel lint (ADR 092 D6). A fan-out/fan-in graph runs
     # concurrently on the native runner (Phase 1) and, as of Phase 2 (D3), on

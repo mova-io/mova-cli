@@ -126,3 +126,30 @@ This compose file is a **dev tool** -- it is not bundled into the Python
 package, not a shipped dependency, and not subject to
 `scripts/check_licenses.py` (which only checks `pyproject.toml`). See
 `docs/license-posture.md` for the full posture.
+
+## Unified observability store (ADR 095) — ClickHouse + Postgres
+
+This stack now also prototypes the **unified observability store** (ADR 095):
+
+- **`clickhouse`** — the unified TELEMETRY store. The collector's `clickhouse`
+  exporter writes **traces + metrics + logs** into the `otel` database
+  (`otel_traces` / `otel_metrics_*` / `otel_logs`), alongside the existing
+  Jaeger + Prometheus fanout (additive — nothing breaks).
+- **`postgres`** — the BUSINESS OF RECORD (runs, cost ledger, governance),
+  seeded from `seed/postgres-bor.sql`. In prod this is the shared Azure Postgres
+  `movate` DB; repoint the `postgres-bor` datasource at it (read-only role).
+- **Grafana datasources** — `clickhouse-otel` (plugin) + `postgres-bor` (built-in),
+  auto-provisioned.
+- **`dashboards/grafana/mdk-unified-observability.json`** — one pane over both
+  stores; the bottom table is the **cross-store join on `trace_id`** (Postgres
+  cost/outcome ⨯ ClickHouse span volume).
+
+Run it, point mdk at the collector (same env as above), make some runs, and open
+Grafana → **mdk - unified observability**. The Postgres panels show the seeded
+business-of-record; the ClickHouse panels fill as OTLP arrives; the cross-store
+join lights up when a run's `trace_id` appears in both stores.
+
+**Azure rollout (ADR 095 D6):** mirror the `clickhouse` exporter into
+`infra/azure/modules/containerapp-otel-collector.bicep`, point it at a reachable
+ClickHouse (reuse the Langfuse VM's or a managed cluster), and add the two
+datasources to the deployed Grafana.

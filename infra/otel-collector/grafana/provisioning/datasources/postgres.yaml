@@ -1,0 +1,23 @@
+# ADR 095 — the BUSINESS-OF-RECORD datasource. Grafana's built-in Postgres
+# datasource reads the authoritative relational store (runs, cost ledger,
+# governance). Locally this points at the seeded stand-in; in prod, repoint
+# `url`/`user`/`database` at the shared Azure Postgres `movate` DB (read-only
+# role recommended).
+#
+# uid "postgres-bor" is referenced by dashboards/grafana/mdk-unified-observability.json.
+apiVersion: 1
+
+datasources:
+  - name: Postgres (business of record)
+    type: postgres
+    access: proxy
+    uid: postgres-bor
+    url: postgres:5432
+    user: movate
+    editable: false
+    jsonData:
+      database: movate
+      sslmode: disable
+      postgresVersion: 1600
+    secureJsonData:
+      password: movate

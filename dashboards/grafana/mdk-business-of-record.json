@@ -1,0 +1,299 @@
+{
+  "uid": "mdk-business-of-record",
+  "title": "mdk - business of record (live Postgres)",
+  "tags": [
+    "mdk",
+    "movate",
+    "observability",
+    "postgres",
+    "adr-095",
+    "live"
+  ],
+  "timezone": "",
+  "schemaVersion": 39,
+  "version": 0,
+  "refresh": "30s",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 99,
+      "type": "text",
+      "title": "",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - business of record (ADR 095)\nLive panels from the **real `movate` Postgres** (the authoritative store: `runs`, `workflow_runs`, cost). This is the Postgres half of the unified pane (ADR 095 D3); pair with the Prometheus metric dashboards for the full picture. Cost is extracted from `runs.metrics->>'cost_usd'`."
+      }
+    },
+    {
+      "id": 1,
+      "title": "Workflow runs by status",
+      "type": "piechart",
+      "datasource": {
+        "type": "postgres",
+        "uid": "postgres-movate"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "donut",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value"
+          ]
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "postgres-movate"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT status AS metric, count(*) AS value FROM workflow_runs GROUP BY status ORDER BY value DESC"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Workflow runs by runtime (native vs temporal)",
+      "type": "piechart",
+      "datasource": {
+        "type": "postgres",
+        "uid": "postgres-movate"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 4,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "donut",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value"
+          ]
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "postgres-movate"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT coalesce(runtime,'native') AS metric, count(*) AS value FROM workflow_runs GROUP BY 1 ORDER BY value DESC"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Workflows seen (by name)",
+      "type": "piechart",
+      "datasource": {
+        "type": "postgres",
+        "uid": "postgres-movate"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 4,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "pie",
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value"
+          ]
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "postgres-movate"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT workflow AS metric, count(*) AS value FROM workflow_runs GROUP BY workflow ORDER BY value DESC"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Run cost over time (USD)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "postgres",
+        "uid": "postgres-movate"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "postgres-movate"
+          },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT date_trunc('hour',created_at) AS time, sum((metrics::jsonb->>'cost_usd')::float) AS \"cost_usd\" FROM runs WHERE $__timeFilter(created_at) GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Top agents by total cost (USD)",
+      "type": "barchart",
+      "datasource": {
+        "type": "postgres",
+        "uid": "postgres-movate"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "postgres-movate"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT agent, round(sum((metrics::jsonb->>'cost_usd')::float)::numeric,5) AS cost_usd FROM runs WHERE metrics IS NOT NULL GROUP BY agent ORDER BY cost_usd DESC NULLS LAST LIMIT 12"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Recent workflow runs",
+      "type": "table",
+      "datasource": {
+        "type": "postgres",
+        "uid": "postgres-movate"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "postgres",
+            "uid": "postgres-movate"
+          },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT created_at, workflow, status, coalesce(runtime,'native') AS runtime, paused_node_id, workflow_run_id FROM workflow_runs ORDER BY created_at DESC LIMIT 25"
+        }
+      ]
+    }
+  ]
+}

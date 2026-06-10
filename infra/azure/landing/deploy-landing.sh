@@ -18,6 +18,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "${HERE}/urls.env"
 
+# Control-plane login + deploy stamp. CP_TOKEN is the bearer key behind the
+# login (inject from env: CP_TOKEN="$MDK_DEV_KEY"); DEPLOYED_AT is stamped now so
+# the page can show "deployed <date> · <time> ago" (live in the browser).
+CP_USER="${CP_USER:-movate}"
+CP_PASS="${CP_PASS:-MovateDemo2026!}"
+CP_TOKEN="${CP_TOKEN:-}"
+DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [[ -z "$CP_TOKEN" ]]; then
+  echo "⚠  CP_TOKEN is empty — the Agent Control Plane login will sign in but API calls will 401." >&2
+  echo "   Re-run with: CP_TOKEN=\"\$MDK_DEV_KEY\" ./deploy-landing.sh" >&2
+fi
+
 html="$(cat "${HERE}/index.html.tmpl")"
 html="${html//__OPENWEBUI_URL__/$OPENWEBUI_URL}"
 html="${html//__PLAYGROUND_URL__/$PLAYGROUND_URL}"
@@ -25,9 +37,15 @@ html="${html//__GRAFANA_URL__/$GRAFANA_URL}"
 html="${html//__TEMPORAL_UI_URL__/$TEMPORAL_UI_URL}"
 html="${html//__LANGFUSE_URL__/$LANGFUSE_URL}"
 html="${html//__API_URL__/$API_URL}"
+html="${html//__CP_USER__/$CP_USER}"
+html="${html//__CP_PASS__/$CP_PASS}"
+html="${html//__CP_TOKEN__/$CP_TOKEN}"
+html="${html//__DEPLOYED_AT__/$DEPLOYED_AT}"
 
-if [[ "$html" == *"__"*"_URL__"* ]]; then
-  echo "✗ unresolved placeholder remains — check urls.env" >&2; exit 1
+if printf '%s' "$html" | grep -qE '__[A-Z_]+__'; then
+  echo "✗ unresolved __PLACEHOLDER__ remains — check urls.env / deploy-landing.sh" >&2
+  printf '%s' "$html" | grep -oE '__[A-Z_]+__' | sort -u >&2
+  exit 1
 fi
 
 b64="$(printf '%s' "$html" | base64 | tr -d '\n')"

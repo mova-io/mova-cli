@@ -58,6 +58,7 @@ reads it. An activity invoked before configuration raises a clear
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -151,6 +152,21 @@ class ActivityContext:
     into :func:`load_agent` resolution (project-level model defaults). ``None``
     (the default) lets the loader read project config itself, matching every
     other library caller."""
+    policy: Any = None
+    """Project ``ModelPolicy`` (model allowlist / deny / per-run cost cap)."""
+    runtime_policy: Any = None
+    """Project ``RuntimePolicy`` (allowed AgentRuntime backends)."""
+    skill_policy: Any = None
+    """Project ``SkillPolicy`` (allowed skill side-effect classes)."""
+    guardrails: Any = None
+    """Project ``GuardrailsConfig`` (PII / topic / content safety).
+
+    These are threaded into the per-activity Executor (see :func:`_executor_for`)
+    so the executor's policy enforcement, the ADR 093 governance shadow, **and
+    the safety guardrails** are active on the Temporal backend — exactly as
+    ``build_local_runtime`` wires them for the local/native path. Without them
+    the durable backend ran fully permissive (governance + guardrails silently
+    dormant — PII/content checks did not fire on Temporal runs)."""
 
 
 _CONTEXT: ActivityContext | None = None
@@ -164,6 +180,10 @@ def configure_activities(
     provider: BaseLLMProvider | None = None,
     tenant_id: str = "local",
     defaults: Any = None,
+    policy: Any = None,
+    runtime_policy: Any = None,
+    skill_policy: Any = None,
+    guardrails: Any = None,
 ) -> None:
     """Install the :class:`ActivityContext` the four activities read.
 
@@ -189,6 +209,23 @@ def configure_activities(
 
         provider = LiteLLMProvider()
 
+    # Resolve project-level governance/enforcement policies from the worker's
+    # project config when not passed explicitly — mirrors build_local_runtime's
+    # Executor wiring so the durable backend enforces policy + runs the ADR 093
+    # governance shadow exactly as the native path does. Graceful + permissive:
+    # load_project_config() returns a permissive ProjectConfig() when no config
+    # is on disk, so a deployment without a project config is byte-for-byte
+    # unchanged. Explicit args win (the test escape hatch, like ``defaults``).
+    if policy is None or runtime_policy is None or skill_policy is None or guardrails is None:
+        with contextlib.suppress(Exception):
+            from movate.core.config import load_project_config  # noqa: PLC0415
+
+            cfg = load_project_config()
+            policy = policy if policy is not None else cfg.policy
+            runtime_policy = runtime_policy if runtime_policy is not None else cfg.runtime
+            skill_policy = skill_policy if skill_policy is not None else cfg.skills
+            guardrails = guardrails if guardrails is not None else cfg.guardrails
+
     global _CONTEXT  # noqa: PLW0603 — module-global DI registry, set once at worker startup.
     _CONTEXT = ActivityContext(
         storage=storage,
@@ -197,6 +234,10 @@ def configure_activities(
         provider=provider,
         tenant_id=tenant_id,
         defaults=defaults,
+        policy=policy,
+        runtime_policy=runtime_policy,
+        skill_policy=skill_policy,
+        guardrails=guardrails,
     )
 
 
@@ -251,6 +292,14 @@ def _executor_for(ctx: ActivityContext, state: dict[str, Any]) -> Any:
         storage=ctx.storage,
         tracer=ctx.tracer,
         tenant_id=_resolve_tenant_id(ctx, state),
+        # Thread the project policies + guardrails so the durable backend
+        # enforces policy, runs the governance shadow (ADR 093), AND applies the
+        # PII/topic/content safety guardrails — None ⇒ Executor's permissive
+        # default (the deployed-without-config / native-parity behavior).
+        policy=ctx.policy,
+        runtime_policy=ctx.runtime_policy,
+        skill_policy=ctx.skill_policy,
+        guardrails=ctx.guardrails,
     )
 
 
@@ -595,6 +644,17 @@ async def call_human_activity(
     )
     await ctx.storage.save_workflow_run(record)
 
+    # ADR 096 D3 — pause inventory lands in observability_facts too, so the
+    # platform's facts view shows runs awaiting a human without joining
+    # workflow_runs. Fail-soft + lazy import (the helper logs and never
+    # raises; the pause record above is already durable).
+    from movate.runtime.facts import (  # noqa: PLC0415
+        fact_from_workflow_run,
+        write_fact_failsoft,
+    )
+
+    await write_fact_failsoft(ctx.storage, fact_from_workflow_run(record))
+
     # Escalate to the approval channel (ADR 083) — parity with the native
     # runner's HUMAN-pause branch. Fire-and-forget + never raises (side effects
     # in activities, ADR 054 D10; the pause is already persisted). No-op until
@@ -660,6 +720,18 @@ async def persist_workflow_result_activity(
         runtime="temporal",
     )
     await ctx.storage.save_workflow_run(record)
+
+    # ADR 096 D3 — the terminal fact for a durable run is written here, at
+    # the same persist edge as the record (the detached-HITL path never
+    # returns through the dispatch edge, so dispatch can't cover it). The
+    # fact_id upsert overwrites any prior PAUSED fact under the same id.
+    # Fail-soft + lazy import: a fact hiccup never fails the terminal persist.
+    from movate.runtime.facts import (  # noqa: PLC0415
+        fact_from_workflow_run,
+        write_fact_failsoft,
+    )
+
+    await write_fact_failsoft(ctx.storage, fact_from_workflow_run(record))
 
     # Operational signal (ADR 082): durable workflows never hit the native
     # dispatch edge that powers mdk.jobs.completed, so emit a first-class

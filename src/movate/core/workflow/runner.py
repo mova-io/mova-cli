@@ -76,6 +76,7 @@ from movate.core.models import (
     WorkflowRunRecord,
     WorkflowStatus,
 )
+from movate.core.workflow.decision import _evaluate_decision_traced
 from movate.core.workflow.ir import EdgeKind, NodeType, WorkflowGraph, WorkflowNode
 from movate.core.workflow.judge import (
     build_judge_state_value,
@@ -454,6 +455,16 @@ class WorkflowRunner:
                 chosen_next, router_runs = result
                 runs.extend(router_runs)
                 current_id = chosen_next
+                continue
+
+            if node.type is NodeType.DECISION:
+                # --- DECISION dispatch (ADR 094) ------------------------------
+                # Deterministic value routing: no agent runs (no RunRecord), no
+                # failure path (closed operator set + fail-soft helper). Just
+                # compute the route from state and advance.
+                current_id = self._run_decision(
+                    node_id=node_id, node=node, state=state, wf_span=wf_span
+                )
                 continue
 
             if node.type is NodeType.SUPERVISOR:
@@ -1078,6 +1089,10 @@ class WorkflowRunner:
         specialists: dict[str, str] = meta.get("specialists", {})
         max_delegations: int = int(meta.get("max_delegations", 4) or 4)
         decision_field: str = meta.get("decision_field", "next")
+        # The aggregate cost ceiling across the whole delegation loop (ADR 092
+        # D5 / Phase 4 governance contract). None ⇒ no aggregate cap (the
+        # per-run agent budget still applies via the Executor on every call).
+        budget_usd: float | None = meta.get("budget")
 
         seq_next = self._sequential_successor(graph, node_id)
         runs: list[RunRecord] = []
@@ -1088,13 +1103,21 @@ class WorkflowRunner:
             return seq_next, runs
 
         manager_node = WorkflowNode(id=node_id, type=NodeType.AGENT, ref=manager_ref)
+        spent_usd = 0.0
 
         for _ in range(max_delegations):
+            # Governance: stop before the next delegation once the aggregate
+            # budget is spent (ADR 092 D5) — the loop terminates with what it
+            # has, like the max_delegations cap. The bound is the point.
+            if budget_usd is not None and spent_usd >= budget_usd:
+                break
+
             # 1. The manager decides who to delegate to next (or "done").
             m_resp, m_summary = await self._run_one_agent(
                 manager_node, node_id, state, wf_id, wf_span
             )
             runs.append(m_summary)
+            spent_usd += m_resp.metrics.cost_usd
             if m_resp.status != "success":
                 await self._storage.save_run(m_summary)
                 return self._supervisor_error(wf_id, node_id, state, runs, m_resp.error)
@@ -1113,6 +1136,7 @@ class WorkflowRunner:
                 spec_node, spec_node_id, state, wf_id, wf_span
             )
             runs.append(s_summary)
+            spent_usd += s_resp.metrics.cost_usd
             if s_resp.status != "success":
                 await self._storage.save_run(s_summary)
                 return self._supervisor_error(wf_id, spec_node_id, state, runs, s_resp.error)
@@ -1239,6 +1263,40 @@ class WorkflowRunner:
         chosen_node = routes.get(str(chosen_label), fallback)
 
         return chosen_node, clf_runs
+
+    def _run_decision(
+        self,
+        *,
+        node_id: str,
+        node: WorkflowNode,
+        state: dict[str, Any],
+        wf_span: SpanCtx,
+    ) -> str | None:
+        """Route a DECISION node (ADR 094) deterministically from state.
+
+        No agent runs, so no :class:`RunRecord` is produced. A ``workflow.decision``
+        span (nested under the workflow root) records which case matched and the
+        chosen route, so the branch is visible in Langfuse / Grafana traces even
+        though the node makes no model call. The routing itself goes through the
+        one shared :func:`~movate.core.workflow.decision._evaluate_decision_traced`
+        so native and Temporal can never disagree.
+        """
+        cases: list[dict[str, Any]] = node.metadata["cases"]
+        default: str = node.metadata["default"]
+        span = self._executor.tracer.start_span(
+            "workflow.decision",
+            {"workflow.node_id": node_id},
+            parent=wf_span,
+        )
+        try:
+            chosen, matched_idx = _evaluate_decision_traced(cases, default, state)
+            self._executor.tracer.set_attribute(
+                span, "decision.matched", "default" if matched_idx is None else str(matched_idx)
+            )
+            self._executor.tracer.set_attribute(span, "decision.route", chosen)
+            return chosen
+        finally:
+            self._executor.tracer.end_span(span)
 
 
 # ---------------------------------------------------------------------------

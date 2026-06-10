@@ -57,6 +57,11 @@ _TEMPORAL_WORKBOOK = _REPO_ROOT / "infra" / "azure-monitor" / "workbooks" / "tem
 _VOICE_GRAFANA = _DASHBOARDS_DIR / "grafana" / "azure" / "mdk-voice.json"
 # ADR 093 — the governance decisions dashboard (warn->enforce rollout signal).
 _GOVERNANCE_GRAFANA = _DASHBOARDS_DIR / "grafana" / "mdk-governance.json"
+# The certification matrix dashboard — a live pass/fail grid of the platform
+# capabilities the certification suite (certification/) asserts, driven by the
+# harness-emitted ``mdk.certification.scenario`` counter, grounded by the
+# golden-signal metrics those assertions read.
+_CERT_GRAFANA = _DASHBOARDS_DIR / "grafana" / "mdk-certification.json"
 
 # Prometheus unit / aggregation suffixes the OTLP -> Prometheus convention
 # appends. Stripped (one layer per pass) before matching a Prometheus token
@@ -171,6 +176,17 @@ _VOICE_METRICS = {
     "mdk.voice.turns",
 }
 
+# The certification matrix dashboard — the harness-emitted pass/fail counter
+# plus the golden-signal metrics each capability assertion reads (durable
+# completions, cost, dead-letter, latency).
+_CERT_METRICS = {
+    "mdk.certification.scenario",
+    "mdk.workflow.completed",
+    "mdk.run.cost_usd",
+    "mdk.jobs.completed",
+    "mdk.workflow.duration_ms",
+}
+
 _CASES = [
     pytest.param(_GRAFANA, "json", _ALL_FIVE | _POOL_METRICS, id="grafana"),
     pytest.param(_PROM_RULES, "yaml", _ALL_FIVE, id="prometheus-rules"),
@@ -180,6 +196,7 @@ _CASES = [
     pytest.param(
         _GOVERNANCE_GRAFANA, "json", {"mdk.governance.decisions"}, id="governance-grafana"
     ),
+    pytest.param(_CERT_GRAFANA, "json", _CERT_METRICS, id="certification-grafana"),
 ]
 
 

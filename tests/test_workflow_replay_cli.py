@@ -295,9 +295,11 @@ from movate.core.workflow.compilers.temporal import TemporalCompiler  # noqa: E4
 from movate.core.workflow.temporal_activities import (  # noqa: E402
     call_agent_activity,
     call_gate_activity,
+    call_human_activity,
     call_judge_activity,
     call_skill_activity,
     configure_activities,
+    persist_workflow_result_activity,
 )
 from movate.providers.base import (  # noqa: E402
     BaseLLMProvider,
@@ -376,6 +378,8 @@ async def test_run_then_replay_is_deterministic(tmp_path: Path) -> None:
                 call_skill_activity,
                 call_gate_activity,
                 call_judge_activity,
+                call_human_activity,
+                persist_workflow_result_activity,
             ],
             workflow_runner=UnsandboxedWorkflowRunner(),
         ),

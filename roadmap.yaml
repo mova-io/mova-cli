@@ -194,6 +194,19 @@ items:
     status: planned
     depends_on: [temporal-exec-backend]
 
+  # --- Unified governance layer (ADR 093). One GovernancePolicy + most-
+  # restrictive-wins resolve, one Gate seam + uniform Decision, one audit
+  # spine. Phase 1 (seam #808) + Phase 2 (gates #811; executor shadow #813;
+  # quota shadow #814; mdk.governance.decisions metric + Grafana #815) are
+  # landed/in-flight; the engine runs in WARN-mode SHADOW alongside the legacy
+  # checks (zero behavior change). in_progress until the Phase 3 warn→enforce
+  # flip — gated on the shadow deny-rate panel + sign-off. Granular per-PR
+  # shipped_version backfill awaits the CalVer auto-stamp (ADR 058).
+  - id: adr-093-governance-layer
+    title: "Unified governance layer — policy model + gate seam + audit/metrics, run in warn-mode shadow at the executor & admission edges (warn→enforce rollout pending)"
+    status: in_progress
+    adr: "093"
+
   # --- Long-term agent memory (ADR 086) — governed semantic memory layer.
   # The 2026-06-07 audit found run/conversation/procedural memory already
   # shipped; this phase adds the missing long-term layer on the existing

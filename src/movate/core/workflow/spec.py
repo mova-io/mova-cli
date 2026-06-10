@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import (
@@ -356,6 +356,17 @@ class SupervisorNodeSpec(BaseModel):
             "decision — the anti-runaway bound."
         ),
     )
+    budget: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional aggregate cost ceiling (USD) across the whole delegation "
+            "loop (ADR 092 D5). When the summed cost of the manager + specialist "
+            "runs reaches it, the loop terminates — the governance moat on top of "
+            "the per-run agent budget. Omit for no aggregate cap. (Native-enforced "
+            "today; Temporal enforces the per-run agent budget on every call.)"
+        ),
+    )
     decision_field: str = Field(
         "next",
         description=(
@@ -389,10 +400,88 @@ class SupervisorNodeSpec(BaseModel):
         return self
 
 
-# NodeSpec is a discriminated union of agent, intent-router, human, judge, and
-# supervisor nodes.
+class DecisionConditionSpec(BaseModel):
+    """One predicate in a decision case (ADR 094): ``field op value``.
+
+    Deterministic comparison over workflow state — no LLM. ``op`` is pinned to the
+    closed allowlist so an unknown operator fails at parse time (belt-and-braces
+    with :func:`movate.core.workflow.decision._apply_op`'s runtime guard)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str = Field(..., min_length=1, description="Dotted state path, e.g. 'expense.amount'")
+    op: Literal["gt", "gte", "lt", "lte", "eq", "ne", "in", "not_in", "contains", "truthy", "falsy"]
+    value: Any = Field(
+        default=None,
+        description="Literal compared against the field (omit for truthy/falsy)",
+    )
+
+
+class DecisionCaseSpec(BaseModel):
+    """One ordered branch of a decision node: when ``when`` holds, route ``to``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    when: DecisionConditionSpec
+    to: str = Field(..., min_length=1, description="Target node id when this case matches")
+
+
+class DecisionNodeSpec(BaseModel):
+    """A ``decision`` node (ADR 094): deterministic value routing, no LLM/activity.
+
+    The deterministic twin of ``intent-router``. Evaluates ``cases`` in order
+    against workflow state; the first match's ``to`` wins, else ``default``.
+    Because the comparison is pure it runs inline on both the native runner and
+    the Temporal-compiled workflow (no ``call_gate_activity``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=128)
+    type: Literal["decision"]
+    cases: list[DecisionCaseSpec] = Field(
+        ..., min_length=1, description="Ordered branches; first match wins"
+    )
+    default: str = Field(..., min_length=1, description="Node id when no case matches")
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not re.match(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$", v):
+            raise ValueError(
+                f"node id {v!r} must be lowercase alphanumeric with hyphens/underscores"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_case_values(self) -> DecisionNodeSpec:
+        # Encode membership/comparison value shape at compile time so a bad rule
+        # fails loud in `mdk validate` rather than silently never-matching.
+        for i, case in enumerate(self.cases):
+            op, value = case.when.op, case.when.value
+            if op in ("in", "not_in") and not isinstance(value, list):
+                raise ValueError(
+                    f"decision node {self.id!r} case {i}: op {op!r} needs a list 'value'"
+                )
+            if op == "contains" and not isinstance(value, (list, str)):
+                raise ValueError(
+                    f"decision node {self.id!r} case {i}: op 'contains' needs a list/str 'value'"
+                )
+            if op not in ("truthy", "falsy") and value is None:
+                raise ValueError(
+                    f"decision node {self.id!r} case {i}: op {op!r} requires a 'value'"
+                )
+        return self
+
+
+# NodeSpec is a discriminated union of agent, intent-router, human, judge,
+# supervisor, and decision nodes.
 NodeSpec = Annotated[
-    AgentNodeSpec | IntentRouterNodeSpec | HumanNodeSpec | JudgeNodeSpec | SupervisorNodeSpec,
+    AgentNodeSpec
+    | IntentRouterNodeSpec
+    | HumanNodeSpec
+    | JudgeNodeSpec
+    | SupervisorNodeSpec
+    | DecisionNodeSpec,
     Field(discriminator="type"),
 ]
 

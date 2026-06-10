@@ -1,0 +1,74 @@
+name: temporal-live
+
+# Live-server smoke for the durable workflow path (ADR 054). The rest of the
+# suite exercises Temporal hermetically via the SDK's in-memory time-skipping
+# env (`WorkflowEnvironment.start_time_skipping()`), which is fast but is NOT a
+# real server. This job runs the `@pytest.mark.temporal` suite against an actual
+# `temporal server start-dev` so the compiled-workflow control flow, the full
+# activity set, and the terminal persist activity are proven end-to-end on a
+# live server — the gap that the time-skipping tests can't cover.
+#
+# Path-filtered + manual: it spins up a real server (and downloads the CLI), so
+# it runs only when the workflow/Temporal surface changes (or on demand), not on
+# every unrelated PR. Not a required check — a durable-path canary, not a gate.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/movate/core/workflow/**"
+      - "src/movate/runtime/workflow_backend.py"
+      - "tests/temporal/**"
+      - ".github/workflows/temporal-live.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "src/movate/core/workflow/**"
+      - "src/movate/runtime/workflow_backend.py"
+      - "tests/temporal/**"
+      - ".github/workflows/temporal-live.yml"
+  workflow_dispatch: {}
+
+jobs:
+  temporal-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # fetch-depth: 0 — the version is git-derived (ADR 066); the editable
+      # install runs the hatch metadata hook which counts commits for the
+      # CalVer counter. A shallow clone would undercount it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install the Temporal CLI (single-binary dev server)
+        # The conftest fixture starts `temporal server start-dev` as a
+        # subprocess and skips cleanly if the binary is absent — so without this
+        # step the whole suite would no-op. Install to ~/.temporalio/bin and put
+        # it on PATH for the test run.
+        run: |
+          curl -sSf https://temporal.download/cli.sh | sh
+          echo "$HOME/.temporalio/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the CLI is on PATH
+        run: temporal --version
+
+      - name: Sync deps
+        # --no-extra airflow: airflow pins sqlalchemy<2 while the playground
+        # extra needs >=2, so `--all-extras` alone conflicts (mirrors ci.yml).
+        # The [temporal] extra (temporalio SDK) rides in via --all-extras.
+        run: uv sync --all-extras --no-extra airflow --dev
+
+      - name: Live Temporal smoke (pytest -m temporal)
+        # The @pytest.mark.temporal suite: connectivity, the real
+        # call_agent_activity wiring, and a REAL compiled workflow.yaml run
+        # end-to-end through the full activity set on the live dev server.
+        run: uv run pytest -m temporal -v

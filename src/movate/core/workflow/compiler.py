@@ -33,6 +33,7 @@ from movate.core.workflow.ir import (
 )
 from movate.core.workflow.spec import (
     AgentNodeSpec,
+    DecisionNodeSpec,
     HumanNodeSpec,
     IntentRouterNodeSpec,
     JudgeNodeSpec,
@@ -197,15 +198,46 @@ def compile_workflow(
                         f"not exist: {resolved_sref}"
                     )
                 resolved_specialists[sid] = str(resolved_sref)
+            supervisor_metadata: dict[str, Any] = {
+                "manager": str(resolved_manager),
+                "specialists": resolved_specialists,
+                "max_delegations": ns.max_delegations,
+                "decision_field": ns.decision_field,
+            }
+            # Aggregate budget (ADR 092 D5 / Phase 4) — only stamped when set, so
+            # a plain supervisor's metadata is unchanged and the runner skips the
+            # cost accounting when there's no cap.
+            if ns.budget is not None:
+                supervisor_metadata["budget"] = ns.budget
             nodes[ns.id] = WorkflowNode(
                 id=ns.id,
                 type=NodeType.SUPERVISOR,
                 ref=str(resolved_manager),  # the manager agent (the delegator)
+                metadata=supervisor_metadata,
+            )
+        elif isinstance(ns, DecisionNodeSpec):
+            # DECISION node (ADR 094) — deterministic value routing, no LLM and
+            # no ref. Cases + default live in metadata as plain JSON-able dicts so
+            # the native runner and the Temporal-compiled workflow read the SAME
+            # shape and funnel through the one ``evaluate_decision`` helper. Route
+            # targets are validated below (step 3c).
+            nodes[ns.id] = WorkflowNode(
+                id=ns.id,
+                type=NodeType.DECISION,
+                ref="",  # unused for decision nodes
                 metadata={
-                    "manager": str(resolved_manager),
-                    "specialists": resolved_specialists,
-                    "max_delegations": ns.max_delegations,
-                    "decision_field": ns.decision_field,
+                    "cases": [
+                        {
+                            "when": {
+                                "field": c.when.field,
+                                "op": c.when.op,
+                                "value": c.when.value,
+                            },
+                            "to": c.to,
+                        }
+                        for c in ns.cases
+                    ],
+                    "default": ns.default,
                 },
             )
         else:
@@ -247,6 +279,19 @@ def compile_workflow(
                 raise WorkflowCompileError(
                     f"judge node {ns.id!r}: {leg} target {leg_target!r} is not a valid "
                     f"node id (known: {', '.join(sorted(nodes))})"
+                )
+
+    # 3c. Validate DECISION route targets (ADR 094). Every case ``to`` + the
+    # ``default`` must name a valid node id — caught at compile time, not at run
+    # time when a routing miss would silently dead-end.
+    for ns in spec.nodes:
+        if not isinstance(ns, DecisionNodeSpec):
+            continue
+        for target in [*(c.to for c in ns.cases), ns.default]:
+            if target not in nodes:
+                raise WorkflowCompileError(
+                    f"decision node {ns.id!r}: route target {target!r} "
+                    f"is not a valid node id (known: {', '.join(sorted(nodes))})"
                 )
 
     # 4. Edges — explicit edges must exist + no self-loops; then inject synthetic
@@ -338,6 +383,27 @@ def compile_workflow(
                     to_id=branch_target,
                     kind=EdgeKind.CONDITIONAL,
                     metadata={"synthetic": True, "source": "judge"},
+                )
+            )
+
+    # Inject synthetic edges for DECISION route targets (ADR 094) — like
+    # intent-router/judge targets, CONDITIONAL+synthetic so reachability/topo
+    # order are correct and the join/sequential checks skip them.
+    seen_decision_edges: set[tuple[str, str]] = set()
+    for ns in spec.nodes:
+        if not isinstance(ns, DecisionNodeSpec):
+            continue
+        for target in [*(c.to for c in ns.cases), ns.default]:
+            pair = (ns.id, target)
+            if pair in seen_decision_edges:
+                continue
+            seen_decision_edges.add(pair)
+            edges.append(
+                WorkflowEdge(
+                    from_id=ns.id,
+                    to_id=target,
+                    kind=EdgeKind.CONDITIONAL,
+                    metadata={"synthetic": True, "source": "decision"},
                 )
             )
 
@@ -449,13 +515,16 @@ def validate_linear(graph: WorkflowGraph) -> None:
         # SUPERVISOR (ADR 092 D4) — its delegation loop is internal to the node,
         # so the graph stays linear/acyclic; permitted like a single agent node.
         NodeType.SUPERVISOR,
+        # DECISION (ADR 094) — deterministic value routing; the branching twin of
+        # intent-router (no LLM). Permitted like the other routing primitives.
+        NodeType.DECISION,
     }
     bad_types = sorted(n.id for n in graph.nodes.values() if n.type not in _allowed_types)
     if bad_types:
         raise WorkflowCompileError(
             f"v0.3 supports only type=agent, type=intent-router, type=human, "
-            f"type=judge, and type=supervisor nodes; offenders: {', '.join(bad_types)}. "
-            f"Tools/sub-workflows land in v1.1+."
+            f"type=judge, type=supervisor, and type=decision nodes; "
+            f"offenders: {', '.join(bad_types)}. Tools/sub-workflows land in v1.1+."
         )
 
     # Edge kinds — sequential only, EXCEPT synthetic conditional edges from
@@ -474,7 +543,7 @@ def validate_linear(graph: WorkflowGraph) -> None:
 
     # Branching / joining — intent-router and judge nodes are allowed to branch
     # (that is their whole purpose). We only flag plain agent nodes that branch.
-    _branch_types = {NodeType.INTENT_ROUTER, NodeType.JUDGE}
+    _branch_types = {NodeType.INTENT_ROUTER, NodeType.JUDGE, NodeType.DECISION}
     branching = sorted(
         nid
         for nid in graph.nodes
@@ -510,7 +579,9 @@ def validate_linear(graph: WorkflowGraph) -> None:
     # may have multiple sinks (each branch target that has no successor). We
     # only enforce single-sink on pure-linear (no router / no judge) workflows.
     router_nodes = {
-        nid for nid, n in graph.nodes.items() if n.type in {NodeType.INTENT_ROUTER, NodeType.JUDGE}
+        nid
+        for nid, n in graph.nodes.items()
+        if n.type in {NodeType.INTENT_ROUTER, NodeType.JUDGE, NodeType.DECISION}
     }
     if not router_nodes:
         sinks = graph.sinks()
