@@ -61,6 +61,7 @@ from movate.core.models import (
     JobStatus,
     KbChunk,
     KbChunkWithScore,
+    ObservabilityFact,
     Project,
     ProjectKbMode,
     ProjectMember,
@@ -261,6 +262,48 @@ class StorageProvider(Protocol):
         to find runs awaiting a human signal — ADR 017 D5). ``tenant_id=None``
         returns runs across all tenants — operator tooling only; never exposed
         on the HTTP API.
+        """
+
+    # ------------------------------------------------------------------
+    # Observability facts (ADR 096 — unified reporting surface)
+    #
+    # Additive, derived: one denormalized row per terminal execution
+    # event, written fail-soft at the existing metering edges. ``runs`` /
+    # ``workflow_runs`` stay authoritative; ``fact_id = "<kind>:<source_id>"``
+    # makes every write an idempotent upsert so the table can be rebuilt
+    # from the authoritative rows at any time. Nothing inside mdk's
+    # execution paths reads facts — they exist for the platform's
+    # ``GET /api/v1/observability/facts`` projection (and direct SQL).
+    # ------------------------------------------------------------------
+
+    async def save_observability_fact(self, fact: ObservabilityFact) -> None:
+        """Idempotent upsert keyed by ``fact_id``.
+
+        Re-saving the same ``fact_id`` (a retried job segment, a paused
+        workflow later reaching its terminal state, a backfill re-run)
+        updates the row in place — latest write wins, never a duplicate.
+        Callers at the execution edges wrap this fail-soft: a fact-write
+        failure must log and never fail the run (ADR 096 D3).
+        """
+
+    async def list_observability_facts(
+        self,
+        *,
+        tenant_id: str,
+        kind: str | None = None,
+        workflow: str | None = None,
+        agent: str | None = None,
+        status: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[ObservabilityFact]:
+        """List facts newest-first, tenant-scoped, optionally filtered.
+
+        ``tenant_id`` is **required** (not optional) — facts are the
+        platform's integration surface and are always read per-tenant;
+        there is no cross-tenant list mode. Filters AND together:
+        ``kind`` narrows to ``run`` / ``workflow_run``; ``since`` bounds
+        by ``created_at >= since``.
         """
 
     # ------------------------------------------------------------------

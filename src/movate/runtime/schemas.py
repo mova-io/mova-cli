@@ -31,6 +31,7 @@ from movate.core.models import (
     JobRecord,
     JobStatus,
     Metrics,
+    ObservabilityFact,
     Project,
     ProjectMember,
     ProjectMemberRole,
@@ -4539,6 +4540,75 @@ class ObservabilityInsightListView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     insights: list[ObservabilityInsightView] = Field(default_factory=list)
+    count: int
+
+
+class ObservabilityFactView(BaseModel):
+    """``GET /api/v1/observability/facts`` row — one derived execution fact.
+
+    Mirror of :class:`movate.core.models.ObservabilityFact` minus
+    ``tenant_id`` (the route is tenant-scoped already — same convention as
+    ``WorkflowRunView`` dropping it). This is the ADR 096 D5 integration
+    contract the mova-io platform reads; deep-links (ClickHouse / Langfuse /
+    Temporal Web) are derived client-side from ``trace_id`` + ``source_id``
+    (ADR 096 D2), never stored or returned here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fact_id: str
+    kind: str
+    source_id: str
+    trace_id: str = ""
+    workflow: str | None = None
+    agent: str | None = None
+    node_id: str | None = None
+    status: str
+    runtime: str
+    route: str | None = None
+    cost_usd: float = 0.0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    latency_ms: int = 0
+    governance_effect: str | None = None
+    error_type: str | None = None
+    created_at: datetime
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def from_record(cls, fact: ObservabilityFact) -> ObservabilityFactView:
+        return cls(
+            fact_id=fact.fact_id,
+            kind=fact.kind,
+            source_id=fact.source_id,
+            trace_id=fact.trace_id,
+            workflow=fact.workflow,
+            agent=fact.agent,
+            node_id=fact.node_id,
+            status=fact.status,
+            runtime=fact.runtime,
+            route=fact.route,
+            cost_usd=fact.cost_usd,
+            tokens_in=fact.tokens_in,
+            tokens_out=fact.tokens_out,
+            latency_ms=fact.latency_ms,
+            governance_effect=fact.governance_effect,
+            error_type=fact.error_type,
+            created_at=fact.created_at,
+            attributes=fact.attributes,
+        )
+
+
+class ObservabilityFactListView(BaseModel):
+    """``GET /api/v1/observability/facts`` envelope.
+
+    Envelope (not a bare list) for the same forward-compat reason as
+    :class:`WorkflowRunListView`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    facts: list[ObservabilityFactView] = Field(default_factory=list)
     count: int
 
 
