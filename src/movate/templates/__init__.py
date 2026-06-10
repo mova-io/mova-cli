@@ -262,6 +262,12 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Tiered expense approval (runtime: temporal). A DECISION node routes on amount (no LLM), each tier pauses durably at a HUMAN gate that routes its own approve/reject decision (ADR 099) — zero LLM classifiers, all tiers converging on ONE shared ERP-post/finalize/rejected tail (ADR 094/098/099).",  # noqa: E501
         "DECISION(amount) → [HUMAN routes approve|reject] → shared ERP-post|rejected → finalize",
     ),
+    "itsm-request": (
+        "pattern_itsm_request",
+        True,
+        "ITSM service-request fulfilment over a parameterized catalog (runtime: temporal). A DECISION node routes the portal's auto_approved flag (no LLM); needs-approval services pause at ONE HUMAN gate routing its own approve/reject decision (ADR 099); fulfilment is a TOOL node calling the workflow-local sim-provision python skill (ADR 097) — auto + approve paths converge on the shared provision→notify tail (ADR 094/097/098/099).",  # noqa: E501
+        "DECISION(auto_approved) → [HUMAN routes approve|reject] → shared TOOL provision → notify | rejected",  # noqa: E501
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

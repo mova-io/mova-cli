@@ -1,0 +1,2 @@
+{"input": {"service": "vpn-access", "requester": "raj.patel", "details": "Need VPN access for remote onboarding week", "auto_approved": true}, "expected": {"summary": "Provisioned automatically with a fulfilment reference."}}
+{"input": {"service": "hardware-request", "requester": "sam.okafor", "details": "Replacement laptop, failing battery", "auto_approved": false}, "expected": {"summary": "Approved by the approver and provisioned with a fulfilment reference."}}

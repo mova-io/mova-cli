@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["service","requester"],"properties":{"service":{"type":"string"},"requester":{"type":"string"},"run_id":{"type":"string"}}}

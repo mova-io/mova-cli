@@ -1,0 +1,5 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "service":{"type":"string"},"requester":{"type":"string"},
+  "details":{"type":"string"},"auto_approved":{"type":"boolean"},
+  "decision":{"type":"string"},
+  "provision_result":{"type":"string"},"summary":{"type":"string"}}}
