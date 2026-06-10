@@ -7,9 +7,10 @@ Two passes:
    ``state_schema``, checks that the entrypoint and edge endpoints exist,
    and detects cycles. Output is a syntactically valid :class:`WorkflowGraph`.
 2. :func:`validate_linear` — semantic gate for v0.3. Rejects branches,
-   joins, conditional edges, and non-agent node types. Lives in its own
-   function so v1.1 can substitute richer validators without touching
-   the compiler.
+   non-exclusive joins (ADR 098 admits OR-merge convergence of mutually
+   exclusive branches), conditional edges, and non-agent node types. Lives
+   in its own function so v1.1 can substitute richer validators without
+   touching the compiler.
 3. :func:`validate_dag` (ADR 092 Phase 1) — semantic gate for a canonical
    fan-out/fan-in DAG (the diamond). :func:`validate_graph` dispatches to it
    for graphs that declare a parallel edge, and to :func:`validate_linear`
@@ -328,6 +329,19 @@ def compile_workflow(
                     f"is not a valid node id (known: {', '.join(sorted(nodes))})"
                 )
 
+    # 3d. Validate HUMAN ``on_timeout`` targets (ADR 098, fixing the ADR 062 D4
+    # gap). The target must name a valid node id — caught here at compile time,
+    # not as the Temporal dispatch loop's "unknown workflow node" at run time.
+    # Mirrors the router/judge/decision target checks above (steps 3/3b/3c).
+    for ns in spec.nodes:
+        if not isinstance(ns, HumanNodeSpec) or ns.timeout is None:
+            continue
+        if ns.on_timeout not in nodes:
+            raise WorkflowCompileError(
+                f"human node {ns.id!r}: on_timeout target {ns.on_timeout!r} "
+                f"is not a valid node id (known: {', '.join(sorted(nodes))})"
+            )
+
     # 4. Edges — explicit edges must exist + no self-loops; then inject synthetic
     # CONDITIONAL edges from each intent-router to its route targets so that the
     # IR graph correctly models reachability and topological order.
@@ -440,6 +454,30 @@ def compile_workflow(
                     metadata={"synthetic": True, "source": "decision"},
                 )
             )
+
+    # Inject synthetic edges for HUMAN timeout routes (ADR 098). Like the
+    # router/judge/decision legs above these are CONDITIONAL+synthetic, so the
+    # timeout leg is reachability/topo-correct, convergence-eligible (clause
+    # (a) of the validate_linear join rule), and skipped by the sequential-
+    # successor walk on both backends (no runtime change — the Temporal
+    # compiler still reads ``on_timeout`` from node metadata; native has no
+    # durable timer and ignores it).
+    seen_timeout_edges: set[tuple[str, str]] = set()
+    for ns in spec.nodes:
+        if not isinstance(ns, HumanNodeSpec) or ns.timeout is None or ns.on_timeout is None:
+            continue
+        pair = (ns.id, ns.on_timeout)
+        if pair in seen_timeout_edges:
+            continue
+        seen_timeout_edges.add(pair)
+        edges.append(
+            WorkflowEdge(
+                from_id=ns.id,
+                to_id=ns.on_timeout,
+                kind=EdgeKind.CONDITIONAL,
+                metadata={"synthetic": True, "source": "human-timeout"},
+            )
+        )
 
     # 4. State schema — load + validate.
     schema_path = (workflow_dir / spec.state_schema).resolve()
@@ -597,6 +635,13 @@ def validate_linear(graph: WorkflowGraph) -> None:
     ``allow_cycles=True`` (the export/cycle-tolerant path) — this validator
     only governs the acyclic eval-gate/branch form.
 
+    ADR 098: **exclusive convergence (OR-merge)** is permitted — mutually
+    exclusive branches (router/judge/decision legs, HUMAN timeout routes, and
+    the single-successor tails hanging off them) may reconverge on one shared
+    node. Only one inbound edge can be active per run, so neither backend
+    needs barrier semantics. ``fan_in`` (ADR 092) remains the only *barrier*
+    join and lives behind :func:`validate_dag`.
+
     Replaceable: v0.4+ phases can call a different validator (or none)
     against the same :class:`WorkflowGraph` without modifying the IR or
     the structural compiler.
@@ -640,13 +685,18 @@ def validate_linear(graph: WorkflowGraph) -> None:
             f"Conditional / parallel edges land in v1.1+."
         )
 
-    # Branching / joining — intent-router and judge nodes are allowed to branch
-    # (that is their whole purpose). We only flag plain agent nodes that branch.
+    # Branching — intent-router / judge / decision nodes are allowed to branch
+    # (that is their whole purpose). We only flag plain nodes whose
+    # NON-SYNTHETIC out-degree exceeds 1: compiler-injected legs (router/judge/
+    # decision routes, HUMAN timeout routes — ADR 098) are exclusive
+    # alternatives, not real fan-out, so e.g. a HUMAN gate with an
+    # ``on_timeout`` leg plus its sequential successor does not "branch".
     _branch_types = {NodeType.INTENT_ROUTER, NodeType.JUDGE, NodeType.DECISION}
     branching = sorted(
         nid
         for nid in graph.nodes
-        if len(graph.successors(nid)) > 1 and graph.nodes[nid].type not in _branch_types
+        if len([e for e in graph.successors(nid) if not e.metadata.get("synthetic")]) > 1
+        and graph.nodes[nid].type not in _branch_types
     )
     if branching:
         raise WorkflowCompileError(
@@ -654,12 +704,43 @@ def validate_linear(graph: WorkflowGraph) -> None:
             f"offenders: {', '.join(branching)}. "
             f"Parallel fan-out lands in v1.1+."
         )
-    joining = sorted(nid for nid in graph.nodes if len(graph.predecessors(nid)) > 1)
-    if joining:
-        raise WorkflowCompileError(
-            f"v0.3 forbids joins (>1 predecessor); offenders: {', '.join(joining)}. "
-            f"Parallel fan-in lands in v1.1+."
-        )
+
+    # Joining — exclusive convergence (OR-merge, ADR 098). A node with more
+    # than one predecessor is legal iff EVERY inbound edge is a leg of a
+    # mutually exclusive branch:
+    #   (a) a routing leg — a compiler-injected synthetic CONDITIONAL edge
+    #       (intent-router / judge / decision route, or a HUMAN timeout route);
+    #       its source activates exactly ONE leg per visit; or
+    #   (b) an exclusive tail — a non-synthetic SEQUENTIAL edge that is its
+    #       source's ONLY non-synthetic successor (per-branch work converging
+    #       after a fork inherits its branch's exclusivity).
+    # Everything else needs barrier semantics — that is ``fan_in`` (ADR 092),
+    # not convergence. PARALLEL_* inbound edges cannot normally reach this
+    # validator (``declares_parallel`` routes such graphs to ``validate_dag``,
+    # and the edge-kind guard above rejects them), but the rule rejects them
+    # locally anyway so it is self-contained rather than guard-order-dependent.
+    for nid in sorted(graph.nodes):
+        inbound = graph.predecessors(nid)
+        if len(inbound) <= 1:
+            continue
+        for e in inbound:
+            if e.kind is EdgeKind.CONDITIONAL and e.metadata.get("synthetic"):
+                continue  # (a) routing leg — exactly one fires per run
+            if e.kind is EdgeKind.SEQUENTIAL and not e.metadata.get("synthetic"):
+                real_out = [
+                    s for s in graph.successors(e.from_id) if not s.metadata.get("synthetic")
+                ]
+                if len(real_out) == 1:
+                    continue  # (b) exclusive tail — the source's only real successor
+            raise WorkflowCompileError(
+                f"join at node {nid!r}: inbound edge {e.from_id!r}→{nid!r} "
+                f"({e.kind.value}) is not an exclusive branch leg. Exclusive "
+                f"convergence (ADR 098) requires every inbound edge to be a "
+                f"routing leg (a router/judge/decision route or HUMAN timeout "
+                f"route) or its source's only non-synthetic sequential "
+                f"successor. Branches that execute in the same run need a "
+                f"barrier join — use fan_in (ADR 092)."
+            )
 
     # Source — exactly one, must be the entrypoint. (Only reachable now if the
     # graph has zero edges or two truly disconnected single-node sub-graphs.)
@@ -677,10 +758,14 @@ def validate_linear(graph: WorkflowGraph) -> None:
     # Sink — for linear workflows exactly one; intent-router / judge workflows
     # may have multiple sinks (each branch target that has no successor). We
     # only enforce single-sink on pure-linear (no router / no judge) workflows.
+    # A HUMAN gate with an ``on_timeout`` leg is a branching primitive too
+    # (ADR 098): its timeout route may end in its own sink (e.g. an escalation
+    # path), so it relaxes the single-sink rule like the routers do.
     router_nodes = {
         nid
         for nid, n in graph.nodes.items()
         if n.type in {NodeType.INTENT_ROUTER, NodeType.JUDGE, NodeType.DECISION}
+        or (n.type is NodeType.HUMAN and n.metadata.get("on_timeout"))
     }
     if not router_nodes:
         sinks = graph.sinks()
