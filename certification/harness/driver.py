@@ -34,6 +34,10 @@ Capabilities (one ``certify`` block each, per case):
 * ``cost`` — ``fact.cost_usd > 0``; only when the case opts in (workflow_run
   facts carry 0 by design — ADR 096 — and the Temporal path emits no
   per-node run facts yet, so scenario specs mark this honest skip).
+* ``governance`` — the terminal fact's ``governance_effect`` is non-null (a
+  governance gate actually evaluated on the run — the deployed worker loaded
+  the bundled policy) AND matches the case's expected effect (``allow`` /
+  ``warn``); only when the case opts in via ``expect.governance``.
 * ``side-effects`` — sim-ledger expectations via
   :mod:`certification.harness.asserts`; evaluated ONLY when the shared DB is
   reachable (``MOVATE_PG_URL``/``MOVATE_DB_URL``), SKIP otherwise.
@@ -62,8 +66,15 @@ CAPABILITIES: tuple[str, ...] = (
     "decision-routing",
     "hitl",
     "cost",
+    "governance",
     "side-effects",
 )
+
+#: The effects a case may expect on its terminal fact. ``deny`` is excluded
+#: by design: an *enforced* deny blocks the run before a terminal-success
+#: fact exists, so a deny expectation belongs to a (future) failure-path
+#: case shape, not this one.
+_GOVERNANCE_EFFECTS = frozenset({"allow", "warn"})
 
 _TERMINAL_JOB_STATUSES = frozenset({"success", "error", "safety_blocked", "dead_letter"})
 _EXPECTED_STATUSES = frozenset({"success", "error", "paused"})
@@ -104,6 +115,9 @@ class CaseExpect:
     status: str
     route: str | None = None
     cost: bool = False
+    governance: str | None = None
+    """Expected ``governance_effect`` on the terminal fact (``allow`` /
+    ``warn``); ``None`` ⇒ the case does not assert governance (honest skip)."""
     final_state_has: tuple[str, ...] = ()
     final_state_lacks: tuple[str, ...] = ()
     side_effects: tuple[SideEffectExpect, ...] = ()
@@ -145,6 +159,7 @@ _EXPECT_KEYS = frozenset(
         "status",
         "route",
         "cost",
+        "governance",
         "final_state_has",
         "final_state_lacks",
         "side_effects",
@@ -201,10 +216,17 @@ def _parse_expect(raw: Any, where: str) -> CaseExpect:
     _require(route is None or isinstance(route, str), f"{where}.route", "must be a string or null")
     cost = raw.get("cost", False)
     _require(isinstance(cost, bool), f"{where}.cost", "must be a boolean")
+    governance = raw.get("governance")
+    _require(
+        governance is None or governance in _GOVERNANCE_EFFECTS,
+        f"{where}.governance",
+        f"must be one of {sorted(_GOVERNANCE_EFFECTS)} or null",
+    )
     return CaseExpect(
         status=str(status),
         route=route,
         cost=cost,
+        governance=str(governance) if governance is not None else None,
         final_state_has=_parse_str_list(raw.get("final_state_has", []), f"{where}.final_state_has"),
         final_state_lacks=_parse_str_list(
             raw.get("final_state_lacks", []), f"{where}.final_state_lacks"
@@ -632,6 +654,7 @@ class SuiteDriver:
             outcomes["decision-routing"] = CapabilityOutcome("skip", "no terminal fact to assert")
 
         outcomes["cost"] = self._cost_outcome(spec, case, fact_holder)
+        outcomes["governance"] = self._governance_outcome(spec, case, fact_holder)
         outcomes["side-effects"] = self._side_effects_outcome(spec, case, workflow_run_id)
         return CaseResult(case.name, workflow_run_id, outcomes)
 
@@ -653,6 +676,32 @@ class SuiteDriver:
             return f"cost_usd={cost}"
 
         return self._certified(spec.scenario, "cost", _cost)
+
+    def _governance_outcome(
+        self, spec: ScenarioSpec, case: CaseSpec, fact: dict[str, Any]
+    ) -> CapabilityOutcome:
+        if case.expect.governance is None:
+            return CapabilityOutcome("skip", "case does not assert governance")
+        if not fact:
+            return CapabilityOutcome("skip", "no terminal fact to assert")
+
+        def _governance() -> str | None:
+            effect = fact.get("governance_effect")
+            # Two distinct failure stories, surfaced separately: NULL means no
+            # gate evaluated at all (the deployed worker never loaded the
+            # bundled policy — the wiring is broken), while a wrong non-null
+            # value means the gates fired but decided differently.
+            assert effect is not None, (
+                "fact.governance_effect is null — no governance gate evaluated "
+                "on this run (is the bundled policy.yaml baked into the worker "
+                "image's WORKDIR as project.yaml?)"
+            )
+            assert effect == case.expect.governance, (
+                f"fact.governance_effect={effect!r}, expected {case.expect.governance!r}"
+            )
+            return f"governance_effect={effect}"
+
+        return self._certified(spec.scenario, "governance", _governance)
 
     def _side_effects_outcome(
         self, spec: ScenarioSpec, case: CaseSpec, workflow_run_id: str

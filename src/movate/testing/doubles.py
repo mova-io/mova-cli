@@ -259,9 +259,12 @@ class InMemoryStorage:
     async def save_observability_fact(self, fact: ObservabilityFact) -> None:
         # Upsert on fact_id (the PRIMARY KEY in sqlite/postgres, ADR 096
         # D4): a re-derived fact replaces its row in place — matching the
-        # DB providers' ON CONFLICT DO UPDATE.
+        # DB providers' ON CONFLICT DO UPDATE, including the COALESCE on
+        # governance_effect (a NULL re-derive never erases a recorded effect).
         for i, existing in enumerate(self.observability_facts):
             if existing.fact_id == fact.fact_id:
+                if fact.governance_effect is None and existing.governance_effect is not None:
+                    fact = fact.model_copy(update={"governance_effect": existing.governance_effect})
                 self.observability_facts[i] = fact
                 return
         self.observability_facts.append(fact)

@@ -13,6 +13,15 @@ gates is a pure no-op (``check`` returns ``ALLOW``), and an empty
 is byte-for-byte safe until gates are registered and a policy is declared.
 """
 
+from movate.governance.effects import (
+    GovernanceEffectScope,
+    consume_run_effect,
+    governance_effect_scope,
+    most_severe,
+    peek_run_effect,
+    record_run_effect,
+    record_scope_effect,
+)
 from movate.governance.engine import AuditSink, GovernanceEngine, LoggingAuditSink
 from movate.governance.gate import (
     Decision,
@@ -32,10 +41,17 @@ __all__ = [
     "Gate",
     "GateKind",
     "GovernanceContext",
+    "GovernanceEffectScope",
     "GovernanceEngine",
     "GovernancePolicy",
     "LoggingAuditSink",
     "Mode",
     "combine",
+    "consume_run_effect",
+    "governance_effect_scope",
+    "most_severe",
+    "peek_run_effect",
+    "record_run_effect",
+    "record_scope_effect",
     "resolve",
 ]

@@ -30,6 +30,16 @@
 #   expectation would always fail; only the reject case asserts the ledger
 #   (no erp row), and only when the shared DB is reachable
 #   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * `governance: allow` everywhere — the bundled policy
+#   (workflows/expense-approval/policy.yaml, baked to the worker image's
+#   WORKDIR as project.yaml) registers MODEL + COST gates on every agent run,
+#   so the terminal fact's `governance_effect` must be NON-NULL (proving the
+#   deployed worker loaded the policy and the gates evaluated) and `allow`
+#   (the allowlist matches the agents' openai/anthropic providers and the
+#   $5.00 ceiling sits above the default $1.00 per-run budget — gates
+#   evaluate, nothing warns or denies). A `warn` here would mean an agent
+#   slipped past the policy's bounds; a NULL means the governance wiring on
+#   the worker image is broken.
 
 scenario: expense-approval
 target: expense-approval # deployed workflow name for POST /run {kind: workflow}
@@ -45,6 +55,7 @@ cases:
     expect:
       status: success
       route: null
+      governance: allow
       final_state_has: [erp_result, summary]
 
   # $800 > $100 → manager gate; approve → shared post-erp/finalize tail.
@@ -58,6 +69,7 @@ cases:
     expect:
       status: success
       route: null
+      governance: allow
       final_state_has: [erp_result, summary]
 
   # $6000 > $5000 → director gate; approve → shared tail.
@@ -71,6 +83,7 @@ cases:
     expect:
       status: success
       route: null
+      governance: allow
       final_state_has: [erp_result, summary]
 
   # $7000 → director gate; reject → rejected node. The workflow still ends
@@ -87,6 +100,7 @@ cases:
     expect:
       status: success
       route: null
+      governance: allow
       final_state_has: [summary]
       final_state_lacks: [erp_result]
       no_side_effects:

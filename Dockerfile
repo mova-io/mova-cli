@@ -94,6 +94,18 @@ ENV MOVATE_AGENTS_PATH=/app/agents
 COPY workflows/ /app/workflows/
 ENV MOVATE_WORKFLOWS_PATH=/app/workflows
 
+# Project governance policy for the baked catalog (ADR 093/096). The config
+# loader (`load_project_config()`) reads the project base file from the
+# process CWD — which is this WORKDIR (/opt/movate), NOT /app — so the policy
+# must land here for `movate serve` / `movate worker` (and the Temporal
+# worker's `configure_activities`, #822) to pick it up. Baked under the
+# loader's canonical base-file name `project.yaml`; the source file keeps the
+# `policy.yaml` name because it documents the governance gates shipped with
+# the expense-approval certification deployable (its header explains scope:
+# the policy applies image-wide, and its constraints are satisfied by every
+# bundled agent so gates EVALUATE without blocking).
+COPY workflows/expense-approval/policy.yaml ./project.yaml
+
 # Default tracer goes to stdout — Container Apps captures stdout to
 # Log Analytics. Operators flip MOVATE_TRACER=otel via env to switch
 # to OTLP.

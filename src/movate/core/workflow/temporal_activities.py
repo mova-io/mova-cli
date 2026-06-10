@@ -347,19 +347,32 @@ async def call_agent_activity(
     """
     from movate.core.loader import load_agent  # noqa: PLC0415
     from movate.core.models import RunRequest  # noqa: PLC0415
+    from movate.governance.effects import (  # noqa: PLC0415
+        governance_effect_scope,
+        record_run_effect,
+    )
 
     ctx = _get_context()
     bundle = load_agent(ref, defaults=ctx.defaults)
     agent_input = _project_state(state, bundle)
     executor = _executor_for(ctx, state)
 
-    response = await executor.execute(
-        bundle,
-        RunRequest(agent=bundle.spec.name, input=agent_input),
-        workflow_run_id=run_id,
-        node_id=node_id,
-        tenant_id_override=_resolve_tenant_id(ctx, state),
-    )
+    # ADR 096 — collect this node's governance decisions and fold them into
+    # the workflow run's process-local effect (deny > warn > allow). The
+    # persist/pause activities stamp it onto the workflow's observability
+    # fact; recorded in a finally so an (enforced) deny that fails the node
+    # still surfaces on the fact.
+    with governance_effect_scope() as gov_scope:
+        try:
+            response = await executor.execute(
+                bundle,
+                RunRequest(agent=bundle.spec.name, input=agent_input),
+                workflow_run_id=run_id,
+                node_id=node_id,
+                tenant_id_override=_resolve_tenant_id(ctx, state),
+            )
+        finally:
+            record_run_effect(run_id, gov_scope.effect)
     if response.status != "success":
         # Surface as an exception so Temporal's retry policy (emitted by the
         # compiler) can retry per D11/D4, instead of silently merging a
@@ -435,6 +448,10 @@ async def call_skill_activity(
         build_skill_input,
         merge_tool_output,
     )
+    from movate.governance.effects import (  # noqa: PLC0415
+        governance_effect_scope,
+        record_run_effect,
+    )
 
     ctx = _get_context()
     skill = load_skill(ref)
@@ -445,12 +462,18 @@ async def call_skill_activity(
     # (ActivityContext policies → Executor), so the durable path enforces the
     # SAME gate the native runner's _run_tool applies. A deny raises
     # PolicyViolationError → the activity fails, attributable in history.
-    _executor_for(ctx, state).govern_skill_dispatch(
-        skill_name=skill.spec.name,
-        side_effects=skill.spec.side_effects,
-        agent=f"workflow-node:{node_id}",
-        tenant_id=tenant_id,
-    )
+    # ADR 096 — the gate's effect folds into the workflow run's process-local
+    # effect (recorded in a finally so an enforced deny still surfaces).
+    with governance_effect_scope() as gov_scope:
+        try:
+            _executor_for(ctx, state).govern_skill_dispatch(
+                skill_name=skill.spec.name,
+                side_effects=skill.spec.side_effects,
+                agent=f"workflow-node:{node_id}",
+                tenant_id=tenant_id,
+            )
+        finally:
+            record_run_effect(run_id, gov_scope.effect)
 
     # Input via the shared helper: explicit map when the node declared one,
     # else the input-schema projection — byte-for-byte the old behavior.
@@ -559,6 +582,10 @@ async def call_gate_activity(
     """
     from movate.core.loader import load_agent  # noqa: PLC0415
     from movate.core.models import RunRequest  # noqa: PLC0415
+    from movate.governance.effects import (  # noqa: PLC0415
+        governance_effect_scope,
+        record_run_effect,
+    )
 
     ctx = _get_context()
     clf_ref = _resolve_classifier_ref(classifier_agent, workflow_dir)
@@ -570,13 +597,18 @@ async def call_gate_activity(
     clf_input = {"text": str(state.get(input_field, "")), "labels": list(route_labels or [])}
     executor = _executor_for(ctx, state)
 
-    response = await executor.execute(
-        bundle,
-        RunRequest(agent=bundle.spec.name, input=clf_input),
-        workflow_run_id=run_id,
-        node_id=node_id,
-        tenant_id_override=_resolve_tenant_id(ctx, state),
-    )
+    # ADR 096 — same effect collection as call_agent_activity.
+    with governance_effect_scope() as gov_scope:
+        try:
+            response = await executor.execute(
+                bundle,
+                RunRequest(agent=bundle.spec.name, input=clf_input),
+                workflow_run_id=run_id,
+                node_id=node_id,
+                tenant_id_override=_resolve_tenant_id(ctx, state),
+            )
+        finally:
+            record_run_effect(run_id, gov_scope.effect)
     if response.status != "success":
         raise RuntimeError(
             f"gate node {node_id!r} classifier {classifier_agent!r} failed: "
@@ -625,6 +657,10 @@ async def call_judge_activity(
         load_judge_bundle,
         verdict_from_response_data,
     )
+    from movate.governance.effects import (  # noqa: PLC0415
+        governance_effect_scope,
+        record_run_effect,
+    )
 
     ctx = _get_context()
     criteria = str(judge_config.get("criteria") or "")
@@ -636,13 +672,18 @@ async def call_judge_activity(
     judge_input = _project_state({"text": str(artifact)}, bundle)
     executor = _executor_for(ctx, state)
 
-    response = await executor.execute(
-        bundle,
-        RunRequest(agent=bundle.spec.name, input=judge_input),
-        workflow_run_id=run_id,
-        node_id=node_id,
-        tenant_id_override=_resolve_tenant_id(ctx, state),
-    )
+    # ADR 096 — same effect collection as call_agent_activity.
+    with governance_effect_scope() as gov_scope:
+        try:
+            response = await executor.execute(
+                bundle,
+                RunRequest(agent=bundle.spec.name, input=judge_input),
+                workflow_run_id=run_id,
+                node_id=node_id,
+                tenant_id_override=_resolve_tenant_id(ctx, state),
+            )
+        finally:
+            record_run_effect(run_id, gov_scope.effect)
     if response.status != "success":
         # Surface as an exception so Temporal's retry policy (emitted by the
         # compiler) can retry, mirroring the agent activity's posture.
@@ -715,13 +756,19 @@ async def call_human_activity(
     # ADR 096 D3 — pause inventory lands in observability_facts too, so the
     # platform's facts view shows runs awaiting a human without joining
     # workflow_runs. Fail-soft + lazy import (the helper logs and never
-    # raises; the pause record above is already durable).
+    # raises; the pause record above is already durable). The governance
+    # effect collected so far is PEEKED, not consumed — the run resumes and
+    # the terminal persist still needs the registry entry.
+    from movate.governance.effects import peek_run_effect  # noqa: PLC0415
     from movate.runtime.facts import (  # noqa: PLC0415
         fact_from_workflow_run,
         write_fact_failsoft,
     )
 
-    await write_fact_failsoft(ctx.storage, fact_from_workflow_run(record))
+    await write_fact_failsoft(
+        ctx.storage,
+        fact_from_workflow_run(record, governance_effect=peek_run_effect(run_id)),
+    )
 
     # Escalate to the approval channel (ADR 083) — parity with the native
     # runner's HUMAN-pause branch. Fire-and-forget + never raises (side effects
@@ -793,13 +840,23 @@ async def persist_workflow_result_activity(
     # the same persist edge as the record (the detached-HITL path never
     # returns through the dispatch edge, so dispatch can't cover it). The
     # fact_id upsert overwrites any prior PAUSED fact under the same id.
-    # Fail-soft + lazy import: a fact hiccup never fails the terminal persist.
+    # The run's governance effect (most severe across every activity this
+    # worker process ran for it — ADR 096) is CONSUMED here: the run is
+    # terminal, the registry slot is freed. Best-effort by design: activities
+    # that executed on a different worker process recorded their effect
+    # there; the COALESCE upsert keeps a previously stamped value when this
+    # write carries none. Fail-soft + lazy import: a fact hiccup never fails
+    # the terminal persist.
+    from movate.governance.effects import consume_run_effect  # noqa: PLC0415
     from movate.runtime.facts import (  # noqa: PLC0415
         fact_from_workflow_run,
         write_fact_failsoft,
     )
 
-    await write_fact_failsoft(ctx.storage, fact_from_workflow_run(record))
+    await write_fact_failsoft(
+        ctx.storage,
+        fact_from_workflow_run(record, governance_effect=consume_run_effect(run_id)),
+    )
 
     # Operational signal (ADR 082): durable workflows never hit the native
     # dispatch edge that powers mdk.jobs.completed, so emit a first-class

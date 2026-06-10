@@ -2,3 +2,16 @@ api_version: movate/v1
 kind: Project
 name: expense-approval
 version: 0.1.0
+
+# Governance gates for the scenario (ADR 093 / ADR 096) — mirrors
+# workflows/expense-approval/policy.yaml, the copy the Docker image bakes to
+# the runtime/worker WORKDIR (as /opt/movate/project.yaml) so the DEPLOYED
+# workers load it via `load_project_config()`. With this block present the
+# Executor's governance shadow evaluates the MODEL + COST gates on every run
+# and the edges stamp `observability_facts.governance_effect` — the column
+# the suite's `governance` capability asserts (expected `allow`: the
+# allowlist matches the agents' provider and the cost ceiling sits above the
+# default per-run budget of 1.0, so gates evaluate without warning/denying).
+policy:
+  allowed_providers: [openai, anthropic]
+  max_cost_per_run_usd: 5.00

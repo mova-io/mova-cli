@@ -54,6 +54,7 @@ class FakeRuntime:
         route: str | None = None,
         final_state: dict[str, Any] | None = None,
         cost_usd: float = 0.0,
+        governance_effect: str | None = None,
         job_status: str = "success",
         job_polls_before_terminal: int = 1,
         never_terminal: bool = False,
@@ -63,6 +64,7 @@ class FakeRuntime:
         self.route = route
         self.final_state = final_state if final_state is not None else {"summary": "done"}
         self.cost_usd = cost_usd
+        self.governance_effect = governance_effect
         self.job_status = job_status
         self.job_polls_before_terminal = job_polls_before_terminal
         self.never_terminal = never_terminal
@@ -137,6 +139,7 @@ class FakeRuntime:
             "runtime": "temporal",
             "route": self.route,
             "cost_usd": self.cost_usd,
+            "governance_effect": self.governance_effect,
             "error_type": None,
         }
         return {"facts": [fact], "count": 1}
@@ -204,6 +207,9 @@ def test_shipped_expense_cases_parse() -> None:
     assert all(c.expect.route is None for c in spec.cases)
     # Cost is an honest skip everywhere (workflow_run facts carry 0 by design).
     assert all(c.expect.cost is False for c in spec.cases)
+    # Governance: every case asserts the bundled policy's gates evaluated and
+    # allowed (non-null effect == 'allow' on the terminal fact).
+    assert all(c.expect.governance == "allow" for c in spec.cases)
     # The reject case is the only one with ledger expectations: no ERP post.
     assert reject.expect.no_side_effects == (SideEffectExpect(system="erp", action="submit"),)
     assert "erp_result" in reject.expect.final_state_lacks
@@ -247,6 +253,14 @@ def _write_cases(tmp_path: Path, body: str) -> Path:
             "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
             "    expect: {status: success, side_effects: [{system: erp}]}\n",
             "`action` (string) is required",
+        ),
+        (
+            # `deny` is deliberately not an expectable effect: an enforced
+            # deny never yields the terminal-success fact this case shape
+            # asserts against.
+            "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
+            "    expect: {status: success, governance: deny}\n",
+            "expect.governance",
         ),
     ],
 )
@@ -322,6 +336,7 @@ def test_auto_tier_passes_durable_and_routing_skips_the_rest() -> None:
     assert result.outcomes["decision-routing"].status == "pass"
     assert result.outcomes["hitl"].status == "skip"
     assert result.outcomes["cost"].status == "skip"
+    assert result.outcomes["governance"].status == "skip"  # not declared on this case
     assert result.outcomes["side-effects"].status == "skip"
     assert not result.failed
     assert fake.signals == []
@@ -369,7 +384,7 @@ def test_job_error_fails_durable_execution_and_skips_the_rest() -> None:
     assert result.workflow_run_id is None
     assert result.outcomes["durable-execution"].status == "fail"
     assert "boom" in result.outcomes["durable-execution"].note
-    for cap in ("decision-routing", "hitl", "cost", "side-effects"):
+    for cap in ("decision-routing", "hitl", "cost", "governance", "side-effects"):
         assert result.outcomes[cap].status == "skip"
 
 
@@ -425,6 +440,51 @@ def test_cost_expectation_passes_and_fails_on_fact_cost_usd() -> None:
     assert zero.outcomes["cost"].status == "fail"
     spent = _driver(FakeRuntime(cost_usd=0.0042)).run_case(_spec(case), case)
     assert spent.outcomes["cost"].status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Governance capability — fact.governance_effect (ADR 096)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_governance_passes_when_effect_matches_expectation() -> None:
+    case = _case(expect=CaseExpect(status="success", route=None, governance="allow"))
+    result = _driver(FakeRuntime(governance_effect="allow")).run_case(_spec(case), case)
+    assert result.outcomes["governance"].status == "pass"
+    assert "governance_effect=allow" in result.outcomes["governance"].note
+
+    warn_case = _case(expect=CaseExpect(status="success", route=None, governance="warn"))
+    warned = _driver(FakeRuntime(governance_effect="warn")).run_case(_spec(warn_case), warn_case)
+    assert warned.outcomes["governance"].status == "pass"
+
+
+@pytest.mark.unit
+def test_governance_fails_on_null_effect_with_wiring_hint() -> None:
+    # NULL means NO gate evaluated — the deployed worker never loaded the
+    # bundled policy. That is a distinct failure from a wrong effect, and the
+    # note must point at the wiring.
+    case = _case(expect=CaseExpect(status="success", route=None, governance="allow"))
+    result = _driver(FakeRuntime(governance_effect=None)).run_case(_spec(case), case)
+    assert result.outcomes["governance"].status == "fail"
+    assert "null" in result.outcomes["governance"].note
+    assert "policy" in result.outcomes["governance"].note
+
+
+@pytest.mark.unit
+def test_governance_fails_on_effect_mismatch() -> None:
+    case = _case(expect=CaseExpect(status="success", route=None, governance="allow"))
+    result = _driver(FakeRuntime(governance_effect="warn")).run_case(_spec(case), case)
+    assert result.outcomes["governance"].status == "fail"
+    assert "expected 'allow'" in result.outcomes["governance"].note
+
+
+@pytest.mark.unit
+def test_governance_skips_when_case_does_not_declare_it() -> None:
+    case = _case()  # expect.governance is None
+    result = _driver(FakeRuntime(governance_effect="allow")).run_case(_spec(case), case)
+    assert result.outcomes["governance"].status == "skip"
+    assert "does not assert governance" in result.outcomes["governance"].note
 
 
 # ---------------------------------------------------------------------------
@@ -504,9 +564,10 @@ def test_capability_outcomes_emit_certification_metric(
     assert ("expense-approval", "hitl", "pass") in emitted
     assert ("expense-approval", "durable-execution", "pass") in emitted
     assert ("expense-approval", "decision-routing", "pass") in emitted
-    # Skipped capabilities (cost / side-effects here) emit NOTHING — skip is a
-    # local-matrix verdict, never a green or red datapoint on the dashboard.
-    assert not any(cap in ("cost", "side-effects") for _, cap, _ in emitted)
+    # Skipped capabilities (cost / governance / side-effects here) emit
+    # NOTHING — skip is a local-matrix verdict, never a green or red
+    # datapoint on the dashboard.
+    assert not any(cap in ("cost", "governance", "side-effects") for _, cap, _ in emitted)
 
 
 @pytest.mark.unit
