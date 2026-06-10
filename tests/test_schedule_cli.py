@@ -104,6 +104,89 @@ def test_set_workflow_with_name_and_disabled(local_db: Path) -> None:
 
 
 @pytest.mark.unit
+def test_set_cron_round_trip(local_db: Path) -> None:
+    """--cron + --tz persist and round-trip (ADR 100 D1)."""
+    r = runner.invoke(
+        app,
+        [
+            "schedule",
+            "set",
+            "exec-briefing",
+            "--kind",
+            "workflow",
+            "--cron",
+            "0 7 * * 1-5",
+            "--tz",
+            "America/New_York",
+        ],
+    )
+    assert r.exit_code == 0, r.stdout + r.stderr
+
+    rows = asyncio.run(_list_schedules())
+    assert len(rows) == 1
+    assert rows[0].cron == "0 7 * * 1-5"
+    assert rows[0].timezone == "America/New_York"
+    assert rows[0].cadence_seconds == 0  # the cron sentinel
+    assert rows[0].kind == JobKind.WORKFLOW
+
+    # The table view renders the cron form (Rich may wrap/truncate the wide
+    # cell, so assert via the machine-readable list).
+    lst = runner.invoke(app, ["schedule", "list", "--format", "json"])
+    assert lst.exit_code == 0
+    listed = json.loads(lst.stdout)
+    assert listed[0]["cron"] == "0 7 * * 1-5"
+    assert listed[0]["timezone"] == "America/New_York"
+
+
+@pytest.mark.unit
+def test_set_cron_json_output(local_db: Path) -> None:
+    r = runner.invoke(
+        app,
+        ["schedule", "set", "faq", "--cron", "0 7 * * *", "--format", "json"],
+    )
+    assert r.exit_code == 0, r.stdout + r.stderr
+    payload = json.loads(r.stdout)
+    assert payload["cron"] == "0 7 * * *"
+    assert payload["timezone"] is None
+    assert payload["cadence_seconds"] == 0
+
+
+@pytest.mark.unit
+def test_set_rejects_both_cadence_and_cron(local_db: Path) -> None:
+    r = runner.invoke(
+        app,
+        ["schedule", "set", "faq", "--cadence", "1h", "--cron", "0 7 * * *"],
+    )
+    assert r.exit_code == 2
+    assert "exactly one" in r.stderr
+
+
+@pytest.mark.unit
+def test_set_rejects_neither_cadence_nor_cron(local_db: Path) -> None:
+    r = runner.invoke(app, ["schedule", "set", "faq"])
+    assert r.exit_code == 2
+    assert "exactly one" in r.stderr
+
+
+@pytest.mark.unit
+def test_set_rejects_tz_without_cron(local_db: Path) -> None:
+    r = runner.invoke(
+        app,
+        ["schedule", "set", "faq", "--cadence", "1h", "--tz", "America/New_York"],
+    )
+    assert r.exit_code == 2
+    assert "--tz" in r.stderr
+
+
+@pytest.mark.unit
+def test_set_rejects_invalid_cron_expression(local_db: Path) -> None:
+    r = runner.invoke(app, ["schedule", "set", "faq", "--cron", "99 99 * * *"])
+    assert r.exit_code == 2
+    assert "invalid cron expression" in r.stderr
+    assert asyncio.run(_list_schedules()) == []
+
+
+@pytest.mark.unit
 def test_set_rejects_eval_kind(local_db: Path) -> None:
     r = runner.invoke(app, ["schedule", "set", "faq", "--kind", "eval", "--cadence", "1h"])
     assert r.exit_code == 2

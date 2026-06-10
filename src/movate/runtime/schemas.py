@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from movate.core.models import (
     AuditFinding,
@@ -40,6 +40,7 @@ from movate.core.models import (
     SkillRecord,
     WorkflowRunRecord,
     WorkflowStatus,
+    validate_cron_fields,
 )
 from movate.core.reporting import (
     AgentRollup,
@@ -1245,9 +1246,18 @@ class JobScheduleSubmission(BaseModel):
     rejected by the JobSchedule model validator (eval has its own scheduler)."""
     target: str
     """Agent or workflow name to run on the cadence."""
-    cadence_seconds: int = Field(ge=1)
+    cadence_seconds: int = Field(0, ge=0)
     """How often (seconds) to enqueue a job. The scheduler tick enqueues
-    when this interval has elapsed since the last enqueue."""
+    when this interval has elapsed since the last enqueue. Exactly one of
+    ``cadence_seconds`` | ``cron`` (ADR 100 D1): omit (or send 0) when
+    ``cron`` is set; must be >= 1 otherwise — enforced by the JobSchedule
+    model validator (→ 422)."""
+    cron: str | None = Field(None)
+    """Optional 5-field cron expression for clock-aligned schedules
+    (ADR 100 D1). Mutually exclusive with ``cadence_seconds``."""
+    timezone: str | None = Field(None)
+    """Optional IANA timezone the ``cron`` expression is evaluated in
+    (default UTC). Only valid together with ``cron``."""
     enabled: bool = Field(True)
     input: dict[str, Any] = Field(default_factory=dict)
     """Job payload — the ``RunRequest.input`` dict for agents, the initial
@@ -1271,9 +1281,35 @@ class JobScheduleSubmission(BaseModel):
             )
         return v
 
+    @model_validator(mode="after")
+    def _exactly_one_cadence(self) -> JobScheduleSubmission:
+        """Reject an ambiguous cadence at request-parse time (→ 422).
+
+        Mirrors :meth:`movate.core.models.JobSchedule._exactly_one_cadence`
+        (which also validates the cron expression / timezone themselves) so
+        the API returns a 422 rather than letting the downstream model
+        raise a 500.
+        """
+        if self.cron is not None:
+            if self.cadence_seconds != 0:
+                raise ValueError("exactly one of cron | cadence_seconds; got both.")
+            validate_cron_fields(self.cron, self.timezone)
+        if self.cron is None and self.cadence_seconds < 1:
+            raise ValueError(
+                "exactly one of cron | cadence_seconds; "
+                "cadence_seconds must be >= 1 when cron is unset."
+            )
+        if self.cron is None and self.timezone is not None:
+            raise ValueError("timezone is only valid together with cron.")
+        return self
+
 
 class JobScheduleView(BaseModel):
-    """One generic cron schedule (response shape for the schedule endpoints)."""
+    """One generic cron schedule (response shape for the schedule endpoints).
+
+    ``cron`` / ``timezone`` (ADR 100 D1) are additive nullable fields —
+    ``None`` on every pre-ADR-100 interval schedule.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1281,6 +1317,8 @@ class JobScheduleView(BaseModel):
     kind: JobKind
     target: str
     cadence_seconds: int
+    cron: str | None = None
+    timezone: str | None = None
     enabled: bool
     input: dict[str, Any]
     notify_email: str | None = None

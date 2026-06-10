@@ -3893,6 +3893,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "beautifulsoup4" },
+    { name = "cronsim" },
     { name = "cryptography" },
     { name = "httpx" },
     { name = "jinja2" },
@@ -4037,6 +4038,7 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12,<5" },
     { name = "cartesia", marker = "extra == 'voice'", specifier = ">=1.4,<3" },
     { name = "chainlit", marker = "extra == 'playground'", specifier = ">=1.3" },
+    { name = "cronsim", specifier = ">=2.6,<3" },
     { name = "cryptography", specifier = ">=3.1" },
     { name = "cryptography", marker = "extra == 'github'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'teams'", specifier = ">=42" },

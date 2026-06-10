@@ -1242,6 +1242,13 @@ _MIGRATIONS = [
     ),
     "CREATE INDEX IF NOT EXISTS idx_tool_descriptors_scope_tenant "
     "ON tool_descriptors(scope, tenant_id)",
+    # ADR 100 D1: clock-aligned cron schedules. Additive nullable columns —
+    # NULL on every pre-ADR-100 interval row (which keeps interval
+    # semantics, byte-for-byte). When cron is set, cadence_seconds persists
+    # as 0 (sentinel behind the model's exactly-one validator), so no
+    # NOT-NULL migration / table rebuild.
+    "ALTER TABLE job_schedules ADD COLUMN cron TEXT",
+    "ALTER TABLE job_schedules ADD COLUMN timezone TEXT",
 ]
 
 
@@ -1913,10 +1920,17 @@ class SqliteProvider:
     # ------------------------------------------------------------------
 
     async def save_job_schedule(self, schedule: JobSchedule) -> None:
-        # Upsert on the (tenant_id, name) primary key.
+        # Upsert on the (tenant_id, name) primary key. Columns are named
+        # explicitly (not positional VALUES) because cron/timezone were
+        # ALTERed in after the table's creation — positional order isn't
+        # stable across fresh-vs-migrated databases.
         await self._db.execute(
             """
-            INSERT INTO job_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO job_schedules (
+                tenant_id, name, kind, target, cadence_seconds, enabled,
+                input, notify_email, created_by, created_at, last_enqueued_at,
+                cron, timezone
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id, name) DO UPDATE SET
                 kind = excluded.kind,
                 target = excluded.target,
@@ -1926,7 +1940,9 @@ class SqliteProvider:
                 notify_email = excluded.notify_email,
                 created_by = excluded.created_by,
                 created_at = excluded.created_at,
-                last_enqueued_at = excluded.last_enqueued_at
+                last_enqueued_at = excluded.last_enqueued_at,
+                cron = excluded.cron,
+                timezone = excluded.timezone
             """,
             (
                 schedule.tenant_id,
@@ -1940,6 +1956,8 @@ class SqliteProvider:
                 schedule.created_by,
                 schedule.created_at.isoformat(),
                 schedule.last_enqueued_at.isoformat() if schedule.last_enqueued_at else None,
+                schedule.cron,
+                schedule.timezone,
             ),
         )
         await self._db.commit()
@@ -5868,6 +5886,11 @@ def _row_to_job_schedule(row: aiosqlite.Row) -> JobSchedule:
         last_enqueued_at=(
             datetime.fromisoformat(row["last_enqueued_at"]) if row["last_enqueued_at"] else None
         ),
+        # ADR 100 D1: cron form. init() has run the ALTER by the time we read
+        # here; .get() stays defensive against a row predating the migration —
+        # such a row is an interval schedule, which is exactly None.
+        cron=dict(row).get("cron"),
+        timezone=dict(row).get("timezone"),
     )
 
 

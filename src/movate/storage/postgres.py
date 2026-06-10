@@ -664,8 +664,17 @@ CREATE TABLE IF NOT EXISTS job_schedules (
     created_by       TEXT,
     created_at       TIMESTAMPTZ NOT NULL,
     last_enqueued_at TIMESTAMPTZ,
+    cron             TEXT,
+    timezone         TEXT,
     PRIMARY KEY (tenant_id, name)
 );
+-- ADR 100 D1: clock-aligned cron schedules. Additive nullable columns —
+-- NULL on every pre-ADR-100 interval row (which keeps interval semantics,
+-- byte-for-byte). When cron is set, cadence_seconds persists as 0 (sentinel
+-- behind the model's exactly-one validator), so no NOT-NULL migration.
+-- ADD COLUMN IF NOT EXISTS keeps init() idempotent on long-lived databases.
+ALTER TABLE job_schedules ADD COLUMN IF NOT EXISTS cron TEXT;
+ALTER TABLE job_schedules ADD COLUMN IF NOT EXISTS timezone TEXT;
 
 -- ADR 017 D2: inbound event/webhook triggers. One row per (tenant, name)
 -- with a public trigger_id (in the webhook URL), a hashed-at-rest per-trigger
@@ -2300,9 +2309,10 @@ class PostgresProvider:
             """
             INSERT INTO job_schedules (
                 tenant_id, name, kind, target, cadence_seconds, enabled,
-                input, notify_email, created_by, created_at, last_enqueued_at
+                input, notify_email, created_by, created_at, last_enqueued_at,
+                cron, timezone
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
             )
             ON CONFLICT (tenant_id, name) DO UPDATE SET
                 kind = EXCLUDED.kind,
@@ -2313,7 +2323,9 @@ class PostgresProvider:
                 notify_email = EXCLUDED.notify_email,
                 created_by = EXCLUDED.created_by,
                 created_at = EXCLUDED.created_at,
-                last_enqueued_at = EXCLUDED.last_enqueued_at
+                last_enqueued_at = EXCLUDED.last_enqueued_at,
+                cron = EXCLUDED.cron,
+                timezone = EXCLUDED.timezone
             """,
             schedule.tenant_id,
             schedule.name,
@@ -2326,6 +2338,8 @@ class PostgresProvider:
             schedule.created_by,
             schedule.created_at,
             schedule.last_enqueued_at,
+            schedule.cron,
+            schedule.timezone,
         )
 
     async def get_job_schedule(self, name: str, *, tenant_id: str) -> JobSchedule | None:
@@ -5870,6 +5884,11 @@ def _row_to_job_schedule(row: asyncpg.Record) -> JobSchedule:
         created_by=row["created_by"],
         created_at=row["created_at"],
         last_enqueued_at=row["last_enqueued_at"],
+        # ADR 100 D1: cron form. init() has run the ALTER by the time we read
+        # here; NULL (every pre-ADR-100 interval row) → None → interval
+        # semantics, byte-for-byte the prior behavior.
+        cron=row["cron"],
+        timezone=row["timezone"],
     )
 
 
