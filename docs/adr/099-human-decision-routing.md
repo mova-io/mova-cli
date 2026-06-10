@@ -1,7 +1,8 @@
 # ADR 099 — HUMAN-node decision routing: route on the approver's structured answer without an LLM
 
-Status: Proposed
+Status: Accepted
 Date: 2026-06-09
+Accepted: 2026-06-09 — approved by Jeremy. Ratified: unmatched decision → accept + fallback (not 422); casefold+trim matching; route_on defaults to 'decision'.
 Deciders: Engineering — additive fields on an existing node spec behind the
 existing node-type seam (CLAUDE.md §7: "extend via adapters/specs, don't
 hardcode").
