@@ -26,9 +26,9 @@ class NodeType(StrEnum):
     JUDGE = "judge"  # v1.x (ADR 056) — runs a judge, gates on its verdict/score
     SUPERVISOR = "supervisor"  # ADR 092 D4 — bounded managerial delegation
     DECISION = "decision"  # ADR 094 — deterministic value routing (no LLM, no activity)
+    TOOL = "tool"  # ADR 097 — one registered skill as one deterministic step (no LLM)
     # Future variants — declared so the IR doesn't need a breaking change
     # when these phases ship. Compiler validators reject them today.
-    TOOL = "tool"  # v1.1 — registered tool/function call
     HUMAN = "human"  # v1.1 — HITL, runner pauses + persists state
     FUNCTION = "function"  # v1.1 — inline Python callable
     SUB_WORKFLOW = "sub_workflow"  # v1.2 — nested WorkflowGraph by ref
