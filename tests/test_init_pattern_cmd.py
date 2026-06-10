@@ -283,3 +283,25 @@ def test_unknown_pattern_is_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     )
     assert result.exit_code == 2
     assert "unknown pattern" in (result.stdout + result.stderr)
+
+
+@pytest.mark.unit
+def test_pattern_scaffold_name_sanitized_from_path_target(tmp_path) -> None:
+    """A path-y init target must yield a VALID workflow name (basename,
+    sanitized to the spec rule) — the raw target used to be written verbatim
+    into ``name:``, producing a scaffold that failed its own validate."""
+    from movate.cli.init import _workflow_name_from_target  # noqa: PLC0415
+    from movate.core.workflow.spec import load_workflow_spec  # noqa: PLC0415
+
+    assert _workflow_name_from_target(str(tmp_path / "exp")) == "exp"
+    assert _workflow_name_from_target("./demos/My_Exp.Test") == "my-exp-test"
+    assert _workflow_name_from_target("expense-approval") == "expense-approval"
+    assert _workflow_name_from_target("___") is None  # unsalvageable → keep template name
+
+    result = runner.invoke(
+        app, ["init", str(tmp_path / "Path_Target.v2"), "--pattern", "expense-approval"]
+    )
+    assert result.exit_code == 0, result.output
+    wf = tmp_path / "Path_Target.v2" / "workflow.yaml"
+    spec, _ = load_workflow_spec(wf)  # parses ⇒ the name passed the spec rule
+    assert spec.name == "path-target-v2"

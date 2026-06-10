@@ -3929,16 +3929,40 @@ def _scaffold_pattern_workflow(
         _launch_editor(open_path, open_editor=open_editor)
 
 
+def _workflow_name_from_target(raw: str) -> str | None:
+    """Derive a VALID workflow name from the operator's init target.
+
+    The init target may be a path (``mdk init ./demos/exp --pattern …`` or an
+    absolute tmp dir) — writing it verbatim into ``name:`` produced a workflow
+    that failed its own ``mdk validate`` (the name rule is
+    ``^[a-z0-9][a-z0-9-]*[a-z0-9]$``). Take the basename, lowercase it, collapse
+    every invalid run to a hyphen, and trim. Returns ``None`` when nothing
+    salvageable remains — the caller then keeps the template's shipped name
+    (which is always valid), matching this scaffolder's best-effort posture.
+    """
+    base = Path(raw).name.lower()
+    candidate = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*[a-z0-9]|[a-z0-9]", candidate):
+        return candidate
+    return None
+
+
 def _set_workflow_name(wf_yaml: Path, name: str) -> None:
-    """Rewrite the ``name:`` field in a scaffolded ``workflow.yaml`` to ``name``.
+    """Rewrite the ``name:`` field in a scaffolded ``workflow.yaml``.
 
     The pattern templates ship a generic workflow name (e.g. ``task-oriented``);
-    we set it to the operator's name so the workflow resolves under
-    ``mdk run <name>`` / ``mdk eval <name>``. Surgical line-replace (not a YAML
-    round-trip) so the heavily-commented template body + ordering are preserved.
-    Best-effort: a parse miss leaves the template name (harmless — the workflow
-    still runs by path).
+    we set it to a name DERIVED from the operator's target (basename, sanitized
+    to the WorkflowSpec name rule — the raw target may be a path) so the
+    workflow resolves under ``mdk run <name>`` / ``mdk eval <name>`` AND still
+    validates. Surgical line-replace (not a YAML round-trip) so the
+    heavily-commented template body + ordering are preserved. Best-effort: a
+    parse miss or an unsalvageable target leaves the template name (harmless —
+    the workflow still runs by path).
     """
+    derived = _workflow_name_from_target(name)
+    if derived is None:
+        return
+    name = derived
     text = wf_yaml.read_text()
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
