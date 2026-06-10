@@ -54,16 +54,43 @@ exporters:
       # can split mdk_db_pool_in_use / mdk_db_pool_max by instance.
       enabled: true
 
+  # ADR 095 — the UNIFIED telemetry store. The same OTLP that fans out to
+  # Jaeger + Prometheus above ALSO lands in ClickHouse: traces, metrics, AND
+  # logs in one columnar store, queried by the Grafana ClickHouse datasource.
+  # This is additive — Jaeger/Prometheus keep working; ClickHouse is the
+  # centralized store the unified dashboards read (correlated to the Postgres
+  # business-of-record by trace_id). The contrib collector auto-creates the
+  # otel_traces / otel_metrics_* / otel_logs tables when create_schema=true.
+  clickhouse:
+    endpoint: tcp://clickhouse:9000?dial_timeout=10s&compress=lz4
+    database: otel
+    username: default
+    password: ""
+    create_schema: true
+    ttl: 72h
+    logs_table_name: otel_logs
+    traces_table_name: otel_traces
+    metrics_table_name: otel_metrics
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+
 service:
   pipelines:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlp/jaeger]
+      exporters: [otlp/jaeger, clickhouse]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [prometheus]
+      exporters: [prometheus, clickhouse]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [clickhouse]
   telemetry:
     logs:
       level: info

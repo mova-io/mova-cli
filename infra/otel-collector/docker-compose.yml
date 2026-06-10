@@ -43,6 +43,7 @@ services:
       - "8889:8889"   # Prometheus exporter scrape endpoint (Prometheus pulls from here)
     depends_on:
       - jaeger
+      - clickhouse
     restart: unless-stopped
 
   jaeger:
@@ -74,6 +75,43 @@ services:
       - otel-collector
     restart: unless-stopped
 
+  # ADR 095 — the UNIFIED telemetry store. ClickHouse holds traces + metrics +
+  # logs (the OTel collector's clickhouse exporter writes here). Grafana's
+  # ClickHouse datasource reads it; the unified dashboard correlates it to the
+  # Postgres business-of-record by trace_id.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: mdk-clickhouse
+    environment:
+      CLICKHOUSE_DB: otel
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    ports:
+      - "8123:8123"   # HTTP (Grafana ClickHouse datasource talks here)
+      - "9000:9000"   # native TCP (the collector clickhouse exporter writes here)
+    restart: unless-stopped
+
+  # ADR 095 — the BUSINESS OF RECORD (the authoritative relational store). In
+  # prod this is the shared Azure Postgres `movate` DB; here a seeded stand-in
+  # so the cross-store dashboard is runnable. The seed creates a `workflow_runs`
+  # table mirroring the mdk shape (run_id, workflow, status, cost_usd, trace_id)
+  # so the unified panel joins PG cost ⨯ CH trace volume on trace_id.
+  postgres:
+    image: postgres:16
+    container_name: mdk-postgres-bor
+    environment:
+      POSTGRES_DB: movate
+      POSTGRES_USER: movate
+      POSTGRES_PASSWORD: movate
+    volumes:
+      - ./seed/postgres-bor.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
   grafana:
     image: grafana/grafana-oss:10.4.4
     container_name: mdk-grafana
@@ -83,6 +121,8 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_USERS_DEFAULT_THEME: "dark"
+      # ADR 095 — the ClickHouse datasource is a plugin (Postgres is built in).
+      GF_INSTALL_PLUGINS: "grafana-clickhouse-datasource"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       # The in-repo dashboards-as-code (dashboards/grafana/*.json) are mounted
