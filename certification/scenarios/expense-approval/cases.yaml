@@ -1,0 +1,93 @@
+# Certification cases — expense-approval (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `expense-approval` workflow
+# (workflows/expense-approval — 6 nodes: a deterministic `decision` tier node,
+# two HUMAN gates with direct decision routes, and the shared
+# post-erp/finalize/rejected tail). The driver submits the case input via
+# POST /run, resumes any expected HUMAN pauses via the signal endpoint, then
+# reads the run back from GET /api/v1/observability/facts (the ADR 096
+# integration surface) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state; the fact builder (movate.runtime.facts.
+#   fact_from_workflow_run) surfaces `route` only from a `tier`/`route` state
+#   key, so the fact's route is None here. We assert that explicitly and prove
+#   the branch instead via (a) the observed pause node (manager vs director vs
+#   none) and (b) `final_state` markers: every approve path merges the
+#   erp-poster's `erp_result` into state, the reject path never does.
+# * `status: success` for ALL cases, including director-reject — the rejected
+#   branch still terminates at the `rejected` agent successfully; "rejected"
+#   is a route, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096), and the
+#   Temporal path does not emit per-node `run` facts yet, so cost is not
+#   assertable for this scenario. The driver records the capability as SKIP
+#   with that note rather than green-washing it.
+# * side-effects — the deployed erp-poster agent does not call the sim-erp
+#   skill (it returns an LLM confirmation only), so a POSITIVE erp.submit
+#   expectation would always fail; only the reject case asserts the ledger
+#   (no erp row), and only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+
+scenario: expense-approval
+target: expense-approval # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # $50 <= $100 → the decision node's default branch: straight to post-erp,
+  # no HUMAN gate. Terminal success without any signal IS the routing
+  # evidence (a mis-route to a gate would pause forever and time out).
+  - name: auto-tier
+    input:
+      expense_text: "Team lunch with the onsite customer crew"
+      amount: 50
+    expect:
+      status: success
+      route: null
+      final_state_has: [erp_result, summary]
+
+  # $800 > $100 → manager gate; approve → shared post-erp/finalize tail.
+  - name: manager-approve
+    input:
+      expense_text: "Conference registration, two engineers"
+      amount: 800
+    hitl:
+      - node: manager-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      final_state_has: [erp_result, summary]
+
+  # $6000 > $5000 → director gate; approve → shared tail.
+  - name: director-approve
+    input:
+      expense_text: "Annual platform license renewal"
+      amount: 6000
+    hitl:
+      - node: director-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      final_state_has: [erp_result, summary]
+
+  # $7000 → director gate; reject → rejected node. The workflow still ends
+  # SUCCESS; the rejection is proven by the pause at director-approval, the
+  # reject signal, final_state LACKING erp_result, and (when the shared DB is
+  # reachable) zero erp rows in the sim ledger.
+  - name: director-reject
+    input:
+      expense_text: "Executive offsite at a resort"
+      amount: 7000
+    hitl:
+      - node: director-approval
+        decision: { decision: reject }
+    expect:
+      status: success
+      route: null
+      final_state_has: [summary]
+      final_state_lacks: [erp_result]
+      no_side_effects:
+        - { system: erp, action: submit }
