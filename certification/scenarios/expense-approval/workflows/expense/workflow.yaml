@@ -4,13 +4,13 @@ name: expense-approval
 version: 0.1.0
 description: >
   Tiered expense approval. CERTIFICATION FINDINGS (the authoring tax to express
-  one standard enterprise workflow): (1) #47 CLOSED — the AMOUNT tier now routes
-  on a deterministic `decision` node (ADR 094), no LLM; (2) HUMAN nodes can't
-  route — each approve/reject still needs an LLM intent-router (#48); (3) no
-  joins/fan-in — the three approval paths can't share one `post-erp`/`finalize`,
-  so each is DUPLICATED (#49). Net after #47: 12 nodes, 2 LLM classifiers (down
-  from 3) + 3 copies of the ERP-submit node. The runtime (durable HITL) is fine;
-  the remaining authoring tax is #48/#49.
+  one standard enterprise workflow): (1) #47 CLOSED — the AMOUNT tier routes on
+  a deterministic `decision` node (ADR 094), no LLM; (2) #49 CLOSED — exclusive
+  convergence (ADR 098) lets all three approval paths SHARE one
+  `post-erp`/`finalize`/`rejected` tail (was 13 nodes with 3 ERP-poster copies;
+  now 8 nodes, every shared step exists once); (3) HUMAN nodes can't route —
+  each approve/reject still needs an LLM intent-router (#48). The runtime
+  (durable HITL) is fine; the remaining authoring tax is #48 only.
 state_schema: ../../state.json
 entrypoint: classify
 nodes:
@@ -23,35 +23,29 @@ nodes:
         to: director-approval
       - when: {field: amount, op: gt, value: 100}
         to: manager-approval
-    default: post-erp-auto
-  # --- auto tier (no approval) ---
-  - {id: post-erp-auto, type: agent, ref: ../../agents/erp-poster}
-  - {id: finalize-auto, type: agent, ref: ../../agents/finalize}
+    default: post-erp
   # --- manager tier ---
   - {id: manager-approval, type: human, prompt: "Approve (manager)?", output_contract: [decision]}
   - id: manager-decision
     type: intent-router
     classifier_agent: ../../agents/decision-classifier
     input_field: decision
-    routes: {approve: post-erp-mgr, reject: rejected-mgr}
-    fallback: rejected-mgr
-  - {id: post-erp-mgr, type: agent, ref: ../../agents/erp-poster}
-  - {id: finalize-mgr, type: agent, ref: ../../agents/finalize}
-  - {id: rejected-mgr, type: agent, ref: ../../agents/rejected}
+    routes: {approve: post-erp, reject: rejected}
+    fallback: rejected
   # --- director tier ---
   - {id: director-approval, type: human, prompt: "Approve (director, >$5000)?", output_contract: [decision]}
   - id: director-decision
     type: intent-router
     classifier_agent: ../../agents/decision-classifier
     input_field: decision
-    routes: {approve: post-erp-dir, reject: rejected-dir}
-    fallback: rejected-dir
-  - {id: post-erp-dir, type: agent, ref: ../../agents/erp-poster}
-  - {id: finalize-dir, type: agent, ref: ../../agents/finalize}
-  - {id: rejected-dir, type: agent, ref: ../../agents/rejected}
+    routes: {approve: post-erp, reject: rejected}
+    fallback: rejected
+  # --- #49 CLOSED: the shared tail (exclusive convergence, ADR 098). One
+  # --- ERP-post, one finalize, one rejected — regardless of tier count.
+  - {id: post-erp, type: agent, ref: ../../agents/erp-poster}
+  - {id: finalize, type: agent, ref: ../../agents/finalize}
+  - {id: rejected, type: agent, ref: ../../agents/rejected}
 edges:
-  - {from: post-erp-auto, to: finalize-auto}
   - {from: manager-approval, to: manager-decision}
-  - {from: post-erp-mgr, to: finalize-mgr}
   - {from: director-approval, to: director-decision}
-  - {from: post-erp-dir, to: finalize-dir}
+  - {from: post-erp, to: finalize}

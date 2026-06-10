@@ -1,11 +1,14 @@
 # Expense Approval pattern — governance
 
-Topology: `DECISION(amount) → {director-approval | manager-approval | auto} → [HITL] → DECISION(intent-router) → ERP-post / reject → finalize`
+Topology: `DECISION(amount) → {director-approval | manager-approval | auto} → [HITL] → ROUTER(approve/reject) → shared post-erp → finalize | rejected`
 
 A tiered approval workflow, durable on Temporal. The **amount tier** routes on a
 deterministic `decision` node (ADR 094) — no LLM, no Temporal activity — then
 each tier pauses durably at a HUMAN approval gate; an LLM classifier reads the
-approver's free-text decision and routes approve→ERP-post or reject.
+approver's free-text decision and routes approve→ERP-post or reject. All tiers
+**converge on one shared tail** (exclusive convergence, ADR 098): one
+`post-erp`, one `finalize`, one `rejected` — regardless of tier count, so a fix
+or eval on the shared step lands once instead of per tier.
 
 ## What this pattern demonstrates
 
