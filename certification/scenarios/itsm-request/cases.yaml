@@ -1,0 +1,150 @@
+# Certification cases — itsm-request (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `itsm-request` workflow
+# (workflows/itsm-request — 5 nodes: a deterministic `decision` node on the
+# catalog's `auto_approved` flag, ONE HUMAN gate with direct decision routes,
+# a provision TOOL node calling the workflow-local `sim-provision` python
+# skill, and the shared notify/rejected tail). One case per business-catalog
+# service: 3 auto-approved, 2 approval→approve, 1 approval→reject. The driver
+# submits the case input via POST /run, resumes any expected HUMAN pause via
+# the signal endpoint, then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state; the fact builder surfaces `route` only from a
+#   `tier`/`route` state key, so the fact's route is None here. We assert that
+#   explicitly and prove the branch instead via (a) the observed pause node
+#   (approval vs none) and (b) `final_state` markers: every provisioned path
+#   merges the TOOL node's `provision_result` into state, the reject path
+#   never does.
+# * `status: success` for ALL cases, including the reject — the rejected
+#   branch still terminates at the `rejected` agent successfully; "rejected"
+#   is a route, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096), and the
+#   Temporal path does not emit per-node `run` facts yet; the driver records
+#   the capability as SKIP with that note rather than green-washing it.
+# * side-effects — UNLIKE expense-approval, this scenario asserts POSITIVE
+#   ledger rows: the provision TOOL node (ADR 097) deterministically records
+#   one `{system: itsm, action: provision}` row per provisioned run via the
+#   self-contained sim-provision skill (impl.py baked into the worker image
+#   inside workflows/itsm-request/skills/). The reject case asserts the
+#   ABSENCE of that row. Evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * `governance: allow` everywhere — the baked catalog policy
+#   (workflows/expense-approval/policy.yaml → /opt/movate/project.yaml;
+#   mirrored by workflows/itsm-request/policy.yaml) registers MODEL + COST
+#   gates on every agent run, so the terminal fact's `governance_effect` must
+#   be NON-NULL and `allow`. A `warn` means an agent slipped past the
+#   policy's bounds; a NULL means the governance wiring on the worker image
+#   is broken.
+
+scenario: itsm-request
+target: itsm-request # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- auto-approved catalog services: decision node → provision TOOL →
+  # --- notify. No HUMAN gate; terminal success without any signal IS the
+  # --- routing evidence, and the ledger row proves the TOOL node executed.
+  - name: password-reset-auto
+    input:
+      service: password-reset
+      requester: jane.doe
+      details: "Forgot my AD password after the holiday"
+      auto_approved: true
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [provision_result, summary]
+      side_effects:
+        - { system: itsm, action: provision, times: 1 }
+
+  - name: vpn-access-auto
+    input:
+      service: vpn-access
+      requester: raj.patel
+      details: "Need VPN access for remote onboarding week"
+      auto_approved: true
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [provision_result, summary]
+      side_effects:
+        - { system: itsm, action: provision, times: 1 }
+
+  - name: email-group-auto
+    input:
+      service: email-group
+      requester: li.wei
+      details: "Add me to the platform-engineering email group"
+      auto_approved: true
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [provision_result, summary]
+      side_effects:
+        - { system: itsm, action: provision, times: 1 }
+
+  # --- needs-approval services: decision default → approval HUMAN gate;
+  # --- approve → the SAME shared provision/notify tail (ADR 098/099).
+  - name: software-license-approve
+    input:
+      service: software-license
+      requester: ana.silva
+      details: "IDE license renewal for the data team"
+      auto_approved: false
+    hitl:
+      - node: approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [provision_result, summary]
+      side_effects:
+        - { system: itsm, action: provision, times: 1 }
+
+  - name: hardware-request-approve
+    input:
+      service: hardware-request
+      requester: sam.okafor
+      details: "Replacement laptop, current one has a failing battery"
+      auto_approved: false
+    hitl:
+      - node: approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [provision_result, summary]
+      side_effects:
+        - { system: itsm, action: provision, times: 1 }
+
+  # --- reject path: the gate routes to `rejected`; the workflow still ends
+  # --- SUCCESS. The rejection is proven by the pause at `approval`, the
+  # --- reject signal, final_state LACKING provision_result, and (when the
+  # --- shared DB is reachable) ZERO itsm provision rows in the sim ledger —
+  # --- the TOOL node must never have run.
+  - name: new-user-onboarding-reject
+    input:
+      service: new-user-onboarding
+      requester: morgan.reyes
+      details: "Contractor onboarding — start date not confirmed yet"
+      auto_approved: false
+    hitl:
+      - node: approval
+        decision: { decision: reject }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [summary]
+      final_state_lacks: [provision_result]
+      no_side_effects:
+        - { system: itsm, action: provision }

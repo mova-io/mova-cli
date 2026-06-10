@@ -1,0 +1,59 @@
+api_version: movate/v1
+kind: Workflow
+name: itsm-request
+version: 0.1.0
+description: >
+  ITSM service-request fulfilment, durable on Temporal — the first production
+  scenario of the 30-use-case certification program, parameterized over the
+  whole business catalog (password reset, VPN access, email group, software
+  license, hardware, onboarding). A deterministic `decision` node (ADR 094)
+  routes on the catalog's `auto_approved` flag: auto services go straight to
+  provisioning; everything else pauses durably at ONE HUMAN approval gate that
+  routes its own structured `decision` (ADR 099 — approve→provision,
+  reject→rejected, any other wording fails safe to rejected). Provisioning is
+  a TOOL node (ADR 097): the workflow-local `sim-provision` python skill
+  records the fulfilment to the sim side-effect ledger deterministically — no
+  LLM, no wrapper agent. Approve + auto paths CONVERGE on the shared
+  provision→notify tail (exclusive convergence, ADR 098). Self-contained:
+  the skill carries its own impl.py next to skill.yaml (workflow-local, so a
+  temporal-worker image bakes it for free). Point sim-provision at your real
+  ITSM/identity backend to go live. Mirrors workflows/itsm-request.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: classify
+nodes:
+  # Deterministic catalog routing (ADR 094): the portal already knows which
+  # services are auto-approved — no LLM in the control path.
+  - id: classify
+    type: decision
+    cases:
+      - when: {field: auto_approved, op: eq, value: true}
+        to: provision
+    default: approval
+  # ONE approval gate for every needs-approval service. The gate routes its
+  # OWN decision (ADR 099) — trim+casefold exact match, no LLM; prose answers
+  # fail safe to rejected.
+  - id: approval
+    type: human
+    prompt: >
+      Approve this ITSM service request? Respond with `decision` set to
+      exactly "approve" or "reject" — any other wording is treated as reject.
+    output_contract: [decision]
+    routes: {approve: provision, reject: rejected}
+    fallback: rejected
+  # --- shared tail (ADR 098): auto + approve paths converge on ONE
+  # --- provision TOOL node (ADR 097 — deterministic skill execution, no LLM)
+  # --- followed by ONE LLM notify; every reject lands on ONE rejected node.
+  - id: provision
+    type: tool
+    skill: sim-provision
+  - {id: notify, type: agent, ref: ./agents/notify}
+  - {id: rejected, type: agent, ref: ./agents/rejected}
+edges:
+  - {from: provision, to: notify}
+tags:
+  - temporal
+  - decision
+  - hitl
+  - tool
+  - certification

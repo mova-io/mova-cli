@@ -1,0 +1,50 @@
+api_version: movate/v1
+kind: Workflow
+name: itsm-request
+version: 0.1.0
+description: >
+  ITSM service-request fulfilment — the first production scenario of the
+  30-use-case certification program, parameterized over the business catalog
+  (password reset, VPN access, email group, software license, hardware,
+  onboarding) via the portal's `auto_approved` flag. ONE workflow exercises
+  the full primitive set: a deterministic `decision` node (ADR 094) routes
+  auto-approved services straight to provisioning; everything else pauses
+  durably at ONE HUMAN gate that routes its own structured `decision`
+  (ADR 099 — approve→provision, reject→rejected, prose fails safe to
+  rejected); provisioning is a TOOL node (ADR 097) calling the `sim-provision`
+  python skill (records the fulfilment to the sim ledger — no LLM, no wrapper
+  agent); approve + auto paths CONVERGE on the shared provision→notify tail
+  (exclusive convergence, ADR 098). Mirrors workflows/itsm-request.
+state_schema: ../../state.json
+entrypoint: classify
+nodes:
+  # Deterministic catalog routing (ADR 094): the portal already knows which
+  # services are auto-approved — no LLM in the control path.
+  - id: classify
+    type: decision
+    cases:
+      - when: {field: auto_approved, op: eq, value: true}
+        to: provision
+    default: approval
+  # ONE approval gate for every needs-approval service. The gate routes its
+  # OWN decision (ADR 099) — trim+casefold exact match, no LLM; prose answers
+  # fail safe to rejected.
+  - id: approval
+    type: human
+    prompt: >
+      Approve this ITSM service request? Respond with `decision` set to
+      exactly "approve" or "reject" — any other wording is treated as reject.
+    output_contract: [decision]
+    routes: {approve: provision, reject: rejected}
+    fallback: rejected
+  # --- shared tail (ADR 098): auto + approve paths converge on ONE provision
+  # --- TOOL node (ADR 097) followed by ONE LLM notify; every reject lands on
+  # --- ONE rejected node. The skill name resolves through the scenario's
+  # --- project registry (project.yaml marker → skills/sim-provision/).
+  - id: provision
+    type: tool
+    skill: sim-provision
+  - {id: notify, type: agent, ref: ../../agents/notify}
+  - {id: rejected, type: agent, ref: ../../agents/rejected}
+edges:
+  - {from: provision, to: notify}

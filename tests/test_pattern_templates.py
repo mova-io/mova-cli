@@ -42,6 +42,7 @@ ALL_PATTERNS = [
     "monitor",
     "simulation",
     "expense-approval",
+    "itsm-request",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"service":{"type":"string"},"requester":{"type":"string"},"provision_result":{"type":"string"}}}
