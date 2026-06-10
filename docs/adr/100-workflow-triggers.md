@@ -1,7 +1,8 @@
 # ADR 100 — Workflow triggers: cron schedules + inbound events converge on the existing job path
 
-Status: Proposed
+Status: Accepted
 Date: 2026-06-09
+Accepted: 2026-06-09 — approved by Jeremy. Ratified: cronsim dependency approved (MIT, license-gate); opt-in auth_mode: token for ADO Service Hooks (must pair with delivery dedup); JobSchedule path over Temporal-native Schedules.
 Deciders: Engineering — additive fields on the existing `JobSchedule`/`Trigger`
 surfaces (CLAUDE.md §7: extend the existing seam, don't add a second
 workflow-start path).
