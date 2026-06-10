@@ -1,0 +1,59 @@
+api_version: movate/v1
+kind: Workflow
+name: expense-approval
+version: 0.1.0
+description: >
+  Tiered expense approval, durable on Temporal. The amount tier routes on a
+  deterministic `decision` node (ADR 094) — no LLM, no Temporal activity — then
+  each tier pauses durably at a HUMAN approval gate; an LLM classifier reads the
+  approver's free-text decision and routes approve→ERP-post or reject. All three
+  tiers CONVERGE on one shared `post-erp`/`finalize`/`rejected` tail (exclusive
+  convergence, ADR 098 — gap #49 closed; the remaining authoring tax is #48
+  only: HUMAN nodes still route approve/reject through an LLM intent-router).
+  Self-contained (bundled into the temporal-worker image): real LLM agents over
+  simulated expense data, real durable execution + tracing (Temporal UI +
+  Langfuse + Grafana). Mirrors certification/scenarios/expense-approval.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: classify
+nodes:
+  # Deterministic value routing on the expense amount (ADR 094) — replaces the
+  # LLM tier-classifier the certification suite flagged as gap #47.
+  - id: classify
+    type: decision
+    cases:
+      - when: {field: amount, op: gt, value: 5000}
+        to: director-approval
+      - when: {field: amount, op: gt, value: 100}
+        to: manager-approval
+    default: post-erp
+  # --- manager tier (>$100) ---
+  - {id: manager-approval, type: human, prompt: "Approve this expense (manager)?", output_contract: [decision]}
+  - id: manager-decision
+    type: intent-router
+    classifier_agent: ./agents/decision-classifier
+    input_field: decision
+    routes: {approve: post-erp, reject: rejected}
+    fallback: rejected
+  # --- director tier (>$5000) ---
+  - {id: director-approval, type: human, prompt: "Approve this expense (director, >$5000)?", output_contract: [decision]}
+  - id: director-decision
+    type: intent-router
+    classifier_agent: ./agents/decision-classifier
+    input_field: decision
+    routes: {approve: post-erp, reject: rejected}
+    fallback: rejected
+  # --- shared tail (ADR 098): every tier's approve path posts + finalizes via
+  # --- ONE node each, every reject path lands on ONE rejected node.
+  - {id: post-erp, type: agent, ref: ./agents/erp-poster}
+  - {id: finalize, type: agent, ref: ./agents/finalize}
+  - {id: rejected, type: agent, ref: ./agents/rejected}
+edges:
+  - {from: manager-approval, to: manager-decision}
+  - {from: director-approval, to: director-decision}
+  - {from: post-erp, to: finalize}
+tags:
+  - temporal
+  - decision
+  - hitl
+  - certification

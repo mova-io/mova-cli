@@ -123,6 +123,90 @@ def test_delete_clears_schedule(client: TestClient, auth_setup) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cron passthrough (ADR 100 D1)
+# ---------------------------------------------------------------------------
+
+
+def test_set_cron_schedule_round_trips(client: TestClient, auth_setup) -> None:
+    auth_header, _ = auth_setup
+    r = client.put(
+        "/api/v1/schedules/briefing",
+        json={
+            "kind": "workflow",
+            "target": "exec-briefing",
+            "cron": "0 7 * * 1-5",
+            "timezone": "America/New_York",
+            "input": {"audience": "leadership"},
+        },
+        headers=auth_header,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["cron"] == "0 7 * * 1-5"
+    assert body["timezone"] == "America/New_York"
+    assert body["cadence_seconds"] == 0
+
+    one = client.get("/api/v1/schedules/briefing", headers=auth_header)
+    assert one.status_code == 200
+    assert one.json()["cron"] == "0 7 * * 1-5"
+    assert one.json()["timezone"] == "America/New_York"
+
+
+def test_interval_schedule_view_carries_null_cron(client: TestClient, auth_setup) -> None:
+    """Back-compat: an interval schedule reads back with cron/timezone null."""
+    auth_header, _ = auth_setup
+    client.put(
+        "/api/v1/schedules/nightly",
+        json={"target": "faq", "cadence_seconds": 3600},
+        headers=auth_header,
+    )
+    body = client.get("/api/v1/schedules/nightly", headers=auth_header).json()
+    assert body["cron"] is None
+    assert body["timezone"] is None
+    assert body["cadence_seconds"] == 3600
+
+
+def test_set_both_cron_and_cadence_422(client: TestClient, auth_setup) -> None:
+    auth_header, _ = auth_setup
+    r = client.put(
+        "/api/v1/schedules/briefing",
+        json={"target": "faq", "cadence_seconds": 3600, "cron": "0 7 * * *"},
+        headers=auth_header,
+    )
+    assert r.status_code == 422
+
+
+def test_set_neither_cron_nor_cadence_422(client: TestClient, auth_setup) -> None:
+    auth_header, _ = auth_setup
+    r = client.put(
+        "/api/v1/schedules/briefing",
+        json={"target": "faq"},
+        headers=auth_header,
+    )
+    assert r.status_code == 422
+
+
+def test_set_invalid_cron_expression_422(client: TestClient, auth_setup) -> None:
+    auth_header, _ = auth_setup
+    r = client.put(
+        "/api/v1/schedules/briefing",
+        json={"target": "faq", "cron": "99 99 * * *"},
+        headers=auth_header,
+    )
+    assert r.status_code == 422
+
+
+def test_set_timezone_without_cron_422(client: TestClient, auth_setup) -> None:
+    auth_header, _ = auth_setup
+    r = client.put(
+        "/api/v1/schedules/briefing",
+        json={"target": "faq", "cadence_seconds": 3600, "timezone": "America/New_York"},
+        headers=auth_header,
+    )
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # Errors + scope gate + validation
 # ---------------------------------------------------------------------------
 

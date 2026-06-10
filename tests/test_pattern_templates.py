@@ -35,7 +35,14 @@ from movate.templates import (
     pattern_is_workflow,
 )
 
-ALL_PATTERNS = ["chatbot", "task-oriented", "goal-oriented", "monitor", "simulation"]
+ALL_PATTERNS = [
+    "chatbot",
+    "task-oriented",
+    "goal-oriented",
+    "monitor",
+    "simulation",
+    "expense-approval",
+]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 
 
@@ -45,9 +52,9 @@ WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 
 
 @pytest.mark.unit
-def test_all_five_patterns_registered() -> None:
+def test_all_patterns_registered() -> None:
     assert set(list_patterns()) == set(ALL_PATTERNS)
-    assert len(PATTERN_TEMPLATES) == 5
+    assert len(PATTERN_TEMPLATES) == len(ALL_PATTERNS)
 
 
 @pytest.mark.unit

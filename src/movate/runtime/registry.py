@@ -123,6 +123,47 @@ def scan_workflows(root: Path) -> dict[str, WorkflowGraph]:
     return graphs
 
 
+def scan_workflow_agents(root: Path) -> list[tuple[str, AgentBundle]]:
+    """Walk ``root`` for agents bundled INSIDE workflows: ``<root>/<workflow>/
+    agents/<name>/agent.yaml``.
+
+    Returns ``(workflow_name, AgentBundle)`` pairs, sorted by
+    ``(workflow, agent name)``. These are the agents a workflow template ships
+    with — invisible to :func:`scan_agents` (which is deliberately one level
+    deep over the standalone ``agents/`` dir). The control plane uses this to
+    surface every agent in the deployment, including workflow-bundled ones,
+    grouped by their owning workflow.
+
+    Same fail-soft + dot-dir-skip invariants as :func:`scan_agents`: a missing
+    root or a bad ``agent.yaml`` is skipped (logged), never fatal.
+    """
+    if not root.exists() or not root.is_dir():
+        logger.info("workflow_agents_root_missing path=%s", root)
+        return []
+
+    pairs: list[tuple[str, AgentBundle]] = []
+    for wf in sorted(root.iterdir()):
+        if not wf.is_dir() or wf.name.startswith("."):
+            continue
+        agents_dir = wf / "agents"
+        if not agents_dir.is_dir():
+            continue
+        for entry in sorted(agents_dir.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            if not (entry / "agent.yaml").exists():
+                continue
+            try:
+                bundle = load_agent(entry)
+            except AgentLoadError as exc:
+                logger.warning("workflow_agent_load_skipped path=%s reason=%s", entry, exc)
+                continue
+            pairs.append((wf.name, bundle))
+
+    pairs.sort(key=lambda p: (p[0], p[1].spec.name))
+    return pairs
+
+
 async def load_published_temporal_workflows(
     storage: Any,
     *,

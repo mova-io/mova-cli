@@ -679,3 +679,25 @@ def test_jobs_reap_cli_reclaims_orphan(tmp_path: Path, monkeypatch) -> None:
         return got.status
 
     assert asyncio.run(_check()) == JobStatus.QUEUED
+
+
+# ---------------------------------------------------------------------------
+# Provenance (ADR 100 D4) — origin round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_origin_round_trips_and_defaults_none(storage) -> None:
+    """ADR 100 D4: origin persists; a job saved without one (every manual
+    submit + every pre-ADR-100 row) reads back as None."""
+    stamped = _make_job(job_id="job-stamped")
+    stamped = stamped.model_copy(update={"origin": "trigger:trig-abc123"})
+    await storage.save_job(stamped)
+    got = await storage.get_job("job-stamped", tenant_id="tenant-a")
+    assert got is not None
+    assert got.origin == "trigger:trig-abc123"
+
+    await storage.save_job(_make_job(job_id="job-manual"))
+    manual = await storage.get_job("job-manual", tenant_id="tenant-a")
+    assert manual is not None
+    assert manual.origin is None

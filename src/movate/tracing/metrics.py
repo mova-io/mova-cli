@@ -148,6 +148,25 @@ METRIC_VOICE_STT_FINAL_MS = "mdk.voice.stt_final_ms"  # turn start → STT endpo
 METRIC_VOICE_TTS_FIRST_AUDIO_MS = "mdk.voice.tts_first_audio_ms"  # turn start → first TTS frame
 METRIC_VOICE_TURNS = "mdk.voice.turns"  # completed voice turns (attr: interrupted = barge-in)
 
+# ADR 093 — governance decisions. One counter for every gate evaluation the
+# GovernanceEngine makes, tagged with the gate ``kind`` (model/runtime/skill/
+# cost/quota/…), the resolved ``effect`` (allow/warn/deny), the rollout ``mode``
+# (warn/enforce), and ``tenant``. The headline rollout signal: in WARN (shadow)
+# mode, ``effect=deny`` would-be-denials are downgraded to ``effect=warn`` —
+# charting ``warn`` rate per ``kind`` is exactly the parity data that gates the
+# Phase 3 warn→enforce flip (flip a gate once its shadow deny-rate is understood
+# and acceptable). Once a gate is ``mode=enforce``, ``effect=deny`` is a real
+# block. Low-cardinality attrs only (never the model string / run_id).
+METRIC_GOVERNANCE_DECISIONS = "mdk.governance.decisions"
+# MDK certification suite — one bump per scenario assertion outcome. Attrs:
+# ``scenario`` (e.g. expense-approval), ``capability`` (governance / temporal /
+# hitl / tracing / retries / parallelism / kb / evals / cost / audit), and
+# ``status`` (pass / fail). The certification Grafana dashboard derives its
+# "is the platform certified?" matrix from this — a capability is green only
+# when its scenarios emit status=pass and zero status=fail. Generated from REAL
+# scenario runs (the harness), so the matrix is earned, not drawn.
+METRIC_CERTIFICATION = "mdk.certification.scenario"
+
 #: Every OTel instrument name this module emits. The single source of truth the
 #: dashboards-as-code drift guard cross-checks against (a dashboard may only
 #: reference a metric that appears here).
@@ -171,6 +190,8 @@ METRIC_NAMES: frozenset[str] = frozenset(
         METRIC_VOICE_STT_FINAL_MS,
         METRIC_VOICE_TTS_FIRST_AUDIO_MS,
         METRIC_VOICE_TURNS,
+        METRIC_GOVERNANCE_DECISIONS,
+        METRIC_CERTIFICATION,
     }
 )
 
@@ -203,6 +224,8 @@ class _State:
     voice_stt_final_ms: Any = None  # Histogram[float]
     voice_tts_first_audio_ms: Any = None  # Histogram[float]
     voice_turns: Any = None  # Counter[int]
+    governance_decisions: Any = None  # Counter[int]  (ADR 093)
+    certification: Any = None  # Counter[int]  (MDK certification suite)
 
     # ADR 034 D3 — DB pool observable gauges are registered lazily by
     # ``register_pool_metrics`` (after storage.init at the edge), not in
@@ -372,6 +395,24 @@ def init_metrics(*, reader: Any | None = None) -> None:
         METRIC_VOICE_TURNS,
         unit="1",
         description="Completed voice turns (attr: interrupted=true for a barge-in).",
+    )
+    _state.governance_decisions = meter.create_counter(
+        METRIC_GOVERNANCE_DECISIONS,
+        unit="1",
+        description=(
+            "Governance gate decisions (ADR 093). Attrs: kind (model/runtime/"
+            "skill/cost/quota/…), effect (allow/warn/deny), mode (warn/enforce), "
+            "tenant. In warn mode a would-be deny is recorded as effect=warn — "
+            "that rate per kind is the parity signal for the warn→enforce flip."
+        ),
+    )
+    _state.certification = meter.create_counter(
+        METRIC_CERTIFICATION,
+        unit="1",
+        description=(
+            "MDK certification scenario assertion outcomes (attrs: scenario, "
+            "capability, status=pass|fail). Backs the certification matrix dashboard."
+        ),
     )
 
     _state.initialized = True
@@ -738,6 +779,44 @@ def record_voice_turn(
     _state.voice_turns.add(1, {"tenant": tenant_id, "interrupted": str(interrupted).lower()})
 
 
+def record_governance_decision(
+    *,
+    kind: str,
+    effect: str,
+    mode: str,
+    tenant_id: str,
+) -> None:
+    """Record one governance gate decision (ADR 093).
+
+    Bumps ``mdk.governance.decisions`` (attrs: ``kind``, ``effect``, ``mode``,
+    ``tenant``). ``kind`` is the gate dimension (``model`` / ``runtime`` /
+    ``skill`` / ``cost`` / ``quota`` / …); ``effect`` is the *resolved* outcome
+    after mode application (``allow`` / ``warn`` / ``deny``); ``mode`` is the
+    rollout posture (``warn`` / ``enforce``). The headline rollout signal: while
+    a gate is ``mode=warn`` a would-be deny lands as ``effect=warn``, so the
+    warn-rate per ``kind`` is the parity evidence for the Phase 3 enforce flip.
+
+    No-op when metrics are off / OTel absent (the instrument is ``None``); never
+    raises — observability must not break a request.
+    """
+    if _state.governance_decisions is None:
+        return
+    _state.governance_decisions.add(
+        1,
+        {"kind": kind, "effect": effect, "mode": mode, "tenant": tenant_id},
+    )
+
+
+def record_certification_result(*, scenario: str, capability: str, status: str) -> None:
+    """Record one MDK certification assertion outcome (attrs: ``scenario``,
+    ``capability``, ``status``=pass|fail). The certification dashboard rolls these
+    up into the per-capability matrix. No-op when metrics are off / OTel absent;
+    never raises — a certification emit must not break the scenario run."""
+    if _state.certification is None:
+        return
+    _state.certification.add(1, {"scenario": scenario, "capability": capability, "status": status})
+
+
 def inc_in_flight(*, tenant_id: str) -> None:
     """Increment the in-flight job gauge (attrs: ``tenant``). No-op when off."""
     if _state.jobs_in_flight is None:
@@ -782,11 +861,13 @@ def dec_sse_connections(*, tenant_id: str) -> None:
 
 
 __all__ = [
+    "METRIC_CERTIFICATION",
     "METRIC_DB_POOL_IDLE",
     "METRIC_DB_POOL_IN_USE",
     "METRIC_DB_POOL_MAX",
     "METRIC_DB_POOL_SIZE",
     "METRIC_DB_POOL_WAITING",
+    "METRIC_GOVERNANCE_DECISIONS",
     "METRIC_JOBS_COMPLETED",
     "METRIC_JOBS_IN_FLIGHT",
     "METRIC_JOB_DURATION_MS",
@@ -806,6 +887,8 @@ __all__ = [
     "inc_in_flight",
     "inc_sse_connections",
     "init_metrics",
+    "record_certification_result",
+    "record_governance_decision",
     "record_job_completed",
     "record_run_usage",
     "record_voice_turn",

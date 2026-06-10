@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 import movate.core.workflow.temporal_activities as ta
-from movate.core.models import ErrorInfo, Metrics, RunResponse
+from movate.core.models import ErrorInfo, Metrics, RunResponse, SkillSideEffects
 from movate.core.workflow.judge import (
     build_judge_state_value,
     derive_terminate,
@@ -44,6 +44,10 @@ class _FakeBundle:
 
         self.spec = _Spec()
         self.spec.name = name  # type: ignore[attr-defined]
+        # Skill-spec fields read by call_skill_activity (ADR 097): the SKILL
+        # governance gate + the timeout_call_ms latent-gap fix.
+        self.spec.side_effects = SkillSideEffects.READ_ONLY  # type: ignore[attr-defined]
+        self.spec.timeout_call_ms = None  # type: ignore[attr-defined]
         # ``input_schema`` is read by the activities' state projection.
         self.input_schema = {"properties": properties} if properties is not None else {}
 

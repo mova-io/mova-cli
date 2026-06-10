@@ -126,10 +126,10 @@ from movate.core.reporting import (
 from movate.core.triggers import (
     DELIVERY_ID_HEADER,
     DELIVERY_ID_MAX_LEN,
-    SIGNATURE_HEADER,
     build_triggered_job,
     mint_trigger,
-    verify_signature,
+    resolve_body_delivery_id,
+    verify_fire_auth,
 )
 from movate.core.webhooks import (
     WebhookAttemptListView,
@@ -356,6 +356,8 @@ from movate.runtime.schemas import (
     ModelCatalogView,
     ModelInfoView,
     NodeDetailView,
+    ObservabilityFactListView,
+    ObservabilityFactView,
     ObservabilityHealthView,
     ObservabilityInsightListView,
     ObservabilityInsightView,
@@ -401,6 +403,8 @@ from movate.runtime.schemas import (
     ThreadView,
     TriggerCreatedView,
     TriggerCreateRequest,
+    TriggerDeliveryListView,
+    TriggerDeliveryView,
     TriggerListView,
     TriggerView,
     TroubleshootRequest,
@@ -6135,6 +6139,69 @@ def build_app(
             )
 
         return AgentCatalogView(agents=items, count=len(items))
+
+    @v1.get(
+        "/workflow-agents",
+        tags=["agents-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflow_agents(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """List agents bundled INSIDE workflow templates, grouped by workflow.
+
+        Standalone agents live in the ``agents/`` catalog (``GET /agents``, a
+        deliberately one-level scan). Workflow templates ship their own agents
+        under ``<workflows>/<wf>/agents/<name>/`` — real, runnable agents that
+        the standalone catalog never surfaces. This read-only endpoint exposes
+        them so the Agent Control Plane (ADR 090) can show EVERY agent in the
+        deployment, including each test/template workflow's bundled agents.
+        """
+        from movate.runtime.registry import scan_workflow_agents  # noqa: PLC0415
+
+        # Resolve every candidate workflows root: the configured path (where
+        # POST /api/v1/workflows lands — usually a sibling of agents_path) AND
+        # the image-baked templates dir from the env the worker uses
+        # (MOVATE_/MDK_WORKFLOWS_PATH = /app/workflows). The API's agents_path is
+        # often a persistent volume (/home/movate/agents) whose workflows sibling
+        # is empty, so the baked templates (/app/workflows) would otherwise be
+        # invisible here. Dedupe by resolved path; scan all.
+        roots: list[Path] = []
+        seen_roots: set[str] = set()
+        candidates: list[Path | None] = [request.app.state.workflows_path]
+        for env_name in ("MDK_WORKFLOWS_PATH", "MOVATE_WORKFLOWS_PATH"):
+            val = os.environ.get(env_name, "").strip()
+            if val:
+                candidates.append(Path(val))
+        for cand in candidates:
+            if cand is None:
+                continue
+            key = str(cand.resolve()) if cand.exists() else str(cand)
+            if key in seen_roots:
+                continue
+            seen_roots.add(key)
+            roots.append(cand)
+
+        items: list[dict[str, Any]] = []
+        seen_agents: set[tuple[str, str]] = set()
+        for wf_root in roots:
+            for wf_name, bundle in scan_workflow_agents(wf_root):
+                spec = bundle.spec
+                if (wf_name, spec.name) in seen_agents:
+                    continue
+                seen_agents.add((wf_name, spec.name))
+                items.append(
+                    {
+                        "workflow": wf_name,
+                        "name": spec.name,
+                        "version": spec.version,
+                        "description": spec.description,
+                        "role": getattr(spec, "role", None),
+                        "model": getattr(getattr(spec, "model", None), "provider", None),
+                    }
+                )
+        return {"workflow_agents": items, "count": len(items)}
 
     @v1.patch(
         "/agents/{name}/status",
@@ -11943,6 +12010,8 @@ def build_app(
             kind=s.kind,
             target=s.target,
             cadence_seconds=s.cadence_seconds,
+            cron=s.cron,
+            timezone=s.timezone,
             enabled=s.enabled,
             input=s.input,
             notify_email=s.notify_email,
@@ -11981,6 +12050,8 @@ def build_app(
             kind=body.kind,
             target=body.target,
             cadence_seconds=body.cadence_seconds,
+            cron=body.cron,
+            timezone=body.timezone,
             enabled=body.enabled,
             input=body.input,
             notify_email=body.notify_email,
@@ -12093,6 +12164,10 @@ def build_app(
             kind=t.kind,
             target=t.target,
             input_defaults=t.input_defaults,
+            event_key=t.event_key,
+            input_map=t.input_map,
+            dedup_key=t.dedup_key,
+            auth_mode=t.auth_mode,
             enabled=t.enabled,
             last_fired_at=t.last_fired_at.isoformat() if t.last_fired_at else None,
             created_at=t.created_at.isoformat(),
@@ -12138,6 +12213,10 @@ def build_app(
             kind=body.kind,
             target=body.target,
             input_defaults=body.input_defaults,
+            event_key=body.event_key,
+            input_map=body.input_map,
+            dedup_key=body.dedup_key,
+            auth_mode=body.auth_mode,
             enabled=body.enabled,
             created_by=ctx.api_key_id,
         )
@@ -12226,6 +12305,56 @@ def build_app(
         await store.delete_trigger(name, tenant_id=ctx.tenant_id)
         return Response(status_code=204)
 
+    @v1.get(
+        "/triggers/{trigger_id}/deliveries",
+        response_model=TriggerDeliveryListView,
+        tags=["triggers"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_trigger_deliveries(
+        trigger_id: str,
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+        limit: int = 50,
+    ) -> TriggerDeliveryListView:
+        """Recent deliveries for one trigger, joined to job status (ADR 100 D4).
+
+        The per-trigger delivery ledger: every fire that carried a delivery
+        id (the ``X-Movate-Delivery-Id`` header, or the trigger's
+        ``dedup_key`` body path) lists here with the ``job_id`` it enqueued
+        and that job's current status — "did my webhook fire, and what
+        happened to the run it started". Keyed by the public ``trigger_id``
+        (the same id in the webhook URL), newest first, ``limit`` capped at
+        200.
+
+        Tenant-scoped: another tenant's trigger 404s (no existence leak).
+        Fires without a delivery id (no header, no resolvable ``dedup_key``)
+        are not recorded and do not list here — ``last_fired_at`` on the
+        trigger remains the cheap liveness signal.
+
+        Errors:
+
+        * **401** — bad bearer token
+        * **403** — missing the ``read`` scope
+        * **404** — no trigger with this id for this tenant
+        """
+        store: StorageProvider = request.app.state.storage
+        trigger = await store.get_trigger_by_id(trigger_id)
+        if trigger is None or trigger.tenant_id != ctx.tenant_id:
+            raise not_found("trigger", trigger_id)
+        capped_limit = max(1, min(limit, 200))
+        rows = await store.list_trigger_deliveries(trigger_id, limit=capped_limit)
+        views = [
+            TriggerDeliveryView(
+                delivery_id=r.delivery_id,
+                job_id=r.job_id,
+                job_status=r.job_status,
+                created_at=r.created_at.isoformat(),
+            )
+            for r in rows
+        ]
+        return TriggerDeliveryListView(deliveries=views, count=len(views))
+
     @v1.post(
         "/triggers/{trigger_id}/events",
         response_model=RunAccepted,
@@ -12246,11 +12375,19 @@ def build_app(
         api-key auth dependency — the external caller has no ``mvt_*`` key,
         and the secret never travels on the wire (only a body-bound HMAC).
         The raw body is the event payload (a JSON object); it is merged OVER
-        the trigger's ``input_defaults`` to form the job input, and a
-        ``JobKind.AGENT``/``WORKFLOW`` job is enqueued scoped to the
-        **trigger's** tenant. The enqueued job is the same shape ``POST /run``
-        produces, so it runs through the existing dispatch with no new branch,
-        and is observable + retryable as a normal job.
+        the trigger's ``input_defaults`` to form the job input — or, when the
+        trigger declares ``event_key``/``input_map`` (ADR 100 D2), nested
+        under ``event_key`` and/or extracted via the declared dotted paths —
+        and a ``JobKind.AGENT``/``WORKFLOW`` job is enqueued scoped to the
+        **trigger's** tenant. A trigger with ``auth_mode: "token"``
+        (ADR 100 D3) authenticates via ``X-Movate-Trigger-Token`` instead of
+        the HMAC signature; in HMAC mode GitHub's ``X-Hub-Signature-256`` is
+        accepted as an alias when ``X-Movate-Signature`` is absent. A
+        ``dedup_key`` dotted path sources the delivery id from the body when
+        the ``X-Movate-Delivery-Id`` header is absent. The enqueued job is
+        the same shape ``POST /run`` produces, so it runs through the
+        existing dispatch with no new branch, and is observable + retryable
+        as a normal job.
 
         Returns **202** ``{job_id, status, deduplicated}`` (mirrors
         ``RunAccepted``).
@@ -12286,11 +12423,14 @@ def build_app(
         if trigger is None or not trigger.enabled:
             raise not_found("trigger", trigger_id)
 
-        # Per-trigger-secret auth: recompute the body-bound HMAC from the
-        # stored secret_hash and constant-time compare against the presented
-        # X-Movate-Signature. No normal API key is accepted here.
-        presented = request.headers.get(SIGNATURE_HEADER)
-        if not verify_signature(trigger, raw_body, presented):
+        # Per-trigger-secret auth (ADR 100 D3). No normal API key is
+        # accepted here. Dispatches on the trigger's auth_mode: "hmac"
+        # (default — body-bound X-Movate-Signature, with GitHub's
+        # X-Hub-Signature-256 as an alias when the movate header is absent)
+        # or "token" (static X-Movate-Trigger-Token, constant-time-compared
+        # against the stored hash — for senders that cannot HMAC, e.g. ADO
+        # Service Hooks; weaker, replayable until rotation).
+        if not verify_fire_auth(trigger, raw_body, request.headers):
             raise auth_required()
 
         # The event body becomes the job input (merged over input_defaults).
@@ -12323,6 +12463,15 @@ def build_app(
         delivery_id = raw_delivery_id.strip() if raw_delivery_id else None
         if not delivery_id or len(delivery_id) > DELIVERY_ID_MAX_LEN:
             delivery_id = None
+
+        # ADR 100 D2 — body-sourced dedup. When the header is absent and the
+        # trigger declares a dedup_key dotted path, the event body supplies
+        # the delivery id (ADO carries its event id at body path `id` and
+        # cannot send custom headers). Header wins when both are present;
+        # unresolvable path / no dedup_key → None → today's always-enqueue
+        # behavior. From here the id flows through the existing
+        # insert-or-ignore dedup path unchanged.
+        delivery_id = delivery_id or resolve_body_delivery_id(trigger, event_body)
 
         if delivery_id is not None:
             # A prior delivery of this id for this trigger → return the SAME
@@ -15432,6 +15581,52 @@ def build_app(
             anomaly_count=len(latest.anomalies),
             has_insight=True,
         )
+
+    @v1.get(
+        "/observability/facts",
+        response_model=ObservabilityFactListView,
+        tags=["observability-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_observability_facts(
+        request: Request,
+        kind: str | None = Query(default=None, description="run | workflow_run"),
+        workflow: str | None = Query(default=None),
+        agent: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        since: datetime | None = Query(
+            default=None, description="ISO 8601 timestamp; created_at >= since."
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> ObservabilityFactListView:
+        """List this tenant's derived observability facts, newest-first (ADR 096 D5).
+
+        The platform integration surface: one denormalized row per terminal
+        execution event (agent run completed; workflow run terminal/paused),
+        flat scalar columns the reader never has to re-derive from
+        ``runs.metrics`` / ``workflow_runs``. Deep-links out (ClickHouse /
+        Langfuse / Temporal Web) are constructed client-side from
+        ``trace_id`` + ``source_id`` — never stored. Filters AND together;
+        ``limit`` is capped at 500 to keep the response bounded. Pure read,
+        always tenant-scoped (``read`` scope).
+
+        Errors:
+
+        * **401** — missing / bad bearer token
+        """
+        store: StorageProvider = request.app.state.storage
+        rows = await store.list_observability_facts(
+            tenant_id=ctx.tenant_id,
+            kind=kind,
+            workflow=workflow,
+            agent=agent,
+            status=status,
+            since=since,
+            limit=limit,
+        )
+        views = [ObservabilityFactView.from_record(r) for r in rows]
+        return ObservabilityFactListView(facts=views, count=len(views))
 
     @v1.post(
         "/observability/ask",

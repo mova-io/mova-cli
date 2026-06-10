@@ -55,12 +55,18 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
 from movate.core.auth import _urlsafe_b64, hash_secret
 from movate.core.models import JobKind, JobRecord, Trigger
+
+# ADR 100 D2: ``input_map``/``dedup_key`` dotted-path extraction deliberately
+# REUSES the decision node's reader (ADR 094) so "dotted path into a dict,
+# fail-soft on a missing segment" has exactly ONE semantics in the codebase.
+from movate.core.workflow.decision import _MISSING, _read_field
 
 # Entropy for the per-trigger secret. 256 bits — same as an API key secret;
 # brute-forcing it (or the HMAC keyed by its hash) is economically infeasible.
@@ -71,6 +77,20 @@ TRIGGER_SALT_BYTES = 16
 # tolerate on it (``sha256=<hex>``) — GitHub-webhook-compatible.
 SIGNATURE_HEADER = "X-Movate-Signature"
 _SIG_PREFIX = "sha256="
+
+# ADR 100 D3: GitHub sends the same sha256-HMAC-over-body under its own
+# header name. Accepted as an alias ONLY when ``X-Movate-Signature`` is
+# absent (the operator pastes the minted signing key into GitHub as the
+# webhook secret). Zero new crypto.
+GITHUB_SIGNATURE_HEADER = "X-Hub-Signature-256"
+
+# ADR 100 D3: the static-token header for ``auth_mode: "token"`` triggers —
+# senders that cannot compute a per-body HMAC (ADO Service Hooks support
+# static headers only). The presented value is the plaintext per-trigger
+# secret; the server recomputes ``hash_secret(token, salt)`` and
+# constant-time-compares against the stored ``secret_hash``. Explicitly
+# weaker than HMAC (replayable until rotation) — pair with ``dedup_key``.
+TOKEN_HEADER = "X-Movate-Trigger-Token"
 
 # item 23 (ADR 017 D2 follow-up): the optional per-delivery idempotency key an
 # external caller may send to suppress at-least-once retries — the GitHub
@@ -104,6 +124,10 @@ def mint_trigger(
     kind: JobKind,
     target: str,
     input_defaults: dict[str, Any] | None = None,
+    event_key: str | None = None,
+    input_map: dict[str, str] | None = None,
+    dedup_key: str | None = None,
+    auth_mode: str = "hmac",
     enabled: bool = True,
     created_by: str | None = None,
 ) -> MintedTrigger:
@@ -114,6 +138,10 @@ def mint_trigger(
     :class:`Trigger`. The caller persists ``minted.record`` and shows
     ``minted.secret`` exactly once — it is irrecoverable afterward, exactly
     like a minted API key.
+
+    ``event_key`` / ``input_map`` / ``dedup_key`` / ``auth_mode`` are the
+    ADR 100 D2/D3 event-mapping + auth fields; all default to the
+    pre-ADR-100 behavior (verbatim merge, header-only dedup, HMAC).
     """
     secret = _urlsafe_b64(TRIGGER_SECRET_BYTES)
     salt = _urlsafe_b64(TRIGGER_SALT_BYTES)
@@ -126,6 +154,10 @@ def mint_trigger(
         secret_hash=hash_secret(secret, salt),
         salt=salt,
         input_defaults=input_defaults or {},
+        event_key=event_key,
+        input_map=input_map,
+        dedup_key=dedup_key,
+        auth_mode=auth_mode,  # type: ignore[arg-type]  # Literal validated by pydantic
         enabled=enabled,
         created_by=created_by,
     )
@@ -135,23 +167,107 @@ def mint_trigger(
 def build_triggered_job(trigger: Trigger, event_body: dict[str, Any]) -> JobRecord:
     """Construct the ``JobKind.AGENT``/``WORKFLOW`` :class:`JobRecord` for a fire.
 
-    Merges the trigger's ``input_defaults`` then the inbound ``event_body``
-    (the event body wins on key collisions) into the job ``input``, and
-    copies ``kind`` + ``target`` straight through. The result is the SAME
+    Builds the job ``input`` from the trigger's mapping declaration
+    (ADR 100 D2), in a deterministic, documented order:
+
+    * **Neither ``event_key`` nor ``input_map`` set** (every pre-ADR-100
+      trigger): the existing verbatim merge ``{**input_defaults,
+      **event_body}`` — the event body wins on key collisions — preserved
+      byte-for-byte.
+    * **Otherwise**: ``{**input_defaults, **mapped_fields, **({event_key:
+      event_body} if event_key else {})}`` — ``input_map`` extractions land
+      over the defaults, and the whole raw body is nested under
+      ``event_key`` (when set) so the workflow can still read unmapped
+      fields without top-level state-key collisions. A missing ``input_map``
+      path means the key is **omitted** (fail-soft, the decision node's
+      ``_read_field`` semantics), never an exception.
+
+    ``kind`` + ``target`` copy straight through. The result is the SAME
     shape ``POST /run`` (``runtime.app.v1_agent_run``) and
     :func:`movate.core.scheduler.build_scheduled_job` produce, so the
     worker's existing ``_execute_agent`` / ``_execute_workflow`` dispatch
     runs it with no new branch. The enqueued job is scoped to the trigger's
     own ``tenant_id`` (the external caller is otherwise tenant-less).
     """
-    merged: dict[str, Any] = {**trigger.input_defaults, **event_body}
+    if trigger.event_key is None and trigger.input_map is None:
+        merged: dict[str, Any] = {**trigger.input_defaults, **event_body}
+    else:
+        mapped: dict[str, Any] = {}
+        for out_key, dotted in (trigger.input_map or {}).items():
+            value = _read_field(event_body, dotted)
+            if value is not _MISSING:
+                mapped[out_key] = value
+        merged = {**trigger.input_defaults, **mapped}
+        if trigger.event_key is not None:
+            merged[trigger.event_key] = event_body
     return JobRecord(
         job_id=str(uuid4()),
         tenant_id=trigger.tenant_id,
         kind=trigger.kind,
         target=trigger.target,
         input=merged,
+        # ADR 100 D4 provenance: walk the job back to the trigger that fired
+        # it (the stable public id the deliveries view + webhook URL key
+        # off). Manual submits carry None.
+        origin=f"trigger:{trigger.trigger_id}",
     )
+
+
+def resolve_body_delivery_id(trigger: Trigger, event_body: dict[str, Any]) -> str | None:
+    """Resolve the body-sourced delivery id for dedup (ADR 100 D2).
+
+    Used by the fire endpoint when the ``X-Movate-Delivery-Id`` header is
+    absent and the trigger declares a ``dedup_key`` dotted path. The
+    resolved value is stringified and capped at ``DELIVERY_ID_MAX_LEN``
+    (truncated — still deterministic per event, so retries keep deduping).
+    Unresolvable path / empty value / no ``dedup_key`` → ``None`` (no
+    dedup — today's behavior), never an exception.
+    """
+    if trigger.dedup_key is None:
+        return None
+    value = _read_field(event_body, trigger.dedup_key)
+    if value is _MISSING or value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:DELIVERY_ID_MAX_LEN]
+
+
+def verify_fire_auth(trigger: Trigger, raw_body: bytes, headers: Mapping[str, str]) -> bool:
+    """Authenticate one fire request per the trigger's ``auth_mode`` (ADR 100 D3).
+
+    * ``"hmac"`` (default — today's behavior): body-bound HMAC via
+      ``X-Movate-Signature``, with GitHub's ``X-Hub-Signature-256`` accepted
+      as an alias ONLY when the movate header is absent. The static token
+      header is NOT accepted in this mode.
+    * ``"token"``: static ``X-Movate-Trigger-Token`` compared constant-time
+      against the stored hash. The HMAC headers are NOT accepted in this
+      mode (one declared auth path per trigger — no silent fallbacks).
+
+    ``headers`` is any case-insensitive mapping (e.g. ``request.headers``).
+    Returns ``False`` (never raises) on any missing/invalid credential.
+    """
+    if trigger.auth_mode == "token":
+        return verify_token(trigger, headers.get(TOKEN_HEADER))
+    presented = headers.get(SIGNATURE_HEADER) or headers.get(GITHUB_SIGNATURE_HEADER)
+    return verify_signature(trigger, raw_body, presented)
+
+
+def verify_token(trigger: Trigger, presented: str | None) -> bool:
+    """Constant-time check of a presented ``X-Movate-Trigger-Token`` (ADR 100 D3).
+
+    Recomputes ``hash_secret(presented, salt)`` and compares (timing-safe)
+    against the stored ``secret_hash`` — the exact at-rest posture of HMAC
+    mode, but the plaintext secret travels on the wire instead of a
+    body-bound signature, so a captured request is replayable until
+    rotation (pair ``auth_mode: "token"`` with ``dedup_key``). Returns
+    ``False`` (never raises) when the header is absent/empty.
+    """
+    if not presented:
+        return False
+    presented_hash = hash_secret(presented.strip(), trigger.salt)
+    return hmac.compare_digest(presented_hash, trigger.secret_hash)
 
 
 def signing_key(secret: str, salt: str) -> str:
@@ -199,13 +315,18 @@ def verify_signature(trigger: Trigger, raw_body: bytes, presented: str | None) -
 __all__ = [
     "DELIVERY_ID_HEADER",
     "DELIVERY_ID_MAX_LEN",
+    "GITHUB_SIGNATURE_HEADER",
     "SIGNATURE_HEADER",
+    "TOKEN_HEADER",
     "TRIGGER_SALT_BYTES",
     "TRIGGER_SECRET_BYTES",
     "MintedTrigger",
     "build_triggered_job",
     "expected_signature",
     "mint_trigger",
+    "resolve_body_delivery_id",
     "signing_key",
+    "verify_fire_auth",
     "verify_signature",
+    "verify_token",
 ]

@@ -248,6 +248,51 @@ class Executor:
         except Exception:  # pragma: no cover — shadow is best-effort
             log.debug("governance shadow check failed for %s", kind, exc_info=True)
 
+    def govern_skill_dispatch(
+        self,
+        *,
+        skill_name: str,
+        side_effects: Any,
+        agent: str = "workflow",
+        tenant_id: str | None = None,
+    ) -> None:
+        """Apply the SKILL gate for ONE standalone skill dispatch (ADR 097 D5).
+
+        A skill invoked by a workflow ``tool`` node must clear the SAME policy a
+        skill invoked by an agent clears — this mirrors the per-skill block at
+        the top of :meth:`execute` (the runtime re-check pattern: "bundles
+        loaded over HTTP can skip validate, so we re-check here") for the one
+        skill entry point that lacked it. Two layers, same order as
+        :meth:`execute`:
+
+        * the ADR 093 governance shadow (``GateKind.SKILL`` with
+          ``side_effects`` + ``skill_name`` attributes) — warn-mode posture,
+          records the decision, never blocks, failures swallowed;
+        * the authoritative legacy :class:`SkillPolicy` check — raises
+          :class:`PolicyViolationError` on deny.
+
+        ``agent`` labels the governance record's principal (a workflow tool
+        node passes ``workflow:<name>`` — there is no agent at this edge).
+        Shared by the native runner's ``_run_tool`` and the Temporal
+        ``call_skill_activity`` so the two backends cannot disagree.
+        """
+        if self._governance is not None:
+            try:
+                self._governance.check(
+                    GateKind.SKILL,
+                    GovernanceContext(
+                        tenant_id=tenant_id or self._tenant_id or "local",
+                        agent=agent,
+                        attributes={"side_effects": side_effects, "skill_name": skill_name},
+                    ),
+                )
+            except Exception:  # pragma: no cover — shadow is best-effort (ADR 093)
+                log.debug("governance shadow check failed for SKILL", exc_info=True)
+        if not self._skill_policy.is_permissive():
+            violation = self._skill_policy.check_skill(skill_name, side_effects)
+            if violation is not None:
+                raise PolicyViolationError(violation)
+
     @property
     def tracer(self) -> Tracer:
         """Expose the underlying tracer for callers that need to push scores."""

@@ -256,6 +256,12 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Bounded multi-agent simulation: a FIXED roster of two participants under a supervisor, hard-capped turns, terminating JUDGE. NOT a swarm.",  # noqa: E501
         "SUPERVISOR → (A → B → JUDGE) x2 → done",
     ),
+    "expense-approval": (
+        "pattern_expense_approval",
+        True,
+        "Tiered expense approval (runtime: temporal). A DECISION node routes on amount (no LLM), each tier pauses durably at a HUMAN gate, then an LLM classifier routes approve/reject — all tiers converging on ONE shared ERP-post/finalize/rejected tail (ADR 094 + ADR 098).",  # noqa: E501
+        "DECISION(amount) → [HUMAN] → ROUTER(approve/reject) → shared ERP-post|reject → finalize",
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

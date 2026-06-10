@@ -1,0 +1,2 @@
+{"input": {"expense_text": "Team lunch for 4 people at the local cafe", "amount": 50}, "expected": {"summary": "Approved automatically and posted to the ERP with a posting reference."}}
+{"input": {"expense_text": "Annual offsite venue deposit for the engineering team", "amount": 6000}, "expected": {"summary": "Approved by the director and posted to the ERP with a posting reference."}}

@@ -104,7 +104,8 @@ class GovernanceEngine:
         gates = self._gates.get(kind, ())
         decision = combine(gate.evaluate(ctx) for gate in gates)
 
-        if decision.effect is Effect.DENY and self._policy.mode_for(kind) is Mode.WARN:
+        mode = self._policy.mode_for(kind)
+        if decision.effect is Effect.DENY and mode is Mode.WARN:
             decision = Decision(
                 effect=Effect.WARN,
                 gate_kind=decision.gate_kind,
@@ -113,7 +114,36 @@ class GovernanceEngine:
                 policy_id=decision.policy_id,
             )
 
+        # Meter every governed decision (ADR 093) — but only for kinds that
+        # actually have a registered gate, so a check for an ungoverned kind
+        # stays a pure no-op (no spurious effect=allow datapoints). The
+        # resolved ``effect`` + rollout ``mode`` are the warn→enforce signal.
+        if gates:
+            self._record_metric(kind, decision, mode, ctx)
+
         if audit and (decision.effect is not Effect.ALLOW or self._audit_allows):
             self._audit.emit(decision, ctx)
 
         return decision
+
+    @staticmethod
+    def _record_metric(
+        kind: GateKind, decision: Decision, mode: Mode, ctx: GovernanceContext
+    ) -> None:
+        """Emit the governance-decision counter (ADR 093). Lazy + fail-soft.
+
+        Lazy import keeps the pure seam free of ``tracing`` at module load
+        (mirrors :class:`LoggingAuditSink`); the helper is itself a no-op when
+        metrics are off / OTel absent. Wrapped so a metrics failure can never
+        break a governed request."""
+        try:
+            from movate.tracing.metrics import record_governance_decision  # noqa: PLC0415
+
+            record_governance_decision(
+                kind=kind.value,
+                effect=decision.effect.value,
+                mode=mode.value,
+                tenant_id=ctx.tenant_id,
+            )
+        except Exception:  # pragma: no cover — metrics are best-effort
+            pass

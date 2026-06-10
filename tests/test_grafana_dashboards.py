@@ -51,6 +51,16 @@ _ALLOWED_METRICS: frozenset[str] = frozenset(
         "mdk.db.pool.in_use",
         "mdk.db.pool.waiting",
         "mdk.db.pool.max",
+        # ADR 082 -- durable-workflow completion + latency (Temporal terminal
+        # activity), referenced by the certification dashboard's supporting panels.
+        "mdk.workflow.completed",
+        "mdk.workflow.duration_ms",
+        # Certification matrix -- harness-emitted pass/fail per (scenario,
+        # capability), the metric behind dashboards/grafana/mdk-certification.json.
+        "mdk.certification.scenario",
+        # ADR 093 — governance gate decisions (kind/effect/mode/tenant), the
+        # warn→enforce rollout dashboard.
+        "mdk.governance.decisions",
     }
 )
 

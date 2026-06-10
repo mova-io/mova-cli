@@ -119,6 +119,154 @@ def test_is_due_works_for_eval_schedule() -> None:
 
 
 # ---------------------------------------------------------------------------
+# is_due — cron form (ADR 100 D1)
+# ---------------------------------------------------------------------------
+
+
+def _cron_schedule(
+    *,
+    cron: str = "0 7 * * 1-5",
+    timezone: str | None = "America/New_York",
+    created_at: datetime | None = None,
+    last_enqueued_at: datetime | None = None,
+    name: str = "briefing",
+) -> JobSchedule:
+    return JobSchedule(
+        tenant_id="tenant-a",
+        name=name,
+        kind=JobKind.WORKFLOW,
+        target="exec-briefing",
+        cadence_seconds=0,
+        cron=cron,
+        timezone=timezone,
+        input={"audience": "leadership"},
+        created_at=created_at or datetime(2026, 6, 1, 0, 0, tzinfo=UTC),
+        last_enqueued_at=last_enqueued_at,
+    )
+
+
+@pytest.mark.unit
+def test_cron_due_when_window_passed() -> None:
+    """07:00 Mon-Fri NY: due at 11:30 UTC Monday (07:00 EDT == 11:00 UTC)."""
+    s = _cron_schedule(last_enqueued_at=datetime(2026, 6, 5, 11, 5, tzinfo=UTC))  # Fri post-fire
+    # Monday 2026-06-08 11:30 UTC = 07:30 EDT — the 07:00 window has passed.
+    assert is_due(s, now=datetime(2026, 6, 8, 11, 30, tzinfo=UTC)) is True
+
+
+@pytest.mark.unit
+def test_cron_not_due_before_window() -> None:
+    s = _cron_schedule(last_enqueued_at=datetime(2026, 6, 5, 11, 5, tzinfo=UTC))
+    # Monday 10:30 UTC = 06:30 EDT — before the 07:00 window.
+    assert is_due(s, now=datetime(2026, 6, 8, 10, 30, tzinfo=UTC)) is False
+
+
+@pytest.mark.unit
+def test_cron_not_due_on_weekend() -> None:
+    s = _cron_schedule(last_enqueued_at=datetime(2026, 6, 5, 11, 5, tzinfo=UTC))
+    # Saturday 2026-06-06 12:00 UTC — "1-5" excludes weekends.
+    assert is_due(s, now=datetime(2026, 6, 6, 12, 0, tzinfo=UTC)) is False
+
+
+@pytest.mark.unit
+def test_cron_never_fired_anchors_at_created_at() -> None:
+    """A never-fired schedule is due only once a window AFTER creation passes —
+    occurrences predating the schedule never fire."""
+    created = datetime(2026, 6, 8, 12, 0, tzinfo=UTC)  # Mon 08:00 EDT, after 07:00
+    s = _cron_schedule(created_at=created, last_enqueued_at=None)
+    # Still Monday, 13:00 UTC: today's 07:00 EDT window predates creation.
+    assert is_due(s, now=datetime(2026, 6, 8, 13, 0, tzinfo=UTC)) is False
+    # Tuesday 11:30 UTC = 07:30 EDT — the first post-creation window passed.
+    assert is_due(s, now=datetime(2026, 6, 9, 11, 30, tzinfo=UTC)) is True
+
+
+@pytest.mark.unit
+async def test_cron_tick_fires_once_per_window(storage: InMemoryStorage) -> None:
+    """Two ticks inside one matched window enqueue exactly ONE job."""
+    await storage.save_job_schedule(
+        _cron_schedule(last_enqueued_at=datetime(2026, 6, 5, 11, 5, tzinfo=UTC))
+    )
+    first = await run_job_scheduler_tick(
+        storage, tenant_id="tenant-a", now=datetime(2026, 6, 8, 11, 10, tzinfo=UTC)
+    )
+    second = await run_job_scheduler_tick(
+        storage, tenant_id="tenant-a", now=datetime(2026, 6, 8, 11, 20, tzinfo=UTC)
+    )
+    assert first.enqueued_count == 1
+    assert second.enqueued_count == 0
+    assert len(storage.jobs) == 1
+    # The next weekday window fires again.
+    tuesday = await run_job_scheduler_tick(
+        storage, tenant_id="tenant-a", now=datetime(2026, 6, 9, 11, 10, tzinfo=UTC)
+    )
+    assert tuesday.enqueued_count == 1
+
+
+@pytest.mark.unit
+async def test_cron_missed_windows_yield_one_catchup_run(storage: InMemoryStorage) -> None:
+    """A tick down across several windows fires ONE catch-up, not a backfill."""
+    await storage.save_job_schedule(
+        _cron_schedule(last_enqueued_at=datetime(2026, 6, 1, 11, 5, tzinfo=UTC))  # Mon
+    )
+    # The tick comes back Thursday — Tue + Wed + Thu windows were all missed.
+    result = await run_job_scheduler_tick(
+        storage, tenant_id="tenant-a", now=datetime(2026, 6, 4, 12, 0, tzinfo=UTC)
+    )
+    assert result.enqueued_count == 1
+    assert len(storage.jobs) == 1
+    # And the stamp moved to "now", so the SAME tick window won't re-fire.
+    again = await run_job_scheduler_tick(
+        storage, tenant_id="tenant-a", now=datetime(2026, 6, 4, 12, 5, tzinfo=UTC)
+    )
+    assert again.enqueued_count == 0
+
+
+@pytest.mark.unit
+def test_cron_due_tracks_wall_clock_across_dst_transition() -> None:
+    """07:00 America/New_York is 12:00 UTC in EST but 11:00 UTC in EDT.
+
+    US spring-forward 2026 is Sun Mar 8. The schedule must stay pinned to
+    07:00 local on both sides of the transition.
+    """
+    # Friday 2026-03-06 (EST): 07:00 local == 12:00 UTC.
+    pre = _cron_schedule(last_enqueued_at=datetime(2026, 3, 5, 12, 5, tzinfo=UTC))
+    assert is_due(pre, now=datetime(2026, 3, 6, 11, 30, tzinfo=UTC)) is False  # 06:30 EST
+    assert is_due(pre, now=datetime(2026, 3, 6, 12, 30, tzinfo=UTC)) is True  # 07:30 EST
+    # Monday 2026-03-09 (EDT): 07:00 local == 11:00 UTC.
+    post = _cron_schedule(last_enqueued_at=datetime(2026, 3, 6, 12, 5, tzinfo=UTC))
+    assert is_due(post, now=datetime(2026, 3, 9, 10, 30, tzinfo=UTC)) is False  # 06:30 EDT
+    assert is_due(post, now=datetime(2026, 3, 9, 11, 30, tzinfo=UTC)) is True  # 07:30 EDT
+
+
+@pytest.mark.unit
+def test_cron_nonexistent_spring_forward_slot_fires_after_jump() -> None:
+    """02:30 local doesn't exist on 2026-03-08 (clocks jump 02:00→03:00);
+    cronsim resolves it to the post-jump instant rather than skipping the day."""
+    s = _cron_schedule(
+        cron="30 2 * * *",
+        last_enqueued_at=datetime(2026, 3, 7, 8, 0, tzinfo=UTC),  # Sat 03:00 EST
+    )
+    # 03:00 EDT on Mar 8 == 07:00 UTC — the resolved slot has passed by 07:30.
+    assert is_due(s, now=datetime(2026, 3, 8, 7, 30, tzinfo=UTC)) is True
+    # …but not before the jump (06:30 UTC == 01:30 EST).
+    assert is_due(s, now=datetime(2026, 3, 8, 6, 30, tzinfo=UTC)) is False
+
+
+@pytest.mark.unit
+def test_cron_defaults_to_utc_without_timezone() -> None:
+    s = _cron_schedule(
+        cron="0 7 * * *", timezone=None, last_enqueued_at=datetime(2026, 6, 7, 8, 0, tzinfo=UTC)
+    )
+    assert is_due(s, now=datetime(2026, 6, 8, 6, 30, tzinfo=UTC)) is False
+    assert is_due(s, now=datetime(2026, 6, 8, 7, 30, tzinfo=UTC)) is True
+
+
+@pytest.mark.unit
+def test_cron_disabled_never_due() -> None:
+    s = _cron_schedule(last_enqueued_at=None).model_copy(update={"enabled": False})
+    assert is_due(s, now=datetime(2026, 6, 8, 23, 59, tzinfo=UTC)) is False
+
+
+# ---------------------------------------------------------------------------
 # build_scheduled_job
 # ---------------------------------------------------------------------------
 
@@ -142,6 +290,14 @@ def test_build_scheduled_job_workflow() -> None:
     assert job.kind == JobKind.WORKFLOW
     assert job.target == "pipeline"
     assert job.input == {"state": 1}
+
+
+@pytest.mark.unit
+def test_build_scheduled_job_stamps_origin() -> None:
+    """ADR 100 D4: a scheduled job carries provenance back to its schedule
+    handle; a manually-built JobRecord defaults to None."""
+    job = build_scheduled_job(_job_schedule(name="nightly-returns"))
+    assert job.origin == "schedule:nightly-returns"
 
 
 # ---------------------------------------------------------------------------

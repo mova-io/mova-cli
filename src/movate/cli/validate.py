@@ -1271,6 +1271,40 @@ def _lint_state_threading(graph: WorkflowGraph) -> None:
         schemas[nid] = (required_in, produced)
         produced_by_any |= produced
 
+    # Pass 1b: TOOL nodes (ADR 097 D6) — consumed/produced from the skill's
+    # contract. A tool node consumes its input-map source-path ROOTS (literals
+    # excluded — they read nothing from state), or, under the default
+    # projection, the skill input schema's `required` keys. It produces the
+    # skill output schema's `properties` keys — namespaced to just
+    # {output_key} when the node opts into namespacing.
+    tool_schemas: dict[str, tuple[set[str], set[str]]] = {}
+    for nid, node in graph.nodes.items():
+        if node.type is not NodeType.TOOL or not node.ref:
+            continue
+        try:
+            from movate.core.skill_loader import load_skill  # noqa: PLC0415
+
+            skill = load_skill(node.ref)
+        except Exception:
+            continue  # compile_workflow already resolved the skill; skip on load issues
+        input_map = node.metadata.get("input_map")
+        if input_map:
+            consumed = {
+                str(src).split(".")[0]
+                for src in input_map.values()
+                if isinstance(src, str) and src.strip()
+            }
+        else:
+            consumed = set(skill.input_schema.get("required", []))
+        output_key = node.metadata.get("output_key")
+        produced = (
+            {str(output_key)}
+            if output_key
+            else set(skill.output_schema.get("properties", {}).keys())
+        )
+        tool_schemas[nid] = (consumed, produced)
+        produced_by_any |= produced
+
     # Pass 2: thread availability through the topological order.
     available = state_props - produced_by_any  # external initial inputs
     issues: list[str] = []
@@ -1292,6 +1326,22 @@ def _lint_state_threading(graph: WorkflowGraph) -> None:
                     f"produced by any upstream node and not a declared initial-state input "
                     f"(available here: {avail_show})"
                 )
+            continue
+        # A TOOL node (ADR 097 D6) reads state through its input map (or the
+        # skill's required input under default projection) — same silent-gap
+        # risk as a chained agent's required input — and contributes its
+        # skill's (possibly namespaced) output keys downstream.
+        if node.type is NodeType.TOOL:
+            t_consumed, t_produced = tool_schemas.get(nid, (set(), set()))
+            t_missing = t_consumed - available
+            if t_missing:
+                avail_show = ", ".join(sorted(available)) or "∅"
+                issues.append(
+                    f"tool node {nid!r} reads state key(s) {sorted(t_missing)} — not "
+                    f"produced by any upstream node and not a declared initial-state "
+                    f"input (available here: {avail_show})"
+                )
+            available |= t_produced
             continue
         required_in, produced = schemas.get(nid, (set(), set()))
         missing = required_in - available
@@ -1350,6 +1400,68 @@ def _validate_workflow(path: Path) -> None:
     # than blocks. Best-effort — never break validate.
     with contextlib.suppress(Exception):  # a lint must never break validation
         _lint_state_threading(graph)
+
+    # TOOL-node checks (ADR 097). Static SKILL gate first (D5): every tool
+    # node's skill must clear the SAME SkillPolicy an agent-declared skill
+    # clears — the analogue of the agent-bundle check above, using the
+    # side_effects the compiler stamped into node metadata. Then the deploy
+    # lint (D2): a runtime: temporal workflow referencing a PROJECT-level
+    # skill won't have it inside the worker image (only workflow-local
+    # skills/ ship via the Dockerfile's COPY workflows/) — warn at author
+    # time, since at worker startup that resolution would fail loud.
+    from movate.core.workflow.ir import NodeType as _NodeType  # noqa: PLC0415
+
+    tool_nodes = [(nid, n) for nid, n in graph.nodes.items() if n.type is _NodeType.TOOL]
+    if tool_nodes:
+        project_cfg = None
+        with contextlib.suppress(Exception):
+            from movate.core.loader import _resolve_project_root  # noqa: PLC0415
+            from movate.core.models import SkillSideEffects  # noqa: PLC0415
+
+            # The workflow may be validated from any cwd, so resolve the
+            # project root by the marker walk-up (the same rule skill
+            # resolution used at compile time) and load its config file.
+            project_root = _resolve_project_root(parent)
+            cfg_file = next(
+                (project_root / m for m in PROJECT_MARKER_FILES if (project_root / m).is_file()),
+                None,
+            )
+            if cfg_file is not None:
+                project_cfg = load_project_config(cfg_file)
+        if project_cfg is not None and not project_cfg.skills.is_permissive():
+            tool_violations: list[str] = []
+            for nid, node in tool_nodes:
+                err = project_cfg.skills.check_skill(
+                    str(node.metadata.get("skill", "")),
+                    SkillSideEffects(str(node.metadata.get("side_effects", "read-only"))),
+                )
+                if err is not None:
+                    tool_violations.append(f"tool node {nid!r}: {err}")
+            if tool_violations:
+                console.print(
+                    f"[red]✗ skill policy violation:[/red] workflow {graph.name!r} "
+                    f"uses tool-node skills outside the project's allowed side-effects"
+                )
+                for v in tool_violations:
+                    console.print(f"  [red]·[/red] {v}")
+                console.print(
+                    "[dim]  fix: relax policy.yaml: skills.allowed_side_effects, "
+                    "or change the workflow's tool nodes.[/dim]"
+                )
+                raise typer.Exit(code=2)
+
+        if getattr(graph, "runtime", "native") == "temporal":
+            for nid, node in tool_nodes:
+                if node.metadata.get("skill_source") == "project":
+                    skill_name = node.metadata.get("skill", "")
+                    console.print(
+                        f"  [yellow]![/yellow] tool node [bold]{nid}[/bold] resolves "
+                        f"skill [bold]{skill_name!r}[/bold] from the project-level "
+                        f"skills/ root — not baked into the Temporal worker image "
+                        f"(only workflow-local skills ship via COPY workflows/). "
+                        f"Move it to <workflow>/skills/{skill_name}/ before deploy "
+                        f"(ADR 097 D2)."
+                    )
 
     # Backend-aware parallel lint (ADR 092 D6). A fan-out/fan-in graph runs
     # concurrently on the native runner (Phase 1) and, as of Phase 2 (D3), on

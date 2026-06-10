@@ -328,7 +328,7 @@ class WorkflowRunner:
         finally:
             self._executor.tracer.end_span(wf_span)
 
-    async def _walk_traced(  # noqa: PLR0912 — node-type dispatch loop (agent/judge/router/human/supervisor)
+    async def _walk_traced(  # noqa: PLR0912 — node-type dispatch loop (agent/judge/router/human/supervisor/tool)
         self,
         graph: WorkflowGraph,
         *,
@@ -465,6 +465,50 @@ class WorkflowRunner:
                 current_id = self._run_decision(
                     node_id=node_id, node=node, state=state, wf_span=wf_span
                 )
+                continue
+
+            if node.type is NodeType.TOOL:
+                # --- TOOL dispatch (ADR 097) ----------------------------------
+                # One registered skill as one deterministic step: no LLM, no
+                # RunRecord (D7). Success merges the skill's output delta into
+                # state and advances to the sequential successor; a SkillError /
+                # policy deny fails the workflow AT this node (D4) — the
+                # agent-node failure contract.
+                tool_outcome = await self._run_tool(
+                    node_id=node_id,
+                    node=node,
+                    state=state,
+                    graph=graph,
+                    wf_id=wf_id,
+                    mock=mock,
+                    wf_span=wf_span,
+                )
+                if isinstance(tool_outcome, WorkflowResult):
+                    await self._storage.save_workflow_run(
+                        WorkflowRunRecord(
+                            workflow_run_id=wf_id,
+                            tenant_id=self._tenant_id,
+                            workflow=graph.name,
+                            workflow_version=graph.version,
+                            status=WorkflowStatus.ERROR,
+                            initial_state=initial_state,
+                            final_state=state,
+                            error_node_id=tool_outcome.error_node_id,
+                            error=tool_outcome.error,
+                        )
+                    )
+                    return WorkflowResult(
+                        workflow_run_id=wf_id,
+                        status=WorkflowStatus.ERROR,
+                        initial_state=initial_state,
+                        final_state=state,
+                        runs=runs,
+                        error_node_id=tool_outcome.error_node_id,
+                        error=tool_outcome.error,
+                        started_at=started,
+                        finished_at=time.monotonic(),
+                    )
+                current_id = tool_outcome
                 continue
 
             if node.type is NodeType.SUPERVISOR:
@@ -1297,6 +1341,171 @@ class WorkflowRunner:
             return chosen
         finally:
             self._executor.tracer.end_span(span)
+
+    # --------------------------------------------------------------- tool node
+
+    async def _run_tool(
+        self,
+        *,
+        node_id: str,
+        node: WorkflowNode,
+        state: dict[str, Any],
+        graph: WorkflowGraph,
+        wf_id: str,
+        mock: bool,
+        wf_span: SpanCtx,
+    ) -> str | None | WorkflowResult:
+        """Dispatch a TOOL node (ADR 097): one skill, one deterministic step.
+
+        Executes the compile-resolved skill (``node.ref`` is the absolute skill
+        dir) through the SAME :func:`movate.core.skill_backend.base.dispatch_skill`
+        the Executor's tool-use loop uses — one execution model, no second skill
+        path (D3). Around that dispatch:
+
+        * **Input** via the shared :func:`build_skill_input` helper — the
+          explicit ``input:`` map when the author gave one, else the
+          input-schema projection (the agent rule).
+        * **Governance (D5)** — :meth:`Executor.govern_skill_dispatch` applies
+          the SAME SKILL gate an agent-invoked skill clears (ADR 093 shadow +
+          authoritative ``SkillPolicy``); a deny fails the node like a skill
+          failure (no catch-and-continue).
+        * **Timeout** — the skill's ``timeout_call_ms`` becomes the dispatch
+          ``call_ms_budget`` (default 30 s when undeclared).
+        * **Output** via the shared :func:`merge_tool_output` helper — raw
+          merge, or namespaced under ``output_key``.
+        * **Observability (D7)** — one ``workflow.tool`` span nested under the
+          workflow root, attributed with the node id, skill name,
+          side-effects class, and outcome (error type on failure). No
+          synthetic :class:`RunRecord` — a tool node runs no model.
+
+        Returns the sequential successor id (or ``None`` at the sink) on
+        success, or a partial :class:`WorkflowResult` (ERROR at this node, one
+        attempt — D4) which the caller persists + propagates. Raises
+        :class:`WorkflowRunError` only when the skill bundle won't load
+        (mirroring the agent-node load-failure contract).
+        """
+        from movate.core.failures import PolicyViolationError  # noqa: PLC0415
+
+        # Importing the backend modules registers them with the dispatch
+        # registry (the Executor tool-use loop's exact pattern) — we still
+        # touch only the SkillBackend Protocol surface, never a concrete
+        # backend (CLAUDE.md §6).
+        from movate.core.skill_backend import agent as _agent_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend import workflow as _workflow_backend  # noqa: F401, PLC0415
+        from movate.core.skill_backend.base import (  # noqa: PLC0415
+            SkillError,
+            SkillExecutionContext,
+            dispatch_skill,
+        )
+        from movate.core.skill_loader import SkillLoadError, load_skill  # noqa: PLC0415
+        from movate.core.workflow.tool import (  # noqa: PLC0415
+            build_skill_input,
+            merge_tool_output,
+        )
+
+        meta = node.metadata
+        skill_name = str(meta.get("skill", ""))
+        tracer = self._executor.tracer
+        span = tracer.start_span(
+            "workflow.tool",
+            {
+                "workflow.node_id": node_id,
+                "tool.skill": skill_name,
+                "tool.side_effects": str(meta.get("side_effects", "")),
+            },
+            parent=wf_span,
+        )
+        try:
+            try:
+                skill = load_skill(node.ref)
+            except SkillLoadError as exc:
+                tracer.set_attribute(span, "tool.outcome", "load_error")
+                raise WorkflowRunError(
+                    f"tool node {node_id!r}: skill at {node.ref} failed to load: {exc}"
+                ) from exc
+
+            # Governance SKILL gate (ADR 097 D5) — the same belt-and-braces
+            # Executor.execute applies per agent skill: shadow check (warn-mode,
+            # ADR 093) + the authoritative SkillPolicy deny.
+            try:
+                self._executor.govern_skill_dispatch(
+                    skill_name=skill.spec.name,
+                    side_effects=skill.spec.side_effects,
+                    agent=f"workflow:{graph.name}",
+                    tenant_id=self._tenant_id,
+                )
+            except PolicyViolationError as exc:
+                tracer.set_attribute(span, "tool.outcome", "policy_denied")
+                return self._tool_error(
+                    wf_id,
+                    node_id,
+                    state,
+                    ErrorInfo(
+                        type=exc.failure_type.value,
+                        message=str(exc),
+                        retryable=exc.retryable,
+                    ),
+                )
+
+            skill_input = build_skill_input(
+                state, meta.get("input_map"), skill.input_schema.get("properties")
+            )
+            timeout_ms = meta.get("timeout_call_ms") or skill.spec.timeout_call_ms or 30_000
+            skill_ctx = SkillExecutionContext(
+                run_id=wf_id,
+                tenant_id=self._tenant_id,
+                call_ms_budget=int(timeout_ms),
+                mock=mock,
+                storage=self._storage,
+                tracer=tracer,
+                parent_span=span,
+            )
+            try:
+                output = await dispatch_skill(skill, skill_input, skill_ctx)
+            except SkillError as exc:
+                # One attempt (D4) — dispatch_skill has no retry natively,
+                # matching the Executor's tool-use loop. Partial state (every
+                # merge BEFORE this node) is retained by the caller.
+                tracer.set_attribute(span, "tool.outcome", "error")
+                tracer.set_attribute(span, "tool.error_type", exc.type.value)
+                return self._tool_error(
+                    wf_id,
+                    node_id,
+                    state,
+                    ErrorInfo(type=exc.type.value, message=exc.message),
+                )
+
+            state.update(merge_tool_output(dict(output), meta.get("output_key")))
+            tracer.set_attribute(span, "tool.outcome", "success")
+            return self._sequential_successor(graph, node_id)
+        finally:
+            tracer.end_span(span)
+
+    def _tool_error(
+        self,
+        wf_id: str,
+        error_node_id: str,
+        state: dict[str, Any],
+        error: ErrorInfo,
+    ) -> WorkflowResult:
+        """A partial-failure :class:`WorkflowResult` for a TOOL-node skill error
+        (ADR 097 D4) — no runs (a tool node produces no RunRecord, D7); the
+        caller persists the ERROR record and propagates, exactly like an
+        agent-node failure."""
+        return WorkflowResult(
+            workflow_run_id=wf_id,
+            status=WorkflowStatus.ERROR,
+            initial_state=state,
+            final_state=state,
+            runs=[],
+            error_node_id=error_node_id,
+            error=error,
+            started_at=0.0,
+            finished_at=time.monotonic(),
+        )
 
 
 # ---------------------------------------------------------------------------

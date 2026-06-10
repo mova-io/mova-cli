@@ -724,25 +724,31 @@ def test_validate_linear_rejects_branching() -> None:
 
 
 @pytest.mark.unit
-def test_validate_linear_rejects_joining() -> None:
+def test_validate_linear_rejects_non_exclusive_joining() -> None:
+    """ADR 098 admits OR-merge joins of mutually exclusive branches, but a
+    join fed by a sequential edge whose source has >1 real successor (i.e. an
+    inbound leg that is NOT an exclusive tail) keeps failing — that shape
+    needs barrier semantics (fan_in, ADR 092). The DECISION source is exempt
+    from the branch guard, so this isolates the join rule itself."""
     g = WorkflowGraph(
         name="demo",
         version="0.1.0",
         description="",
         state_schema={"type": "object"},
-        entrypoint="a",
+        entrypoint="d",
         nodes={
-            "a": WorkflowNode(id="a", type=NodeType.AGENT, ref="/x"),
+            "d": WorkflowNode(id="d", type=NodeType.DECISION, ref=""),
             "b": WorkflowNode(id="b", type=NodeType.AGENT, ref="/y"),
             "c": WorkflowNode(id="c", type=NodeType.AGENT, ref="/z"),
         },
         edges=[
-            WorkflowEdge(from_id="a", to_id="c"),
+            WorkflowEdge(from_id="d", to_id="c"),
+            WorkflowEdge(from_id="d", to_id="b"),
             WorkflowEdge(from_id="b", to_id="c"),
         ],
         workflow_dir=Path("/"),
     )
-    with pytest.raises(WorkflowCompileError, match="forbids joins"):
+    with pytest.raises(WorkflowCompileError, match=r"join at node 'c'.*not an exclusive"):
         validate_linear(g)
 
 
@@ -769,7 +775,8 @@ def test_validate_linear_rejects_conditional_edges() -> None:
 
 @pytest.mark.unit
 def test_validate_linear_rejects_non_agent_nodes() -> None:
-    # TOOL is still a rejected node type (ADR 017 D5 only un-gated HUMAN).
+    # FUNCTION is still a rejected node type (TOOL was un-gated by ADR 097,
+    # HUMAN by ADR 017 D5; FUNCTION/SUB_WORKFLOW remain reserved).
     g = WorkflowGraph(
         name="demo",
         version="0.1.0",
@@ -778,7 +785,7 @@ def test_validate_linear_rejects_non_agent_nodes() -> None:
         entrypoint="a",
         nodes={
             "a": WorkflowNode(id="a", type=NodeType.AGENT, ref="/x"),
-            "b": WorkflowNode(id="b", type=NodeType.TOOL, ref="/y"),
+            "b": WorkflowNode(id="b", type=NodeType.FUNCTION, ref="/y"),
         },
         edges=[WorkflowEdge(from_id="a", to_id="b")],
         workflow_dir=Path("/"),

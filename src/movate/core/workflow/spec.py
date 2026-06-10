@@ -13,8 +13,9 @@ v0.3 surface intentionally narrow:
 
 ADR 017 D5 (PR 1) additionally admits a ``"human"`` node — a HITL gate the
 runner pauses at (it persists a checkpoint and stops; PR 2 resumes on an
-external signal). Other future variants (tool, sub-workflow) stay rejected
-by :func:`validate_linear`.
+external signal). ADR 097 adopts the reserved ``"tool"`` node (one registered
+skill as one deterministic step). Other future variants (function,
+sub-workflow) stay rejected by :func:`validate_linear`.
 
 Later phases relax these via separate validator passes.
 """
@@ -473,15 +474,107 @@ class DecisionNodeSpec(BaseModel):
         return self
 
 
+class ToolNodeSpec(BaseModel):
+    """A ``tool`` node (ADR 097): one registered skill as one deterministic step.
+
+    Executes the named skill through the one shared ``dispatch_skill`` path —
+    no LLM, no prompt, no wrapper agent. ``skill`` is a registry NAME (the same
+    vocabulary agents put in ``skills: [...]``), resolved to a skill directory
+    at compile time (workflow-local ``<workflow>/skills/<name>/`` first, then
+    the project registry) so a typo fails ``mdk validate``, not the Nth
+    production run.
+
+    * ``input`` (optional) — explicit input map: each value is a dotted state
+      path (``order.id``) or a ``{literal: <value>}`` constant. When present it
+      is EXCLUSIVE (only mapped keys are sent). Omitted ⇒ the skill's input is
+      state narrowed to its input-schema ``properties`` (the established
+      projection rule agents and ``call_skill_activity`` already use).
+    * ``output_key`` (optional) — namespace the whole output dict under one
+      state key (``state[output_key] = <output>``). Omitted ⇒ raw merge
+      (``state.update(output)``, the agent-node convention).
+
+    Additive + ``extra="forbid"`` (CLAUDE.md rule 5): no existing workflow
+    declares ``tool`` (``validate_linear`` rejected the reserved type until
+    now), so every existing workflow is byte-for-byte unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=128)
+    type: Literal["tool"]
+    skill: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Registry name of the skill to execute — the same name agents put "
+            "in skills: [...]. Resolved at compile time: workflow-local "
+            "skills/<name>/ first, then the project skills/ root."
+        ),
+    )
+    input: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Optional EXCLUSIVE input map: key → dotted state path (str) or "
+            "{literal: <value>} constant. Omitted ⇒ input-schema projection of "
+            "workflow state (the default agents get)."
+        ),
+    )
+    output_key: str | None = Field(
+        None,
+        min_length=1,
+        description=(
+            "Optional state key to namespace the skill's whole output dict "
+            "under. Omitted ⇒ raw merge into state (state.update(output))."
+        ),
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not re.match(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$", v):
+            raise ValueError(
+                f"node id {v!r} must be lowercase alphanumeric with hyphens/underscores"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_input_map(self) -> ToolNodeSpec:
+        # Encode the mapping shape at parse time so a malformed map fails loud
+        # in `mdk validate` rather than silently sending nothing to the skill.
+        if self.input is None:
+            return self
+        for key, src in self.input.items():
+            if isinstance(src, str):
+                if not src.strip():
+                    raise ValueError(
+                        f"tool node {self.id!r}: input {key!r} must be a non-empty "
+                        f"dotted state path"
+                    )
+            elif isinstance(src, dict):
+                if set(src.keys()) != {"literal"}:
+                    raise ValueError(
+                        f"tool node {self.id!r}: input {key!r} mapping dict must be "
+                        f"exactly {{literal: <value>}} (got keys: {sorted(src)})"
+                    )
+            else:
+                raise ValueError(
+                    f"tool node {self.id!r}: input {key!r} must be a dotted state "
+                    f"path string or a {{literal: <value>}} dict, got "
+                    f"{type(src).__name__}"
+                )
+        return self
+
+
 # NodeSpec is a discriminated union of agent, intent-router, human, judge,
-# supervisor, and decision nodes.
+# supervisor, decision, and tool nodes.
 NodeSpec = Annotated[
     AgentNodeSpec
     | IntentRouterNodeSpec
     | HumanNodeSpec
     | JudgeNodeSpec
     | SupervisorNodeSpec
-    | DecisionNodeSpec,
+    | DecisionNodeSpec
+    | ToolNodeSpec,
     Field(discriminator="type"),
 ]
 
