@@ -12,6 +12,11 @@
 #   ./dashboards-prom/*.json     (dashboards/grafana/mdk-*.json — PromQL, ADR 087)
 FROM grafana/grafana-oss:11.3.0
 
+# ADR 095 — the ClickHouse datasource plugin, baked at BUILD time so the
+# provisioned clickhouse-otel datasource never races a boot-time
+# GF_INSTALL_PLUGINS download (and works without egress at start).
+RUN grafana cli plugins install grafana-clickhouse-datasource
+
 # Provisioning config (Azure Monitor + Prometheus datasources + dashboard
 # providers) → Grafana's well-known config root. The Azure datasource pins uid
 # ffnrfwjnew5xcc and the Prometheus datasource pins uid mdkpromds00001 (the uids

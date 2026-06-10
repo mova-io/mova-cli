@@ -1,0 +1,28 @@
+# Auto-provisioned ClickHouse datasource (ADR 095) — the unified TELEMETRY
+# store. The OTel collector's clickhouse exporter writes traces + metrics +
+# logs into the `otel` database on movate-dev-clickhouse (internal TCP 9000);
+# this datasource is how the unified dashboards read them.
+#
+# The uid is PINNED to "clickhouse-otel" — the value
+# dashboards/grafana/mdk-unified-observability.json references — same approach
+# as the Azure Monitor / Prometheus pinned uids. The plugin itself is baked
+# into the image at build time (see Dockerfile) so provisioning never races a
+# boot-time plugin download.
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse (otel)
+    uid: clickhouse-otel
+    type: grafana-clickhouse-datasource
+    access: proxy
+    orgId: 1
+    isDefault: false
+    editable: false
+    jsonData:
+      host: movate-dev-clickhouse
+      port: 9000
+      protocol: native
+      username: default
+      defaultDatabase: otel
+    secureJsonData:
+      password: ""

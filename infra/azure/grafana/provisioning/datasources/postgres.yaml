@@ -1,0 +1,26 @@
+# Auto-provisioned Postgres datasource (ADR 095/096) — the BUSINESS OF RECORD.
+# Reads the real `movate` DB (runs, workflow_runs, observability_facts) for the
+# business-of-record + unified dashboards. uid PINNED to "postgres-movate".
+#
+# The password is NOT in this file: Grafana expands ${GF_PG_PASSWORD} at
+# provisioning time from the container env, which deploy.sh wires to the
+# Container App secret `pg-password` (same credential the workers use).
+# Least-privilege follow-up: swap movateadmin for a read-only reporting role.
+apiVersion: 1
+
+datasources:
+  - name: Postgres (movate)
+    uid: postgres-movate
+    type: postgres
+    access: proxy
+    orgId: 1
+    url: movate-dev-pg-mvt.postgres.database.azure.com:5432
+    user: movateadmin
+    isDefault: false
+    editable: false
+    jsonData:
+      database: movate
+      sslmode: require
+      postgresVersion: 1600
+    secureJsonData:
+      password: ${GF_PG_PASSWORD}
