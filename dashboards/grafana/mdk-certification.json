@@ -1,0 +1,510 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "mdk certification matrix: the acceptance criteria the certification suite (certification/) asserts on every run. Each scenario runs the REAL platform (real Temporal, real governance, real HITL, real tracing, real persistence) with only external destinations simulated, then asserts what the PLATFORM did per capability. The harness emits mdk.certification.scenario{scenario,capability,status=pass|fail} for each assertion, so this dashboard is a live pass/fail matrix of mdk's production-ready guarantees. Any red (status=fail) panel is a regression in a certified capability. Supporting golden-signal panels (durable completions, cost, dead-letter, latency) ground the matrix in the underlying platform metrics those assertions read.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "text",
+      "id": 400,
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 0},
+      "title": "mdk - certification matrix",
+      "options": {
+        "mode": "markdown",
+        "content": "## mdk - certification: acceptance criteria\n\n**What this shows.** A live pass/fail matrix of the platform capabilities the certification suite (`certification/`) claims are production-ready. Each scenario runs the **real platform** end-to-end — durable Temporal execution, the governance engine, durable HITL pause/resume, OTel tracing, retry/dead-letter, cost accounting, the audit trail — and only the **external destinations** (email/SMS/SAP/ServiceNow/Slack/identity) are simulated to an auditable ledger in the same DB. After the run, each capability is asserted against what the *platform* actually did (not what the LLM said), and the harness records `mdk.certification.scenario{scenario,capability,status=pass|fail}`.\n\n**Capabilities asserted.** `durable-execution` (workflow reaches durable SUCCESS) · `governance` (cost/quota/model gate fired) · `hitl` (human pause + signal resume) · `tracing` (spans propagated) · `retries` (no unexpected dead-letter) · `cost` (per-node cost tracked) · `audit` (governance decisions logged) · `side-effects` (exactly the expected external calls, no more).\n\n**Normal range.** Every cell green; `status=fail` count == 0. **Any red = a certified capability regressed** — open the scenario, re-run `certification/`, and treat it like a failing acceptance test before shipping.\n\n**Supporting panels.** The golden-signal rows below are the raw platform metrics the assertions read (`mdk.workflow.completed`, `mdk.run.cost_usd`, `mdk.jobs.completed{status=dead_letter}`, `mdk.workflow.duration_ms`) — they let you see *why* a capability cell went red."
+      }
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Total certification assertions that FAILED in the window. Source: mdk.certification.scenario{status=fail}. This must be 0 — any non-zero value is a certified-capability regression.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 7},
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_certification_scenario_total{status=\"fail\"}[$__range]))",
+          "legendFormat": "failing assertions",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Certification failures (must be 0)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Total certification assertions that PASSED in the window. Source: mdk.certification.scenario{status=pass}.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 7},
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_certification_scenario_total{status=\"pass\"}[$__range]))",
+          "legendFormat": "passing assertions",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Certification passes (window)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Distinct capabilities exercised with at least one failure in the window. Source: mdk.certification.scenario{status=fail}. 0 = full green matrix.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 7},
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "count(sum by (capability) (increase(mdk_certification_scenario_total{status=\"fail\"}[$__range])) > 0) or vector(0)",
+          "legendFormat": "capabilities failing",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Capabilities failing (must be 0)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "The certification matrix: per (scenario, capability) the pass and fail assertion counts in the window. Source: mdk.certification.scenario. A non-zero Fail column for any row is a certified-capability regression for that scenario.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {"align": "auto", "cellOptions": {"type": "auto"}, "inspect": false},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "text", "value": null}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Fail"},
+            "properties": [
+              {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "red", "value": 1}
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {"id": "byName", "options": "Pass"},
+            "properties": [
+              {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {"color": "transparent", "value": null},
+                    {"color": "dark-green", "value": 1}
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {"h": 11, "w": 24, "x": 0, "y": 13},
+      "id": 4,
+      "options": {
+        "showHeader": true,
+        "sortBy": [{"desc": true, "displayName": "Fail"}]
+      },
+      "pluginVersion": "9.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (scenario, capability) (increase(mdk_certification_scenario_total{status=\"pass\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "refId": "Pass"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (scenario, capability) (increase(mdk_certification_scenario_total{status=\"fail\"}[$__range]))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "refId": "Fail"
+        }
+      ],
+      "title": "Certification matrix - scenario x capability (pass / fail)",
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true},
+            "indexByName": {"scenario": 0, "capability": 1, "Value #Pass": 2, "Value #Fail": 3},
+            "renameByName": {
+              "scenario": "Scenario",
+              "capability": "Capability",
+              "Value #Pass": "Pass",
+              "Value #Fail": "Fail"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Failed assertions per capability in the window. Source: mdk.certification.scenario{status=fail}. Every bar should be 0 (green).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 24},
+      "id": 5,
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "showUnfilled": true
+      },
+      "pluginVersion": "9.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (capability) (increase(mdk_certification_scenario_total{status=\"fail\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "{{capability}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Failures by capability (target: all 0)",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Passing assertions per capability in the window. Source: mdk.certification.scenario{status=pass}. Confirms each capability was actually exercised (not silently skipped).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "continuous-GrYlRed"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 24},
+      "id": 6,
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "showUnfilled": true
+      },
+      "pluginVersion": "9.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (capability) (increase(mdk_certification_scenario_total{status=\"pass\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "{{capability}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Passes by capability (coverage)",
+      "type": "bargauge"
+    },
+    {
+      "type": "text",
+      "id": 401,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 33},
+      "title": "Supporting platform signals",
+      "options": {
+        "mode": "markdown",
+        "content": "### Supporting platform signals\n\nThe raw golden-signal metrics the certification assertions read. When a capability cell goes red above, these show *why*: a durable-execution failure shows up as missing `mdk.workflow.completed`, a `retries` failure as a non-zero dead-letter, a `cost` failure as flat `mdk.run.cost_usd`."
+      }
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Durable workflow completions by status (backs the durable-execution capability). Source: mdk.workflow.completed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 36},
+      "id": 7,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (status) (rate(mdk_workflow_completed_total[5m]))",
+          "legendFormat": "{{status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Durable workflow completions (mdk.workflow.completed)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Dead-letter jobs during certification runs (backs the retries capability). A non-zero value means a job exhausted its retry budget — a retries-capability regression. Source: mdk.jobs.completed{status=dead_letter}.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 36},
+      "id": 8,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_jobs_completed_total{status=\"dead_letter\"}[$__range]))",
+          "legendFormat": "dead-letters",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Dead-letters during certification (must be 0)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Total run cost accumulated during certification (backs the cost capability — proves per-node cost accounting is wired). Source: mdk.run.cost_usd.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "showPoints": "never"},
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 44},
+      "id": 9,
+      "options": {
+        "legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_run_cost_usd_sum[5m]))",
+          "legendFormat": "run cost",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Run cost during certification (mdk.run.cost_usd)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Durable workflow latency p95 (backs the durable-execution latency expectation). Source: mdk.workflow.duration_ms.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"},
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 44},
+      "id": 10,
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mdk_workflow_duration_ms_bucket[5m])))",
+          "legendFormat": "p95 duration",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Durable workflow p95 latency (mdk.workflow.duration_ms)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "certification", "acceptance", "quality"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {"from": "now-24h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - certification",
+  "uid": "mdk-certification",
+  "version": 1,
+  "weekStart": ""
+}

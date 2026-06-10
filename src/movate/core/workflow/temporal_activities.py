@@ -712,6 +712,17 @@ async def call_human_activity(
     )
     await ctx.storage.save_workflow_run(record)
 
+    # ADR 096 D3 — pause inventory lands in observability_facts too, so the
+    # platform's facts view shows runs awaiting a human without joining
+    # workflow_runs. Fail-soft + lazy import (the helper logs and never
+    # raises; the pause record above is already durable).
+    from movate.runtime.facts import (  # noqa: PLC0415
+        fact_from_workflow_run,
+        write_fact_failsoft,
+    )
+
+    await write_fact_failsoft(ctx.storage, fact_from_workflow_run(record))
+
     # Escalate to the approval channel (ADR 083) — parity with the native
     # runner's HUMAN-pause branch. Fire-and-forget + never raises (side effects
     # in activities, ADR 054 D10; the pause is already persisted). No-op until
@@ -777,6 +788,18 @@ async def persist_workflow_result_activity(
         runtime="temporal",
     )
     await ctx.storage.save_workflow_run(record)
+
+    # ADR 096 D3 — the terminal fact for a durable run is written here, at
+    # the same persist edge as the record (the detached-HITL path never
+    # returns through the dispatch edge, so dispatch can't cover it). The
+    # fact_id upsert overwrites any prior PAUSED fact under the same id.
+    # Fail-soft + lazy import: a fact hiccup never fails the terminal persist.
+    from movate.runtime.facts import (  # noqa: PLC0415
+        fact_from_workflow_run,
+        write_fact_failsoft,
+    )
+
+    await write_fact_failsoft(ctx.storage, fact_from_workflow_run(record))
 
     # Operational signal (ADR 082): durable workflows never hit the native
     # dispatch edge that powers mdk.jobs.completed, so emit a first-class
