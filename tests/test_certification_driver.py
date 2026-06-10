@@ -1,0 +1,524 @@
+"""Certification suite driver — case-spec parsing, capability mapping, matrix
+rendering, and the submit→poll→signal→facts flow against a mocked HTTP layer.
+
+Hermetic: every HTTP request goes through an ``httpx.MockTransport`` (the
+repo's webhook-worker pattern) — the live dev API is never touched. Polling
+seams (``sleep``/timeouts) are overridden so the tests are instant.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+from certification.harness import cert_metrics, sim_systems
+from certification.harness.driver import (
+    CAPABILITIES,
+    CapabilityOutcome,
+    CaseExpect,
+    CaseResult,
+    CaseSpec,
+    CaseSpecError,
+    HitlStep,
+    RuntimeApiClient,
+    ScenarioSpec,
+    SideEffectExpect,
+    SuiteDriver,
+    aggregate_matrix,
+    load_scenario_spec,
+    render_matrix,
+    side_effects_db_configured,
+    summary_json,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXPENSE_CASES = REPO_ROOT / "certification" / "scenarios" / "expense-approval" / "cases.yaml"
+
+
+# ---------------------------------------------------------------------------
+# Fake runtime — a stateful MockTransport handler for one workflow run.
+# ---------------------------------------------------------------------------
+
+
+class FakeRuntime:
+    """Simulates the runtime API: one job → one workflow run → pauses → fact."""
+
+    def __init__(
+        self,
+        *,
+        pause_nodes: list[str] | None = None,
+        final_status: str = "success",
+        route: str | None = None,
+        final_state: dict[str, Any] | None = None,
+        cost_usd: float = 0.0,
+        job_status: str = "success",
+        job_polls_before_terminal: int = 1,
+        never_terminal: bool = False,
+    ) -> None:
+        self.pending_pauses = list(pause_nodes or [])
+        self.final_status = final_status
+        self.route = route
+        self.final_state = final_state if final_state is not None else {"summary": "done"}
+        self.cost_usd = cost_usd
+        self.job_status = job_status
+        self.job_polls_before_terminal = job_polls_before_terminal
+        self.never_terminal = never_terminal
+        self.signals: list[dict[str, Any]] = []
+        self.requests: list[str] = []
+
+    # -- handler ------------------------------------------------------------
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.requests.append(f"{request.method} {path}")
+        if request.method == "POST" and path == "/run":
+            return httpx.Response(202, json={"job_id": "job-1", "status": "queued"})
+        if request.method == "GET" and path == "/jobs/job-1":
+            return self._job_view()
+        if request.method == "GET" and path == "/api/v1/workflow-runs":
+            if request.url.params.get("status") == "paused":
+                return httpx.Response(200, json=self._paused_listing())
+            return httpx.Response(200, json=self._run_listing())
+        if request.method == "POST" and path == "/api/v1/workflow-runs/wfr-1/signal":
+            self.signals.append(json.loads(request.content))
+            if self.pending_pauses:
+                self.pending_pauses.pop(0)
+            return httpx.Response(202, json={"job_id": "job-2", "status": "queued"})
+        if request.method == "GET" and path == "/api/v1/observability/facts":
+            return httpx.Response(200, json=self._facts_listing())
+        return httpx.Response(404, json={"detail": f"unexpected {request.method} {path}"})
+
+    # -- pieces ---------------------------------------------------------------
+
+    def _job_view(self) -> httpx.Response:
+        if self.job_polls_before_terminal > 0:
+            self.job_polls_before_terminal -= 1
+            return httpx.Response(200, json={"job_id": "job-1", "status": "running"})
+        body: dict[str, Any] = {"job_id": "job-1", "status": self.job_status}
+        if self.job_status == "success":
+            body["result_run_id"] = "wfr-1"
+        else:
+            body["error"] = {"type": "NodeError", "message": "boom"}
+        return httpx.Response(200, json=body)
+
+    def _paused_listing(self) -> dict[str, Any]:
+        if not self.pending_pauses:
+            return {"workflow_runs": [], "count": 0}
+        row = {
+            "workflow_run_id": "wfr-1",
+            "workflow": "expense-approval",
+            "status": "paused",
+            "paused_node_id": self.pending_pauses[0],
+            "human_task": {"prompt": "Approve?", "output_contract": ["decision"]},
+        }
+        return {"workflow_runs": [row], "count": 1}
+
+    def _run_listing(self) -> dict[str, Any]:
+        row = {
+            "workflow_run_id": "wfr-1",
+            "workflow": "expense-approval",
+            "status": self.final_status if not self.pending_pauses else "paused",
+            "final_state": self.final_state,
+        }
+        return {"workflow_runs": [row], "count": 1}
+
+    def _facts_listing(self) -> dict[str, Any]:
+        terminal_blocked = bool(self.pending_pauses) or self.never_terminal
+        status = "paused" if terminal_blocked else self.final_status
+        fact = {
+            "fact_id": "workflow_run:wfr-1",
+            "kind": "workflow_run",
+            "source_id": "wfr-1",
+            "workflow": "expense-approval",
+            "status": status,
+            "runtime": "temporal",
+            "route": self.route,
+            "cost_usd": self.cost_usd,
+            "error_type": None,
+        }
+        return {"facts": [fact], "count": 1}
+
+
+def _driver(fake: FakeRuntime, **kwargs: Any) -> SuiteDriver:
+    client = RuntimeApiClient(
+        "http://cert.test", "test-key", transport=httpx.MockTransport(fake.handler)
+    )
+    defaults: dict[str, Any] = {
+        "poll_interval_s": 0.0,
+        "job_timeout_s": 5.0,
+        "pause_timeout_s": 5.0,
+        "fact_timeout_s": 5.0,
+        "side_effects_enabled": False,
+        "sleep": lambda _s: None,
+    }
+    defaults.update(kwargs)
+    return SuiteDriver(client, **defaults)
+
+
+def _spec(*cases: CaseSpec) -> ScenarioSpec:
+    return ScenarioSpec(scenario="expense-approval", target="expense-approval", cases=cases)
+
+
+def _case(
+    name: str = "auto-tier",
+    *,
+    hitl: tuple[HitlStep, ...] = (),
+    expect: CaseExpect | None = None,
+) -> CaseSpec:
+    return CaseSpec(
+        name=name,
+        input={"expense_text": "x", "amount": 50},
+        hitl=hitl,
+        expect=expect or CaseExpect(status="success", route=None),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Case-spec parsing — the shipped cases.yaml + validation failures
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_shipped_expense_cases_parse() -> None:
+    spec = load_scenario_spec(EXPENSE_CASES)
+    assert spec.scenario == "expense-approval"
+    assert spec.target == "expense-approval"
+    assert [c.name for c in spec.cases] == [
+        "auto-tier",
+        "manager-approve",
+        "director-approve",
+        "director-reject",
+    ]
+    auto, manager, director, reject = spec.cases
+    assert auto.hitl == ()
+    assert manager.hitl[0].node == "manager-approval"
+    assert manager.hitl[0].decision == {"decision": "approve"}
+    assert director.hitl[0].node == "director-approval"
+    assert reject.hitl[0].decision == {"decision": "reject"}
+    # All cases terminate SUCCESS (the rejected branch is a route, not an
+    # error) and honestly expect route=None (nothing writes tier/route).
+    assert all(c.expect.status == "success" for c in spec.cases)
+    assert all(c.expect.route is None for c in spec.cases)
+    # Cost is an honest skip everywhere (workflow_run facts carry 0 by design).
+    assert all(c.expect.cost is False for c in spec.cases)
+    # The reject case is the only one with ledger expectations: no ERP post.
+    assert reject.expect.no_side_effects == (SideEffectExpect(system="erp", action="submit"),)
+    assert "erp_result" in reject.expect.final_state_lacks
+    assert all("erp_result" in c.expect.final_state_has for c in (auto, manager, director))
+
+
+def _write_cases(tmp_path: Path, body: str) -> Path:
+    p = tmp_path / "cases.yaml"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("body", "fragment"),
+    [
+        ("[]", "top level must be a mapping"),
+        ("scenario: s\ntarget: t\ncases: []\n", "`cases` (non-empty list) required"),
+        (
+            "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
+            "    expect: {status: exploded}\n",
+            "expect.status",
+        ),
+        (
+            "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
+            "    expect: {status: success, routee: x}\n",
+            "unknown key(s) ['routee']",
+        ),
+        (
+            "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
+            "    hitl: [{node: gate}]\n    expect: {status: success}\n",
+            "`decision` (non-empty mapping) is required",
+        ),
+        (
+            "scenario: s\ntarget: t\ncases:\n"
+            "  - {name: a, input: {}, expect: {status: success}}\n"
+            "  - {name: a, input: {}, expect: {status: success}}\n",
+            "duplicate case name",
+        ),
+        (
+            "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
+            "    expect: {status: success, side_effects: [{system: erp}]}\n",
+            "`action` (string) is required",
+        ),
+    ],
+)
+def test_case_spec_validation_errors(tmp_path: Path, body: str, fragment: str) -> None:
+    with pytest.raises(CaseSpecError) as exc_info:
+        load_scenario_spec(_write_cases(tmp_path, body))
+    message = str(exc_info.value)
+    assert "cases.yaml" in message  # the error names the offending file
+    assert fragment in message
+
+
+# ---------------------------------------------------------------------------
+# Matrix aggregation + rendering
+# ---------------------------------------------------------------------------
+
+
+def _result(name: str, **statuses: str) -> CaseResult:
+    outcomes = {
+        cap: CapabilityOutcome(statuses.get(cap.replace("-", "_"), "skip")) for cap in CAPABILITIES
+    }
+    return CaseResult(name=name, workflow_run_id="wfr-1", outcomes=outcomes)
+
+
+@pytest.mark.unit
+def test_aggregate_matrix_fail_dominates_then_pass_then_skip() -> None:
+    results = [
+        _result("a", durable_execution="pass", hitl="skip", cost="skip"),
+        _result("b", durable_execution="pass", hitl="fail", cost="skip"),
+    ]
+    matrix = aggregate_matrix(results)
+    assert matrix["durable-execution"] == "pass"
+    assert matrix["hitl"] == "fail"
+    assert matrix["cost"] == "skip"
+
+
+@pytest.mark.unit
+def test_render_matrix_contains_capabilities_and_verdicts() -> None:
+    text = render_matrix(
+        [("expense-approval", {cap: "pass" for cap in CAPABILITIES} | {"cost": "skip"})]
+    )
+    for cap in CAPABILITIES:
+        assert cap in text
+    assert "expense-approval" in text
+    assert "PASS" in text
+    assert "SKIP" in text
+
+
+@pytest.mark.unit
+def test_summary_json_shape_and_ok_flag() -> None:
+    spec = _spec(_case())
+    good = summary_json("dev", [(spec, [_result("auto-tier", durable_execution="pass")])])
+    assert good["ok"] is True
+    assert good["scenarios"][0]["matrix"]["durable-execution"] == "pass"
+    assert good["scenarios"][0]["cases"][0]["name"] == "auto-tier"
+    bad = summary_json("dev", [(spec, [_result("auto-tier", hitl="fail")])])
+    assert bad["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Driver flow — mocked HTTP
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_auto_tier_passes_durable_and_routing_skips_the_rest() -> None:
+    fake = FakeRuntime(final_state={"erp_result": "posted", "summary": "ok"})
+    case = _case(
+        expect=CaseExpect(status="success", route=None, final_state_has=("erp_result", "summary"))
+    )
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.workflow_run_id == "wfr-1"
+    assert result.outcomes["durable-execution"].status == "pass"
+    assert result.outcomes["decision-routing"].status == "pass"
+    assert result.outcomes["hitl"].status == "skip"
+    assert result.outcomes["cost"].status == "skip"
+    assert result.outcomes["side-effects"].status == "skip"
+    assert not result.failed
+    assert fake.signals == []
+
+
+@pytest.mark.unit
+def test_hitl_case_observes_pause_signals_and_completes() -> None:
+    fake = FakeRuntime(
+        pause_nodes=["manager-approval"],
+        final_state={"erp_result": "posted", "summary": "ok", "decision": "approve"},
+    )
+    case = _case(
+        "manager-approve",
+        hitl=(HitlStep(node="manager-approval", decision={"decision": "approve"}),),
+        expect=CaseExpect(status="success", route=None, final_state_has=("erp_result",)),
+    )
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["hitl"].status == "pass"
+    assert "manager-approval" in result.outcomes["hitl"].note
+    assert result.outcomes["durable-execution"].status == "pass"
+    assert fake.signals == [{"decision": {"decision": "approve"}}]
+
+
+@pytest.mark.unit
+def test_pause_at_wrong_node_fails_hitl_and_short_circuits() -> None:
+    fake = FakeRuntime(pause_nodes=["director-approval"])
+    case = _case(
+        "manager-approve",
+        hitl=(HitlStep(node="manager-approval", decision={"decision": "approve"}),),
+    )
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["hitl"].status == "fail"
+    assert "director-approval" in result.outcomes["hitl"].note
+    assert result.outcomes["durable-execution"].status == "fail"
+    assert "HITL phase failed" in result.outcomes["durable-execution"].note
+    assert result.outcomes["decision-routing"].status == "skip"
+    assert fake.signals == []  # never signalled the wrong gate
+
+
+@pytest.mark.unit
+def test_job_error_fails_durable_execution_and_skips_the_rest() -> None:
+    fake = FakeRuntime(job_status="error")
+    case = _case()
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.workflow_run_id is None
+    assert result.outcomes["durable-execution"].status == "fail"
+    assert "boom" in result.outcomes["durable-execution"].note
+    for cap in ("decision-routing", "hitl", "cost", "side-effects"):
+        assert result.outcomes[cap].status == "skip"
+
+
+@pytest.mark.unit
+def test_fact_never_terminal_times_out_as_durable_failure() -> None:
+    fake = FakeRuntime(never_terminal=True)
+    case = _case()
+    result = _driver(fake, fact_timeout_s=0.0).run_case(_spec(case), case)
+    assert result.outcomes["durable-execution"].status == "fail"
+    assert "timed out" in result.outcomes["durable-execution"].note
+
+
+@pytest.mark.unit
+def test_unexpected_terminal_status_fails_durable_execution() -> None:
+    fake = FakeRuntime(final_status="error")
+    case = _case()  # expects success
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["durable-execution"].status == "fail"
+    assert "status='error'" in result.outcomes["durable-execution"].note
+
+
+@pytest.mark.unit
+def test_route_mismatch_fails_decision_routing() -> None:
+    fake = FakeRuntime(route="manager")
+    case = _case()  # expects route=None
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["decision-routing"].status == "fail"
+    assert "route='manager'" in result.outcomes["decision-routing"].note
+
+
+@pytest.mark.unit
+def test_final_state_lacks_marker_fails_routing_when_branch_leaked() -> None:
+    # Reject case, but the fake run's final_state shows the ERP DID post.
+    fake = FakeRuntime(
+        pause_nodes=["director-approval"],
+        final_state={"erp_result": "posted", "summary": "ok"},
+    )
+    case = _case(
+        "director-reject",
+        hitl=(HitlStep(node="director-approval", decision={"decision": "reject"}),),
+        expect=CaseExpect(status="success", route=None, final_state_lacks=("erp_result",)),
+    )
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["hitl"].status == "pass"
+    assert result.outcomes["decision-routing"].status == "fail"
+    assert "erp_result" in result.outcomes["decision-routing"].note
+
+
+@pytest.mark.unit
+def test_cost_expectation_passes_and_fails_on_fact_cost_usd() -> None:
+    case = _case(expect=CaseExpect(status="success", route=None, cost=True))
+    zero = _driver(FakeRuntime(cost_usd=0.0)).run_case(_spec(case), case)
+    assert zero.outcomes["cost"].status == "fail"
+    spent = _driver(FakeRuntime(cost_usd=0.0042)).run_case(_spec(case), case)
+    assert spent.outcomes["cost"].status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Side-effects gating + ledger assertions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_side_effects_skip_when_shared_db_not_configured() -> None:
+    case = _case(
+        expect=CaseExpect(
+            status="success",
+            route=None,
+            no_side_effects=(SideEffectExpect(system="erp", action="submit"),),
+        )
+    )
+    result = _driver(FakeRuntime(), side_effects_enabled=False).run_case(_spec(case), case)
+    assert result.outcomes["side-effects"].status == "skip"
+    assert "MOVATE_PG_URL" in result.outcomes["side-effects"].note
+
+
+@pytest.mark.unit
+def test_side_effects_db_configured_reads_env() -> None:
+    assert side_effects_db_configured({}) is False
+    assert side_effects_db_configured({"MOVATE_PG_URL": "  "}) is False
+    assert side_effects_db_configured({"MOVATE_PG_URL": "postgres://x"}) is True
+    assert side_effects_db_configured({"MOVATE_DB_URL": "postgres://y"}) is True
+
+
+@pytest.mark.unit
+def test_side_effects_assert_against_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    ledger: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        sim_systems, "read", lambda run_id=None: [e for e in ledger if e["run_id"] == run_id]
+    )
+    case = _case(
+        expect=CaseExpect(
+            status="success",
+            route=None,
+            no_side_effects=(SideEffectExpect(system="erp", action="submit"),),
+        )
+    )
+    clean = _driver(FakeRuntime(), side_effects_enabled=True).run_case(_spec(case), case)
+    assert clean.outcomes["side-effects"].status == "pass"
+
+    ledger.append({"run_id": "wfr-1", "system": "erp", "action": "submit", "payload": {}})
+    dirty = _driver(FakeRuntime(), side_effects_enabled=True).run_case(_spec(case), case)
+    assert dirty.outcomes["side-effects"].status == "fail"
+    assert "erp.submit" in dirty.outcomes["side-effects"].note
+
+
+# ---------------------------------------------------------------------------
+# Assert-to-capability metric mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_capability_outcomes_emit_certification_metric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[tuple[str, str, str]] = []
+
+    def _capture(*, scenario: str, capability: str, status: str) -> None:
+        emitted.append((scenario, capability, status))
+
+    monkeypatch.setattr(cert_metrics, "record_certification_result", _capture)
+    fake = FakeRuntime(
+        pause_nodes=["manager-approval"],
+        final_state={"erp_result": "posted", "summary": "ok"},
+    )
+    case = _case(
+        "manager-approve",
+        hitl=(HitlStep(node="manager-approval", decision={"decision": "approve"}),),
+        expect=CaseExpect(status="success", route=None, final_state_has=("erp_result",)),
+    )
+    _driver(fake).run_case(_spec(case), case)
+    assert ("expense-approval", "hitl", "pass") in emitted
+    assert ("expense-approval", "durable-execution", "pass") in emitted
+    assert ("expense-approval", "decision-routing", "pass") in emitted
+    # Skipped capabilities (cost / side-effects here) emit NOTHING — skip is a
+    # local-matrix verdict, never a green or red datapoint on the dashboard.
+    assert not any(cap in ("cost", "side-effects") for _, cap, _ in emitted)
+
+
+@pytest.mark.unit
+def test_launch_failure_emits_durable_execution_fail_metric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[tuple[str, str, str]] = []
+
+    def _capture(*, scenario: str, capability: str, status: str) -> None:
+        emitted.append((scenario, capability, status))
+
+    monkeypatch.setattr(cert_metrics, "record_certification_result", _capture)
+    case = _case()
+    _driver(FakeRuntime(job_status="error")).run_case(_spec(case), case)
+    assert emitted == [("expense-approval", "durable-execution", "fail")]
