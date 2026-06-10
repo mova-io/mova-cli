@@ -38,6 +38,7 @@ from movate.core.workflow.spec import (
     IntentRouterNodeSpec,
     JudgeNodeSpec,
     SupervisorNodeSpec,
+    ToolNodeSpec,
     WorkflowSpec,
 )
 
@@ -238,6 +239,39 @@ def compile_workflow(
                         for c in ns.cases
                     ],
                     "default": ns.default,
+                },
+            )
+        elif isinstance(ns, ToolNodeSpec):
+            # TOOL node (ADR 097 D2). ``skill`` is a registry NAME (the same
+            # vocabulary agents use in ``skills: [...]``), resolved HERE — at
+            # compile time — to an absolute skill directory baked into
+            # ``node.ref`` (exactly the string ``call_skill_activity`` expects),
+            # failing loud on a miss like an agent-ref typo does. Resolution is
+            # workflow-local-first (``<workflow>/skills/<name>/``, paralleling
+            # the workflow-local agents/ convention — and the tier that ships in
+            # the Temporal worker image via ``COPY workflows/``), then the
+            # project ``skills/`` root found by the same marker walk-up agent
+            # skill resolution uses. Everything downstream consumers need is
+            # stamped into metadata so neither validate nor the compilers
+            # re-load the skill: the name, ``side_effects`` (static SKILL gate,
+            # D5), ``capabilities`` (determinism lint, D6), ``timeout_call_ms``,
+            # and the ``input`` map / ``output_key`` (runner + activity, D3).
+            bundle, skill_source = _resolve_tool_skill(ns, workflow_dir)
+            nodes[ns.id] = WorkflowNode(
+                id=ns.id,
+                type=NodeType.TOOL,
+                ref=str(bundle.skill_dir),  # absolute skill dir — the activity contract
+                metadata={
+                    "skill": ns.skill,
+                    "side_effects": bundle.spec.side_effects.value,
+                    "capabilities": bundle.spec.capabilities.model_dump(),
+                    "timeout_call_ms": bundle.spec.timeout_call_ms,
+                    "input_map": ns.input,
+                    "output_key": ns.output_key,
+                    # "workflow-local" | "project" — read by `mdk validate` to
+                    # warn when a runtime: temporal workflow references a
+                    # project-level skill the worker image bake won't include.
+                    "skill_source": skill_source,
                 },
             )
         else:
@@ -458,6 +492,66 @@ def compile_workflow(
     return graph
 
 
+def _resolve_tool_skill(ns: ToolNodeSpec, workflow_dir: Path) -> tuple[Any, str]:
+    """Resolve a tool node's skill NAME to a loaded bundle (ADR 097 D2).
+
+    Two tiers, fail-loud on a miss (the agent-ref rule — a typo'd skill name
+    must fail compile/``mdk validate``, not the Nth production run):
+
+    1. **Workflow-local** — ``<workflow_dir>/skills/<name>/`` (parallels the
+       workflow-local ``agents/`` convention). Wins on collision; this is the
+       tier the Dockerfile's ``COPY workflows/`` ships into the Temporal
+       worker image for free.
+    2. **Project registry** — ``load_skill_registry`` over the project root
+       found by the same ``project.yaml``/``policy.yaml`` marker walk-up agent
+       skill resolution uses (``core/loader.py``).
+
+    Returns ``(SkillBundle, source)`` where ``source`` is ``"workflow-local"``
+    or ``"project"`` (stamped into node metadata for the deploy lint).
+    Lazy imports keep the compiler import-cheap and cycle-free, matching the
+    rest of ``core/workflow``.
+    """
+    from movate.core.loader import _resolve_project_root  # noqa: PLC0415
+    from movate.core.skill_loader import (  # noqa: PLC0415
+        SkillLoadError,
+        load_skill,
+        load_skill_registry,
+    )
+
+    local_dir = workflow_dir / "skills" / ns.skill
+    if (local_dir / "skill.yaml").is_file():
+        try:
+            return load_skill(local_dir), "workflow-local"
+        except SkillLoadError as exc:
+            raise WorkflowCompileError(
+                f"tool node {ns.id!r}: workflow-local skill {ns.skill!r} at "
+                f"{local_dir} failed to load: {exc}"
+            ) from exc
+
+    project_root = _resolve_project_root(workflow_dir)
+    try:
+        registry = load_skill_registry(project_root)
+    except SkillLoadError as exc:
+        raise WorkflowCompileError(
+            f"tool node {ns.id!r}: project skill registry at "
+            f"{project_root / 'skills'} failed to load: {exc}"
+        ) from exc
+    if ns.skill in registry:
+        return registry[ns.skill], "project"
+
+    available = sorted(registry)
+    hint = (
+        ", ".join(available)
+        if available
+        else "(none — add <workflow>/skills/<name>/ or <project>/skills/<name>/)"
+    )
+    raise WorkflowCompileError(
+        f"tool node {ns.id!r}: skill {ns.skill!r} not found. Looked in "
+        f"workflow-local {local_dir} and the project registry at "
+        f"{project_root / 'skills'}. Available: {hint}"
+    )
+
+
 def _reachable(graph: WorkflowGraph, start: str) -> set[str]:
     seen: set[str] = {start}
     stack = [start]
@@ -490,8 +584,10 @@ def validate_linear(graph: WorkflowGraph) -> None:
 
     ADR 017 D5 (PR 1): ``human`` (HITL gate) nodes (``NodeType.HUMAN``) are
     now also permitted — the runner pauses + persists a durable checkpoint
-    at a human gate rather than executing it. TOOL / FUNCTION / sub-workflow
-    node types remain rejected (they land in later phases).
+    at a human gate rather than executing it. ADR 097: ``tool`` nodes
+    (``NodeType.TOOL``) are permitted — one registered skill as one
+    sequential step (no branching). FUNCTION / sub-workflow node types
+    remain rejected (they land in later phases).
 
     ADR 056: ``judge`` nodes (``NodeType.JUDGE``) are permitted — like
     ``intent-router`` they are a verdict-driven branching primitive, so they
@@ -505,8 +601,8 @@ def validate_linear(graph: WorkflowGraph) -> None:
     against the same :class:`WorkflowGraph` without modifying the IR or
     the structural compiler.
     """
-    # Node types — agent + intent-router + human (HITL gate) + judge. Tools/
-    # functions/sub-workflows are still rejected. Most specific failure first.
+    # Node types — agent + intent-router + human (HITL gate) + judge + tool.
+    # Functions/sub-workflows are still rejected. Most specific failure first.
     _allowed_types = {
         NodeType.AGENT,
         NodeType.INTENT_ROUTER,
@@ -518,13 +614,16 @@ def validate_linear(graph: WorkflowGraph) -> None:
         # DECISION (ADR 094) — deterministic value routing; the branching twin of
         # intent-router (no LLM). Permitted like the other routing primitives.
         NodeType.DECISION,
+        # TOOL (ADR 097) — one registered skill as one deterministic sequential
+        # step (no LLM, no branching). Permitted like a single agent node.
+        NodeType.TOOL,
     }
     bad_types = sorted(n.id for n in graph.nodes.values() if n.type not in _allowed_types)
     if bad_types:
         raise WorkflowCompileError(
             f"v0.3 supports only type=agent, type=intent-router, type=human, "
-            f"type=judge, type=supervisor, and type=decision nodes; "
-            f"offenders: {', '.join(bad_types)}. Tools/sub-workflows land in v1.1+."
+            f"type=judge, type=supervisor, type=decision, and type=tool nodes; "
+            f"offenders: {', '.join(bad_types)}. Functions/sub-workflows land in v1.1+."
         )
 
     # Edge kinds — sequential only, EXCEPT synthetic conditional edges from

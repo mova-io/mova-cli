@@ -630,9 +630,10 @@ class TemporalCompiler:
         if node_type is NodeType.HUMAN:
             return self._emit_human_node(nid, node, spec)
         if node_type is NodeType.TOOL:
-            # TOOL nodes haven't shipped yet (v1.1); the spec validator
-            # rejects them, but the compiler is still total: emit a skill
-            # call so a future TOOL adoption needs only a metadata field.
+            # TOOL nodes (ADR 097) — a registered skill as one deterministic
+            # step. Lowers to the call_skill_activity wrapper that was wired
+            # for exactly this adoption; the metadata field the original
+            # comment reserved now carries the input map / output_key.
             return self._emit_skill_node(nid, node, spec)
         if node_type is NodeType.SUB_WORKFLOW:
             # Sub-workflow support is Phase 3+. Emit a placeholder so the
@@ -787,14 +788,25 @@ class TemporalCompiler:
     def _emit_skill_node(
         self, nid: str, node: Any, spec: WorkflowGraph
     ) -> tuple[list[str], set[str]]:
-        """SKILL → ``await workflow.execute_activity(call_skill_activity, ...)``."""
+        """SKILL/TOOL → ``await workflow.execute_activity(call_skill_activity, ...)``.
+
+        ADR 097 D3: the activity call gains the node's ``input``-map +
+        ``output_key`` as defaulted trailing args (appended, never reordered —
+        the lockstep rule in ``temporal_activities.py``); both come from the
+        metadata the compiler stamped at resolve time. The activity now returns
+        the state *delta* (mapping applied activity-side via the shared
+        ``core.workflow.tool`` helpers), so the generated workflow shape —
+        ``state.update(<result>)`` then advance — is unchanged.
+        """
         method = _safe_method_name(nid)
         nxt = self._sequential_successor(spec, nid)
+        input_map = node.metadata.get("input_map")
+        output_key = node.metadata.get("output_key")
         body = [
-            f"# node {nid!r} — SKILL (ADR 054 D4 row 7)",
+            f"# node {nid!r} — TOOL/SKILL (ADR 054 D4 row 7; ADR 097)",
             f"{method}_result = await workflow.execute_activity(",
             "    call_skill_activity,",
-            f"    args=[{nid!r}, {node.ref!r}, state, run_id],",
+            f"    args=[{nid!r}, {node.ref!r}, state, run_id, {input_map!r}, {output_key!r}],",
             "    schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
             "    heartbeat_timeout=_HEARTBEAT,",
             "    retry_policy=_RETRY_POLICY,",
