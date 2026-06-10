@@ -1,7 +1,8 @@
 # ADR 097 — A first-class `tool` node: deterministic skill execution as a workflow step
 
-Status: Proposed
+Status: Accepted
 Date: 2026-06-09
+Accepted: 2026-06-09 — approved by Jeremy. All recommendations ratified (raw-merge default + opt-in output_key, activity-side mapping via shared helpers, compile-time resolution, no RunRecord).
 Deciders: Engineering — additive workflow-node primitive behind the existing
 node-type seam (CLAUDE.md §7: "extend via adapters/specs, don't hardcode").
 Closes authoring gap #50 surfaced by the certification suite (an external call —
