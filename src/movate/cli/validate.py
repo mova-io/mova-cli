@@ -1249,7 +1249,9 @@ def _lint_state_threading(graph: WorkflowGraph) -> None:
     schema that *some* node produces is treated as available only AFTER its
     producer (so it also catches ordering bugs), while keys nobody produces are
     assumed external inputs (always available). Non-agent nodes (gate/judge/
-    human/fan-out) carry no I/O schema and are pass-through here.
+    fan-out) carry no I/O schema and are pass-through here; HUMAN gates
+    contribute their ``output_contract`` keys (the signal endpoint guarantees a
+    delivered decision carries them — ADR 017 D5 / ADR 099).
     """
     from movate.core.workflow.ir import NodeType  # noqa: PLC0415
 
@@ -1326,6 +1328,15 @@ def _lint_state_threading(graph: WorkflowGraph) -> None:
                     f"produced by any upstream node and not a declared initial-state input "
                     f"(available here: {avail_show})"
                 )
+            continue
+        # A HUMAN gate (ADR 017/062) produces its ``output_contract`` keys —
+        # the signal endpoint's 422 guarantees a delivered decision carries
+        # them — so downstream consumers (and a routed gate's own ``route_on``
+        # key, ADR 099, which the spec validator pins to the contract) are
+        # available from the gate onward. Never warns: the gate consumes
+        # nothing from state.
+        if node.type is NodeType.HUMAN:
+            available |= {str(k) for k in node.metadata.get("output_contract", []) if k}
             continue
         # A TOOL node (ADR 097 D6) reads state through its input map (or the
         # skill's required input under default projection) — same silent-gap

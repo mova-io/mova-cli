@@ -40,6 +40,11 @@ Semantics (ADR 094 D3, fail-soft + deterministic):
   its negation; ``contains`` ⇒ ``value in field_value`` (``field`` is the
   collection/string). ``truthy``/``falsy`` test the field's Python truthiness and
   ignore ``value``.
+
+ADR 099 adds :func:`evaluate_human_route` here — the HUMAN gate's decision
+routing (trim + casefold exact match, unmatched → fallback). Same contract,
+same reason: one pure helper both backends funnel through, so native and
+Temporal can never disagree on a branch.
 """
 
 from __future__ import annotations
@@ -158,3 +163,31 @@ def evaluate_decision(
     else ``default``. The single source of truth shared by the native runner and
     the Temporal-compiled workflow (ADR 094 D3)."""
     return _evaluate_decision_traced(cases, default, state)[0]
+
+
+def _evaluate_human_route_traced(
+    routes: dict[str, str],
+    fallback: str,
+    value: Any,
+) -> tuple[str, str | None]:
+    """Return ``(target_node_id, matched_route_key)``; key is ``None`` when the
+    ``fallback`` route is taken. The key feeds the ``workflow.human_route`` span
+    so the branch is observable (ADR 099 D3)."""
+    if value is None:
+        # Missing/None routing key ⇒ fallback (never str(None) == "none").
+        return fallback, None
+    needle = str(value).strip().casefold()
+    for key, target in routes.items():
+        if key.strip().casefold() == needle:
+            return str(target), key
+    return fallback, None
+
+
+def evaluate_human_route(routes: dict[str, str], fallback: str, value: Any) -> str:
+    """Exact-match route for a HUMAN gate's decision value (ADR 099 D2): trim +
+    casefold ``value`` and compare against the route keys (casefolded); first
+    match wins, else ``fallback``. Pure + total — never raises (an unmatched or
+    missing value is the *declared* fallback, mirroring ADR 094 D3's fail-soft
+    rule, never an exception that wedges the run). The single source of truth
+    shared by the native runner's resume and the Temporal-compiled workflow."""
+    return _evaluate_human_route_traced(routes, fallback, value)[0]

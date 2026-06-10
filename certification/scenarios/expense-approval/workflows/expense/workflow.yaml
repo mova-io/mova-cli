@@ -8,9 +8,11 @@ description: >
   a deterministic `decision` node (ADR 094), no LLM; (2) #49 CLOSED — exclusive
   convergence (ADR 098) lets all three approval paths SHARE one
   `post-erp`/`finalize`/`rejected` tail (was 13 nodes with 3 ERP-poster copies;
-  now 8 nodes, every shared step exists once); (3) HUMAN nodes can't route —
-  each approve/reject still needs an LLM intent-router (#48). The runtime
-  (durable HITL) is fine; the remaining authoring tax is #48 only.
+  every shared step exists once); (3) #48 CLOSED — HUMAN gates route directly
+  on the approver's structured `decision` (ADR 099): approve/reject is
+  deterministic (trim+casefold exact match, unmatched fails safe to rejected),
+  the two `*-decision` LLM intent-routers are GONE (was 8 nodes; now 6), and
+  ZERO LLM classifiers remain on the approval path.
 state_schema: ../../state.json
 entrypoint: classify
 nodes:
@@ -24,20 +26,22 @@ nodes:
       - when: {field: amount, op: gt, value: 100}
         to: manager-approval
     default: post-erp
-  # --- manager tier ---
-  - {id: manager-approval, type: human, prompt: "Approve (manager)?", output_contract: [decision]}
-  - id: manager-decision
-    type: intent-router
-    classifier_agent: ../../agents/decision-classifier
-    input_field: decision
+  # --- #48 CLOSED: the HUMAN gates route their OWN decision (ADR 099) — no
+  # --- `*-decision` intent-router, no classifier LLM; prose fails safe.
+  - id: manager-approval
+    type: human
+    prompt: >
+      Approve (manager)? Respond with `decision` set to exactly "approve" or
+      "reject" — any other wording is treated as reject.
+    output_contract: [decision]
     routes: {approve: post-erp, reject: rejected}
     fallback: rejected
-  # --- director tier ---
-  - {id: director-approval, type: human, prompt: "Approve (director, >$5000)?", output_contract: [decision]}
-  - id: director-decision
-    type: intent-router
-    classifier_agent: ../../agents/decision-classifier
-    input_field: decision
+  - id: director-approval
+    type: human
+    prompt: >
+      Approve (director, >$5000)? Respond with `decision` set to exactly
+      "approve" or "reject" — any other wording is treated as reject.
+    output_contract: [decision]
     routes: {approve: post-erp, reject: rejected}
     fallback: rejected
   # --- #49 CLOSED: the shared tail (exclusive convergence, ADR 098). One
@@ -46,6 +50,4 @@ nodes:
   - {id: finalize, type: agent, ref: ../../agents/finalize}
   - {id: rejected, type: agent, ref: ../../agents/rejected}
 edges:
-  - {from: manager-approval, to: manager-decision}
-  - {from: director-approval, to: director-decision}
   - {from: post-erp, to: finalize}
