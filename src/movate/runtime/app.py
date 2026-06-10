@@ -6138,6 +6138,69 @@ def build_app(
 
         return AgentCatalogView(agents=items, count=len(items))
 
+    @v1.get(
+        "/workflow-agents",
+        tags=["agents-v1"],
+        dependencies=[_scope("read")],
+    )
+    async def v1_list_workflow_agents(
+        request: Request,
+        ctx: AuthContext = Depends(auth_dep),
+    ) -> dict[str, Any]:
+        """List agents bundled INSIDE workflow templates, grouped by workflow.
+
+        Standalone agents live in the ``agents/`` catalog (``GET /agents``, a
+        deliberately one-level scan). Workflow templates ship their own agents
+        under ``<workflows>/<wf>/agents/<name>/`` — real, runnable agents that
+        the standalone catalog never surfaces. This read-only endpoint exposes
+        them so the Agent Control Plane (ADR 090) can show EVERY agent in the
+        deployment, including each test/template workflow's bundled agents.
+        """
+        from movate.runtime.registry import scan_workflow_agents  # noqa: PLC0415
+
+        # Resolve every candidate workflows root: the configured path (where
+        # POST /api/v1/workflows lands — usually a sibling of agents_path) AND
+        # the image-baked templates dir from the env the worker uses
+        # (MOVATE_/MDK_WORKFLOWS_PATH = /app/workflows). The API's agents_path is
+        # often a persistent volume (/home/movate/agents) whose workflows sibling
+        # is empty, so the baked templates (/app/workflows) would otherwise be
+        # invisible here. Dedupe by resolved path; scan all.
+        roots: list[Path] = []
+        seen_roots: set[str] = set()
+        candidates: list[Path | None] = [request.app.state.workflows_path]
+        for env_name in ("MDK_WORKFLOWS_PATH", "MOVATE_WORKFLOWS_PATH"):
+            val = os.environ.get(env_name, "").strip()
+            if val:
+                candidates.append(Path(val))
+        for cand in candidates:
+            if cand is None:
+                continue
+            key = str(cand.resolve()) if cand.exists() else str(cand)
+            if key in seen_roots:
+                continue
+            seen_roots.add(key)
+            roots.append(cand)
+
+        items: list[dict[str, Any]] = []
+        seen_agents: set[tuple[str, str]] = set()
+        for wf_root in roots:
+            for wf_name, bundle in scan_workflow_agents(wf_root):
+                spec = bundle.spec
+                if (wf_name, spec.name) in seen_agents:
+                    continue
+                seen_agents.add((wf_name, spec.name))
+                items.append(
+                    {
+                        "workflow": wf_name,
+                        "name": spec.name,
+                        "version": spec.version,
+                        "description": spec.description,
+                        "role": getattr(spec, "role", None),
+                        "model": getattr(getattr(spec, "model", None), "provider", None),
+                    }
+                )
+        return {"workflow_agents": items, "count": len(items)}
+
     @v1.patch(
         "/agents/{name}/status",
         response_model=AgentStatusView,
