@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 import asyncpg
 
 if TYPE_CHECKING:
-    from movate.storage.base import RunSubmissionRecord
+    from movate.storage.base import RunSubmissionRecord, TriggerDeliveryRecord
 
 from movate.core.dr_backup import ImportResult
 from movate.core.events import Event
@@ -298,6 +298,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS notify_email TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+-- ADR 100 D4: job provenance ("schedule:<name>" / "trigger:<trigger_id>").
+-- Additive nullable column — NULL on every manual submit and every
+-- pre-ADR-100 row, byte-for-byte the prior behavior.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS origin TEXT;
 CREATE INDEX IF NOT EXISTS idx_jobs_queue_head
     ON jobs(tenant_id, created_at) WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_created
@@ -665,8 +669,17 @@ CREATE TABLE IF NOT EXISTS job_schedules (
     created_by       TEXT,
     created_at       TIMESTAMPTZ NOT NULL,
     last_enqueued_at TIMESTAMPTZ,
+    cron             TEXT,
+    timezone         TEXT,
     PRIMARY KEY (tenant_id, name)
 );
+-- ADR 100 D1: clock-aligned cron schedules. Additive nullable columns —
+-- NULL on every pre-ADR-100 interval row (which keeps interval semantics,
+-- byte-for-byte). When cron is set, cadence_seconds persists as 0 (sentinel
+-- behind the model's exactly-one validator), so no NOT-NULL migration.
+-- ADD COLUMN IF NOT EXISTS keeps init() idempotent on long-lived databases.
+ALTER TABLE job_schedules ADD COLUMN IF NOT EXISTS cron TEXT;
+ALTER TABLE job_schedules ADD COLUMN IF NOT EXISTS timezone TEXT;
 
 -- ADR 017 D2: inbound event/webhook triggers. One row per (tenant, name)
 -- with a public trigger_id (in the webhook URL), a hashed-at-rest per-trigger
@@ -692,6 +705,16 @@ CREATE TABLE IF NOT EXISTS triggers (
     PRIMARY KEY (tenant_id, name)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_triggers_trigger_id ON triggers(trigger_id);
+-- ADR 100 D2/D3: event→state mapping (event_key/input_map), body-sourced
+-- dedup (dedup_key), and the fire-auth mode. Additive nullable columns —
+-- NULL on every pre-ADR-100 row, which keeps the verbatim-merge /
+-- header-only-dedup / HMAC behavior byte-for-byte (auth_mode NULL reads
+-- back as the "hmac" model default). ADD COLUMN IF NOT EXISTS keeps init()
+-- idempotent on long-lived databases.
+ALTER TABLE triggers ADD COLUMN IF NOT EXISTS event_key TEXT;
+ALTER TABLE triggers ADD COLUMN IF NOT EXISTS input_map JSONB;
+ALTER TABLE triggers ADD COLUMN IF NOT EXISTS dedup_key TEXT;
+ALTER TABLE triggers ADD COLUMN IF NOT EXISTS auth_mode TEXT;
 
 -- item 23: trigger replay / idempotency (ADR 017 D2 follow-up). One row per
 -- (trigger_id, delivery_id) recording the job_id the FIRST delivery enqueued,
@@ -2333,9 +2356,10 @@ class PostgresProvider:
             """
             INSERT INTO job_schedules (
                 tenant_id, name, kind, target, cadence_seconds, enabled,
-                input, notify_email, created_by, created_at, last_enqueued_at
+                input, notify_email, created_by, created_at, last_enqueued_at,
+                cron, timezone
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
             )
             ON CONFLICT (tenant_id, name) DO UPDATE SET
                 kind = EXCLUDED.kind,
@@ -2346,7 +2370,9 @@ class PostgresProvider:
                 notify_email = EXCLUDED.notify_email,
                 created_by = EXCLUDED.created_by,
                 created_at = EXCLUDED.created_at,
-                last_enqueued_at = EXCLUDED.last_enqueued_at
+                last_enqueued_at = EXCLUDED.last_enqueued_at,
+                cron = EXCLUDED.cron,
+                timezone = EXCLUDED.timezone
             """,
             schedule.tenant_id,
             schedule.name,
@@ -2359,6 +2385,8 @@ class PostgresProvider:
             schedule.created_by,
             schedule.created_at,
             schedule.last_enqueued_at,
+            schedule.cron,
+            schedule.timezone,
         )
 
     async def get_job_schedule(self, name: str, *, tenant_id: str) -> JobSchedule | None:
@@ -2417,9 +2445,11 @@ class PostgresProvider:
             """
             INSERT INTO triggers (
                 tenant_id, name, trigger_id, kind, target, secret_hash, salt,
-                input_defaults, enabled, created_by, created_at, last_fired_at
+                input_defaults, enabled, created_by, created_at, last_fired_at,
+                event_key, input_map, dedup_key, auth_mode
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16
             )
             ON CONFLICT (tenant_id, name) DO UPDATE SET
                 trigger_id = EXCLUDED.trigger_id,
@@ -2431,7 +2461,11 @@ class PostgresProvider:
                 enabled = EXCLUDED.enabled,
                 created_by = EXCLUDED.created_by,
                 created_at = EXCLUDED.created_at,
-                last_fired_at = EXCLUDED.last_fired_at
+                last_fired_at = EXCLUDED.last_fired_at,
+                event_key = EXCLUDED.event_key,
+                input_map = EXCLUDED.input_map,
+                dedup_key = EXCLUDED.dedup_key,
+                auth_mode = EXCLUDED.auth_mode
             """,
             trigger.tenant_id,
             trigger.name,
@@ -2445,6 +2479,10 @@ class PostgresProvider:
             trigger.created_by,
             trigger.created_at,
             trigger.last_fired_at,
+            trigger.event_key,
+            trigger.input_map,
+            trigger.dedup_key,
+            trigger.auth_mode,
         )
 
     async def get_trigger(self, name: str, *, tenant_id: str) -> Trigger | None:
@@ -2517,6 +2555,36 @@ class PostgresProvider:
             datetime.now(UTC),
         )
         return status.endswith(" 1")
+
+    async def list_trigger_deliveries(
+        self, trigger_id: str, *, limit: int = 50
+    ) -> list[TriggerDeliveryRecord]:
+        from movate.storage.base import TriggerDeliveryRecord  # noqa: PLC0415
+
+        # ADR 100 D4: the per-trigger delivery ledger. LEFT JOIN so a
+        # delivery whose job row is gone (pruned) still lists, with a NULL
+        # status — the delivery record is the durable fact.
+        rows = await self._db.fetch(
+            """
+            SELECT d.delivery_id, d.job_id, d.created_at, j.status AS job_status
+            FROM trigger_deliveries d
+            LEFT JOIN jobs j ON j.job_id = d.job_id
+            WHERE d.trigger_id = $1
+            ORDER BY d.created_at DESC
+            LIMIT $2
+            """,
+            trigger_id,
+            limit,
+        )
+        return [
+            TriggerDeliveryRecord(
+                delivery_id=r["delivery_id"],
+                job_id=r["job_id"],
+                created_at=r["created_at"],
+                job_status=r["job_status"],
+            )
+            for r in rows
+        ]
 
     async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
         row = await self._db.fetchrow(
@@ -4067,10 +4135,10 @@ class PostgresProvider:
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
                 target_version, resume_workflow_run_id, batch_id,
-                trace_context, cancel_requested
+                trace_context, cancel_requested, origin
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
             )
             """,
             job.job_id,
@@ -4100,6 +4168,8 @@ class PostgresProvider:
             # (a fresh job is never pre-cancelled); set later by
             # request_job_cancel for a RUNNING job.
             job.cancel_requested,
+            # ADR 100 D4: provenance. NULL for manual submits.
+            job.origin,
         )
 
     async def get_job(self, job_id: str, *, tenant_id: str) -> JobRecord | None:
@@ -5999,6 +6069,11 @@ def _row_to_job_schedule(row: asyncpg.Record) -> JobSchedule:
         created_by=row["created_by"],
         created_at=row["created_at"],
         last_enqueued_at=row["last_enqueued_at"],
+        # ADR 100 D1: cron form. init() has run the ALTER by the time we read
+        # here; NULL (every pre-ADR-100 interval row) → None → interval
+        # semantics, byte-for-byte the prior behavior.
+        cron=row["cron"],
+        timezone=row["timezone"],
     )
 
 
@@ -6030,6 +6105,14 @@ def _row_to_trigger(row: asyncpg.Record) -> Trigger:
         secret_hash=row["secret_hash"],
         salt=row["salt"],
         input_defaults=dict(row["input_defaults"]),
+        # ADR 100 D2/D3: event mapping + dedup + auth mode. init() has run
+        # the ALTERs by the time we read here; NULL (every pre-ADR-100 row)
+        # → None / the "hmac" default → verbatim-merge / header-only-dedup /
+        # HMAC behavior, byte-for-byte the prior path.
+        event_key=row["event_key"],
+        input_map=dict(row["input_map"]) if row["input_map"] is not None else None,
+        dedup_key=row["dedup_key"],
+        auth_mode=row["auth_mode"] or "hmac",
         enabled=row["enabled"],
         created_by=row["created_by"],
         created_at=row["created_at"],
@@ -6319,6 +6402,9 @@ def _row_to_job(row: asyncpg.Record) -> JobRecord:
         # item 36 (R4b): cooperative-cancel flag. NOT NULL DEFAULT FALSE in the
         # schema, so a pre-cancel / never-cancelled row reads back as False.
         cancel_requested=row["cancel_requested"],
+        # ADR 100 D4: provenance. NULL (every manual submit + every
+        # pre-ADR-100 row) → None, byte-for-byte the prior behavior.
+        origin=row["origin"],
     )
 
 

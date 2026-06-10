@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from movate.core.models import JobKind, Trigger
+from movate.core.models import JobKind, JobRecord, JobStatus, Trigger
 
 
 def _make_trigger(
@@ -211,3 +211,107 @@ async def test_delivery_distinct_ids_independent(storage) -> None:
     assert await storage.record_trigger_delivery("trig-1", "del-2", "job-2") is True
     assert await storage.get_trigger_delivery("trig-1", "del-1") == "job-1"
     assert await storage.get_trigger_delivery("trig-1", "del-2") == "job-2"
+
+
+@pytest.mark.unit
+async def test_adr100_mapping_fields_round_trip(storage) -> None:
+    """ADR 100 D2/D3: event_key/input_map/dedup_key/auth_mode persist; the
+    defaults read back on a trigger saved without them (back-compat)."""
+    t = Trigger(
+        tenant_id="tenant-a",
+        name="ado",
+        trigger_id="trig-ado",
+        kind=JobKind.WORKFLOW,
+        target="work-item-triage",
+        secret_hash="abc123",
+        salt="saltsalt",
+        input_defaults={"source": "ado"},
+        event_key="event",
+        input_map={"work_item_id": "resource.id", "event_type": "eventType"},
+        dedup_key="id",
+        auth_mode="token",
+    )
+    await storage.save_trigger(t)
+    got = await storage.get_trigger("ado", tenant_id="tenant-a")
+    assert got is not None
+    assert got.event_key == "event"
+    assert got.input_map == {"work_item_id": "resource.id", "event_type": "eventType"}
+    assert got.dedup_key == "id"
+    assert got.auth_mode == "token"
+    # The fire-path lookup carries them too.
+    by_id = await storage.get_trigger_by_id("trig-ado")
+    assert by_id is not None and by_id.auth_mode == "token" and by_id.dedup_key == "id"
+
+    # A trigger saved WITHOUT the new fields reads back with the defaults.
+    await storage.save_trigger(_make_trigger(name="plain", trigger_id="trig-plain"))
+    plain = await storage.get_trigger("plain", tenant_id="tenant-a")
+    assert plain is not None
+    assert plain.event_key is None
+    assert plain.input_map is None
+    assert plain.dedup_key is None
+    assert plain.auth_mode == "hmac"
+
+
+@pytest.mark.unit
+async def test_adr100_fields_upsert_clears_on_resave(storage) -> None:
+    """Re-registering a trigger without the mapping fields clears them —
+    last write wins, exactly like every other trigger field."""
+    t = Trigger(
+        tenant_id="tenant-a",
+        name="flip",
+        trigger_id="trig-flip",
+        kind=JobKind.AGENT,
+        target="triage-agent",
+        secret_hash="abc123",
+        salt="saltsalt",
+        event_key="event",
+        dedup_key="id",
+        auth_mode="token",
+    )
+    await storage.save_trigger(t)
+    await storage.save_trigger(_make_trigger(name="flip", trigger_id="trig-flip2"))
+    got = await storage.get_trigger("flip", tenant_id="tenant-a")
+    assert got is not None
+    assert got.event_key is None
+    assert got.dedup_key is None
+    assert got.auth_mode == "hmac"
+
+
+# ---------------------------------------------------------------------------
+# Deliveries ledger (ADR 100 D4) — list_trigger_deliveries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_list_trigger_deliveries_joins_job_status(storage) -> None:
+    await storage.save_job(
+        JobRecord(
+            job_id="job-1",
+            tenant_id="tenant-a",
+            kind=JobKind.AGENT,
+            target="triage-agent",
+            input={},
+        )
+    )
+    assert await storage.record_trigger_delivery("trig-1", "evt-1", "job-1") is True
+    # A delivery whose job row is GONE still lists, with a None status.
+    assert await storage.record_trigger_delivery("trig-1", "evt-2", "job-gone") is True
+    # Another trigger's deliveries never leak in.
+    assert await storage.record_trigger_delivery("trig-other", "evt-3", "job-x") is True
+
+    rows = await storage.list_trigger_deliveries("trig-1")
+    assert len(rows) == 2
+    by_id = {r.delivery_id: r for r in rows}
+    assert by_id["evt-1"].job_id == "job-1"
+    assert by_id["evt-1"].job_status == JobStatus.QUEUED.value
+    assert by_id["evt-1"].created_at is not None
+    assert by_id["evt-2"].job_status is None
+
+
+@pytest.mark.unit
+async def test_list_trigger_deliveries_empty_and_limit(storage) -> None:
+    assert await storage.list_trigger_deliveries("trig-none") == []
+    for i in range(5):
+        await storage.record_trigger_delivery("trig-many", f"evt-{i}", f"job-{i}")
+    rows = await storage.list_trigger_deliveries("trig-many", limit=3)
+    assert len(rows) == 3

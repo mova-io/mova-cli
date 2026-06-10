@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from movate.core.models import (
     AuditFinding,
@@ -41,6 +41,7 @@ from movate.core.models import (
     SkillRecord,
     WorkflowRunRecord,
     WorkflowStatus,
+    validate_cron_fields,
 )
 from movate.core.reporting import (
     AgentRollup,
@@ -117,6 +118,9 @@ class JobView(BaseModel):
     claimed_at: datetime | None = None
     completed_at: datetime | None = None
     notify_email: str | None = None
+    origin: str | None = None
+    """ADR 100 D4 provenance: ``"schedule:<name>"`` / ``"trigger:<id>"``,
+    ``None`` for manual submits and pre-ADR-100 jobs (additive field)."""
 
     @classmethod
     def from_record(cls, record: JobRecord) -> JobView:
@@ -132,6 +136,7 @@ class JobView(BaseModel):
             claimed_at=record.claimed_at,
             completed_at=record.completed_at,
             notify_email=record.notify_email,
+            origin=record.origin,
         )
 
 
@@ -1246,9 +1251,18 @@ class JobScheduleSubmission(BaseModel):
     rejected by the JobSchedule model validator (eval has its own scheduler)."""
     target: str
     """Agent or workflow name to run on the cadence."""
-    cadence_seconds: int = Field(ge=1)
+    cadence_seconds: int = Field(0, ge=0)
     """How often (seconds) to enqueue a job. The scheduler tick enqueues
-    when this interval has elapsed since the last enqueue."""
+    when this interval has elapsed since the last enqueue. Exactly one of
+    ``cadence_seconds`` | ``cron`` (ADR 100 D1): omit (or send 0) when
+    ``cron`` is set; must be >= 1 otherwise — enforced by the JobSchedule
+    model validator (→ 422)."""
+    cron: str | None = Field(None)
+    """Optional 5-field cron expression for clock-aligned schedules
+    (ADR 100 D1). Mutually exclusive with ``cadence_seconds``."""
+    timezone: str | None = Field(None)
+    """Optional IANA timezone the ``cron`` expression is evaluated in
+    (default UTC). Only valid together with ``cron``."""
     enabled: bool = Field(True)
     input: dict[str, Any] = Field(default_factory=dict)
     """Job payload — the ``RunRequest.input`` dict for agents, the initial
@@ -1272,9 +1286,35 @@ class JobScheduleSubmission(BaseModel):
             )
         return v
 
+    @model_validator(mode="after")
+    def _exactly_one_cadence(self) -> JobScheduleSubmission:
+        """Reject an ambiguous cadence at request-parse time (→ 422).
+
+        Mirrors :meth:`movate.core.models.JobSchedule._exactly_one_cadence`
+        (which also validates the cron expression / timezone themselves) so
+        the API returns a 422 rather than letting the downstream model
+        raise a 500.
+        """
+        if self.cron is not None:
+            if self.cadence_seconds != 0:
+                raise ValueError("exactly one of cron | cadence_seconds; got both.")
+            validate_cron_fields(self.cron, self.timezone)
+        if self.cron is None and self.cadence_seconds < 1:
+            raise ValueError(
+                "exactly one of cron | cadence_seconds; "
+                "cadence_seconds must be >= 1 when cron is unset."
+            )
+        if self.cron is None and self.timezone is not None:
+            raise ValueError("timezone is only valid together with cron.")
+        return self
+
 
 class JobScheduleView(BaseModel):
-    """One generic cron schedule (response shape for the schedule endpoints)."""
+    """One generic cron schedule (response shape for the schedule endpoints).
+
+    ``cron`` / ``timezone`` (ADR 100 D1) are additive nullable fields —
+    ``None`` on every pre-ADR-100 interval schedule.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1282,6 +1322,8 @@ class JobScheduleView(BaseModel):
     kind: JobKind
     target: str
     cadence_seconds: int
+    cron: str | None = None
+    timezone: str | None = None
     enabled: bool
     input: dict[str, Any]
     notify_email: str | None = None
@@ -1324,6 +1366,21 @@ class TriggerCreateRequest(BaseModel):
     input_defaults: dict[str, Any] = Field(default_factory=dict)
     """Baseline job payload, merged UNDER the inbound event body (the event
     body wins on key collisions)."""
+    event_key: str | None = Field(None)
+    """ADR 100 D2: nest the raw event body under this single state key
+    instead of merging it at top level. ``None`` → verbatim merge (today's
+    behavior, unless ``input_map`` is set)."""
+    input_map: dict[str, str] | None = Field(None)
+    """ADR 100 D2: output state key → dotted path into the event body.
+    Missing path → key omitted (fail-soft), never an error."""
+    dedup_key: str | None = Field(None)
+    """ADR 100 D2: dotted path into the event body used as the delivery id
+    when the ``X-Movate-Delivery-Id`` header is absent."""
+    auth_mode: Literal["hmac", "token"] = Field("hmac")
+    """ADR 100 D3: fire-endpoint auth. ``hmac`` (default — body-bound
+    ``X-Movate-Signature``, with GitHub's ``X-Hub-Signature-256`` as an
+    alias) or ``token`` (static ``X-Movate-Trigger-Token`` header — weaker,
+    replayable until rotation; pair with ``dedup_key``)."""
     enabled: bool = Field(True)
 
     @field_validator("kind")
@@ -1356,6 +1413,15 @@ class TriggerView(BaseModel):
     kind: JobKind
     target: str
     input_defaults: dict[str, Any]
+    event_key: str | None = None
+    """ADR 100 D2 event-body nesting key — ``None`` on every pre-ADR-100
+    trigger (verbatim-merge behavior)."""
+    input_map: dict[str, str] | None = None
+    """ADR 100 D2 declared field extraction — ``None`` when unset."""
+    dedup_key: str | None = None
+    """ADR 100 D2 body-sourced delivery-id path — ``None`` when unset."""
+    auth_mode: Literal["hmac", "token"] = "hmac"
+    """ADR 100 D3 fire-endpoint auth mode."""
     enabled: bool
     last_fired_at: str | None = None
     created_at: str
@@ -1387,6 +1453,30 @@ class TriggerListView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     triggers: list[TriggerView]
+    count: int
+
+
+class TriggerDeliveryView(BaseModel):
+    """One delivery row in the per-trigger ledger (ADR 100 D4).
+
+    ``job_status`` is the joined job's status at read time — ``None`` when
+    the job row is gone (the delivery record is the durable fact).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    delivery_id: str
+    job_id: str
+    job_status: str | None = None
+    created_at: str
+
+
+class TriggerDeliveryListView(BaseModel):
+    """``GET /api/v1/triggers/{trigger_id}/deliveries`` response (ADR 100 D4)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deliveries: list[TriggerDeliveryView]
     count: int
 
 

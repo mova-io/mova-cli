@@ -80,18 +80,68 @@ class _Schedulable(Protocol):
 _S = TypeVar("_S", bound=_Schedulable)
 
 
+def _next_cron_occurrence(cron: str, timezone: str | None, *, after: datetime) -> datetime:
+    """First occurrence of ``cron`` STRICTLY after ``after`` (ADR 100 D1).
+
+    Evaluated in the schedule's IANA ``timezone`` (``None`` → UTC) so a
+    "07:00 Mon-Fri" briefing tracks local wall-clock time across DST
+    transitions — ``cronsim`` does the DST arithmetic (a nonexistent
+    spring-forward slot fires at the post-jump instant; an ambiguous
+    fall-back slot fires once). The returned datetime is tz-aware and
+    directly comparable with the (UTC) tick ``now``.
+    """
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    from cronsim import CronSim  # noqa: PLC0415
+
+    tz = ZoneInfo(timezone or "UTC")
+    return next(CronSim(cron, after.astimezone(tz)))
+
+
 def is_due(schedule: _Schedulable, *, now: datetime) -> bool:
     """Return whether ``schedule`` should enqueue at ``now``.
 
-    Due when enabled AND (never enqueued before OR the cadence interval
-    has fully elapsed since the last enqueue). Disabled schedules are
-    never due — they're retained but dormant.
+    Due when enabled AND the cadence window has elapsed. Two cadence forms
+    share this one due-check (so the tick's idempotency story stays in one
+    place):
+
+    * **Interval** (``cadence_seconds``, the pre-ADR-100 behavior): due when
+      never enqueued before OR the interval has fully elapsed since the
+      last enqueue.
+    * **Cron** (``cron`` + optional ``timezone``, ADR 100 D1 — only
+      :class:`JobSchedule` carries it): due when the next occurrence after
+      ``last_enqueued_at`` (or ``created_at`` for a never-fired schedule)
+      is ``<= now``. Because the tick stamps ``last_enqueued_at = now`` on
+      enqueue, a schedule fires AT MOST ONCE per matched window, and a
+      missed window (tick down over a weekend) yields ONE catch-up run —
+      never a backfill storm.
+
+    Disabled schedules are never due — they're retained but dormant.
 
     Typed against the structural :class:`_Schedulable` protocol so both
-    :class:`EvalSchedule` and :class:`JobSchedule` are accepted.
+    :class:`EvalSchedule` and :class:`JobSchedule` are accepted (``cron``
+    is read structurally; a model without it is an interval schedule).
     """
     if not schedule.enabled:
         return False
+    cron = getattr(schedule, "cron", None)
+    if cron is not None:
+        # Anchor at the last enqueue, or creation for a never-fired
+        # schedule — occurrences predating the schedule itself never fire.
+        anchor = schedule.last_enqueued_at or getattr(schedule, "created_at", None)
+        if anchor is None:  # pragma: no cover — JobSchedule always stamps created_at
+            return True
+        try:
+            occurrence = _next_cron_occurrence(
+                cron, getattr(schedule, "timezone", None), after=anchor
+            )
+        except Exception:
+            # A row with an unevaluable cron (e.g. hand-edited storage) is
+            # skipped, never crashes the tick — same per-schedule fail-soft
+            # posture as enqueue_due.
+            logger.warning("cron_due_check_failed cron=%r — treating as not due", cron)
+            return False
+        return occurrence <= now
     if schedule.last_enqueued_at is None:
         return True
     elapsed = (now - schedule.last_enqueued_at).total_seconds()
@@ -150,6 +200,9 @@ def build_scheduled_job(schedule: JobSchedule) -> JobRecord:
         target=schedule.target,
         input=schedule.input,
         notify_email=schedule.notify_email,
+        # ADR 100 D4 provenance: walk the job back to the schedule that
+        # enqueued it (the per-tenant handle). Manual submits carry None.
+        origin=f"schedule:{schedule.name}",
     )
 
 

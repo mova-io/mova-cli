@@ -129,3 +129,80 @@ def test_delete_removes_trigger(local_db: Path) -> None:
     # Deleting a missing trigger is a friendly no-op (exit 0).
     again = runner.invoke(app, ["trigger", "delete", "t1"])
     assert again.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# ADR 100 D2/D3 — --event-key / --input-map / --dedup-key / --auth-mode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_create_with_mapping_flags_round_trips(local_db: Path) -> None:
+    r = runner.invoke(
+        app,
+        [
+            "trigger",
+            "create",
+            "work-item-triage",
+            "--kind",
+            "workflow",
+            "--name",
+            "ado-work-items",
+            "--auth-mode",
+            "token",
+            "--dedup-key",
+            "id",
+            "--event-key",
+            "event",
+            "--input-map",
+            '{"work_item_id": "resource.id", "event_type": "eventType"}',
+        ],
+    )
+    assert r.exit_code == 0, r.stdout + r.stderr
+    # Token mode warns (weaker; pair with dedup).
+    assert "weaker" in r.stderr
+
+    rows = asyncio.run(_list_triggers())
+    assert len(rows) == 1
+    t = rows[0]
+    assert t.event_key == "event"
+    assert t.input_map == {"work_item_id": "resource.id", "event_type": "eventType"}
+    assert t.dedup_key == "id"
+    assert t.auth_mode == "token"
+
+    lst = runner.invoke(app, ["trigger", "list", "--format", "json"])
+    assert lst.exit_code == 0
+    listed = json.loads(lst.stdout)
+    assert listed[0]["auth_mode"] == "token"
+    assert listed[0]["dedup_key"] == "id"
+
+
+@pytest.mark.unit
+def test_create_defaults_stay_pre_adr100(local_db: Path) -> None:
+    r = runner.invoke(app, ["trigger", "create", "triage-agent"])
+    assert r.exit_code == 0, r.stdout + r.stderr
+    assert "weaker" not in r.stderr  # no token warning in hmac mode
+    t = asyncio.run(_list_triggers())[0]
+    assert t.event_key is None
+    assert t.input_map is None
+    assert t.dedup_key is None
+    assert t.auth_mode == "hmac"
+
+
+@pytest.mark.unit
+def test_create_rejects_bad_auth_mode(local_db: Path) -> None:
+    r = runner.invoke(app, ["trigger", "create", "triage-agent", "--auth-mode", "basic"])
+    assert r.exit_code == 2
+    assert "--auth-mode" in r.stderr
+    assert asyncio.run(_list_triggers()) == []
+
+
+@pytest.mark.unit
+def test_create_rejects_non_string_input_map(local_db: Path) -> None:
+    r = runner.invoke(
+        app,
+        ["trigger", "create", "triage-agent", "--input-map", '{"k": 1}'],
+    )
+    assert r.exit_code == 2
+    assert "--input-map" in r.stderr
+    assert asyncio.run(_list_triggers()) == []

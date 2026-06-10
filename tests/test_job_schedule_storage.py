@@ -75,6 +75,57 @@ async def test_save_and_get_round_trip(storage) -> None:
 
 
 @pytest.mark.unit
+async def test_cron_fields_round_trip(storage) -> None:
+    """ADR 100 D1: cron + timezone persist; NULL on interval rows."""
+    s = JobSchedule(
+        tenant_id="tenant-a",
+        name="briefing",
+        kind=JobKind.WORKFLOW,
+        target="exec-briefing",
+        cadence_seconds=0,
+        cron="0 7 * * 1-5",
+        timezone="America/New_York",
+        input={"audience": "leadership"},
+    )
+    await storage.save_job_schedule(s)
+    got = await storage.get_job_schedule("briefing", tenant_id="tenant-a")
+    assert got is not None
+    assert got.cron == "0 7 * * 1-5"
+    assert got.timezone == "America/New_York"
+    assert got.cadence_seconds == 0
+
+    # An interval schedule reads back with both cron fields None (back-compat).
+    await storage.save_job_schedule(_make_schedule(name="interval"))
+    interval = await storage.get_job_schedule("interval", tenant_id="tenant-a")
+    assert interval is not None
+    assert interval.cron is None
+    assert interval.timezone is None
+
+
+@pytest.mark.unit
+async def test_upsert_interval_to_cron_and_back(storage) -> None:
+    """Re-setting a schedule flips cleanly between the two cadence forms."""
+    await storage.save_job_schedule(_make_schedule(name="flip", cadence_seconds=3600))
+    await storage.save_job_schedule(
+        JobSchedule(
+            tenant_id="tenant-a",
+            name="flip",
+            kind=JobKind.AGENT,
+            target="faq-agent",
+            cadence_seconds=0,
+            cron="0 7 * * *",
+        )
+    )
+    as_cron = await storage.get_job_schedule("flip", tenant_id="tenant-a")
+    assert as_cron is not None and as_cron.cron == "0 7 * * *"
+    await storage.save_job_schedule(_make_schedule(name="flip", cadence_seconds=600))
+    back = await storage.get_job_schedule("flip", tenant_id="tenant-a")
+    assert back is not None
+    assert back.cron is None
+    assert back.cadence_seconds == 600
+
+
+@pytest.mark.unit
 async def test_save_upserts_on_tenant_name(storage) -> None:
     """Re-saving the same (tenant, name) overwrites — one row, last write wins."""
     await storage.save_job_schedule(_make_schedule(cadence_seconds=3600))

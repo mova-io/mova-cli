@@ -80,7 +80,7 @@ from movate.core.observability.models import ObservabilityInsight
 from movate.core.webhooks import WebhookAttempt, WebhookSubscription
 
 if TYPE_CHECKING:
-    from movate.storage.base import RunSubmissionRecord
+    from movate.storage.base import RunSubmissionRecord, TriggerDeliveryRecord
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -1275,6 +1275,27 @@ _MIGRATIONS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_observability_facts_tenant_created "
     "ON observability_facts(tenant_id, created_at DESC)",
+    # ADR 100 D1: clock-aligned cron schedules. Additive nullable columns —
+    # NULL on every pre-ADR-100 interval row (which keeps interval
+    # semantics, byte-for-byte). When cron is set, cadence_seconds persists
+    # as 0 (sentinel behind the model's exactly-one validator), so no
+    # NOT-NULL migration / table rebuild.
+    "ALTER TABLE job_schedules ADD COLUMN cron TEXT",
+    "ALTER TABLE job_schedules ADD COLUMN timezone TEXT",
+    # ADR 100 D2/D3: trigger event→state mapping (event_key/input_map,
+    # input_map JSON-encoded like input_defaults), body-sourced dedup
+    # (dedup_key), and the fire-auth mode. Additive nullable columns — NULL
+    # on every pre-ADR-100 row, which keeps the verbatim-merge /
+    # header-only-dedup / HMAC behavior byte-for-byte (auth_mode NULL reads
+    # back as the "hmac" model default).
+    "ALTER TABLE triggers ADD COLUMN event_key TEXT",
+    "ALTER TABLE triggers ADD COLUMN input_map TEXT",
+    "ALTER TABLE triggers ADD COLUMN dedup_key TEXT",
+    "ALTER TABLE triggers ADD COLUMN auth_mode TEXT",
+    # ADR 100 D4: job provenance ("schedule:<name>" / "trigger:<trigger_id>").
+    # Additive nullable column — NULL on every manual submit and every
+    # pre-ADR-100 row, byte-for-byte the prior behavior.
+    "ALTER TABLE jobs ADD COLUMN origin TEXT",
 ]
 
 
@@ -1946,10 +1967,17 @@ class SqliteProvider:
     # ------------------------------------------------------------------
 
     async def save_job_schedule(self, schedule: JobSchedule) -> None:
-        # Upsert on the (tenant_id, name) primary key.
+        # Upsert on the (tenant_id, name) primary key. Columns are named
+        # explicitly (not positional VALUES) because cron/timezone were
+        # ALTERed in after the table's creation — positional order isn't
+        # stable across fresh-vs-migrated databases.
         await self._db.execute(
             """
-            INSERT INTO job_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO job_schedules (
+                tenant_id, name, kind, target, cadence_seconds, enabled,
+                input, notify_email, created_by, created_at, last_enqueued_at,
+                cron, timezone
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id, name) DO UPDATE SET
                 kind = excluded.kind,
                 target = excluded.target,
@@ -1959,7 +1987,9 @@ class SqliteProvider:
                 notify_email = excluded.notify_email,
                 created_by = excluded.created_by,
                 created_at = excluded.created_at,
-                last_enqueued_at = excluded.last_enqueued_at
+                last_enqueued_at = excluded.last_enqueued_at,
+                cron = excluded.cron,
+                timezone = excluded.timezone
             """,
             (
                 schedule.tenant_id,
@@ -1973,6 +2003,8 @@ class SqliteProvider:
                 schedule.created_by,
                 schedule.created_at.isoformat(),
                 schedule.last_enqueued_at.isoformat() if schedule.last_enqueued_at else None,
+                schedule.cron,
+                schedule.timezone,
             ),
         )
         await self._db.commit()
@@ -2028,10 +2060,17 @@ class SqliteProvider:
     # ------------------------------------------------------------------
 
     async def save_trigger(self, trigger: Trigger) -> None:
-        # Upsert on the (tenant_id, name) management key.
+        # Upsert on the (tenant_id, name) management key. Columns are named
+        # explicitly (not positional VALUES) because the ADR 100 columns were
+        # ALTERed in after the table's creation — positional order isn't
+        # stable across fresh-vs-migrated databases.
         await self._db.execute(
             """
-            INSERT INTO triggers VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO triggers (
+                tenant_id, name, trigger_id, kind, target, secret_hash, salt,
+                input_defaults, enabled, created_by, created_at, last_fired_at,
+                event_key, input_map, dedup_key, auth_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id, name) DO UPDATE SET
                 trigger_id = excluded.trigger_id,
                 kind = excluded.kind,
@@ -2042,7 +2081,11 @@ class SqliteProvider:
                 enabled = excluded.enabled,
                 created_by = excluded.created_by,
                 created_at = excluded.created_at,
-                last_fired_at = excluded.last_fired_at
+                last_fired_at = excluded.last_fired_at,
+                event_key = excluded.event_key,
+                input_map = excluded.input_map,
+                dedup_key = excluded.dedup_key,
+                auth_mode = excluded.auth_mode
             """,
             (
                 trigger.tenant_id,
@@ -2057,6 +2100,10 @@ class SqliteProvider:
                 trigger.created_by,
                 trigger.created_at.isoformat(),
                 trigger.last_fired_at.isoformat() if trigger.last_fired_at else None,
+                trigger.event_key,
+                json.dumps(trigger.input_map) if trigger.input_map is not None else None,
+                trigger.dedup_key,
+                trigger.auth_mode,
             ),
         )
         await self._db.commit()
@@ -2130,6 +2177,36 @@ class SqliteProvider:
         )
         await self._db.commit()
         return cur.rowcount > 0
+
+    async def list_trigger_deliveries(
+        self, trigger_id: str, *, limit: int = 50
+    ) -> list[TriggerDeliveryRecord]:
+        from movate.storage.base import TriggerDeliveryRecord  # noqa: PLC0415
+
+        # ADR 100 D4: the per-trigger delivery ledger. LEFT JOIN so a
+        # delivery whose job row is gone (pruned) still lists, with a NULL
+        # status — the delivery record is the durable fact.
+        async with self._db.execute(
+            """
+            SELECT d.delivery_id, d.job_id, d.created_at, j.status AS job_status
+            FROM trigger_deliveries d
+            LEFT JOIN jobs j ON j.job_id = d.job_id
+            WHERE d.trigger_id = ?
+            ORDER BY d.created_at DESC
+            LIMIT ?
+            """,
+            (trigger_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            TriggerDeliveryRecord(
+                delivery_id=r["delivery_id"],
+                job_id=r["job_id"],
+                created_at=datetime.fromisoformat(r["created_at"]),
+                job_status=r["job_status"],
+            )
+            for r in rows
+        ]
 
     async def get_run_submission(self, tenant_id: str, idempotency_key: str) -> str | None:
         async with self._db.execute(
@@ -3671,8 +3748,8 @@ class SqliteProvider:
                 created_at, claimed_at, completed_at,
                 notify_email, attempt_count, next_retry_at, thread_id,
                 target_version, resume_workflow_run_id, batch_id,
-                trace_context, cancel_requested
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                trace_context, cancel_requested, origin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.job_id,
@@ -3702,6 +3779,8 @@ class SqliteProvider:
                 # pre-cancelled); set later by request_job_cancel for a RUNNING
                 # job.
                 int(job.cancel_requested),
+                # ADR 100 D4: provenance. NULL for manual submits.
+                job.origin,
             ),
         )
         await self._db.commit()
@@ -6000,6 +6079,11 @@ def _row_to_job_schedule(row: aiosqlite.Row) -> JobSchedule:
         last_enqueued_at=(
             datetime.fromisoformat(row["last_enqueued_at"]) if row["last_enqueued_at"] else None
         ),
+        # ADR 100 D1: cron form. init() has run the ALTER by the time we read
+        # here; .get() stays defensive against a row predating the migration —
+        # such a row is an interval schedule, which is exactly None.
+        cron=dict(row).get("cron"),
+        timezone=dict(row).get("timezone"),
     )
 
 
@@ -6022,6 +6106,12 @@ def _row_to_canary_config(row: aiosqlite.Row) -> CanaryConfig:
 
 
 def _row_to_trigger(row: aiosqlite.Row) -> Trigger:
+    # ADR 100 D2/D3 columns. init() has run the ALTERs by the time we read
+    # here; .get() stays defensive against a row predating the migration —
+    # such a row is a verbatim-merge / header-only-dedup / HMAC trigger,
+    # which is exactly the None / "hmac" defaults.
+    as_dict = dict(row)
+    input_map_raw = as_dict.get("input_map")
     return Trigger(
         tenant_id=row["tenant_id"],
         name=row["name"],
@@ -6031,6 +6121,10 @@ def _row_to_trigger(row: aiosqlite.Row) -> Trigger:
         secret_hash=row["secret_hash"],
         salt=row["salt"],
         input_defaults=json.loads(row["input_defaults"]),
+        event_key=as_dict.get("event_key"),
+        input_map=json.loads(input_map_raw) if input_map_raw else None,
+        dedup_key=as_dict.get("dedup_key"),
+        auth_mode=as_dict.get("auth_mode") or "hmac",
         enabled=bool(row["enabled"]),
         created_by=row["created_by"],
         created_at=datetime.fromisoformat(row["created_at"]),
@@ -6191,6 +6285,10 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         # defensive against a row predating the migration (NULL/missing → 0 →
         # False), which is exactly a never-cancelled job.
         cancel_requested=bool(dict(row).get("cancel_requested") or 0),
+        # ADR 100 D4: provenance. .get() stays defensive against a row
+        # predating the migration — such a row is a manual submit, which is
+        # exactly None.
+        origin=dict(row).get("origin"),
     )
 
 

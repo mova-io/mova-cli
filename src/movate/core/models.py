@@ -3430,6 +3430,17 @@ class JobRecord(BaseModel):
     :func:`movate.tracing.continue_trace_context` before starting the job's
     root span (ADR 019, item 32). Additive + JSONB/TEXT column: pre-R2 rows
     read back as ``{}``."""
+    origin: str | None = None
+    """Job provenance (ADR 100 D4): ``"schedule:<name>"`` for a job the
+    scheduler tick enqueued (the schedule's per-tenant handle) or
+    ``"trigger:<trigger_id>"`` for a job the fire endpoint enqueued (the
+    trigger's stable public id — what the deliveries view and webhook URL
+    key off). Stamped by ``build_scheduled_job`` / ``build_triggered_job``;
+    ``None`` (the overwhelming common case) for every manual submit —
+    byte-for-byte the pre-ADR-100 path. Lets ``mdk jobs`` / ``/api/v1/jobs``
+    / Grafana slice trigger-started vs scheduled vs manual runs, and lets an
+    operator walk a dead-lettered job back to what started it. Additive +
+    nullable: pre-ADR-100 rows read back as ``None``."""
 
 
 class BatchRecord(BaseModel):
@@ -3464,6 +3475,32 @@ class BatchRecord(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+def validate_cron_fields(cron: str, timezone: str | None) -> None:
+    """Validate a cron expression + optional IANA timezone (ADR 100 D1).
+
+    Raises :class:`ValueError` with an operator-actionable message on a bad
+    expression or unknown timezone. Shared by the :class:`JobSchedule` model
+    validator and the API submission schema (so a bad cron is a 422 at the
+    HTTP edge, not a 500 from the downstream model).
+    """
+    from datetime import datetime as _dt  # noqa: PLC0415
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    from cronsim import CronSim, CronSimError  # noqa: PLC0415
+
+    try:
+        CronSim(cron, _dt(2020, 1, 1))
+    except CronSimError as exc:
+        raise ValueError(f"invalid cron expression {cron!r}: {exc}") from exc
+    if timezone is not None:
+        try:
+            ZoneInfo(timezone)
+        except Exception as exc:
+            raise ValueError(
+                f"invalid timezone {timezone!r}; use an IANA name like America/New_York."
+            ) from exc
+
+
 class JobSchedule(BaseModel):
     """A per-(tenant, name) cadence for cron-driven agent/workflow runs (ADR 017 D2).
 
@@ -3483,16 +3520,20 @@ class JobSchedule(BaseModel):
     schedule, and existing agent/workflow/job behaviour is unchanged for
     everything without one.
 
-    The cadence is an **interval in seconds** (``cadence_seconds``) — a
-    portable primitive any cron can satisfy (run the tick every N minutes;
-    the tick only enqueues schedules that are actually due). A richer
-    cron-expression cadence is a documented follow-up; the interval covers
-    the D2 "run on a cadence" requirement without a new dependency.
+    The cadence is either an **interval in seconds** (``cadence_seconds``) —
+    a portable primitive any cron can satisfy (run the tick every N minutes;
+    the tick only enqueues schedules that are actually due) — or, since
+    ADR 100 D1, a clock-aligned **cron expression** (``cron`` + optional IANA
+    ``timezone``). Exactly one of the two per schedule (model validator
+    below).
 
     **Idempotency.** The tick stamps ``last_enqueued_at`` and a schedule is
-    "due" only once ``now - last_enqueued_at >= cadence_seconds``, so
+    "due" only once ``now - last_enqueued_at >= cadence_seconds`` (interval
+    form) or once the next cron occurrence after ``last_enqueued_at`` (or
+    ``created_at`` for a never-fired schedule) is ``<= now`` (cron form), so
     running the tick more often than the cadence never double-enqueues
-    inside a window.
+    inside a window — and a missed cron window yields ONE catch-up run,
+    never a backfill storm.
 
     ``(tenant_id, name)`` is unique — one active schedule per handle per
     tenant. Re-running ``set`` upserts (overwrites) the row.
@@ -3514,11 +3555,24 @@ class JobSchedule(BaseModel):
     target: str
     """Agent name or workflow name to run — pairs with ``kind`` exactly as
     ``JobRecord.target`` does."""
-    cadence_seconds: int = Field(ge=1)
+    cadence_seconds: int = Field(default=0, ge=0)
     """How often, in seconds, to enqueue a job for this schedule. The tick
     enqueues when ``now - last_enqueued_at >= cadence_seconds`` (or when
-    ``last_enqueued_at`` is null — first tick). An interval (not a cron
-    expression) keeps the tick trivially portable and idempotent."""
+    ``last_enqueued_at`` is null — first tick). Mutually exclusive with
+    ``cron`` (ADR 100 D1): a cron schedule persists ``0`` here as a sentinel
+    (the bound is ``ge=0`` behind the exactly-one validator below, so
+    neither storage backend needs a NOT-NULL migration); an interval
+    schedule must be ``>= 1``."""
+    cron: str | None = None
+    """Optional 5-field cron expression (ADR 100 D1) for clock-aligned
+    schedules ("07:00 Mon-Fri") that an interval can't express. Evaluated
+    with ``cronsim``; validated at construction. Exactly one of ``cron`` |
+    ``cadence_seconds`` per schedule. ``None`` (the pre-ADR-100 common
+    case) → interval semantics, byte-for-byte today's behavior."""
+    timezone: str | None = None
+    """Optional IANA timezone name (e.g. ``America/New_York``) the ``cron``
+    expression is evaluated in. ``None`` → UTC. Only meaningful with
+    ``cron`` — rejected on an interval schedule (validator below)."""
     enabled: bool = True
     """Soft on/off. A disabled schedule is retained (history + quick
     re-enable) but never enqueues. ``mdk schedule clear`` deletes the
@@ -3558,6 +3612,36 @@ class JobSchedule(BaseModel):
                 "scheduling target."
             )
         return v
+
+    @model_validator(mode="after")
+    def _exactly_one_cadence(self) -> JobSchedule:
+        """Exactly one of ``cron`` | ``cadence_seconds`` (ADR 100 D1).
+
+        ``cadence_seconds=0`` is the persisted sentinel for "cron-driven" —
+        valid only when ``cron`` is set. ``timezone`` is part of the cron
+        form and is rejected without it. The cron expression and timezone
+        are validated here (``cronsim`` parse + ``zoneinfo`` lookup) so a
+        bad schedule fails at write time, not silently at the first tick.
+        """
+        if self.cron is not None:
+            if self.cadence_seconds != 0:
+                raise ValueError(
+                    "JobSchedule accepts exactly one of cron | cadence_seconds; "
+                    "got both. Drop --cadence to use the cron expression."
+                )
+            validate_cron_fields(self.cron, self.timezone)
+        else:
+            if self.cadence_seconds < 1:
+                raise ValueError(
+                    "JobSchedule requires exactly one of cron | cadence_seconds "
+                    "(cadence_seconds must be >= 1 when cron is unset)."
+                )
+            if self.timezone is not None:
+                raise ValueError(
+                    "JobSchedule.timezone is only valid with a cron expression; "
+                    "an interval cadence has no timezone."
+                )
+        return self
 
 
 class Trigger(BaseModel):
@@ -3627,6 +3711,39 @@ class Trigger(BaseModel):
     the enqueued job's ``input`` (the event body wins on key collisions).
     Lets an operator pin fixed fields (e.g. ``{"source": "zendesk"}``) while
     the event supplies the per-event payload."""
+    event_key: str | None = None
+    """ADR 100 D2: nest the raw event body under this single state key
+    (e.g. ``event``) instead of merging it at top level — the cheapest safe
+    default for "give the workflow the whole payload" without state-key
+    collisions. ``None`` (every pre-ADR-100 trigger) → the verbatim
+    top-level merge, byte-for-byte today's behavior (unless ``input_map``
+    is also unset)."""
+    input_map: dict[str, str] | None = None
+    """ADR 100 D2: declared field extraction — output state key → dotted
+    path into the event body (e.g. ``{"work_item_id": "resource.id"}``),
+    resolved with the same fail-soft semantics as the decision node's
+    ``_read_field`` (ADR 094): a missing path means the key is **omitted**
+    (the workflow's state schema then reports exactly what's missing),
+    never an exception. No templates, no expressions, no eval. ``None`` →
+    no extraction."""
+    dedup_key: str | None = None
+    """ADR 100 D2: dotted path into the event body used as the delivery id
+    when the ``X-Movate-Delivery-Id`` header is absent — what makes ADO
+    Service Hooks replays safe (they carry their event id at body path
+    ``id`` and cannot send custom per-event headers). The resolved value is
+    stringified and capped at ``DELIVERY_ID_MAX_LEN``; unresolvable → no
+    dedup (today's behavior). ``None`` → header-only dedup."""
+    auth_mode: Literal["hmac", "token"] = "hmac"
+    """ADR 100 D3: how the fire endpoint authenticates the caller.
+    ``"hmac"`` (the default — today's behavior) verifies the body-bound
+    ``X-Movate-Signature`` HMAC, with ``X-Hub-Signature-256`` accepted as a
+    GitHub-compat alias when the movate header is absent. ``"token"``
+    verifies a static ``X-Movate-Trigger-Token: <secret>`` header
+    (recomputing ``hash_secret(token, salt)`` + constant-time compare
+    against the stored ``secret_hash``) — for senders that cannot HMAC (ADO
+    Service Hooks' static-header support). Explicitly weaker: the secret
+    travels on the wire (TLS-protected) and a captured request is
+    replayable until rotation — pair it with ``dedup_key``."""
     enabled: bool = True
     """Soft on/off. A disabled trigger is retained (history + quick
     re-enable) but the fire endpoint treats it as absent (404, no existence
