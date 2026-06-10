@@ -19,7 +19,9 @@ existing agent/workflow/job behaviour is unchanged otherwise.
 
 Subcommands:
 
-* ``set <target> --kind agent|workflow --cadence <dur>`` — create / update.
+* ``set <target> --kind agent|workflow --cadence <dur>`` — create / update
+  (or ``--cron "<expr>" [--tz <iana>]`` for clock-aligned schedules,
+  ADR 100 D1; exactly one of the two).
 * ``list`` — show this project's schedules.
 * ``clear <name>`` — remove a schedule by its handle.
 """
@@ -91,10 +93,23 @@ def set_schedule(
         help="Agent or workflow name to run on the cadence.",
         shell_complete=complete_agent_path,
     ),
-    cadence: str = typer.Option(
-        ...,
+    cadence: str | None = typer.Option(
+        None,
         "--cadence",
-        help="How often to run: int seconds or a duration (30m, 6h, 1d).",
+        help="How often to run: int seconds or a duration (30m, 6h, 1d). "
+        "Exactly one of --cadence | --cron.",
+    ),
+    cron: str | None = typer.Option(
+        None,
+        "--cron",
+        help='Clock-aligned 5-field cron expression (e.g. "0 7 * * 1-5"). '
+        "Exactly one of --cadence | --cron (ADR 100 D1).",
+    ),
+    tz: str | None = typer.Option(
+        None,
+        "--tz",
+        help="IANA timezone the --cron expression runs in (e.g. America/New_York). "
+        "Default UTC; only valid with --cron.",
     ),
     kind: JobKind = typer.Option(
         JobKind.AGENT,
@@ -133,9 +148,15 @@ def set_schedule(
       $ mdk schedule set returns-pipeline -k workflow --cadence 1d \\
           --name nightly-returns --notify-email me@co.com
 
+      [dim]# Clock-aligned: a 07:00 Mon-Fri briefing in New York time[/dim]
+      $ mdk schedule set exec-briefing -k workflow --cron "0 7 * * 1-5" \\
+          --tz America/New_York
+
     Drive the tick from cron: [bold]mdk scheduler-tick[/bold] every few
     minutes (Azure: a Container Apps Job). The tick only enqueues schedules
-    that are actually due, and drains eval schedules too.
+    that are actually due, and drains eval schedules too. A --cron
+    schedule fires at most once per matched window; precision is bounded
+    by how often the tick runs.
     """
     if kind not in (JobKind.AGENT, JobKind.WORKFLOW):
         err_console.print(
@@ -144,11 +165,23 @@ def set_schedule(
         )
         raise typer.Exit(code=2)
 
-    try:
-        cadence_seconds = _parse_cadence(cadence)
-    except ValueError as exc:
-        err_console.print(f"[red]✗[/red] {exc}")
-        raise typer.Exit(code=2) from None
+    if (cadence is None) == (cron is None):
+        err_console.print(
+            "[red]✗[/red] exactly one of --cadence | --cron is required "
+            '(e.g. --cadence 6h, or --cron "0 7 * * 1-5")'
+        )
+        raise typer.Exit(code=2)
+    if tz is not None and cron is None:
+        err_console.print("[red]✗[/red] --tz is only valid together with --cron")
+        raise typer.Exit(code=2)
+
+    cadence_seconds = 0
+    if cadence is not None:
+        try:
+            cadence_seconds = _parse_cadence(cadence)
+        except ValueError as exc:
+            err_console.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(code=2) from None
 
     try:
         payload = _coerce_input(input_arg) if input_arg is not None else {}
@@ -159,25 +192,34 @@ def set_schedule(
     target_name = _resolve_target_name(target)
     schedule_name = name or target_name
 
-    schedule = JobSchedule(
-        tenant_id=_LOCAL_TENANT,
-        name=schedule_name,
-        kind=kind,
-        target=target_name,
-        cadence_seconds=cadence_seconds,
-        enabled=not disabled,
-        input=payload,
-        notify_email=notify_email,
-    )
+    try:
+        schedule = JobSchedule(
+            tenant_id=_LOCAL_TENANT,
+            name=schedule_name,
+            kind=kind,
+            target=target_name,
+            cadence_seconds=cadence_seconds,
+            cron=cron,
+            timezone=tz,
+            enabled=not disabled,
+            input=payload,
+            notify_email=notify_email,
+        )
+    except ValueError as exc:
+        # A bad cron expression / timezone fails at write time with the
+        # model validator's actionable message, not silently at the tick.
+        err_console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=2) from None
     asyncio.run(_save(schedule))
 
     if output_format == Report.JSON:
         console.print_json(schedule.model_dump_json())
         return
     state = "enabled" if schedule.enabled else "disabled (dormant)"
+    when = f"cron '{cron}' ({tz or 'UTC'})" if cron else f"every {_humanize(cadence_seconds)}"
     console.print(
         f"[green]✓[/green] schedule [bold]{schedule_name}[/bold] set: "
-        f"{kind.value} [bold]{target_name}[/bold] every {_humanize(cadence_seconds)} ({state})"
+        f"{kind.value} [bold]{target_name}[/bold] {when} ({state})"
     )
     console.print(
         "[dim]drive it from cron:[/dim] [bold]mdk scheduler-tick[/bold] "
@@ -207,11 +249,14 @@ def list_schedules(
     table.add_column("enabled")
     table.add_column("last enqueued")
     for s in schedules:
+        cadence_cell = (
+            f"cron {s.cron} ({s.timezone or 'UTC'})" if s.cron else _humanize(s.cadence_seconds)
+        )
         table.add_row(
             s.name,
             s.kind.value,
             s.target,
-            _humanize(s.cadence_seconds),
+            cadence_cell,
             "yes" if s.enabled else "no",
             s.last_enqueued_at.isoformat(timespec="seconds") if s.last_enqueued_at else "never",
         )

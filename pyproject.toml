@@ -76,6 +76,15 @@ dependencies = [
     # it requires Poppler — a heavier system dependency than Tesseract.
     "pytesseract>=0.3,<1",
     "pillow>=10.0",
+    # Cron-expression evaluation for JobSchedule.cron (ADR 100 D1).
+    # BSD-3-Clause (ADR 100 said MIT; the resolved wheel reports
+    # BSD-3-Clause — equally permissive, gate-verified), zero-dependency,
+    # single-module. Hand-rolling cron arithmetic (DST
+    # transitions, month-end wrap) is a known foot-gun — the parser is the
+    # well-tested commodity here, the hand-roll is the risk (the opposite
+    # trade from ADR 094 D2, argued in ADR 100). Passes
+    # scripts/check_licenses.py --strict.
+    "cronsim>=2.6,<3",
 ]
 
 [project.optional-dependencies]

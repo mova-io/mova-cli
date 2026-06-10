@@ -1,0 +1,4 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "expense_text":{"type":"string"},"amount":{"type":"number"},
+  "tier":{"type":"string"},"decision":{"type":"string"},
+  "erp_result":{"type":"string"},"summary":{"type":"string"}}}

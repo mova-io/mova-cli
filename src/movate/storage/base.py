@@ -61,6 +61,7 @@ from movate.core.models import (
     JobStatus,
     KbChunk,
     KbChunkWithScore,
+    ObservabilityFact,
     Project,
     ProjectKbMode,
     ProjectMember,
@@ -96,6 +97,23 @@ class EvalCommitResult:
     dataset_path: str
     cases_added: int
     judge_yaml_updated: bool
+
+
+@dataclass(frozen=True)
+class TriggerDeliveryRecord:
+    """One trigger delivery joined to its job's current status (ADR 100 D4).
+
+    Returned by :meth:`StorageProvider.list_trigger_deliveries` — the
+    per-trigger delivery ledger behind ``GET /api/v1/triggers/{id}/deliveries``.
+    ``job_status`` is the joined ``jobs.status`` at read time, or ``None``
+    when the job row is gone (e.g. pruned) — the delivery record itself is
+    the durable fact.
+    """
+
+    delivery_id: str
+    job_id: str
+    created_at: datetime
+    job_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -261,6 +279,48 @@ class StorageProvider(Protocol):
         to find runs awaiting a human signal — ADR 017 D5). ``tenant_id=None``
         returns runs across all tenants — operator tooling only; never exposed
         on the HTTP API.
+        """
+
+    # ------------------------------------------------------------------
+    # Observability facts (ADR 096 — unified reporting surface)
+    #
+    # Additive, derived: one denormalized row per terminal execution
+    # event, written fail-soft at the existing metering edges. ``runs`` /
+    # ``workflow_runs`` stay authoritative; ``fact_id = "<kind>:<source_id>"``
+    # makes every write an idempotent upsert so the table can be rebuilt
+    # from the authoritative rows at any time. Nothing inside mdk's
+    # execution paths reads facts — they exist for the platform's
+    # ``GET /api/v1/observability/facts`` projection (and direct SQL).
+    # ------------------------------------------------------------------
+
+    async def save_observability_fact(self, fact: ObservabilityFact) -> None:
+        """Idempotent upsert keyed by ``fact_id``.
+
+        Re-saving the same ``fact_id`` (a retried job segment, a paused
+        workflow later reaching its terminal state, a backfill re-run)
+        updates the row in place — latest write wins, never a duplicate.
+        Callers at the execution edges wrap this fail-soft: a fact-write
+        failure must log and never fail the run (ADR 096 D3).
+        """
+
+    async def list_observability_facts(
+        self,
+        *,
+        tenant_id: str,
+        kind: str | None = None,
+        workflow: str | None = None,
+        agent: str | None = None,
+        status: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[ObservabilityFact]:
+        """List facts newest-first, tenant-scoped, optionally filtered.
+
+        ``tenant_id`` is **required** (not optional) — facts are the
+        platform's integration surface and are always read per-tenant;
+        there is no cross-tenant list mode. Filters AND together:
+        ``kind`` narrows to ``run`` / ``workflow_run``; ``since`` bounds
+        by ``created_at >= since``.
         """
 
     # ------------------------------------------------------------------
@@ -473,6 +533,19 @@ class StorageProvider(Protocol):
         a single winner rather than recording two jobs. Returns ``True`` if
         this call inserted the row, ``False`` if a row already existed (the
         existing ``job_id`` is preserved — never overwritten).
+        """
+
+    async def list_trigger_deliveries(
+        self, trigger_id: str, *, limit: int = 50
+    ) -> list[TriggerDeliveryRecord]:
+        """Recent deliveries for one trigger, newest first (ADR 100 D4).
+
+        Joins each delivery to its job's current status (``job_status`` is
+        ``None`` when the job row is gone). Keyed by the public
+        ``trigger_id``; the HTTP layer resolves the trigger and enforces the
+        tenant check before calling (a ``trigger_id`` is tenant-bound, so
+        the rows are implicitly tenant-scoped). ``limit`` callers cap at the
+        API edge (≤ 200).
         """
 
     # ------------------------------------------------------------------

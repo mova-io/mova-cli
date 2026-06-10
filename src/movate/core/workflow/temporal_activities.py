@@ -377,53 +377,121 @@ async def call_skill_activity(
     ref: str,
     state: dict[str, Any],
     run_id: str,
+    input_map: dict[str, Any] | None = None,
+    output_key: str | None = None,
 ) -> dict[str, Any]:
-    """SKILL node → dispatch the skill through ``SkillBackend``; return its output.
+    """TOOL/SKILL node → dispatch the skill; return the state DELTA (ADR 097).
 
     Compiler contract (``_emit_skill_node``): the workflow does
-    ``state.update(<result>)``, so we return the skill's output dict.
+    ``state.update(<result>)``, so we return the skill's contribution to state
+    — the raw output dict by default, or ``{output_key: <output>}`` when the
+    node namespaces it. Mapping is applied HERE (activity-side) via the shared
+    pure helpers in :mod:`movate.core.workflow.tool`, the SAME two functions
+    the native runner's ``_run_tool`` uses — so the backends cannot disagree
+    on what the skill saw or what state became (ADR 097 D3).
 
     ADR 054 D3: dispatches through the SAME
     :func:`movate.core.skill_backend.base.dispatch_skill` the Executor's
     tool-use loop uses — no second skill path. ``ref`` is the skill directory
-    (the compiler emits ``node.ref``; for a SKILL/TOOL IR node that is the
-    skill dir, resolved exactly like the agent loader resolves an agent dir).
-    The skill input is the current ``state`` narrowed to the skill's input
-    schema, same projection rule as agents.
+    (the compiler resolves the node's skill NAME to an absolute dir at compile
+    time and bakes it into ``node.ref`` — ADR 097 D2).
 
-    Note: standalone SKILL/TOOL workflow nodes are a v1.1 IR type the spec
-    validator does not yet accept (``ir.py`` — TOOL is declared but rejected),
-    so this path is reachable in Phase 1 only via a hand-built graph or a
-    future IR. It is wired against the real ``dispatch_skill`` so it lights up
-    for free when TOOL nodes ship — no stub.
+    The two trailing args are **additive + defaulted** (appended, never
+    reordered — the lockstep rule above): an old 4-arg call (hand-built graph,
+    already-compiled workflow) behaves byte-for-byte as before — no map ⇒ the
+    input-schema projection, no ``output_key`` ⇒ the raw output dict.
+
+    ADR 097 also closes two latent gaps this activity had:
+
+    * it now honors the skill's declared ``timeout_call_ms`` (previously the
+      hard-coded 30 s context default);
+    * it now enforces the SKILL governance gate / ``skill_policy`` from the
+      :class:`ActivityContext` before dispatch — same semantics as the native
+      path (ADR 093 shadow in warn-mode + the authoritative ``SkillPolicy``
+      deny), via the same :meth:`Executor.govern_skill_dispatch`. Previously
+      it checked neither (the gate lived only in ``Executor.execute``, which a
+      standalone skill call never enters).
+
+    Failure (D4): a :class:`SkillError` is re-raised as a ``RuntimeError``
+    naming node, skill, and error type — mirroring ``call_agent_activity``'s
+    failure surfacing — so the compiler-emitted retry policy retries it and an
+    exhausted failure is attributable in workflow history.
     """
+    # Importing the backend modules registers them with the dispatch registry
+    # (the Executor tool-use loop's exact pattern) — a worker that never ran an
+    # agent's tool-use loop can still dispatch a standalone TOOL node.
+    from movate.core.skill_backend import agent as _agent_backend  # noqa: F401, PLC0415
+    from movate.core.skill_backend import http as _http_backend  # noqa: F401, PLC0415
+    from movate.core.skill_backend import mcp as _mcp_backend  # noqa: F401, PLC0415
+    from movate.core.skill_backend import python as _python_backend  # noqa: F401, PLC0415
+    from movate.core.skill_backend import workflow as _workflow_backend  # noqa: F401, PLC0415
     from movate.core.skill_backend.base import (  # noqa: PLC0415
+        SkillError,
         SkillExecutionContext,
         dispatch_skill,
     )
     from movate.core.skill_loader import load_skill  # noqa: PLC0415
+    from movate.core.workflow.tool import (  # noqa: PLC0415
+        build_skill_input,
+        merge_tool_output,
+    )
 
     ctx = _get_context()
     skill = load_skill(ref)
-
-    # Narrow state to the skill's declared input (same projection rule as
-    # agents) so the skill sees a contract-shaped input, not the whole state.
-    props = skill.input_schema.get("properties")
-    if isinstance(props, dict) and props:
-        skill_input = {k: state[k] for k in props if k in state}
-    else:
-        skill_input = dict(state)
-
     tenant_id = _resolve_tenant_id(ctx, state)
-    skill_ctx = SkillExecutionContext(
-        run_id=run_id,
+
+    # Governance SKILL gate (ADR 097 D5 / ADR 093 warn-mode posture). The
+    # per-activity Executor mirrors the agent/gate/judge activities' wiring
+    # (ActivityContext policies → Executor), so the durable path enforces the
+    # SAME gate the native runner's _run_tool applies. A deny raises
+    # PolicyViolationError → the activity fails, attributable in history.
+    _executor_for(ctx, state).govern_skill_dispatch(
+        skill_name=skill.spec.name,
+        side_effects=skill.spec.side_effects,
+        agent=f"workflow-node:{node_id}",
         tenant_id=tenant_id,
-        mock=bool(state.get("mock")),
-        storage=ctx.storage,
-        tracer=ctx.tracer,
     )
-    output = await dispatch_skill(skill, skill_input, skill_ctx)
-    return dict(output)
+
+    # Input via the shared helper: explicit map when the node declared one,
+    # else the input-schema projection — byte-for-byte the old behavior.
+    skill_input = build_skill_input(state, input_map, skill.input_schema.get("properties"))
+
+    # Observability (ADR 097 D7): the same `workflow.tool` span the native
+    # runner emits, so both backends produce one trace shape. The durable
+    # control-flow record is Temporal history; this is the cross-store span.
+    span = ctx.tracer.start_span(
+        "workflow.tool",
+        {
+            "workflow.node_id": node_id,
+            "tool.skill": skill.spec.name,
+            "tool.side_effects": str(getattr(skill.spec.side_effects, "value", "")),
+        },
+    )
+    try:
+        skill_ctx = SkillExecutionContext(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            # Latent-gap fix (ADR 097 D3): honor the skill's own per-call
+            # timeout; fall back to the context default it always had.
+            call_ms_budget=skill.spec.timeout_call_ms or 30_000,
+            mock=bool(state.get("mock")),
+            storage=ctx.storage,
+            tracer=ctx.tracer,
+            parent_span=span,
+        )
+        try:
+            output = await dispatch_skill(skill, skill_input, skill_ctx)
+        except SkillError as exc:
+            ctx.tracer.set_attribute(span, "tool.outcome", "error")
+            ctx.tracer.set_attribute(span, "tool.error_type", exc.type.value)
+            raise RuntimeError(
+                f"tool node {node_id!r} skill {skill.spec.name!r} ({ref}) failed: "
+                f"[{exc.type.value}] {exc.message}"
+            ) from exc
+        ctx.tracer.set_attribute(span, "tool.outcome", "success")
+        return merge_tool_output(dict(output), output_key)
+    finally:
+        ctx.tracer.end_span(span)
 
 
 def _resolve_classifier_ref(classifier_agent: str, workflow_dir: str) -> str:
@@ -644,6 +712,17 @@ async def call_human_activity(
     )
     await ctx.storage.save_workflow_run(record)
 
+    # ADR 096 D3 — pause inventory lands in observability_facts too, so the
+    # platform's facts view shows runs awaiting a human without joining
+    # workflow_runs. Fail-soft + lazy import (the helper logs and never
+    # raises; the pause record above is already durable).
+    from movate.runtime.facts import (  # noqa: PLC0415
+        fact_from_workflow_run,
+        write_fact_failsoft,
+    )
+
+    await write_fact_failsoft(ctx.storage, fact_from_workflow_run(record))
+
     # Escalate to the approval channel (ADR 083) — parity with the native
     # runner's HUMAN-pause branch. Fire-and-forget + never raises (side effects
     # in activities, ADR 054 D10; the pause is already persisted). No-op until
@@ -709,6 +788,18 @@ async def persist_workflow_result_activity(
         runtime="temporal",
     )
     await ctx.storage.save_workflow_run(record)
+
+    # ADR 096 D3 — the terminal fact for a durable run is written here, at
+    # the same persist edge as the record (the detached-HITL path never
+    # returns through the dispatch edge, so dispatch can't cover it). The
+    # fact_id upsert overwrites any prior PAUSED fact under the same id.
+    # Fail-soft + lazy import: a fact hiccup never fails the terminal persist.
+    from movate.runtime.facts import (  # noqa: PLC0415
+        fact_from_workflow_run,
+        write_fact_failsoft,
+    )
+
+    await write_fact_failsoft(ctx.storage, fact_from_workflow_run(record))
 
     # Operational signal (ADR 082): durable workflows never hit the native
     # dispatch edge that powers mdk.jobs.completed, so emit a first-class

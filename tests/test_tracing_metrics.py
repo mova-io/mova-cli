@@ -30,7 +30,7 @@ from movate.tracing import (
     record_workflow_completed,
     record_workflow_duration,
 )
-from movate.tracing.metrics import _State
+from movate.tracing.metrics import _State, record_governance_decision
 
 
 def _otel_installed() -> bool:
@@ -196,6 +196,37 @@ def test_record_job_completed_emits_counter_and_histogram() -> None:
     assert ("eval", "dead_letter") in dur_attrs
     for dp in metrics["mdk.job.duration_ms"]:
         assert "tenant" not in dp.attributes
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not _otel_installed(), reason="needs OTel SDK")
+def test_record_governance_decision_emits_counter_with_attrs() -> None:
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader  # noqa: PLC0415
+
+    reader = InMemoryMetricReader()
+    init_metrics(reader=reader)
+    assert metrics_mod._state.governance_decisions is not None  # instrument built
+
+    # A would-be deny recorded in warn mode (the shadow rollout signal) + an
+    # enforced deny + an allow — all four attrs ride along.
+    record_governance_decision(kind="cost", effect="warn", mode="warn", tenant_id="t1")
+    record_governance_decision(kind="model", effect="deny", mode="enforce", tenant_id="t1")
+    record_governance_decision(kind="runtime", effect="allow", mode="warn", tenant_id="t2")
+
+    metrics = _collect(reader)
+    assert "mdk.governance.decisions" in metrics
+    seen = {
+        (
+            dp.attributes["kind"],
+            dp.attributes["effect"],
+            dp.attributes["mode"],
+            dp.attributes["tenant"],
+        ): dp.value
+        for dp in metrics["mdk.governance.decisions"]
+    }
+    assert seen[("cost", "warn", "warn", "t1")] == 1
+    assert seen[("model", "deny", "enforce", "t1")] == 1
+    assert seen[("runtime", "allow", "warn", "t2")] == 1
 
 
 @pytest.mark.unit

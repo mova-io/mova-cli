@@ -769,7 +769,8 @@ def test_validate_linear_rejects_conditional_edges() -> None:
 
 @pytest.mark.unit
 def test_validate_linear_rejects_non_agent_nodes() -> None:
-    # TOOL is still a rejected node type (ADR 017 D5 only un-gated HUMAN).
+    # FUNCTION is still a rejected node type (TOOL was un-gated by ADR 097,
+    # HUMAN by ADR 017 D5; FUNCTION/SUB_WORKFLOW remain reserved).
     g = WorkflowGraph(
         name="demo",
         version="0.1.0",
@@ -778,7 +779,7 @@ def test_validate_linear_rejects_non_agent_nodes() -> None:
         entrypoint="a",
         nodes={
             "a": WorkflowNode(id="a", type=NodeType.AGENT, ref="/x"),
-            "b": WorkflowNode(id="b", type=NodeType.TOOL, ref="/y"),
+            "b": WorkflowNode(id="b", type=NodeType.FUNCTION, ref="/y"),
         },
         edges=[WorkflowEdge(from_id="a", to_id="b")],
         workflow_dir=Path("/"),

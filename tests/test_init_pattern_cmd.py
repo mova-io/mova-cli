@@ -28,7 +28,7 @@ from movate.cli.main import app
 
 runner = CliRunner(mix_stderr=False)
 
-WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
+WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation", "expense-approval"]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 
 # A unified mock response: every node's required output key + a router `label`.
