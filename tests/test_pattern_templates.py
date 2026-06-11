@@ -62,6 +62,8 @@ ALL_PATTERNS = [
     "employee-onboarding",
     "incident-response",
     "cross-system-action",
+    "executive-briefing",
+    "ops-center",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

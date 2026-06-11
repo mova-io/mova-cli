@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"window":{"type":"string"},"summary":{"type":"string"},"failure_count":{"type":"integer"},"top_risks":{"type":"array"},"decision":{"type":"string"}}}

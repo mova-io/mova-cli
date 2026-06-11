@@ -382,6 +382,18 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Coordinated multi-system action with an audit trail (runtime: temporal). A descriptive plan agent feeds FOUR deterministic TOOL nodes in a FIXED order — CRM (salesforce) → ERP (sap) → ticket (servicenow) → email — each recording its own auditable ledger row; the order guarantee is structural (a strict sequential chain, one activity at a time), and an audit-summary agent writes the one record naming all four references (ADR 097).",  # noqa: E501
         "plan → TOOL crm-update → TOOL erp-update → TOOL create-ticket → TOOL send-email → audit-summary",  # noqa: E501
     ),
+    "executive-briefing": (
+        "pattern_executive_briefing",
+        True,
+        "Scheduled multi-source executive digest (runtime: temporal), CRON-BORN per ADR 100 (mdk schedule set --cron). A SEQUENTIAL chain of two TOOL nodes (entrypoint fan-out is not available for TOOL nodes) runs the workflow-local sim-gather-metrics / sim-gather-incidents python skills (auditable gather ledger rows, no network IO); the ONE composing digest agent writes the briefing strictly from the gathered results and emits a risk_count a DECISION node routes — risky briefings escalate via flag, clean ones file via archive (ADR 094/097/100).",  # noqa: E501
+        "TOOL gather-metrics → TOOL gather-incidents → digest → DECISION(risk_count) → {flag | archive}",  # noqa: E501
+    ),
+    "ops-center": (
+        "pattern_ops_center",
+        True,
+        "AI ops-center daily summary over the unified observability reporting surface (runtime: temporal, ADR 096). A fetch-facts TOOL node returns canned observability_facts-shaped rows (echoing the real GET /api/v1/observability/facts endpoint it would query — never network IO); the ONE summarize agent counts totals/failures/top risks strictly from the rows; a DECISION node pages a HUMAN gate on failure_count > 0 (ack → report, fallback report — fail-open: a page can delay the daily report, never kill it), clean windows report directly (ADR 094/096/097/098/099).",  # noqa: E501
+        "TOOL fetch-facts → summarize → DECISION(failure_count) → {[HUMAN page ack] → report | report}",  # noqa: E501
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

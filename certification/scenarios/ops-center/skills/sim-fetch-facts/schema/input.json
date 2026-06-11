@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"window":{"type":"string"},"profile":{"type":"string","enum":["steady","degraded"]},"facts_endpoint":{"type":"string"},"run_id":{"type":"string"}}}

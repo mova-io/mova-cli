@@ -1,0 +1,2 @@
+{"input": {"window": "24h", "profile": "degraded"}, "expected": {"daily_report": "2 failures in the window (a pii-detection workflow SkillError and an erp-poster timeout with a governance warn); the on-call acknowledged the page."}}
+{"input": {"window": "24h", "profile": "steady"}, "expected": {"daily_report": "A clean 24h window: every recorded run succeeded, 0 failures, no page sent."}}

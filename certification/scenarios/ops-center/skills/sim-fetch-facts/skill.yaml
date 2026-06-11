@@ -1,0 +1,37 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-fetch-facts
+version: 0.1.0
+description: >-
+  Simulate the ops-center facts pull: returns canned, deterministic
+  observability_facts-shaped rows (the same flat columns
+  GET /api/v1/observability/facts serves — ADR 096) keyed by the `profile`
+  knob (steady | degraded; missing → steady) and records one auditable
+  `{system: observability, action: fetch_facts}` row to the shared
+  sim_side_effects ledger (same DB MDK itself uses). Accepts the real facts
+  endpoint as an optional `facts_endpoint` input but NEVER does network IO —
+  it echoes the endpoint it would have queried in `facts_source`.
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `sim-fetch-facts.impl`
+  imports from the baked workflows/ tree without certification/ being
+  present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-fetch-facts.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - observability
+  - simulation
+  - certification

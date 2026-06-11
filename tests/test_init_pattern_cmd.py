@@ -54,6 +54,8 @@ WORKFLOW_PATTERNS = [
     "employee-onboarding",
     "incident-response",
     "cross-system-action",
+    "executive-briefing",
+    "ops-center",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 

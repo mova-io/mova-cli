@@ -1,0 +1,2 @@
+{"input": {"period": "daily", "profile": "degraded"}, "expected": {"escalation": "Escalated: success rate below the 0.95 floor, spend over budget, and incidents INC-4102/INC-4105 open."}}
+{"input": {"period": "daily", "profile": "steady"}, "expected": {"archive_note": "Filed with no risk flags: a clean day inside budget with zero open incidents."}}
