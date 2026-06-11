@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: failed
+version: 0.1.0
+description: >-
+  Fail-safe notification when the provider check could not confirm a healthy
+  result — the decision node's defensive default (no certification case
+  routes here; a flaky-call failure surfaces as the activity retry/error).
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

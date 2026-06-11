@@ -316,6 +316,24 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Multi-agent business process under the bounded SUPERVISOR primitive (runtime: temporal, ADR 092 D4). A process-manager agent delegates across a FIXED specialist allowlist (research/pricing/compliance — calibrated sims with JSON contracts) in a loop hard-capped at max_delegations, then a proposal agent composes the deliverable and notify confirms it — managerial delegation WITH structural bounds, not a swarm.",  # noqa: E501
         "SUPERVISOR(manager ⇒ research|pricing|compliance, ≤4) → proposal → notify",
     ),
+    "external-api-failure": (
+        "pattern_external_api_failure",
+        True,
+        "Retries + fallback provider with OBSERVABLE activity retries (runtime: temporal). A flaky TOOL entrypoint records one ledger attempt row per invocation and raises while attempts <= fail_times — so ledger rows = Temporal retry attempts (max 3); transient failures recover via the durable retry (the fallback provider serves them), exhaustion fails the workflow loudly with zero downstream record rows (ADR 094/097/098).",  # noqa: E501
+        "TOOL flaky-call ⟳3 → DECISION(provider_ok) → shared TOOL record → notify | failed",
+    ),
+    "partial-failure-recovery": (
+        "pattern_partial_failure_recovery",
+        True,
+        "Three-step pipeline whose flaky middle step proves completed steps are NEVER re-executed on retry (runtime: temporal). step1/step3 share ONE parameterized sim-step skill (ADR 097 D1 input literals + output_key); the flaky step2 records an attempt row per invocation and succeeds on the durable retry — the ledger shows step1 exactly once next to step2's two attempts (ADR 097/098).",  # noqa: E501
+        "TOOL step-one → TOOL step-two ⟳3 → TOOL step-three → notify",
+    ),
+    "long-running-research": (
+        "pattern_long_running_research",
+        True,
+        "Scheduled incremental research — the ADR 100 D1 cron-schedule shape (runtime: temporal). The schedule is the durable outer loop, each fire runs ONE idempotent increment: a research agent drafts findings, a TOOL node appends the auditable research-log row (increment in the payload), and a DECISION routes increment gte 3 into the final report (earlier increments get a light ack) — no week-long sleeping workflow (ADR 094/097/100).",  # noqa: E501
+        "research → TOOL append → DECISION(increment) → {final-report | ack}",
+    ),
     "agent-deploy-approval": (
         "pattern_agent_deploy_approval",
         True,

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["provider_ok","provider","api_result"],"properties":{"provider_ok":{"type":"boolean"},"provider":{"type":"string"},"api_result":{"type":"string"}}}

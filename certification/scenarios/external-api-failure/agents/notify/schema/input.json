@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"request":{"type":"string"},"provider":{"type":"string"},"api_result":{"type":"string"},"record_result":{"type":"string"}}}
