@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["kb_findings"],"properties":{"kb_findings":{"type":"string"}}}
