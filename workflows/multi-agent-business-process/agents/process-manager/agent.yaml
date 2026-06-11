@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: process-manager
+version: 0.1.0
+description: >-
+  The supervisor's manager: each delegation round it reads the gathered
+  state and names the next specialist (research / pricing / compliance) or
+  the sentinel "done" — the value the bounded delegation loop routes on.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

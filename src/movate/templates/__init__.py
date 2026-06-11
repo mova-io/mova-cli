@@ -286,6 +286,18 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Low-confidence human escalation with RESUME-WITH-FEEDBACK (runtime: temporal). A triage agent drafts an answer + a calibrated numeric confidence; a DECISION node routes confidence ≥ 0.8 straight to finalize (no second LLM judging the first), everything else pauses at the review HUMAN gate (output_contract [decision, feedback]) — the reviewer's feedback merges into state and the finalize agent incorporates it (ADR 094/098/099).",  # noqa: E501
         "triage → DECISION(confidence) → {finalize | [HUMAN review + feedback]} → finalize | rejected",  # noqa: E501
     ),
+    "multi-agent-investigation": (
+        "pattern_multi_agent_investigation",
+        True,
+        "Multi-agent investigation over the PARALLEL FAN-OUT/FAN-IN diamond (runtime: temporal, ADR 092). A plan agent decomposes the question, THREE calibrated specialist sims (web/kb/data) research it CONCURRENTLY — durable asyncio.gather on Temporal — each writing its own disjoint findings key, and ONE synthesize agent joins the branches into {conclusion, confidence}, explicitly acknowledging disagreement between sources.",  # noqa: E501
+        "plan → FAN-OUT {web ∥ kb ∥ data} → FAN-IN synthesize",
+    ),
+    "multi-agent-business-process": (
+        "pattern_multi_agent_business_process",
+        True,
+        "Multi-agent business process under the bounded SUPERVISOR primitive (runtime: temporal, ADR 092 D4). A process-manager agent delegates across a FIXED specialist allowlist (research/pricing/compliance — calibrated sims with JSON contracts) in a loop hard-capped at max_delegations, then a proposal agent composes the deliverable and notify confirms it — managerial delegation WITH structural bounds, not a swarm.",  # noqa: E501
+        "SUPERVISOR(manager ⇒ research|pricing|compliance, ≤4) → proposal → notify",
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

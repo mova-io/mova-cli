@@ -46,6 +46,8 @@ ALL_PATTERNS = [
     "purchase-order",
     "approval-timeout",
     "human-escalation",
+    "multi-agent-investigation",
+    "multi-agent-business-process",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 
