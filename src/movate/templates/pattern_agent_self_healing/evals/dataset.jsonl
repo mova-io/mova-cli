@@ -1,0 +1,3 @@
+{"input": {"agent_name": "order-tracker"}, "expected": {"summary": "Passed the health check above the 0.8 threshold — no remediation needed."}}
+{"input": {"agent_name": "invoice-parser"}, "expected": {"summary": "Healed: the diagnosed fix was applied for the schema-validation symptom."}}
+{"input": {"agent_name": "support-summarizer"}, "expected": {"summary": "Incident filed: the model-drift fix failed and the case is with a human operator."}}

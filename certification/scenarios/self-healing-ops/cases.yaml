@@ -1,0 +1,110 @@
+# Certification cases — self-healing-ops (driven by
+# certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `self-healing-ops`
+# workflow (workflows/self-healing-ops — 8 nodes: the sim-detect TOOL node
+# mapping the monitor signal to the canned fault catalog, ONE triage agent
+# (severity + recommended remediation), TWO sequential remediation TOOL
+# attempts — the retry is UNROLLED because mdk workflows have no cycles —
+# each verified by a deterministic `decision` node, ONE HUMAN escalation
+# gate with an "ack" route, and ONE shared closure agent all three exits
+# converge on). One case per canned fault: fixed on attempt 1, fixed on the
+# retry, and hardware-escalates. The driver submits the case input via
+# POST /run, resumes the expected HUMAN pause via the signal endpoint, then
+# reads the run back from GET /api/v1/observability/facts (ADR 096) and
+# asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision nodes pick the next node but write NOTHING
+#   into workflow state; the fact builder surfaces `route` only from a
+#   `tier`/`route` state key, so the fact's route is None here. We assert
+#   that explicitly and prove the branch instead via (a) the observed pause
+#   node (escalate vs none), (b) the per-attempt status keys
+#   (`final_state_contains` pins r1_status/r2_status per path, and the
+#   attempt-1 success case LACKS r2_status — the retry must never run), and
+#   (c) the remediate ledger row COUNT (times: 1 vs times: 2 — both attempts
+#   write the same `{system: ops, action: remediate}` row, distinguished by
+#   `attempt` in the payload).
+# * `status: success` for ALL cases, including the escalation — the
+#   acknowledged-escalation branch still terminates at the shared closure
+#   agent successfully; a failed remediation is a route, not a workflow
+#   error.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096), and the
+#   Temporal path does not emit per-node `run` facts yet; the driver records
+#   the capability as SKIP with that note rather than green-washing it.
+# * side-effects — the detect TOOL node records ONE `{system: monitor,
+#   action: detect}` row on EVERY run (it is the entrypoint); each
+#   remediation attempt records one `{system: ops, action: remediate}` row.
+#   Evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * `governance: allow` everywhere — the baked catalog policy (mirrored by
+#   workflows/self-healing-ops/policy.yaml) registers MODEL + COST gates on
+#   every agent run, so the terminal fact's `governance_effect` must be
+#   NON-NULL and `allow`. A `warn` means an agent slipped past the policy's
+#   bounds; a NULL means the governance wiring on the worker image is broken.
+
+scenario: self-healing-ops
+target: self-healing-ops # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- fixed on attempt 1: the pool-exhaustion fault applies first try →
+  # --- closure. Exactly ONE remediate row; r2_status must never be set (the
+  # --- unrolled retry never ran) and the run never pauses.
+  - name: attempt-1-success
+    input:
+      signal: checkout-latency-spike
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [fault, component, severity, remediation_action, r1_status, summary]
+      final_state_lacks: [r2_status, decision]
+      final_state_contains:
+        r1_status: ["applied"]
+      side_effects:
+        - { system: monitor, action: detect, times: 1 }
+        - { system: ops, action: remediate, times: 1 }
+
+  # --- fixed on the retry: the TRANSIENT "stuck consumer" fault races
+  # --- attempt 1 (failed) and lands on attempt 2 (applied) → closure. TWO
+  # --- remediate rows (attempt 1 + attempt 2); both statuses pinned; the
+  # --- run never pauses.
+  - name: attempt-2-success
+    input:
+      signal: queue-backlog-alarm
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [fault, component, severity, remediation_action, r1_status, r2_status, summary]
+      final_state_lacks: [decision]
+      final_state_contains:
+        r1_status: ["failed"]
+        r2_status: ["applied"]
+      side_effects:
+        - { system: monitor, action: detect, times: 1 }
+        - { system: ops, action: remediate, times: 2 }
+
+  # --- both attempts fail: the HARDWARE fault is out of software's reach —
+  # --- attempt 1 and the retry both fail deterministically, the escalate
+  # --- HUMAN gate pauses durably, and the operator's ack lands on the SAME
+  # --- shared closure agent. TWO remediate rows, both attempts auditable.
+  - name: hardware-escalates
+    input:
+      signal: disk-failure-alert
+    hitl:
+      - node: escalate
+        decision: { decision: ack }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [fault, component, r1_status, r2_status, decision, summary]
+      final_state_contains:
+        r1_status: ["failed"]
+        r2_status: ["failed"]
+      side_effects:
+        - { system: monitor, action: detect, times: 1 }
+        - { system: ops, action: remediate, times: 2 }

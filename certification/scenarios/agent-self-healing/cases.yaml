@@ -1,0 +1,105 @@
+# Certification cases — agent-self-healing (driven by
+# certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `agent-self-healing`
+# workflow (workflows/agent-self-healing — 9 nodes: the sim-health-check
+# TOOL node measuring canned quality metrics for the named agent, a
+# deterministic `decision` node on the 0.8 quality threshold, the diagnose
+# agent, the sim-apply-fix TOOL node (a "drift" symptom deterministically
+# FAILS — the one fault class self-healing cannot fix), a second decision on
+# `fix_status`, ONE HUMAN escalation gate with an "ack" route, and the
+# healthy-report / verify-report / incident-report tails). One case per
+# canned agent: healthy short-circuit, degraded-but-fixable, and
+# drift-escalates. The driver submits the case input via POST /run, resumes
+# the expected HUMAN pause via the signal endpoint, then reads the run back
+# from GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision nodes pick the next node but write NOTHING
+#   into workflow state; the fact builder surfaces `route` only from a
+#   `tier`/`route` state key, so the fact's route is None here. We assert
+#   that explicitly and prove the branch instead via (a) the observed pause
+#   node (escalate vs none) and (b) `final_state` markers: only degraded
+#   paths carry `cause`/`fix_status`, and `final_state_contains` pins the
+#   exact fix outcome ("applied" vs "failed") per path.
+# * `status: success` for ALL cases, including the escalation — the
+#   incident-report branch still terminates successfully; a failed FIX is a
+#   route, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096), and the
+#   Temporal path does not emit per-node `run` facts yet; the driver records
+#   the capability as SKIP with that note rather than green-washing it.
+# * side-effects — the health-check TOOL node records ONE `{system: monitor,
+#   action: health_check}` row on EVERY run (it is the entrypoint); the
+#   apply-fix TOOL records `{system: agent_registry, action: apply_fix}` on
+#   the degraded paths ONLY — the healthy case asserts its ABSENCE (the fix
+#   must never run on a healthy agent). Evaluated only when the shared DB is
+#   reachable (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * `governance: allow` everywhere — the baked catalog policy (mirrored by
+#   workflows/agent-self-healing/policy.yaml) registers MODEL + COST gates
+#   on every agent run, so the terminal fact's `governance_effect` must be
+#   NON-NULL and `allow`. A `warn` means an agent slipped past the policy's
+#   bounds; a NULL means the governance wiring on the worker image is broken.
+
+scenario: agent-self-healing
+target: agent-self-healing # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- healthy short-circuit: quality 0.93 ≥ 0.8 → healthy-report. No
+  # --- diagnosis, no fix, no gate; terminal success without any signal IS
+  # --- the routing evidence, and the absence of the apply_fix row proves
+  # --- the fix TOOL never ran.
+  - name: healthy-short-circuit
+    input:
+      agent_name: order-tracker
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [quality_score, symptom, summary]
+      final_state_lacks: [cause, fix_action, fix_status, decision]
+      side_effects:
+        - { system: monitor, action: health_check, times: 1 }
+      no_side_effects:
+        - { system: agent_registry, action: apply_fix }
+
+  # --- degraded but fixable: quality 0.55 → diagnose → apply-fix (the
+  # --- schema-drift symptom applies deterministically) → verify-report.
+  # --- Both ledger rows present; fix_status pinned to "applied"; no pause.
+  - name: degraded-fix-applied
+    input:
+      agent_name: invoice-parser
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [cause, fix_action, fix_status, summary]
+      final_state_lacks: [decision]
+      final_state_contains:
+        fix_status: ["applied"]
+      side_effects:
+        - { system: monitor, action: health_check, times: 1 }
+        - { system: agent_registry, action: apply_fix, times: 1 }
+
+  # --- the un-self-fixable fault: quality 0.41 with a model-DRIFT symptom →
+  # --- diagnose → apply-fix FAILS deterministically → the escalate HUMAN
+  # --- gate pauses durably; the operator's ack lands on incident-report.
+  # --- The apply_fix row still exists (the attempt is auditable) with
+  # --- fix_status pinned to "failed".
+  - name: drift-escalates
+    input:
+      agent_name: support-summarizer
+    hitl:
+      - node: escalate
+        decision: { decision: ack }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [cause, fix_action, fix_status, decision, summary]
+      final_state_contains:
+        fix_status: ["failed"]
+      side_effects:
+        - { system: monitor, action: health_check, times: 1 }
+        - { system: agent_registry, action: apply_fix, times: 1 }

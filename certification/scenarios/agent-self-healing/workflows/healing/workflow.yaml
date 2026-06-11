@@ -1,0 +1,79 @@
+api_version: movate/v1
+kind: Workflow
+name: agent-self-healing
+version: 0.1.0
+description: >
+  An agent detects its own degraded output quality and heals — scenario #16
+  of the 30-use-case certification program (B9 self-healing batch). The
+  autonomy story: THE MONITOR AND THE FIX ARE NEVER AN LLM'S JOB. The entry
+  `health-check` TOOL node (ADR 097) runs the scenario-local
+  `sim-health-check` python skill — deterministic quality metrics for the
+  named agent from canned monitor data, recorded as a `{system: monitor,
+  action: health_check}` ledger row. A deterministic `decision` node
+  (ADR 094) routes on the measured `quality_score`: at or above 0.8 → ONE
+  healthy-report agent, done. Below → the `diagnose` agent names the
+  probable cause + the one fix action, and the `apply-fix` TOOL node applies
+  it deterministically (`sim-apply-fix` — a model-drift symptom cannot be
+  self-fixed and FAILS; everything else applies), recording the `{system:
+  agent_registry, action: apply_fix}` row. A second decision routes
+  `fix_status`: applied → ONE verify-report agent confirms the healing;
+  failed → the run pauses durably at the `escalate` HUMAN gate (ADR 099 —
+  the operator acknowledges with `decision: ack`; any other wording falls
+  back the same way) and lands on ONE incident-report agent. No cycles: mdk
+  workflows are acyclic by construction, so "try again" never loops — a
+  failed fix can only escalate. The skill names resolve through the
+  scenario's project registry (project.yaml marker → skills/). Mirrors
+  workflows/agent-self-healing.
+state_schema: ../../state.json
+entrypoint: health-check
+nodes:
+  # Deterministic health measurement FIRST (ADR 097): the quality score that
+  # decides the run's path is canned monitor data, not a model's self-grade.
+  - id: health-check
+    type: tool
+    skill: sim-health-check
+  # Deterministic quality routing (ADR 094): the monitor already measured the
+  # score — no LLM in the control path.
+  - id: quality-gate
+    type: decision
+    cases:
+      - when: {field: quality_score, op: gte, value: 0.8}
+        to: healthy-report
+    default: diagnose
+  # Healthy short-circuit: one report, done — no diagnosis, no fix, no gate.
+  - {id: healthy-report, type: agent, ref: ../../agents/healthy-report}
+  # The ONE judgment call before the fix: name the probable cause + the one
+  # fix action. The fix itself stays deterministic (the TOOL node below).
+  - {id: diagnose, type: agent, ref: ../../agents/diagnose}
+  # Deterministic remediation (ADR 097): the registry applies the fix and
+  # reports applied/failed — a drift symptom deterministically fails (the
+  # one fault class self-healing cannot fix).
+  - id: apply-fix
+    type: tool
+    skill: sim-apply-fix
+  # Deterministic verification routing (ADR 094) on the fix outcome.
+  - id: verify
+    type: decision
+    cases:
+      - when: {field: fix_status, op: eq, value: applied}
+        to: verify-report
+    default: escalate
+  - {id: verify-report, type: agent, ref: ../../agents/verify-report}
+  # The failed-fix path pauses durably for a human operator. ONE route
+  # vocabulary ("ack") and the SAME fail-safe fallback (ADR 099): however
+  # the operator words it, the run can only land on the incident report.
+  - id: escalate
+    type: human
+    prompt: >
+      Automated remediation FAILED for this degraded agent — it cannot heal
+      itself. Acknowledge the escalation: respond with `decision` set to
+      exactly "ack" (any other wording is treated as ack) to file the
+      incident report.
+    output_contract: [decision]
+    routes: {ack: incident-report}
+    fallback: incident-report
+  - {id: incident-report, type: agent, ref: ../../agents/incident-report}
+edges:
+  - {from: health-check, to: quality-gate}
+  - {from: diagnose, to: apply-fix}
+  - {from: apply-fix, to: verify}

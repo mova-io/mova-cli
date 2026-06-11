@@ -66,6 +66,8 @@ ALL_PATTERNS = [
     "ops-center",
     "rag-debug",
     "kb-refresh",
+    "agent-self-healing",
+    "self-healing-ops",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

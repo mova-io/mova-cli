@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["cause","fix_action"],"properties":{"cause":{"type":"string"},"fix_action":{"type":"string"}}}

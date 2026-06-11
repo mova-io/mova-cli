@@ -58,6 +58,8 @@ WORKFLOW_PATTERNS = [
     "ops-center",
     "rag-debug",
     "kb-refresh",
+    "agent-self-healing",
+    "self-healing-ops",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 

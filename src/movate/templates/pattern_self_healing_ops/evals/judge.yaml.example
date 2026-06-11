@@ -1,0 +1,25 @@
+# LLM-as-judge for the Self-Healing Ops workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the final ``summary`` against the expected outcome: a remediated
+# fault must read as fixed (naming the attempt that landed it); an
+# exhausted fault must read as escalated to a human operator after both
+# attempts failed. Used as the CI eval-gate the pattern's governance leans
+# on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's final summary against the expected outcome.
+    1.0 = summary states the correct outcome (fixed on attempt 1, fixed on
+          the retry, or escalated to a human after both attempts failed)
+          and matches the expectation
+    0.5 = correct outcome but missing which attempt landed it / the
+          escalation rationale
+    0.0 = wrong outcome, contradicts the expectation, or hallucinated
+
+threshold: 0.7
