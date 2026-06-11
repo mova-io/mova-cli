@@ -732,3 +732,35 @@ def test_final_state_contains_stringifies_non_string_values() -> None:
     case = _contains_case(contains=(("provision", ('"ref": "ITSM-1"',)),))
     result = _driver(fake).run_case(_spec(case), case)
     assert result.outcomes["decision-routing"].status == "pass"
+
+
+@pytest.mark.unit
+def test_client_retries_polling_through_429_rate_limit() -> None:
+    # The deployed API rate-limits the polling endpoints under suite load; a
+    # 429 is back-pressure, not a verdict — the client must retry (honouring
+    # Retry-After) instead of surfacing HTTPStatusError to a capability row.
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return httpx.Response(200, json={"workflow_runs": []})
+
+    client = RuntimeApiClient(
+        "http://cert.test", "test-key", transport=httpx.MockTransport(handler)
+    )
+    assert client.list_paused_runs() == []
+    assert calls["n"] == 3
+
+
+@pytest.mark.unit
+def test_client_gives_up_after_max_429_retries() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "0"})
+
+    client = RuntimeApiClient(
+        "http://cert.test", "test-key", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        client.list_paused_runs()
