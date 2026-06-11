@@ -71,7 +71,12 @@ def _run_async(make_coro: Callable[[], Awaitable[Any]]) -> Any:
     running event loop, e.g. a Temporal activity) — execute it on a dedicated
     thread with its own loop."""
     with ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(lambda: asyncio.run(make_coro())).result()
+        return ex.submit(lambda: asyncio.run(_as_coro(make_coro()))).result()
+
+
+async def _as_coro(awaitable: Awaitable[Any]) -> Any:
+    """Adapt any Awaitable to a true coroutine (asyncio.run requires one)."""
+    return await awaitable
 
 
 # ---------------------------------------------------------------------------

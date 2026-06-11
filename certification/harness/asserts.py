@@ -142,5 +142,5 @@ def assert_governance_fired(cap: GovernanceAudit, *, kind: str, effect: str | No
     assert cap.has(kind=kind, effect=effect), (
         f"no governance decision matching {where} was recorded — governance "
         f"did not fire (engine dormant, or no policy configured). "
-        f"saw: {[e.get('action') + '/' + str(e.get('effect')) for e in cap.events] or '∅'}"
+        f"saw: {[str(e.get('action')) + '/' + str(e.get('effect')) for e in cap.events] or '∅'}"
     )
