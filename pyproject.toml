@@ -547,6 +547,15 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 python_version = "3.11"
 strict = true
 files = ["src/movate"]
+# Workflow-pattern templates bundle self-contained skill impls under
+# hyphenated dirs (skills/sim-create-po/impl.py, ADR 097 D2). The hyphen is
+# not a valid identifier segment, so mypy maps every such file to the bare
+# module "impl" — two or more patterns with bundled skills collide as
+# "Duplicate module named 'impl'". These are template DATA (scaffold copies of
+# the never-type-checked workflows/<scenario>/skills/ originals), not library
+# code; their behavior is pinned by tests/test_itsm_scenario.py and
+# tests/test_b1_scenarios.py, which import and exercise them directly.
+exclude = ['^src/movate/templates/pattern_[^/]+/skills/']
 
 [[tool.mypy.overrides]]
 module = [

@@ -268,6 +268,24 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "ITSM service-request fulfilment over a parameterized catalog (runtime: temporal). A DECISION node routes the portal's auto_approved flag (no LLM); needs-approval services pause at ONE HUMAN gate routing its own approve/reject decision (ADR 099); fulfilment is a TOOL node calling the workflow-local sim-provision python skill (ADR 097) — auto + approve paths converge on the shared provision→notify tail (ADR 094/097/098/099).",  # noqa: E501
         "DECISION(auto_approved) → [HUMAN routes approve|reject] → shared TOOL provision → notify | rejected",  # noqa: E501
     ),
+    "purchase-order": (
+        "pattern_purchase_order",
+        True,
+        "Tiered purchase-order approval with a SEQUENTIAL APPROVAL CHAIN (runtime: temporal). A DECISION node tiers on the amount (no LLM): ≤500 auto-creates the PO; everything else pauses at the manager HUMAN gate, and a second DECISION chains >5000 orders into the director gate — both must approve. PO creation is a TOOL node calling the workflow-local sim-create-po python skill (ADR 097); all approve paths converge on the shared create-po→notify tail (ADR 094/097/098/099).",  # noqa: E501
+        "DECISION(amount) → [HUMAN manager] → DECISION(escalate) → [HUMAN director] → shared TOOL create-po → notify | rejected",  # noqa: E501
+    ),
+    "approval-timeout": (
+        "pattern_approval_timeout",
+        True,
+        "Approval with DURABLE TIMEOUT + escalation (runtime: temporal) — the live shape of ADR 062 D4. The primary HUMAN gate carries a 90s durable deadline whose expiry escalates to a second HUMAN gate (the alternate approver); ITS expiry fails safe to rejected — silence can never fulfil. Fulfilment is a TOOL node calling the workflow-local sim-fulfill python skill (ADR 097); both approve paths converge on the shared fulfill→notify tail (ADR 062/097/098/099).",  # noqa: E501
+        "[HUMAN primary ⏲90s] → on_timeout → [HUMAN escalation ⏲90s] → shared TOOL fulfill → notify | rejected",  # noqa: E501
+    ),
+    "human-escalation": (
+        "pattern_human_escalation",
+        True,
+        "Low-confidence human escalation with RESUME-WITH-FEEDBACK (runtime: temporal). A triage agent drafts an answer + a calibrated numeric confidence; a DECISION node routes confidence ≥ 0.8 straight to finalize (no second LLM judging the first), everything else pauses at the review HUMAN gate (output_contract [decision, feedback]) — the reviewer's feedback merges into state and the finalize agent incorporates it (ADR 094/098/099).",  # noqa: E501
+        "triage → DECISION(confidence) → {finalize | [HUMAN review + feedback]} → finalize | rejected",  # noqa: E501
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

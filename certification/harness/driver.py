@@ -102,10 +102,18 @@ class SideEffectExpect:
 
 @dataclass(frozen=True)
 class HitlStep:
-    """One expected HUMAN pause: the node id + the decision to signal."""
+    """One expected HUMAN pause: the node id + the decision to signal.
+
+    ``wait_timeout: true`` (ADR 062 D4) inverts the second half: the driver
+    observes the pause at ``node`` and deliberately does NOT signal — the
+    gate's durable timer must fire and route the run itself (``decision``
+    must be omitted). The NEXT step's pause poll (or the terminal-fact poll)
+    excludes this node, so it naturally waits out the deadline.
+    """
 
     node: str
-    decision: dict[str, Any]
+    decision: dict[str, Any] | None
+    wait_timeout: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,6 +140,11 @@ class CaseSpec:
     input: dict[str, Any]
     expect: CaseExpect
     hitl: tuple[HitlStep, ...] = ()
+    timeout_s: float | None = None
+    """Per-case override for the driver's pause + fact poll timeouts.
+    Durable-timeout cases (ADR 062 D4) wait out real 90s deadlines, so a
+    case's wall clock can legitimately exceed the suite defaults; ``None``
+    keeps them."""
 
 
 @dataclass(frozen=True)
@@ -153,7 +166,7 @@ def _check_keys(raw: Mapping[str, Any], allowed: frozenset[str], where: str) -> 
     _require(not unknown, where, f"unknown key(s) {unknown}; allowed: {sorted(allowed)}")
 
 
-_CASE_KEYS = frozenset({"name", "input", "hitl", "expect"})
+_CASE_KEYS = frozenset({"name", "input", "hitl", "expect", "timeout_s"})
 _EXPECT_KEYS = frozenset(
     {
         "status",
@@ -166,7 +179,7 @@ _EXPECT_KEYS = frozenset(
         "no_side_effects",
     }
 )
-_HITL_KEYS = frozenset({"node", "decision"})
+_HITL_KEYS = frozenset({"node", "decision", "wait_timeout"})
 _EFFECT_KEYS = frozenset({"system", "action", "times"})
 
 
@@ -249,7 +262,20 @@ def _parse_hitl(raw: Any, where: str) -> tuple[HitlStep, ...]:
         _check_keys(item, _HITL_KEYS, w)
         node = item.get("node")
         _require(isinstance(node, str) and bool(node), w, "`node` (string) is required")
+        wait_timeout = item.get("wait_timeout", False)
+        _require(isinstance(wait_timeout, bool), w, "`wait_timeout` must be a boolean")
         decision = item.get("decision")
+        if wait_timeout:
+            # ADR 062 D4: the step observes the pause and lets the gate's
+            # durable timer fire — a decision here would be a contradiction.
+            _require(
+                decision is None,
+                w,
+                "`decision` must be omitted when `wait_timeout` is true "
+                "(the step observes the pause and lets the durable timer fire)",
+            )
+            steps.append(HitlStep(node=str(node), decision=None, wait_timeout=True))
+            continue
         _require(
             isinstance(decision, dict) and bool(decision),
             w,
@@ -288,12 +314,24 @@ def load_scenario_spec(path: Path) -> ScenarioSpec:
         seen.add(str(name))
         case_input = item.get("input")
         _require(isinstance(case_input, dict), w, "`input` (mapping) is required")
+        timeout_s = item.get("timeout_s")
+        _require(
+            timeout_s is None
+            or (
+                isinstance(timeout_s, (int, float))
+                and not isinstance(timeout_s, bool)
+                and timeout_s > 0
+            ),
+            f"{w}.timeout_s",
+            "must be a positive number",
+        )
         cases.append(
             CaseSpec(
                 name=str(name),
                 input=dict(case_input),
                 hitl=_parse_hitl(item.get("hitl", []), f"{w}.hitl"),
                 expect=_parse_expect(item.get("expect"), f"{w}.expect"),
+                timeout_s=float(timeout_s) if timeout_s is not None else None,
             )
         )
     return ScenarioSpec(scenario=str(scenario), target=str(target), cases=tuple(cases))
@@ -526,12 +564,21 @@ class SuiteDriver:
         return str(run_id)
 
     def _drive_hitl(self, spec: ScenarioSpec, case: CaseSpec, workflow_run_id: str) -> str:
-        """Observe each expected pause at its node, signal the decision."""
+        """Observe each expected pause at its node, signal the decision.
+
+        ``wait_timeout`` steps (ADR 062 D4) observe the pause and deliberately
+        do NOT signal: the gate's durable timer must fire and route the run
+        itself. The next step's poll excludes the previous node either way, so
+        after a wait_timeout step it naturally waits out the deadline until
+        the run pauses at the NEXT gate (or, for the last step, the terminal
+        fact poll waits out the final deadline).
+        """
         notes: list[str] = []
         previous_node: str | None = None
+        pause_timeout_s = case.timeout_s if case.timeout_s is not None else self._pause_timeout_s
         for step in case.hitl:
             row = self._poll(
-                self._pause_timeout_s,
+                pause_timeout_s,
                 functools.partial(self._paused_row, workflow_run_id, exclude_node=previous_node),
                 f"run {workflow_run_id} to pause at {step.node!r}",
             )
@@ -539,8 +586,11 @@ class SuiteDriver:
             assert paused_node == step.node, (
                 f"run {workflow_run_id} paused at {paused_node!r}, expected {step.node!r}"
             )
-            self._client.signal(workflow_run_id, step.decision)
-            notes.append(f"paused@{step.node} → signalled {step.decision}")
+            if step.wait_timeout:
+                notes.append(f"paused@{step.node} → no signal, awaiting the durable timeout")
+            else:
+                self._client.signal(workflow_run_id, step.decision or {})
+                notes.append(f"paused@{step.node} → signalled {step.decision}")
             previous_node = step.node
         return "; ".join(notes)
 
@@ -626,9 +676,11 @@ class SuiteDriver:
         # Phase 3 — terminal fact (the ADR 096 surface) + per-capability asserts.
         fact_holder: dict[str, Any] = {}
 
+        fact_timeout_s = case.timeout_s if case.timeout_s is not None else self._fact_timeout_s
+
         def _terminal() -> str | None:
             fact = self._poll(
-                self._fact_timeout_s,
+                fact_timeout_s,
                 lambda: self._terminal_fact(spec.target, workflow_run_id),
                 f"a terminal workflow_run fact for {workflow_run_id}",
             )

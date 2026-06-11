@@ -1,0 +1,82 @@
+api_version: movate/v1
+kind: Workflow
+name: purchase-order
+version: 0.1.0
+description: >
+  Tiered purchase-order approval, durable on Temporal — scenario #8 of the
+  30-use-case certification program, the first SEQUENTIAL APPROVAL CHAIN. A
+  deterministic `decision` node (ADR 094) tiers on the amount: ≤500 auto-issues
+  the PO; everything else pauses durably at the manager HUMAN gate (ADR 099 —
+  the gate routes its own structured `decision`). A manager approve then takes
+  a SECOND deterministic decision (`escalate-check`): >5000 CHAINS into the
+  director HUMAN gate (manager AND director must both approve), ≤5000 goes
+  straight to PO creation — one manager gate serves both tiers, no clone. PO
+  creation is a TOOL node (ADR 097): the workflow-local `sim-create-po` python
+  skill records the `{system: erp, action: create_po}` row to the sim
+  side-effect ledger deterministically — no LLM, no wrapper agent. Auto +
+  both approve paths CONVERGE on the shared create-po→notify tail and every
+  reject (either gate) lands on ONE rejected node (exclusive convergence,
+  ADR 098). Self-contained (bundled into the temporal-worker image): the skill
+  carries its own impl.py next to skill.yaml, so the worker imports it from
+  the baked workflows/ tree. Mirrors certification/scenarios/purchase-order.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: classify
+nodes:
+  # Deterministic amount tiering (ADR 094): ≤500 needs no human — no LLM in
+  # the control path.
+  - id: classify
+    type: decision
+    cases:
+      - when: {field: amount, op: lte, value: 500}
+        to: create-po
+    default: manager-approval
+  # ONE manager gate for every needs-approval order. The gate routes its OWN
+  # decision (ADR 099) — trim+casefold exact match, no LLM; prose answers fail
+  # safe to rejected. Approve does NOT go straight to the PO: it routes into
+  # the deterministic escalate-check, which chains >5000 orders into the
+  # director gate (the sequential approval chain).
+  - id: manager-approval
+    type: human
+    prompt: >
+      Approve this purchase order (manager)? Respond with `decision` set to
+      exactly "approve" or "reject" — any other wording is treated as reject.
+      Orders over 5000 also need director approval after yours.
+    output_contract: [decision]
+    routes: {approve: escalate-check, reject: rejected}
+    fallback: rejected
+  # Deterministic chain escalation (ADR 094): a manager-approved order >5000
+  # must ALSO clear the director gate; ≤5000 is done after the manager.
+  - id: escalate-check
+    type: decision
+    cases:
+      - when: {field: amount, op: gt, value: 5000}
+        to: director-approval
+    default: create-po
+  # --- director tier (>5000, AFTER the manager approved — the chain's second
+  # --- gate). Reject here must leave NO erp row: create-po never ran.
+  - id: director-approval
+    type: human
+    prompt: >
+      Approve this purchase order (director, >5000 — the manager already
+      approved)? Respond with `decision` set to exactly "approve" or "reject"
+      — any other wording is treated as reject.
+    output_contract: [decision]
+    routes: {approve: create-po, reject: rejected}
+    fallback: rejected
+  # --- shared tail (ADR 098): auto + both approve paths converge on ONE
+  # --- create-po TOOL node (ADR 097 — deterministic skill execution, no LLM)
+  # --- followed by ONE LLM notify; every reject lands on ONE rejected node.
+  - id: create-po
+    type: tool
+    skill: sim-create-po
+  - {id: notify, type: agent, ref: ./agents/notify}
+  - {id: rejected, type: agent, ref: ./agents/rejected}
+edges:
+  - {from: create-po, to: notify}
+tags:
+  - temporal
+  - decision
+  - hitl
+  - tool
+  - certification

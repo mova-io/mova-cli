@@ -1,0 +1,5 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "item":{"type":"string"},"requester":{"type":"string"},
+  "amount":{"type":"number"},"details":{"type":"string"},
+  "decision":{"type":"string"},
+  "po_result":{"type":"string"},"summary":{"type":"string"}}}
