@@ -1,7 +1,7 @@
 api_version: movate/v1
 kind: Skill
 
-name: sim-remediate
+name: sim-remediate-ops
 version: 0.1.0
 description: >-
   Simulate remediation attempt #1 on a detected infrastructure fault:
@@ -9,11 +9,14 @@ description: >-
   transient — "stuck", which needs the retry — or "hardware", which software
   remediation can never fix) and records one auditable `{system: ops,
   action: remediate}` row (attempt: 1 in the payload) to the shared
-  sim_side_effects ledger (same DB MDK itself uses). SELF-CONTAINED for the
-  deployed temporal-worker image (ADR 097 D2): the implementation lives in
-  impl.py next to this file — the python backend puts the skill dir's
-  parent on sys.path, so `sim-remediate.impl` imports from the baked
-  workflows/ tree without certification/ being present.
+  sim_side_effects ledger (same DB MDK itself uses) — fail-soft and
+  idempotent (the row is observability; the predicate is the contract).
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `sim-remediate-ops.impl`
+  imports from the baked workflows/ tree without certification/ being
+  present. NOT named `sim-remediate`: that module name is already claimed
+  by workflows/incident-response on the shared worker (see impl.py).
 
 schema:
   input: ./schema/input.json
@@ -21,7 +24,7 @@ schema:
 
 implementation:
   kind: python
-  entry: "sim-remediate.impl:run"
+  entry: "sim-remediate-ops.impl:run"
 
 cost:
   per_call_usd: 0.0
