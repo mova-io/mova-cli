@@ -1,0 +1,15 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: incident-response
+kind: workflow
+description: 'Event-driven incident diagnosis + remediation + escalation (runtime: temporal).
+  A calibrated-confidence diagnose agent feeds a DECISION node (gte 0.7 → the sim-remediate
+  TOOL, whose applied/failed status is deterministic on the alert and whose ATTEMPT is always
+  an auditable ops ledger row); a verify agent mirrors the machine status into a second DECISION;
+  both escalation reasons converge on ONE HUMAN gate routing its own ack (fallback notify
+  — a human can delay closure, never wedge it). Trigger-shaped input for ADR 100 (--event-key
+  alert) (ADR 094/097/098/099/100).'
+topology: diagnose → DECISION(confidence) → {TOOL remediate → verify → DECISION(resolved)
+  → notify | [HUMAN escalate routes ack] → notify}

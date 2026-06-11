@@ -1,0 +1,11 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: expense-approval
+kind: workflow
+description: 'Tiered expense approval (runtime: temporal). A DECISION node routes on amount
+  (no LLM), each tier pauses durably at a HUMAN gate that routes its own approve/reject decision
+  (ADR 099) — zero LLM classifiers, all tiers converging on ONE shared ERP-post/finalize/rejected
+  tail (ADR 094/098/099).'
+topology: DECISION(amount) → [HUMAN routes approve|reject] → shared ERP-post|rejected → finalize

@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: continuous-eval
+kind: workflow
+description: 'ONE increment of a scheduled production-quality sampling pipeline (runtime:
+  temporal; cadence lives in the ADR 100 scheduler, not a loop). A calibrated scorer agent
+  scores one sampled interaction 0-1; a DECISION node applies the 0.6 floor (no LLM): regressions
+  record an auditable quality_alert ledger row (TOOL, ADR 097) + an escalation summary, healthy
+  samples record their score + a one-line ack — every increment leaves a ledger row (ADR 094/097/100).'
+topology: scorer → DECISION(score) → {TOOL alert → escalate | TOOL record → ack}

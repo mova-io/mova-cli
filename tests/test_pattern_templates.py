@@ -29,12 +29,19 @@ from movate.core.loader import load_agent
 from movate.core.workflow.compiler import compile_workflow, validate_graph
 from movate.core.workflow.spec import load_workflow_spec
 from movate.templates import (
+    PATTERN_METADATA_FILE,
     PATTERN_TEMPLATES,
+    PatternMetadataError,
+    _load_pattern_registry,
     get_pattern_path,
     list_patterns,
     pattern_is_workflow,
 )
 
+# Deletion guard ONLY (a superset assertion below): every name here must stay
+# discoverable. New patterns register by dropping a pattern_*/ dir with a
+# pattern.yaml — they do NOT need to be added here (the per-pattern
+# completeness tests parametrize over the discovered registry instead).
 ALL_PATTERNS = [
     "chatbot",
     "task-oriented",
@@ -79,12 +86,24 @@ WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 
 @pytest.mark.unit
 def test_all_patterns_registered() -> None:
-    assert set(list_patterns()) == set(ALL_PATTERNS)
-    assert len(PATTERN_TEMPLATES) == len(ALL_PATTERNS)
+    """Superset, not equality: accidental deletion of a known pattern still
+    fails loudly here, while ADDING a pattern needs no test edit (the
+    per-pattern tests below parametrize over the discovered registry)."""
+    missing = set(ALL_PATTERNS) - set(list_patterns())
+    assert not missing, f"known patterns dropped from discovery: {sorted(missing)}"
+    assert len(PATTERN_TEMPLATES) == len(list_patterns())
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("name", ALL_PATTERNS)
+def test_registry_is_sorted_and_deterministic() -> None:
+    """Discovery must yield a name-sorted dict regardless of filesystem
+    enumeration order — stable `mdk patterns list` / catalog output."""
+    assert list(PATTERN_TEMPLATES) == sorted(PATTERN_TEMPLATES)
+    assert _load_pattern_registry() == PATTERN_TEMPLATES
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", list_patterns())
 def test_pattern_metadata_well_formed(name: str) -> None:
     _rel, is_workflow, one_liner, topology = PATTERN_TEMPLATES[name]
     assert get_pattern_path(name).is_dir()
@@ -99,6 +118,75 @@ def test_pattern_metadata_well_formed(name: str) -> None:
 def test_get_pattern_path_unknown_raises() -> None:
     with pytest.raises(ValueError, match="unknown pattern"):
         get_pattern_path("does-not-exist")
+
+
+# ---------------------------------------------------------------------------
+# Auto-discovery failure modes (_load_pattern_registry against a temp tree)
+# ---------------------------------------------------------------------------
+
+
+def _write_meta(pattern_dir: Path, **overrides: str) -> None:
+    pattern_dir.mkdir(parents=True)
+    data: dict[str, str] = {
+        "name": "demo",
+        "kind": "workflow",
+        "description": "A demo pattern for discovery tests.",
+        "topology": "a → b",
+    }
+    data.update(overrides)
+    (pattern_dir / PATTERN_METADATA_FILE).write_text(
+        yaml.safe_dump(data, allow_unicode=True), encoding="utf-8"
+    )
+
+
+@pytest.mark.unit
+def test_discovery_missing_metadata_file_fails_loud(tmp_path: Path) -> None:
+    (tmp_path / "pattern_orphan").mkdir()
+    with pytest.raises(PatternMetadataError, match=r"missing pattern\.yaml"):
+        _load_pattern_registry(tmp_path)
+
+
+@pytest.mark.unit
+def test_discovery_invalid_kind_fails_loud(tmp_path: Path) -> None:
+    _write_meta(tmp_path / "pattern_demo", kind="swarm")
+    with pytest.raises(PatternMetadataError, match="kind"):
+        _load_pattern_registry(tmp_path)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("field_name", ["name", "description", "topology"])
+def test_discovery_missing_field_fails_loud(tmp_path: Path, field_name: str) -> None:
+    _write_meta(tmp_path / "pattern_demo", **{field_name: ""})
+    with pytest.raises(PatternMetadataError, match=field_name):
+        _load_pattern_registry(tmp_path)
+
+
+@pytest.mark.unit
+def test_discovery_duplicate_name_fails_loud(tmp_path: Path) -> None:
+    _write_meta(tmp_path / "pattern_demo_a")
+    _write_meta(tmp_path / "pattern_demo_b")
+    with pytest.raises(PatternMetadataError, match="duplicate pattern name 'demo'"):
+        _load_pattern_registry(tmp_path)
+
+
+@pytest.mark.unit
+def test_discovery_malformed_yaml_fails_loud(tmp_path: Path) -> None:
+    pdir = tmp_path / "pattern_demo"
+    pdir.mkdir()
+    (pdir / PATTERN_METADATA_FILE).write_text("name: [unclosed", encoding="utf-8")
+    with pytest.raises(PatternMetadataError, match="invalid YAML"):
+        _load_pattern_registry(tmp_path)
+
+
+@pytest.mark.unit
+def test_discovery_builds_expected_entry_shape(tmp_path: Path) -> None:
+    """Public tuple shape preserved: (relative dir, is_workflow, description,
+    topology) — rule 5, the dict consumers must not notice the refactor."""
+    _write_meta(tmp_path / "pattern_demo")
+    registry = _load_pattern_registry(tmp_path)
+    assert registry == {
+        "demo": ("pattern_demo", True, "A demo pattern for discovery tests.", "a → b")
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +353,7 @@ def test_simulation_is_bounded_not_a_swarm() -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("name", ALL_PATTERNS)
+@pytest.mark.parametrize("name", list_patterns())
 def test_pattern_ships_governance_doc(name: str) -> None:
     gov = get_pattern_path(name) / "GOVERNANCE.md"
     assert gov.is_file()
@@ -280,7 +368,7 @@ def test_pattern_ships_governance_doc(name: str) -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("name", ALL_PATTERNS)
+@pytest.mark.parametrize("name", list_patterns())
 def test_pattern_ships_judge_example(name: str) -> None:
     judge = get_pattern_path(name) / "evals" / "judge.yaml.example"
     assert judge.is_file()

@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: multi-agent-business-process
+kind: workflow
+description: 'Multi-agent business process under the bounded SUPERVISOR primitive (runtime:
+  temporal, ADR 092 D4). A process-manager agent delegates across a FIXED specialist allowlist
+  (research/pricing/compliance — calibrated sims with JSON contracts) in a loop hard-capped
+  at max_delegations, then a proposal agent composes the deliverable and notify confirms it
+  — managerial delegation WITH structural bounds, not a swarm.'
+topology: SUPERVISOR(manager ⇒ research|pricing|compliance, ≤4) → proposal → notify

@@ -1,0 +1,14 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: self-healing-ops
+kind: workflow
+description: 'Infrastructure self-healing with two-attempt remediation (runtime: temporal).
+  The sim-detect TOOL node maps the monitor signal onto a canned fault catalog; ONE triage
+  agent recommends the action; ''retry on failure'' is UNROLLED into two sequential remediation
+  TOOL attempts (no cycles — the cap is structural), each verified by a DECISION node and
+  each writing its own ops ledger row; a fault surviving both attempts pauses at a HUMAN ack
+  gate — all three exits converge on ONE guarded closure agent (ADR 094/097/098/099).'
+topology: TOOL detect → triage → TOOL remediate-1 → DECISION → {closure | TOOL remediate-2
+  → DECISION → {closure | [HUMAN ack] → closure}}

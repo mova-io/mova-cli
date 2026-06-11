@@ -221,209 +221,100 @@ ROLE_TEMPLATES: dict[str, str] = {
 #   * "chatbot" is a single AGENT (INPUT → AGENT → OUTPUT) — scaffolds an agent
 #     dir (agent.yaml + prompt + schemas + dataset + judge), same on-disk shape
 #     as the TEMPLATES above (so ``mdk run``/``eval`` work on it directly).
-#   * the other four are WORKFLOW bundles (workflow.yaml + state.json + nested
-#     agents/ + workflow-level dataset/judge) — scaffold a workflow dir.
+#   * every other pattern is a WORKFLOW bundle (workflow.yaml + state.json +
+#     nested agents/ + workflow-level dataset/judge) — scaffolds a workflow dir.
 #
-# Each entry: (relative dir, is_workflow, one-line description, topology).
-PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
-    "chatbot": (
-        "pattern_chatbot",
-        False,
-        "Single governed agent answering one turn under an enforced output contract.",
-        "INPUT → AGENT → OUTPUT",
-    ),
-    "task-oriented": (
-        "pattern_task_oriented",
-        True,
-        "Bounded supervisor fan-out: a planner decomposes into a fixed, capped task set, then collects.",  # noqa: E501
-        "SUPERVISOR → task-a → task-b → collector",
-    ),
-    "goal-oriented": (
-        "pattern_goal_oriented",
-        True,
-        "Bounded supervisor loop: a worker iterates while a JUDGE/GATE checks the goal, exiting on satisfaction or a max-iterations cap.",  # noqa: E501
-        "SUPERVISOR → (worker → JUDGE/GATE) x2 → done",
-    ),
-    "monitor": (
-        "pattern_monitor",
-        True,
-        "Observe a signal, VALIDATE/GATE it against a threshold, and on breach fire an allowlisted action (stub). Schedule/trigger-friendly.",  # noqa: E501
-        "observer → VALIDATE/GATE → {action | no-op}",
-    ),
-    "simulation": (
-        "pattern_simulation",
-        True,
-        "Bounded multi-agent simulation: a FIXED roster of two participants under a supervisor, hard-capped turns, terminating JUDGE. NOT a swarm.",  # noqa: E501
-        "SUPERVISOR → (A → B → JUDGE) x2 → done",
-    ),
-    "expense-approval": (
-        "pattern_expense_approval",
-        True,
-        "Tiered expense approval (runtime: temporal). A DECISION node routes on amount (no LLM), each tier pauses durably at a HUMAN gate that routes its own approve/reject decision (ADR 099) — zero LLM classifiers, all tiers converging on ONE shared ERP-post/finalize/rejected tail (ADR 094/098/099).",  # noqa: E501
-        "DECISION(amount) → [HUMAN routes approve|reject] → shared ERP-post|rejected → finalize",
-    ),
-    "itsm-request": (
-        "pattern_itsm_request",
-        True,
-        "ITSM service-request fulfilment over a parameterized catalog (runtime: temporal). A DECISION node routes the portal's auto_approved flag (no LLM); needs-approval services pause at ONE HUMAN gate routing its own approve/reject decision (ADR 099); fulfilment is a TOOL node calling the workflow-local sim-provision python skill (ADR 097) — auto + approve paths converge on the shared provision→notify tail (ADR 094/097/098/099).",  # noqa: E501
-        "DECISION(auto_approved) → [HUMAN routes approve|reject] → shared TOOL provision → notify | rejected",  # noqa: E501
-    ),
-    "purchase-order": (
-        "pattern_purchase_order",
-        True,
-        "Tiered purchase-order approval with a SEQUENTIAL APPROVAL CHAIN (runtime: temporal). A DECISION node tiers on the amount (no LLM): ≤500 auto-creates the PO; everything else pauses at the manager HUMAN gate, and a second DECISION chains >5000 orders into the director gate — both must approve. PO creation is a TOOL node calling the workflow-local sim-create-po python skill (ADR 097); all approve paths converge on the shared create-po→notify tail (ADR 094/097/098/099).",  # noqa: E501
-        "DECISION(amount) → [HUMAN manager] → DECISION(escalate) → [HUMAN director] → shared TOOL create-po → notify | rejected",  # noqa: E501
-    ),
-    "approval-timeout": (
-        "pattern_approval_timeout",
-        True,
-        "Approval with DURABLE TIMEOUT + escalation (runtime: temporal) — the live shape of ADR 062 D4. The primary HUMAN gate carries a 90s durable deadline whose expiry escalates to a second HUMAN gate (the alternate approver); ITS expiry fails safe to rejected — silence can never fulfil. Fulfilment is a TOOL node calling the workflow-local sim-fulfill python skill (ADR 097); both approve paths converge on the shared fulfill→notify tail (ADR 062/097/098/099).",  # noqa: E501
-        "[HUMAN primary ⏲90s] → on_timeout → [HUMAN escalation ⏲90s] → shared TOOL fulfill → notify | rejected",  # noqa: E501
-    ),
-    "human-escalation": (
-        "pattern_human_escalation",
-        True,
-        "Low-confidence human escalation with RESUME-WITH-FEEDBACK (runtime: temporal). A triage agent drafts an answer + a calibrated numeric confidence; a DECISION node routes confidence ≥ 0.8 straight to finalize (no second LLM judging the first), everything else pauses at the review HUMAN gate (output_contract [decision, feedback]) — the reviewer's feedback merges into state and the finalize agent incorporates it (ADR 094/098/099).",  # noqa: E501
-        "triage → DECISION(confidence) → {finalize | [HUMAN review + feedback]} → finalize | rejected",  # noqa: E501
-    ),
-    "pii-detection": (
-        "pattern_pii_detection",
-        True,
-        "PII document scanning + masking (runtime: temporal). A deterministic redact-pii TOOL node (anchored regexes, no LLM) masks emails/SSNs/phones to [EMAIL]/[SSN]/[PHONE]; a DECISION node routes pii_found to a quarantine or clean-store TOOL (auditable dlp ledger rows), converging on ONE notify agent that sees only the redacted text (ADR 094/097/098).",  # noqa: E501
-        "TOOL redact → DECISION(pii_found) → {TOOL quarantine | TOOL store-clean} → notify",
-    ),
-    "data-privacy": (
-        "pattern_data_privacy",
-        True,
-        "Classify → policy-route → AUDITED storage (runtime: temporal). A calibrated enum-pinned classify agent feeds a DECISION node routing public/internal/regulated; regulated documents are masked by the redact-pii TOOL first; ALL paths converge on one sim-audit-store TOOL recording the classification-keyed audit row no path can skip (ADR 094/097/098).",  # noqa: E501
-        "classify → DECISION(classification) → {TOOL redact → TOOL audit-store | TOOL audit-store} → summary",  # noqa: E501
-    ),
-    "content-publishing": (
-        "pattern_content_publishing",
-        True,
-        "Multi-stage content review chain + HITL final gate (runtime: temporal). Calibrated compliance-review and brand-review agents each feed a DECISION node failing safe to a shared rejected agent; content passing BOTH still publishes nothing until a HUMAN gate routes its own approve/reject decision (ADR 099) into the sim-publish TOOL's auditable cms ledger row (ADR 094/097/098/099).",  # noqa: E501
-        "compliance → DECISION → brand → DECISION → [HUMAN routes approve|reject] → TOOL publish → notify | rejected",  # noqa: E501
-    ),
-    "multi-agent-investigation": (
-        "pattern_multi_agent_investigation",
-        True,
-        "Multi-agent investigation over the PARALLEL FAN-OUT/FAN-IN diamond (runtime: temporal, ADR 092). A plan agent decomposes the question, THREE calibrated specialist sims (web/kb/data) research it CONCURRENTLY — durable asyncio.gather on Temporal — each writing its own disjoint findings key, and ONE synthesize agent joins the branches into {conclusion, confidence}, explicitly acknowledging disagreement between sources.",  # noqa: E501
-        "plan → FAN-OUT {web ∥ kb ∥ data} → FAN-IN synthesize",
-    ),
-    "multi-agent-business-process": (
-        "pattern_multi_agent_business_process",
-        True,
-        "Multi-agent business process under the bounded SUPERVISOR primitive (runtime: temporal, ADR 092 D4). A process-manager agent delegates across a FIXED specialist allowlist (research/pricing/compliance — calibrated sims with JSON contracts) in a loop hard-capped at max_delegations, then a proposal agent composes the deliverable and notify confirms it — managerial delegation WITH structural bounds, not a swarm.",  # noqa: E501
-        "SUPERVISOR(manager ⇒ research|pricing|compliance, ≤4) → proposal → notify",
-    ),
-    "external-api-failure": (
-        "pattern_external_api_failure",
-        True,
-        "Retries + fallback provider with OBSERVABLE activity retries (runtime: temporal). A flaky TOOL entrypoint records one ledger attempt row per invocation and raises while attempts <= fail_times — so ledger rows = Temporal retry attempts (max 3); transient failures recover via the durable retry (the fallback provider serves them), exhaustion fails the workflow loudly with zero downstream record rows (ADR 094/097/098).",  # noqa: E501
-        "TOOL flaky-call ⟳3 → DECISION(provider_ok) → shared TOOL record → notify | failed",
-    ),
-    "partial-failure-recovery": (
-        "pattern_partial_failure_recovery",
-        True,
-        "Three-step pipeline whose flaky middle step proves completed steps are NEVER re-executed on retry (runtime: temporal). step1/step3 share ONE parameterized sim-step skill (ADR 097 D1 input literals + output_key); the flaky step2 records an attempt row per invocation and succeeds on the durable retry — the ledger shows step1 exactly once next to step2's two attempts (ADR 097/098).",  # noqa: E501
-        "TOOL step-one → TOOL step-two ⟳3 → TOOL step-three → notify",
-    ),
-    "long-running-research": (
-        "pattern_long_running_research",
-        True,
-        "Scheduled incremental research — the ADR 100 D1 cron-schedule shape (runtime: temporal). The schedule is the durable outer loop, each fire runs ONE idempotent increment: a research agent drafts findings, a TOOL node appends the auditable research-log row (increment in the payload), and a DECISION routes increment gte 3 into the final report (earlier increments get a light ack) — no week-long sleeping workflow (ADR 094/097/100).",  # noqa: E501
-        "research → TOOL append → DECISION(increment) → {final-report | ack}",
-    ),
-    "agent-deploy-approval": (
-        "pattern_agent_deploy_approval",
-        True,
-        "Eval-gated agent promotion with a HUMAN release gate (runtime: temporal). An eval-runner TOOL node (ADR 097 — honestly a calibrated simulation of an mdk eval run, scores deterministic per fixture, auditable eval ledger row) feeds a DECISION node gating eval_score ≥ 0.85 (no LLM); passing candidates still pause at a HUMAN gate routing its own approve/reject decision (ADR 099) before the sim-promote TOOL records the registry ledger row; every rejected exit converges on ONE rejected-with-report agent (ADR 094/097/098/099).",  # noqa: E501
-        "TOOL eval-run → DECISION(score) → [HUMAN routes approve|reject] → TOOL promote → notify | rejected",  # noqa: E501
-    ),
-    "agent-benchmark": (
-        "pattern_agent_benchmark",
-        True,
-        "Two-config benchmark of the SAME task (runtime: temporal). Two candidate agents share the same prompt TEXT but differ in agent.yaml model params (the configs under test), running SEQUENTIALLY with disjoint output keys; a compare judge scores BOTH (required output keys — it cannot ignore one) and picks the enum-pinned winner (a|b); the sim-record-benchmark TOOL records the auditable eval/benchmark ledger row (ADR 097).",  # noqa: E501
-        "candidate-a → candidate-b → compare → TOOL record-benchmark → notify",
-    ),
-    "continuous-eval": (
-        "pattern_continuous_eval",
-        True,
-        "ONE increment of a scheduled production-quality sampling pipeline (runtime: temporal; cadence lives in the ADR 100 scheduler, not a loop). A calibrated scorer agent scores one sampled interaction 0-1; a DECISION node applies the 0.6 floor (no LLM): regressions record an auditable quality_alert ledger row (TOOL, ADR 097) + an escalation summary, healthy samples record their score + a one-line ack — every increment leaves a ledger row (ADR 094/097/100).",  # noqa: E501
-        "scorer → DECISION(score) → {TOOL alert → escalate | TOOL record → ack}",
-    ),
-    "promotion-pipeline": (
-        "pattern_promotion_pipeline",
-        True,
-        "Staged promotion gates in ONE workflow (runtime: temporal). A DECISION node routes the CI-named stage (no LLM; unknown stages fail safe): test runs the sim-run-tests TOOL; staging records eval evidence (TOOL) THEN pauses at a HUMAN sign-off gate (ADR 099); production pauses at a HUMAN approval gate FIRST — the sim-deploy TOOL's promote_prod ledger row is reachable ONLY via its approve route. One stage per run (not a loop), shared notify/rejected tails (ADR 094/097/098/099).",  # noqa: E501
-        "DECISION(stage) → {TOOL tests | TOOL eval → [HUMAN signoff] | [HUMAN approval] → TOOL deploy} → notify | rejected",  # noqa: E501
-    ),
-    "ab-testing": (
-        "pattern_ab_testing",
-        True,
-        "Deterministic A/B traffic split (runtime: temporal). An assign-variant TOOL node (ADR 097) assigns the variant from the SHA-256 parity of the user_id (no randomness, no salted builtin hash — same user, same variant, every replay) with an auditable assign ledger row; a DECISION node routes to one of two arms whose prompt files are BYTE-IDENTICAL and whose agent.yaml model params are the only difference; both arms converge on the sim-record-outcome TOOL recording which variant served (ADR 094/097/098).",  # noqa: E501
-        "TOOL assign → DECISION(variant) → {variant-a | variant-b} → TOOL record-outcome → notify",
-    ),
-    "employee-onboarding": (
-        "pattern_employee_onboarding",
-        True,
-        "New-hire provisioning across three systems (runtime: temporal). A descriptive plan agent feeds THREE deterministic TOOL nodes — AD account, mailbox, and a role-keyed equipment bundle (a fixed map in the skill, never a model decision) — each recording an auditable ledger row, then a welcome agent summarizes. Sequential by phase-gate design: ADR 092 parallel graphs are agent-only today, so the conceptual fan-out diamond ships as a chain (ADR 092/097).",  # noqa: E501
-        "plan → TOOL provision-ad → TOOL provision-email → TOOL provision-equipment → welcome",
-    ),
-    "incident-response": (
-        "pattern_incident_response",
-        True,
-        "Event-driven incident diagnosis + remediation + escalation (runtime: temporal). A calibrated-confidence diagnose agent feeds a DECISION node (gte 0.7 → the sim-remediate TOOL, whose applied/failed status is deterministic on the alert and whose ATTEMPT is always an auditable ops ledger row); a verify agent mirrors the machine status into a second DECISION; both escalation reasons converge on ONE HUMAN gate routing its own ack (fallback notify — a human can delay closure, never wedge it). Trigger-shaped input for ADR 100 (--event-key alert) (ADR 094/097/098/099/100).",  # noqa: E501
-        "diagnose → DECISION(confidence) → {TOOL remediate → verify → DECISION(resolved) → notify | [HUMAN escalate routes ack] → notify}",  # noqa: E501
-    ),
-    "cross-system-action": (
-        "pattern_cross_system_action",
-        True,
-        "Coordinated multi-system action with an audit trail (runtime: temporal). A descriptive plan agent feeds FOUR deterministic TOOL nodes in a FIXED order — CRM (salesforce) → ERP (sap) → ticket (servicenow) → email — each recording its own auditable ledger row; the order guarantee is structural (a strict sequential chain, one activity at a time), and an audit-summary agent writes the one record naming all four references (ADR 097).",  # noqa: E501
-        "plan → TOOL crm-update → TOOL erp-update → TOOL create-ticket → TOOL send-email → audit-summary",  # noqa: E501
-    ),
-    "executive-briefing": (
-        "pattern_executive_briefing",
-        True,
-        "Scheduled multi-source executive digest (runtime: temporal), CRON-BORN per ADR 100 (mdk schedule set --cron). A SEQUENTIAL chain of two TOOL nodes (entrypoint fan-out is not available for TOOL nodes) runs the workflow-local sim-gather-metrics / sim-gather-incidents python skills (auditable gather ledger rows, no network IO); the ONE composing digest agent writes the briefing strictly from the gathered results and emits a risk_count a DECISION node routes — risky briefings escalate via flag, clean ones file via archive (ADR 094/097/100).",  # noqa: E501
-        "TOOL gather-metrics → TOOL gather-incidents → digest → DECISION(risk_count) → {flag | archive}",  # noqa: E501
-    ),
-    "ops-center": (
-        "pattern_ops_center",
-        True,
-        "AI ops-center daily summary over the unified observability reporting surface (runtime: temporal, ADR 096). A fetch-facts TOOL node returns canned observability_facts-shaped rows (echoing the real GET /api/v1/observability/facts endpoint it would query — never network IO); the ONE summarize agent counts totals/failures/top risks strictly from the rows; a DECISION node pages a HUMAN gate on failure_count > 0 (ack → report, fallback report — fail-open: a page can delay the daily report, never kill it), clean windows report directly (ADR 094/096/097/098/099).",  # noqa: E501
-        "TOOL fetch-facts → summarize → DECISION(failure_count) → {[HUMAN page ack] → report | report}",  # noqa: E501
-    ),
-    "rag-debug": (
-        "pattern_rag_debug",
-        True,
-        "RAG with the retrieval stage as an auditable step (runtime: temporal). A retrieve TOOL node (deterministic keyword scoring over an inline KB, auditable vectorstore ledger row — no embeddings, no LLM) feeds a DECISION node routing top_score ≥ 0.5 to a strictly-grounded answer agent; lower scores route to a diagnose agent explaining the low score + suggesting a query reformulation — the failure mode is a route, not an error (ADR 094/097).",  # noqa: E501
-        "TOOL retrieve → DECISION(top_score) → {answer | diagnose}",
-    ),
-    "kb-refresh": (
-        "pattern_kb_refresh",
-        True,
-        "Validated knowledge-base refresh (runtime: temporal). An ingest TOOL node (fixed chunking rule, auditable kb ledger row) feeds a validate agent judging the ingest SUMMARY into {ok, note}; a DECISION node routes ok=true into the sim-kb-publish TOOL (auditable publish row) and failures into a HUMAN ack gate with NO retry route (acyclic by design) — both paths converging on ONE guarded notify tail (ADR 094/097/098/099).",  # noqa: E501
-        "TOOL ingest → validate → DECISION(ok) → {TOOL publish | [HUMAN ack]} → notify",
-    ),
-    "agent-self-healing": (
-        "pattern_agent_self_healing",
-        True,
-        "An agent detects its own degraded output quality and heals (runtime: temporal). The sim-health-check TOOL node measures canned quality metrics (no LLM self-grading); a DECISION node routes the 0.8 threshold; a diagnose agent names cause + fix but the sim-apply-fix TOOL decides applied/failed deterministically (a model-drift symptom can never self-fix); a failed fix pauses at a HUMAN ack gate before the incident report — no cycles, a failed fix can only escalate (ADR 094/097/098/099).",  # noqa: E501
-        "TOOL health-check → DECISION(quality) → {healthy | diagnose → TOOL apply-fix → DECISION → {verified | [HUMAN ack] → incident}}",  # noqa: E501
-    ),
-    "self-healing-ops": (
-        "pattern_self_healing_ops",
-        True,
-        "Infrastructure self-healing with two-attempt remediation (runtime: temporal). The sim-detect TOOL node maps the monitor signal onto a canned fault catalog; ONE triage agent recommends the action; 'retry on failure' is UNROLLED into two sequential remediation TOOL attempts (no cycles — the cap is structural), each verified by a DECISION node and each writing its own ops ledger row; a fault surviving both attempts pauses at a HUMAN ack gate — all three exits converge on ONE guarded closure agent (ADR 094/097/098/099).",  # noqa: E501
-        "TOOL detect → triage → TOOL remediate-1 → DECISION → {closure | TOOL remediate-2 → DECISION → {closure | [HUMAN ack] → closure}}",  # noqa: E501
-    ),
-    # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
-    # they were pushed directly to main substantially incomplete (sub-agents
-    # missing canonical YAML schemas + judge examples; templates missing root
-    # GOVERNANCE.md + judge), which broke the required lint-and-test check and
-    # jammed the merge queue. Re-land them complete via a proper PR.
-}
+# AUTO-DISCOVERED — no central dict literal to edit. Each ``pattern_*/`` dir
+# under this package carries a ``pattern.yaml`` (name / kind / description /
+# topology); the registry is built by scanning for those files at import time.
+# Adding a pattern = drop a directory with a ``pattern.yaml``. This killed the
+# recurring merge conflict where every scenario-batch PR appended to a ~30-entry
+# dict literal here (the "dropped closing paren" seam). ``pattern.yaml`` is a
+# RESERVED name: ``mdk init --pattern`` excludes it from the copied scaffold
+# (see ``_scaffold_pattern_*`` in ``movate.cli.init``), so template payloads
+# must not use it.
+#
+# NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
+# they were pushed directly to main substantially incomplete (sub-agents
+# missing canonical YAML schemas + judge examples; templates missing root
+# GOVERNANCE.md + judge), which broke the required lint-and-test check and
+# jammed the merge queue. Re-land them complete via a proper PR.
+
+PATTERN_METADATA_FILE = "pattern.yaml"
+
+# Public shape preserved (rule 5): name → (relative dir, is_workflow,
+# one-line description, topology) — exactly what the dict literal held.
+PatternEntry = tuple[str, bool, str, str]
+
+
+class PatternMetadataError(Exception):
+    """Raised when a ``pattern_*/pattern.yaml`` is missing or malformed.
+
+    Discovery fails LOUD: a pattern dir without valid metadata is a
+    packaging bug (every shipped pattern's completeness is gated by
+    tests), and a silent skip would make ``mdk init --pattern`` lie
+    about the available catalog.
+    """
+
+
+def _load_pattern_registry(root: Path | None = None) -> dict[str, PatternEntry]:
+    """Build the pattern registry by scanning ``root`` for ``pattern_*/``
+    dirs carrying a :data:`PATTERN_METADATA_FILE`.
+
+    ``root`` defaults to :data:`TEMPLATES_DIR` (the parameter exists so
+    tests can exercise the failure modes against a temp tree). Returned
+    dict is sorted by pattern name — deterministic iteration order for
+    ``mdk patterns list`` and stable ``--json`` output regardless of
+    filesystem enumeration order.
+
+    Raises :class:`PatternMetadataError` on a missing metadata file,
+    unparseable YAML, missing/invalid fields, or a duplicate pattern
+    name across two dirs.
+    """
+    base = root if root is not None else TEMPLATES_DIR
+    entries: dict[str, PatternEntry] = {}
+    for pattern_dir in sorted(p for p in base.glob("pattern_*") if p.is_dir()):
+        meta_file = pattern_dir / PATTERN_METADATA_FILE
+        if not meta_file.is_file():
+            raise PatternMetadataError(
+                f"pattern dir {pattern_dir.name!r} is missing {PATTERN_METADATA_FILE} "
+                "(every shipped pattern_*/ dir must carry registry metadata)"
+            )
+        try:
+            raw = yaml.safe_load(meta_file.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            raise PatternMetadataError(f"invalid YAML in {meta_file}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise PatternMetadataError(f"{meta_file} must be a mapping, got {type(raw).__name__}")
+        name = raw.get("name")
+        kind = raw.get("kind")
+        description = raw.get("description")
+        topology = raw.get("topology")
+        for field_name, value in (
+            ("name", name),
+            ("description", description),
+            ("topology", topology),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise PatternMetadataError(
+                    f"{meta_file}: required field {field_name!r} missing or empty"
+                )
+        if kind not in ("workflow", "agent"):
+            raise PatternMetadataError(
+                f"{meta_file}: `kind` must be 'workflow' or 'agent', got {kind!r}"
+            )
+        assert isinstance(name, str) and isinstance(description, str)  # narrowed above
+        assert isinstance(topology, str)
+        if name in entries:
+            raise PatternMetadataError(
+                f"duplicate pattern name {name!r}: declared by both "
+                f"{entries[name][0]!r} and {pattern_dir.name!r}"
+            )
+        entries[name] = (pattern_dir.name, kind == "workflow", description, topology)
+    return dict(sorted(entries.items()))
+
+
+PATTERN_TEMPLATES: dict[str, PatternEntry] = _load_pattern_registry()
 
 
 def list_patterns() -> list[str]:
@@ -647,11 +538,14 @@ def list_template_infos(*, include_workflows: bool = True) -> list[TemplateInfo]
 
 
 __all__ = [
+    "PATTERN_METADATA_FILE",
     "PATTERN_TEMPLATES",
     "ROLE_TEMPLATES",
     "TEMPLATES",
     "TEMPLATES_DIR",
     "WORKFLOW_TEMPLATES",
+    "PatternEntry",
+    "PatternMetadataError",
     "TemplateInfo",
     "TemplateInfoLoadError",
     "TemplateShape",

@@ -1,0 +1,8 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: chatbot
+kind: agent
+description: Single governed agent answering one turn under an enforced output contract.
+topology: INPUT → AGENT → OUTPUT

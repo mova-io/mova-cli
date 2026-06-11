@@ -1,0 +1,14 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: purchase-order
+kind: workflow
+description: 'Tiered purchase-order approval with a SEQUENTIAL APPROVAL CHAIN (runtime: temporal).
+  A DECISION node tiers on the amount (no LLM): ≤500 auto-creates the PO; everything else
+  pauses at the manager HUMAN gate, and a second DECISION chains >5000 orders into the director
+  gate — both must approve. PO creation is a TOOL node calling the workflow-local sim-create-po
+  python skill (ADR 097); all approve paths converge on the shared create-po→notify tail (ADR
+  094/097/098/099).'
+topology: DECISION(amount) → [HUMAN manager] → DECISION(escalate) → [HUMAN director] → shared
+  TOOL create-po → notify | rejected
