@@ -1,0 +1,5 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "request":{"type":"string"},"fail_times":{"type":"number"},
+  "provider_ok":{"type":"boolean"},"provider":{"type":"string"},
+  "api_result":{"type":"string"},"record_result":{"type":"string"},
+  "summary":{"type":"string"}}}

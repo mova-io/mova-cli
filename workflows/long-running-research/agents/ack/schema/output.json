@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["ack_note"],"properties":{"ack_note":{"type":"string"}}}
