@@ -1378,6 +1378,84 @@ def _lint_state_threading(graph: WorkflowGraph) -> None:
         )
 
 
+def _skill_dir_contents(root: Path) -> dict[str, bytes]:
+    """Relative-path → bytes map of a skill directory, for byte-identity checks.
+
+    Hidden files and ``__pycache__`` artifacts are excluded — they are
+    development-checkout noise, not shipped skill content.
+    """
+    contents: dict[str, bytes] = {}
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root)
+        if any(part == "__pycache__" or part.startswith(".") for part in rel.parts):
+            continue
+        contents[rel.as_posix()] = p.read_bytes()
+    return contents
+
+
+def _check_cross_workflow_skill_collisions(workflow_dir: Path) -> None:
+    """ERROR on a sibling workflow claiming the same skill dir name with different content.
+
+    A skill DIRECTORY name is a process-global Python module name on the
+    shared worker: the python skill backend resolves ``<dir>.impl`` once per
+    worker process, so when two deployed workflows ship same-named skill dirs
+    with DIFFERENT implementations, one workflow silently executes the
+    other's code (the live ``sim-remediate`` failure, #853). Byte-identical
+    duplicates (the ``redact-pii`` convention — interchangeable by
+    construction) stay allowed.
+
+    Scope: sibling directories under the same workflows/ root that contain a
+    ``workflow.yaml`` (i.e. deployable workflows). This is a hard ERROR, not
+    an advisory — the collision breaks live runs.
+    """
+    skills_dir = workflow_dir / "skills"
+    if not skills_dir.is_dir():
+        return
+    workflows_root = workflow_dir.parent
+    collisions: list[tuple[Path, Path]] = []
+    try:
+        for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+            for sibling in sorted(p for p in workflows_root.iterdir() if p.is_dir()):
+                if sibling.resolve() == workflow_dir.resolve():
+                    continue
+                if not (sibling / "workflow.yaml").is_file():
+                    continue  # not a deployable workflow — no shared-worker collision
+                other = sibling / "skills" / skill_dir.name
+                if not other.is_dir():
+                    continue
+                if _skill_dir_contents(skill_dir) != _skill_dir_contents(other):
+                    collisions.append((skill_dir, other))
+    except OSError as exc:
+        # Unreadable sibling tree — degrade to a warning rather than blocking
+        # validation on filesystem noise.
+        console.print(f"  [yellow]![/yellow] cross-workflow skill-name check skipped: {exc}")
+        return
+    if not collisions:
+        return
+    console.print(
+        "[red]✗ ambiguous cross-workflow skill name(s):[/red] a skill directory "
+        "name is a process-global Python module on the shared worker — the "
+        "python backend resolves [bold]<dir>.impl[/bold] once per process, so "
+        "one workflow would execute the other's code at runtime."
+    )
+    for ours, theirs in collisions:
+        console.print(
+            f"  [red]·[/red] skill [bold]{ours.name!r}[/bold] is also claimed by a "
+            f"sibling workflow with DIFFERENT contents:\n"
+            f"      [dim]{ours}[/dim]\n"
+            f"      [dim]{theirs}[/dim]"
+        )
+    console.print(
+        "[dim]  fix: rename one of them to a workflow-scoped name (e.g. the "
+        "sim-remediate → sim-remediate-ops rename in "
+        "workflows/self-healing-ops/) and update the workflow's references. "
+        "Byte-identical copies are fine — interchangeable by construction.[/dim]"
+    )
+    raise typer.Exit(code=2)
+
+
 def _validate_workflow(path: Path) -> None:
     try:
         spec, parent = load_workflow_spec(path)
@@ -1390,6 +1468,11 @@ def _validate_workflow(path: Path) -> None:
     except WorkflowCompileError as exc:
         console.print(f"[red]✗ workflow validation failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
+
+    # Cross-workflow skill-name uniqueness (#853). Hard ERROR — two deployed
+    # workflows shipping same-named skill dirs with different impls means the
+    # shared worker's process-wide entry cache executes the wrong code live.
+    _check_cross_workflow_skill_collisions(parent)
 
     console.print(
         f"[green]✓[/green] {graph.name} [dim]v{graph.version}[/dim] [dim](workflow)[/dim]"
