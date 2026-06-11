@@ -1,0 +1,31 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-deploy
+version: 0.1.0
+description: >-
+  Simulate the PRODUCTION promotion of a change: records one auditable
+  `{system: pipeline, action: promote_prod}` row to the shared
+  sim_side_effects ledger and returns a one-line confirmation. The
+  certification suite asserts this row exists EXACTLY once on the
+  human-approved production path and NEVER on test/staging paths or a
+  rejection. SELF-CONTAINED for the deployed temporal-worker image
+  (ADR 097 D2): the implementation lives in impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-deploy.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - pipeline
+  - simulation
+  - certification

@@ -1,0 +1,104 @@
+# Certification cases — agent-deploy-approval (driven by
+# certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `agent-deploy-approval`
+# workflow (workflows/agent-deploy-approval — 6 nodes: eval-run TOOL →
+# score-gate DECISION (gte 0.85) → promote-approval HUMAN gate with direct
+# decision routes → promote TOOL → notify, with every rejected exit
+# converging on ONE rejected agent). The driver submits the case input via
+# POST /run, resumes any expected HUMAN pause via the signal endpoint, then
+# reads the run back from GET /api/v1/observability/facts (ADR 096) and
+# asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * THE EVAL RUN IS A CALIBRATED SIMULATION — the eval-runner skill stands
+#   in for real `mdk eval` machinery (too heavy to drive inside a workflow
+#   activity). Scores are DETERMINISTIC per the enum-pinned `fixture` key
+#   (passing → 0.93, failing → 0.41), so the score-gate branch taken is
+#   exact, not probabilistic — that determinism is precisely what makes the
+#   promote-row expectations assertable.
+# * "NO PAUSE" IS ASSERTED STRUCTURALLY on failing-eval-blocked: it declares
+#   no `hitl` steps, so the case only passes if a terminal fact appears
+#   WITHOUT any signal; `decision` in final_state_lacks doubles that proof —
+#   only the human gate merges a `decision` key into state.
+# * `route: null` — the decision node writes nothing into state; branches
+#   are proven via final_state markers (promote_result only on the approved
+#   path) + the registry/promote ledger row (or its required absence).
+# * `status: success` for ALL cases — rejection is a route, not an error.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 (ADR 096).
+# * `governance: allow` everywhere — exactly ONE MODEL+COST-gated agent run
+#   per case (notify or rejected); the terminal fact's governance_effect
+#   must be non-null `allow`.
+# * side-effects — the eval ledger row `{system: eval, action: run}` exists
+#   on EVERY case (the eval always runs); the ONE row that gates the
+#   scenario is `{system: registry, action: promote}`: exactly once on the
+#   approved path, and its ABSENCE on the human veto (eval PASSED — proving
+#   the human gate, not the eval, finally guards the registry) and on the
+#   failed eval. Evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+
+scenario: agent-deploy-approval
+target: agent-deploy-approval # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- the full happy path: passing eval (0.93 ≥ 0.85) → human approve →
+  # --- promote TOOL → notify. Exactly one registry/promote ledger row.
+  - name: passing-eval-approved
+    input:
+      candidate: support-triage
+      version: "2026.6.10.3"
+      fixture: passing
+    hitl:
+      - node: promote-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [eval_score, eval_report, promote_result, summary]
+      side_effects:
+        - { system: eval, action: run, times: 1 }
+        - { system: registry, action: promote, times: 1 }
+
+  # --- the HUMAN veto: the eval PASSED, the approver rejects. The pause +
+  # --- reject signal are observed, the run ends success (rejection is a
+  # --- route), and the promote row must NOT exist — the gate, not the
+  # --- eval, is what finally stands between a candidate and the registry.
+  - name: passing-eval-human-rejected
+    input:
+      candidate: support-triage
+      version: "2026.6.10.3"
+      fixture: passing
+    hitl:
+      - node: promote-approval
+        decision: { decision: reject }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [eval_score, eval_report, summary]
+      final_state_lacks: [promote_result]
+      side_effects:
+        - { system: eval, action: run, times: 1 }
+      no_side_effects:
+        - { system: registry, action: promote }
+
+  # --- the eval block: 0.41 < 0.85 → straight to rejected WITH the report
+  # --- (rejected-with-report). No pause (no hitl declared; final_state
+  # --- lacks `decision`), and NO promote row.
+  - name: failing-eval-blocked
+    input:
+      candidate: support-triage
+      version: "2026.6.10.4"
+      fixture: failing
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [eval_score, eval_report, summary]
+      final_state_lacks: [promote_result, decision]
+      side_effects:
+        - { system: eval, action: run, times: 1 }
+      no_side_effects:
+        - { system: registry, action: promote }

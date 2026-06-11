@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["web_findings"],"properties":{"web_findings":{"type":"string"}}}

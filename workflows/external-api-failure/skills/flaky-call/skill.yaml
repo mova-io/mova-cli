@@ -1,0 +1,35 @@
+api_version: movate/v1
+kind: Skill
+
+name: flaky-call
+version: 0.1.0
+description: >-
+  Simulate a flaky external-API call that makes Temporal's activity retry
+  policy observable: every invocation records one auditable
+  `{system: external-api, action: attempt}` row to the shared
+  sim_side_effects ledger (same DB MDK itself uses), then RAISES while its
+  own per-run attempt count is <= the input's fail_times — so ledger rows =
+  activity attempts. Succeeds after, reporting which provider served
+  (primary on the first attempt, fallback after a retry).
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `flaky-call.impl` imports
+  from the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "flaky-call.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - retries
+  - simulation
+  - certification

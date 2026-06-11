@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["request"],"properties":{"request":{"type":"string"},"fail_times":{"type":"number"},"run_id":{"type":"string"}}}

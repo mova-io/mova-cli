@@ -1,0 +1,13 @@
+api_version: movate/v1
+kind: Agent
+name: ack
+version: 0.1.0
+description: >-
+  Acknowledges a healthy sample: one line confirming the score was
+  recorded. Terminal node of the healthy path.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

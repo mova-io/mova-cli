@@ -1,0 +1,55 @@
+api_version: movate/v1
+kind: Workflow
+name: agent-benchmark
+version: 0.1.0
+description: >
+  Two-config benchmark of the SAME task, durable on Temporal — scenario #10 of the
+  30-use-case certification program (B6 eval/lifecycle batch). The task runs
+  SEQUENTIALLY through two candidate agents that share the same prompt TEXT
+  but differ in agent.yaml model params (temperature 0.0 vs 0.9 — the
+  configs under test; they are separate agent dirs by convention, and
+  sequential by design: the ADR 092 parallel diamond would buy nothing
+  assertable here). Each candidate writes its own response key
+  (response_a / response_b), then a `compare` judge agent scores BOTH (0-1
+  each, REQUIRED output keys — the judge cannot ignore one) and picks the
+  enum-pinned winner (a|b, no ties). The verdict is recorded by the
+  `sim-record-benchmark` TOOL node (ADR 097): one `{system: eval, action:
+  benchmark}` ledger row per run. HONESTY: which candidate wins is an LLM
+  judgment over two live LLM responses — the certification cases assert the
+  CONTRACT (winner present and enum-pinned, both scores present, the ledger
+  row recorded exactly once), never a specific winner.
+  Self-contained (bundled into the temporal-worker image): the skill carries
+  its own impl.py next to skill.yaml. Mirrors
+  certification/scenarios/agent-benchmark.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: candidate-a
+nodes:
+  # The two configs under test — same prompt TEXT, different agent.yaml
+  # model params (temperature 0.0 vs 0.9), disjoint output keys
+  # (response_a / response_b) so both responses survive in state. They are
+  # separate agent dirs by convention (self-contained bundles); sequential
+  # by design — the ADR 092 parallel diamond would buy nothing assertable
+  # here.
+  - {id: candidate-a, type: agent, ref: ./agents/candidate-a}
+  - {id: candidate-b, type: agent, ref: ./agents/candidate-b}
+  # The judge: scores BOTH responses (required output keys — it cannot
+  # ignore one) and picks the enum-pinned winner (a|b, no third value).
+  - {id: compare, type: agent, ref: ./agents/compare}
+  # The audit row (ADR 097): the verdict lands in the eval ledger
+  # deterministically — no LLM between the judge and the record.
+  - id: record-benchmark
+    type: tool
+    skill: sim-record-benchmark
+  - {id: notify, type: agent, ref: ./agents/notify}
+edges:
+  - {from: candidate-a, to: candidate-b}
+  - {from: candidate-b, to: compare}
+  - {from: compare, to: record-benchmark}
+  - {from: record-benchmark, to: notify}
+tags:
+  - temporal
+  - tool
+  - eval
+  - lifecycle
+  - certification

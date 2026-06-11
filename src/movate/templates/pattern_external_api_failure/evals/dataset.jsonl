@@ -1,0 +1,2 @@
+{"input": {"request": "currency-rates", "fail_times": 0}, "expected": {"summary": "The call completed via the primary provider and the result was recorded."}}
+{"input": {"request": "shipment-status", "fail_times": 1}, "expected": {"summary": "The call completed via the fallback provider after a retry and the result was recorded."}}

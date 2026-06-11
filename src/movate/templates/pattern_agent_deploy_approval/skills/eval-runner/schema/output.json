@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["eval_score","eval_report"],"properties":{"eval_score":{"type":"number"},"eval_report":{"type":"string"}}}

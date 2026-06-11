@@ -1,0 +1,13 @@
+api_version: movate/v1
+kind: Agent
+name: compliance
+version: 0.1.0
+description: >-
+  Calibrated sim of the compliance officer: assesses ONLY against its
+  embedded compliance checklist into a labeled JSON assessment contract.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

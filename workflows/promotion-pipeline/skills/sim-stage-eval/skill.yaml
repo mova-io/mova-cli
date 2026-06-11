@@ -1,0 +1,32 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-stage-eval
+version: 0.1.0
+description: >-
+  Simulate the STAGING eval gate of a promotion pipeline: records one
+  auditable `{system: eval, action: stage_eval}` row to the shared
+  sim_side_effects ledger and returns a one-line eval summary for the
+  human sign-off that follows. HONESTY: a calibrated simulation — the
+  real eval machinery is too heavy to drive in-workflow, so the
+  summary is deterministic. SELF-CONTAINED for the deployed
+  temporal-worker image (ADR 097 D2): the implementation lives in
+  impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-stage-eval.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - eval
+  - simulation
+  - certification

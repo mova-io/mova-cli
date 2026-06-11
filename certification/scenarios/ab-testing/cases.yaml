@@ -1,0 +1,69 @@
+# Certification cases — ab-testing (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `ab-testing` workflow
+# (workflows/ab-testing — 6 nodes: assign-variant TOOL → variant-gate
+# DECISION → {variant-a | variant-b} → record-outcome TOOL → notify). The
+# driver submits the case input via POST /run, then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * THE SPLIT IS EXACTLY ASSERTABLE — assignment is the SHA-256 parity of
+#   the user_id (deterministic, process-independent; explicitly NOT the
+#   salted builtin hash()). The two user_ids below were PRECOMPUTED:
+#   sha256("user-1001") is even → variant a; sha256("user-1003") is odd →
+#   variant b. `final_state_contains` pins the exact variant value per
+#   case — a drifted hash function fails both cases loudly.
+# * THE ARMS DIFFER ONLY IN MODEL PARAMS — byte-identical prompt files
+#   (asserted by the structural test suite), temperature 0.0 vs 0.9 in
+#   agent.yaml. Which arm produces "better" responses is not asserted —
+#   only that the routed arm ran (the shared `response` key is present).
+# * `route: null` — the decision node writes nothing into state; the branch
+#   is proven via the pinned `variant` value + the assign/outcome rows.
+# * `hitl` — no human gate in this workflow; both cases record an honest
+#   SKIP.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 (ADR 096).
+# * `governance: allow` everywhere — exactly TWO MODEL+COST-gated agent
+#   runs per case (the routed arm + notify).
+# * side-effects — exactly one `{system: ab, action: assign}` row AND
+#   exactly one `{system: ab, action: record_outcome}` row per run (the
+#   experiment is auditable end to end). Evaluated only when the shared DB
+#   is reachable (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+
+scenario: ab-testing
+target: ab-testing # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- sha256("user-1001") % 2 == 0 → variant a (precomputed; pinned via
+  # --- final_state_contains).
+  - name: variant-a-user
+    input:
+      request: Recommend a quick healthy lunch I can make in ten minutes.
+      user_id: user-1001
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [variant, assign_result, response, outcome_result, summary]
+      final_state_contains:
+        variant: ["a"]
+      side_effects:
+        - { system: ab, action: assign, times: 1 }
+        - { system: ab, action: record_outcome, times: 1 }
+
+  # --- sha256("user-1003") % 2 == 1 → variant b (precomputed; pinned via
+  # --- final_state_contains).
+  - name: variant-b-user
+    input:
+      request: Recommend a quick healthy lunch I can make in ten minutes.
+      user_id: user-1003
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [variant, assign_result, response, outcome_result, summary]
+      final_state_contains:
+        variant: ["b"]
+      side_effects:
+        - { system: ab, action: assign, times: 1 }
+        - { system: ab, action: record_outcome, times: 1 }

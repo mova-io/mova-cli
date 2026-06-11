@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"employee":{"type":"string"},"role":{"type":"string"},"start_date":{"type":"string"},"accounts_needed":{"type":"string"},"ad_result":{"type":"string"},"email_result":{"type":"string"},"equipment_result":{"type":"string"}}}

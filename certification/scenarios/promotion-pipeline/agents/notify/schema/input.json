@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"change":{"type":"string"},"stage":{"type":"string"},"test_result":{"type":"string"},"stage_eval_result":{"type":"string"},"deploy_result":{"type":"string"}}}

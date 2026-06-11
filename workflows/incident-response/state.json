@@ -1,0 +1,8 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "alert":{"type":"object","properties":{
+    "service":{"type":"string"},"severity":{"type":"string"},"message":{"type":"string"}}},
+  "root_cause":{"type":"string"},"confidence":{"type":"number"},
+  "remediation":{"type":"string"},
+  "remediation_status":{"type":"string"},"remediation_result":{"type":"string"},
+  "resolved":{"type":"boolean"},"status_note":{"type":"string"},
+  "decision":{"type":"string"},"summary":{"type":"string"}}}

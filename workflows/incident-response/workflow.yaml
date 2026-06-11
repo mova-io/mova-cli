@@ -1,0 +1,86 @@
+api_version: movate/v1
+kind: Workflow
+name: incident-response
+version: 0.1.0
+description: >
+  Event-driven incident diagnosis + remediation + escalation, durable on
+  Temporal — scenario #7 of the 30-use-case certification program (B5
+  cross-system batch). A `diagnose` agent names the root cause and
+  self-scores a calibrated confidence; a deterministic `decision` node
+  (ADR 094) routes `confidence gte 0.7` to the `sim-remediate` TOOL
+  (ADR 097 — the ATTEMPT is always an auditable `{system: ops, action:
+  remediate}` ledger row, and its applied/failed status is deterministic on
+  the alert message); a `verify` agent reports `resolved` from the ops
+  system's status, and a second `decision` node routes resolved → notify,
+  not-resolved → the `escalate` HUMAN gate. Low-confidence diagnoses skip
+  remediation and escalate directly — BOTH escalation paths converge on the
+  ONE gate (exclusive convergence, ADR 098), which routes its own
+  acknowledgement (ADR 099: ack → notify; any other wording falls back to
+  notify too — an acknowledgement can delay closure, never wedge it) into
+  the ONE notify agent. Born for ADR 100 triggers: the input shape
+  ({alert: {service, severity, message}}) is exactly what a webhook trigger
+  created with `--event-key alert` feeds it — see README.md for the
+  verified trigger binding. Self-contained (bundled into the temporal-worker
+  image): the skill carries its own impl.py next to skill.yaml, so the
+  worker imports it from the baked workflows/ tree. Mirrors
+  certification/scenarios/incident-response.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: diagnose
+nodes:
+  # The diagnosis LLM: root cause + remediation + a calibrated confidence.
+  - {id: diagnose, type: agent, ref: ./agents/diagnose}
+  # Deterministic confidence routing (ADR 094): the threshold is a pure
+  # numeric predicate over the diagnose output — no second LLM judging the
+  # first.
+  - id: confidence-gate
+    type: decision
+    cases:
+      - when: {field: confidence, op: gte, value: 0.7}
+        to: remediate
+    default: escalate
+  # The remediation TOOL (ADR 097): records the attempt to the ops ledger
+  # deterministically; applied/failed is keyed off the alert message (a
+  # hardware/physical/manual fault cannot be auto-fixed).
+  - id: remediate
+    type: tool
+    skill: sim-remediate
+  # The verification LLM: mirrors the ops system's machine status into the
+  # `resolved` boolean the next decision routes on.
+  - {id: verify, type: agent, ref: ./agents/verify}
+  # Deterministic outcome routing (ADR 094): resolved closes, anything else
+  # goes to the human.
+  - id: resolved-gate
+    type: decision
+    cases:
+      - when: {field: resolved, op: eq, value: true}
+        to: notify
+    default: escalate
+  # ONE escalation gate for BOTH escalation reasons (low confidence, failed
+  # remediation). The gate routes its OWN decision (ADR 099); the fallback is
+  # notify as well — a human acknowledgement can only delay closure, never
+  # wedge the run.
+  - id: escalate
+    type: human
+    prompt: >
+      This incident needs a human: either the diagnosis confidence was below
+      0.7 or an automated remediation failed. Acknowledge it: respond with
+      `decision` set to exactly "ack" — any other wording is also treated as
+      acknowledged (the closure notification is sent either way).
+    output_contract: [decision]
+    routes: {ack: notify}
+    fallback: notify
+  # --- shared tail (ADR 098): the auto-resolved path and both acknowledged
+  # --- escalation paths converge on ONE notify agent.
+  - {id: notify, type: agent, ref: ./agents/notify}
+edges:
+  - {from: diagnose, to: confidence-gate}
+  - {from: remediate, to: verify}
+  - {from: verify, to: resolved-gate}
+tags:
+  - temporal
+  - decision
+  - hitl
+  - tool
+  - triggers
+  - certification

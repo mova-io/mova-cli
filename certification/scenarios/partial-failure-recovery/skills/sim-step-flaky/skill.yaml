@@ -1,0 +1,36 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-step-flaky
+version: 0.1.0
+description: >-
+  Simulate the flaky middle step of a pipeline: every invocation records one
+  auditable `{system: pipeline, action: step2_attempt}` row to the shared
+  sim_side_effects ledger (same DB MDK itself uses), RAISES while its own
+  per-run attempt count is <= the input's fail_times, and records the one
+  `{system: pipeline, action: step2}` row ONLY on the invocation that
+  succeeds — so attempt rows = activity attempts and the success row proves
+  the step completed exactly once.
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `sim-step-flaky.impl` imports
+  from the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-step-flaky.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - pipeline
+  - retries
+  - simulation
+  - certification

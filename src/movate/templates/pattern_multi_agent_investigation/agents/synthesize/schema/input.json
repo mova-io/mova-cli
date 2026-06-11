@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"question":{"type":"string"},"web_findings":{"type":"string"},"kb_findings":{"type":"string"},"data_findings":{"type":"string"}}}

@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: candidate-a
+version: 0.1.0
+description: >-
+  Benchmark candidate A: completes the task under config A
+  (temperature 0.0 — deterministic, conservative). Same prompt text
+  as candidate-b; ONLY the agent.yaml model params and the output
+  key differ (the configs under test).
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

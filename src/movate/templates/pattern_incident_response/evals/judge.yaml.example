@@ -1,0 +1,27 @@
+# LLM-as-judge for the Incident Response workflow. Rename to ``judge.yaml``
+# to enable.
+#
+# Scores the final ``summary`` against the expected outcome: an
+# auto-remediated incident must read as remediated AND verified; an escalated
+# incident must state WHY it was escalated (low confidence vs a failed
+# remediation). Claiming resolution for an escalated incident is a 0.0. Used
+# as the CI eval-gate the pattern's governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's final summary against the expected outcome.
+    1.0 = correct outcome (auto-remediated-and-verified vs escalated), the
+          root cause is named, and an escalation states the correct reason
+          (low diagnosis confidence, or a failed remediation)
+    0.5 = correct outcome but the root cause or the escalation reason is
+          missing or muddled
+    0.0 = wrong outcome — e.g. the summary claims resolution for an
+          escalated incident, or invents a remediation that never ran
+
+threshold: 0.7

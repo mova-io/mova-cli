@@ -1,0 +1,56 @@
+api_version: movate/v1
+kind: Workflow
+name: cross-system-action
+version: 0.1.0
+description: >
+  Coordinated multi-system action with an audit trail, durable on Temporal.
+  A `plan` agent restates the requested action in business terms
+  (descriptive only — it cannot change the chain), then FOUR TOOL nodes
+  (ADR 097) touch the four systems IN A FIXED ORDER, each recording its own
+  auditable ledger row: CRM (`{system: salesforce, action: update_record}`)
+  → ERP (`{system: sap, action: update_vendor}`) → ticket
+  (`{system: servicenow, action: create_ticket}`) → notification email
+  (`{system: email, action: send}`) — and an `audit-summary` agent writes
+  the one audit record naming all four references. The ORDER guarantee is
+  structural: the graph is a strict sequential chain and the Temporal
+  lowering executes one activity at a time, so the ERP can never be touched
+  before the CRM, and a mid-chain failure leaves a ledger prefix (rows in
+  order up to the failed step) — exactly what an auditor wants to read.
+  Self-contained: every skill carries its own impl.py next to skill.yaml
+  (workflow-local, so a temporal-worker image bakes them for free). Point
+  the sim-* skills at your real CRM/ERP/ITSM/email backends to go live.
+  Mirrors workflows/cross-system-action.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: plan
+nodes:
+  # The planning LLM is descriptive only: the system set + order below is
+  # fixed in the graph — the model cannot widen or reorder it.
+  - {id: plan, type: agent, ref: ./agents/plan}
+  # --- the cross-system TOOL chain (ADR 097 — deterministic ledger rows, no
+  # --- LLM), strictly ordered: CRM → ERP → ticket → email.
+  - id: crm-update
+    type: tool
+    skill: sim-crm-update
+  - id: erp-update
+    type: tool
+    skill: sim-erp-update
+  - id: create-ticket
+    type: tool
+    skill: sim-ticket
+  - id: send-email
+    type: tool
+    skill: sim-notify-email
+  # The audit record runs after ALL four results merged into state.
+  - {id: audit-summary, type: agent, ref: ./agents/audit-summary}
+edges:
+  - {from: plan, to: crm-update}
+  - {from: crm-update, to: erp-update}
+  - {from: erp-update, to: create-ticket}
+  - {from: create-ticket, to: send-email}
+  - {from: send-email, to: audit-summary}
+tags:
+  - temporal
+  - tool
+  - audit
+  - certification

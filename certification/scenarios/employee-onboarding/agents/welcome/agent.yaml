@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: welcome
+version: 0.1.0
+description: >-
+  Summarizes everything that was provisioned for the new hire — the AD
+  account, the mailbox, and the equipment order — referencing each system's
+  fulfilment reference. Runs AFTER the three TOOL nodes, so every result key
+  is always present.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

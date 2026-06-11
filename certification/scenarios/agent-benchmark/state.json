@@ -1,0 +1,10 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "task":{"type":"string"},
+  "response_a":{"type":"string"},
+  "response_b":{"type":"string"},
+  "winner":{"type":"string"},
+  "rationale":{"type":"string"},
+  "score_a":{"type":"number"},
+  "score_b":{"type":"number"},
+  "benchmark_result":{"type":"string"},
+  "summary":{"type":"string"}}}

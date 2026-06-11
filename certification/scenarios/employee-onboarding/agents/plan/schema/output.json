@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["accounts_needed"],"properties":{"accounts_needed":{"type":"string"}}}

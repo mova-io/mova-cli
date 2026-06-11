@@ -1,0 +1,7 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "sample":{"type":"object"},
+  "score":{"type":"number"},
+  "issues":{"type":"string"},
+  "alert_result":{"type":"string"},
+  "score_result":{"type":"string"},
+  "summary":{"type":"string"}}}
