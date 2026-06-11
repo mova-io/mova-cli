@@ -285,6 +285,7 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         True,
         "Low-confidence human escalation with RESUME-WITH-FEEDBACK (runtime: temporal). A triage agent drafts an answer + a calibrated numeric confidence; a DECISION node routes confidence ≥ 0.8 straight to finalize (no second LLM judging the first), everything else pauses at the review HUMAN gate (output_contract [decision, feedback]) — the reviewer's feedback merges into state and the finalize agent incorporates it (ADR 094/098/099).",  # noqa: E501
         "triage → DECISION(confidence) → {finalize | [HUMAN review + feedback]} → finalize | rejected",  # noqa: E501
+    ),
     "pii-detection": (
         "pattern_pii_detection",
         True,
