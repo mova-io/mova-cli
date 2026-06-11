@@ -12,7 +12,7 @@ description: >
   detect}` ledger row. ONE triage agent assesses severity and recommends the
   remediation action; the action is then APPLIED deterministically, twice at
   most: mdk workflows have NO cycles, so "retry on failure" is unrolled in
-  the graph as two sequential TOOL attempts (`sim-remediate`, then
+  the graph as two sequential TOOL attempts (`sim-remediate-ops`, then
   `sim-remediate-retry`), each writing its own `{system: ops, action:
   remediate}` row (attempt 1 / attempt 2 in the payload). A deterministic
   `decision` node (ADR 094) verifies each attempt: applied → ONE shared
@@ -24,7 +24,7 @@ description: >
   convergence, ADR 098 — the closure prompt guards the keys only some paths
   set). Self-contained: every skill carries its own impl.py next to
   skill.yaml (workflow-local, so a temporal-worker image bakes them for
-  free). Point sim-detect / sim-remediate at your real monitor and
+  free). Point sim-detect / sim-remediate-ops at your real monitor and
   runbook automation to go live. Mirrors workflows/self-healing-ops.
 runtime: temporal
 state_schema: ./state.json
@@ -43,7 +43,7 @@ nodes:
   # --- with attempt: 1.
   - id: remediate-1
     type: tool
-    skill: sim-remediate
+    skill: sim-remediate-ops
   # Deterministic verification of attempt #1 (ADR 094).
   - id: verify-1
     type: decision

@@ -14,8 +14,8 @@ version: 0.1.0
 # budget of 1.0, so gates evaluate without warning/denying). This file also
 # serves as the project MARKER for the scenario: the tool nodes' compile-time
 # skill resolution (ADR 097 D2) walks up from workflows/ops/ to this root and
-# finds skills/sim-detect, skills/sim-remediate and skills/sim-remediate-retry
-# in the project registry.
+# finds skills/sim-detect, skills/sim-remediate-ops and
+# skills/sim-remediate-retry in the project registry.
 policy:
   allowed_providers: [openai, anthropic]
   max_cost_per_run_usd: 5.00

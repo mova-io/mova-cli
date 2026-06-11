@@ -46,7 +46,13 @@ What this module asserts (all deterministic — no LLM, no network):
    retry-stable determinism;
 6. anti-drift — skill AND agent files byte-identical across the three copies
    of each scenario (plus the shared state.json), and the pattern registry
-   carries both scenarios as workflow patterns.
+   carries both scenarios as workflow patterns;
+7. live-failure regressions (cert run movate-cert-suite-ar11boj) — skill dir
+   names must be unambiguous module names across every deployed workflow
+   (the `sim-remediate` collision with incident-response that renamed the ops
+   skill `sim-remediate-ops`), and the scenario's ledger writes are fail-soft
+   + idempotent: a dead ledger DB or a poisoned `sim-remediate.impl` module
+   can no longer fail the activity or duplicate the `times:` counts.
 """
 
 from __future__ import annotations
@@ -63,12 +69,18 @@ from typing import Any
 import pytest
 from certification.harness.driver import load_scenario_spec
 
+from movate.core.executor import Executor
+from movate.core.models import WorkflowStatus
 from movate.core.workflow.compiler import compile_workflow, validate_graph
 from movate.core.workflow.compilers.temporal import TemporalCompiler
 from movate.core.workflow.decision import evaluate_decision, evaluate_human_route
 from movate.core.workflow.ir import NodeType, WorkflowGraph
+from movate.core.workflow.runner import WorkflowRunner
 from movate.core.workflow.spec import load_workflow_spec
+from movate.providers.base import BaseLLMProvider, CompletionRequest, CompletionResponse
+from movate.providers.pricing import load_pricing
 from movate.templates import PATTERN_TEMPLATES, get_pattern_path, pattern_is_workflow
+from movate.testing import InMemoryStorage, NullTracer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPLOYABLES = REPO_ROOT / "workflows"
@@ -322,7 +334,7 @@ def test_ops_verify_gates_route_each_canned_fault(
     payload = {**detected, "remediation_action": "Apply the runbook action."}
 
     cases1, default1 = _decision_meta("self-healing-ops", "verify-1")
-    state1 = _load_impl("self-healing-ops", "sim-remediate").run(payload, _MOCK_CTX)
+    state1 = _load_impl("self-healing-ops", "sim-remediate-ops").run(payload, _MOCK_CTX)
     assert evaluate_decision(cases1, default1, state1) == r1_route
 
     if r2_route is not None:
@@ -586,7 +598,7 @@ def test_sim_remediate_attempt_predicates_differ_exactly_on_transients(
 ) -> None:
     """The two attempts are distinct pure predicates: transient ("stuck")
     faults are the retry's reason to exist; hardware defeats both."""
-    a1 = _load_impl("self-healing-ops", "sim-remediate")
+    a1 = _load_impl("self-healing-ops", "sim-remediate-ops")
     a2 = _load_impl("self-healing-ops", "sim-remediate-retry")
     assert a1.attempt_outcome(fault) == r1
     assert a2.attempt_outcome(fault) == r2
@@ -602,7 +614,7 @@ def test_sim_remediate_attempts_share_action_but_carry_their_attempt(sim_db: Pat
         "remediation_action": "Restart the consumer group.",
     }
     ctx = SimpleNamespace(run_id="wfr-rem-1", mock=False)
-    out1 = _load_impl("self-healing-ops", "sim-remediate").run(payload, ctx)
+    out1 = _load_impl("self-healing-ops", "sim-remediate-ops").run(payload, ctx)
     out2 = _load_impl("self-healing-ops", "sim-remediate-retry").run(payload, ctx)
     assert out1 == {"r1_status": "failed"}
     assert out2 == {"r2_status": "applied"}
@@ -648,7 +660,7 @@ def test_canned_catalogs_are_closed_and_fail_loud(
         ("self-healing-ops", "sim-detect", {"signal": "disk-failure-alert"}),
         (
             "self-healing-ops",
-            "sim-remediate",
+            "sim-remediate-ops",
             {"fault": "f", "component": "c", "remediation_action": "r"},
         ),
         (
@@ -699,7 +711,7 @@ _AGENT_FILES = ("agent.yaml", "prompt.md", "schema/input.json", "schema/output.j
 
 _SCENARIO_SKILLS = {
     "agent-self-healing": ("sim-health-check", "sim-apply-fix"),
-    "self-healing-ops": ("sim-detect", "sim-remediate", "sim-remediate-retry"),
+    "self-healing-ops": ("sim-detect", "sim-remediate-ops", "sim-remediate-retry"),
 }
 _SCENARIO_AGENTS = {
     "agent-self-healing": ("healthy-report", "diagnose", "verify-report", "incident-report"),
@@ -766,3 +778,200 @@ def test_pattern_template_registered(scenario: str) -> None:
     assert get_pattern_path(scenario).is_dir()
     assert (get_pattern_path(scenario) / "GOVERNANCE.md").is_file()
     assert (get_pattern_path(scenario) / "evals" / "judge.yaml.example").is_file()
+
+
+# ---------------------------------------------------------------------------
+# 7. Live-failure regressions — cert run movate-cert-suite-ar11boj (2026-06).
+#
+#    Root cause: the python skill backend imports a skill as ``<dir-name>.impl``
+#    (skill-dir PARENT on sys.path) and caches the resolved callable PER ENTRY
+#    STRING for the worker-process lifetime. ``sim-remediate`` was claimed by
+#    BOTH workflows/incident-response and workflows/self-healing-ops on the
+#    shared certification worker, so whichever scenario dispatched first
+#    poisoned the other: the incident-response impl returns
+#    ``remediation_status`` (not ``r1_status``), the ops node's output-schema
+#    validation failed, and Temporal's retry policy re-ran the activity —
+#    writing one duplicate ``{ops, remediate}`` ledger row per attempt
+#    (3 rows where the cases expect 1/2). Fixed by renaming the ops skill
+#    ``sim-remediate-ops`` and making the scenario's ledger writes fail-soft
+#    + idempotent. These tests pin all three legs.
+# ---------------------------------------------------------------------------
+
+_REMEDIATE_INPUT = {
+    "fault": "connection pool exhaustion",
+    "component": "checkout-api",
+    "remediation_action": "Recycle the connection pool.",
+}
+
+
+@pytest.mark.unit
+def test_skill_dir_names_are_unambiguous_across_deployed_workflows() -> None:
+    """A skill DIRECTORY name is a process-global python module name on the
+    shared worker — two workflows may reuse one name ONLY when the impl is
+    byte-identical (the redact-pii convention: interchangeable by
+    construction). A second `sim-remediate`-class collision must fail here,
+    not in the Nth live certification run."""
+    by_name: dict[str, list[Path]] = {}
+    for impl in sorted(DEPLOYABLES.glob("*/skills/*/impl.py")):
+        by_name.setdefault(impl.parent.name, []).append(impl)
+    assert by_name, "no deployable skills found — the glob is broken"
+    for name, paths in sorted(by_name.items()):
+        canonical = paths[0].read_bytes()
+        for other in paths[1:]:
+            assert other.read_bytes() == canonical, (
+                f"skill dir name {name!r} is claimed by multiple workflows with "
+                f"DIFFERENT impls ({paths[0]} vs {other}): the python backend "
+                "resolves <dir>.impl once per worker process, so one workflow "
+                "would execute the other's code. Rename one of them "
+                "(see workflows/self-healing-ops/skills/sim-remediate-ops)."
+            )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("skill", "payload", "expected"),
+    [
+        (
+            "sim-detect",
+            {"signal": "checkout-latency-spike"},
+            {"fault": "connection pool exhaustion", "component": "checkout-api"},
+        ),
+        ("sim-remediate-ops", _REMEDIATE_INPUT, {"r1_status": "applied"}),
+        ("sim-remediate-retry", _REMEDIATE_INPUT, {"r2_status": "applied"}),
+    ],
+)
+def test_ops_ledger_write_failure_is_fail_soft(
+    sim_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skill: str,
+    payload: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    """The predicate result is the contract, the ledger row is observability:
+    a dead ledger DB must NOT fail the skill (a raise here becomes a Temporal
+    retry storm — each retry re-inserts before failing again)."""
+    impl = _load_impl("self-healing-ops", skill)
+
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("simulated: ledger db down")
+
+    monkeypatch.setattr(impl.sqlite3, "connect", _boom)
+    out = impl.run(payload, SimpleNamespace(run_id="wfr-failsoft", mock=False))
+    assert out == expected  # the contract survives the ledger outage
+    monkeypatch.undo()
+    assert not sim_db.exists()  # and nothing was half-written
+
+
+@pytest.mark.unit
+def test_ops_ledger_rows_are_idempotent_per_attempt(sim_db: Path) -> None:
+    """A Temporal activity retry (e.g. a timeout AFTER the commit) re-runs the
+    pure predicate and rebuilds the byte-identical payload — the re-insert is
+    suppressed, so the certification `times:` counts stay honest. Rows without
+    a run_id keep appending (no safe dedupe key)."""
+    a1 = _load_impl("self-healing-ops", "sim-remediate-ops")
+    a2 = _load_impl("self-healing-ops", "sim-remediate-retry")
+    ctx = SimpleNamespace(run_id="wfr-idem", mock=False)
+
+    assert a1.run(_REMEDIATE_INPUT, ctx) == a1.run(_REMEDIATE_INPUT, ctx)  # the retry
+    a2.run(_REMEDIATE_INPUT, ctx)
+    rows = [r for r in _rows(sim_db) if r[0] == "wfr-idem"]
+    assert [(r[1], r[2], r[3]["attempt"]) for r in rows] == [
+        ("ops", "remediate", 1),  # ONE attempt-1 row despite two executions
+        ("ops", "remediate", 2),
+    ]
+
+    anon = SimpleNamespace(run_id="", mock=False)
+    a1.run(_REMEDIATE_INPUT, anon)
+    a1.run(_REMEDIATE_INPUT, anon)
+    assert len([r for r in _rows(sim_db) if r[0] == ""]) == 2  # no dedupe key
+
+
+class _OpsProvider(BaseLLMProvider):
+    """Deterministic offline provider for the two ops agents: a union of the
+    triage keys (enum-valid severity) and the closure summary, so one provider
+    satisfies both output schemas (the conformance-suite convention)."""
+
+    name = "b9-ops"
+    version = "0.0.1"
+
+    async def complete(self, request: CompletionRequest) -> CompletionResponse:
+        return CompletionResponse(
+            text=json.dumps(
+                {
+                    "severity": "high",
+                    "remediation_action": "Recycle the connection pool.",
+                    "summary": "Fault remediated on attempt 1.",
+                }
+            )
+        )
+
+    async def stream(self, request: Any) -> Any:  # pragma: no cover - unused
+        raise NotImplementedError
+
+    async def embed(self, text: Any, *, model: Any) -> Any:  # pragma: no cover - unused
+        raise NotImplementedError
+
+
+async def _run_ops_native(run_id: str) -> Any:
+    """One native end-to-end run of the DEPLOYABLE self-healing-ops workflow
+    (attempt-1-success path), real skill dispatch (mock=False)."""
+    storage = InMemoryStorage()
+    await storage.init()
+    executor = Executor(
+        provider=_OpsProvider(), pricing=load_pricing(), storage=storage, tracer=NullTracer()
+    )
+    runner = WorkflowRunner(executor=executor, storage=storage)
+    graph = _graph(_workflow_dirs("self-healing-ops")["deployable"])
+    return await runner.run(
+        graph, initial_state={"signal": "checkout-latency-spike"}, workflow_run_id=run_id
+    )
+
+
+@pytest.mark.unit
+async def test_ops_workflow_survives_a_poisoned_sim_remediate_module(
+    sim_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ar11boj replay: a worker process that ALREADY imported
+    incident-response's `sim-remediate.impl` (the collision that poisoned the
+    old `sim-remediate.impl:run` entry) still runs self-healing-ops correctly,
+    because the ops skill now resolves as `sim-remediate-ops.impl` — and the
+    run writes exactly ONE {ops, remediate} ledger row."""
+    monkeypatch.syspath_prepend(str(DEPLOYABLES / "incident-response" / "skills"))
+    poisoned = importlib.import_module("sim-remediate.impl")
+    assert callable(poisoned.run)  # the incident-response impl owns the name
+    try:
+        result = await _run_ops_native("wfr-poisoned")
+    finally:
+        sys.modules.pop("sim-remediate.impl", None)
+        sys.modules.pop("sim-remediate", None)
+
+    assert result.status is WorkflowStatus.SUCCESS
+    assert result.final_state["r1_status"] == "applied"
+    assert "r2_status" not in result.final_state  # the retry never ran
+    rows = [r for r in _rows(sim_db) if r[0] == "wfr-poisoned"]
+    assert [(r[1], r[2]) for r in rows] == [("monitor", "detect"), ("ops", "remediate")]
+    assert rows[1][3]["attempt"] == 1
+    assert rows[1][3]["status"] == "applied"
+
+
+@pytest.mark.unit
+async def test_ops_workflow_completes_when_ledger_db_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end fail-soft: with the ledger DB unreachable (MOVATE_DB points
+    under a regular file), every ledger write fails — and the workflow STILL
+    completes with the deterministic statuses (the live failure mode was the
+    opposite: a write failure after the insert failed the activity and
+    Temporal retried it into duplicate rows)."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.delenv("MOVATE_DB_URL", raising=False)
+    monkeypatch.delenv("MOVATE_PG_URL", raising=False)
+    monkeypatch.setenv("MOVATE_DB", str(blocker / "sim.db"))
+
+    result = await _run_ops_native("wfr-deadledger")
+
+    assert result.status is WorkflowStatus.SUCCESS
+    assert result.final_state["r1_status"] == "applied"
+    assert "r2_status" not in result.final_state
+    assert not (blocker / "sim.db").exists()
