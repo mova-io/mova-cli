@@ -56,6 +56,7 @@ from typing import Any
 import pytest
 from certification.harness.driver import load_scenario_spec
 
+from movate.core.loader import load_agent
 from movate.core.workflow.compiler import compile_workflow, validate_graph
 from movate.core.workflow.compilers.temporal import TemporalCompiler
 from movate.core.workflow.ir import NodeType, WorkflowGraph
@@ -729,3 +730,104 @@ def test_state_schema_identical_across_copies(scenario: str) -> None:
     canonical = (DEPLOYABLES / scenario / "state.json").read_bytes()
     assert (SCENARIOS / scenario / "state.json").read_bytes() == canonical
     assert (TEMPLATES / B2[scenario][1] / "state.json").read_bytes() == canonical
+
+
+# ---------------------------------------------------------------------------
+# 7. Prompt rendering — every path's state projection renders under
+#    StrictUndefined (the #841 regression)
+# ---------------------------------------------------------------------------
+#
+# Each scenario's terminal agent is a CONVERGENCE point: every branch reaches
+# it, but each branch leaves a different subset of state keys behind, and the
+# runner's `_project_state` DROPS missing keys rather than passing None. The
+# prompt renders with StrictUndefined, so any path-exclusive `{{ input.X }}`
+# without an `is defined` guard fails the node at run time on every path that
+# lacks X — which is exactly how the first live B2 certification died (#841).
+# These tests render each converged agent's prompt with the minimal input
+# every path actually produces (the projection of the path's final state onto
+# the agent's input schema; key sets mirror `final_state_has`/`_lacks` in
+# each cases.yaml). Only the deployable copy is rendered —
+# `test_agent_files_identical_across_copies` extends the proof to the other
+# two copies.
+
+#: (scenario, agent) → path name → that path's projected agent input.
+_CONVERGED_AGENT_PATH_INPUTS: dict[tuple[str, str], dict[str, dict[str, Any]]] = {
+    ("pii-detection", "notify"): {
+        # clean path: store-clean ran, quarantine didn't → no dlp_result.
+        "clean": {
+            "source": "wiki/onboarding-guide",
+            "pii_found": False,
+            "pii_count": 0,
+            "redacted_text": "Welcome to the team wiki.",
+            "store_result": "DLP-STORE-3B8XA1",
+        },
+        # quarantine path: the mirror image → no store_result.
+        "quarantined": {
+            "source": "hr/complaint-4821",
+            "pii_found": True,
+            "pii_count": 2,
+            "redacted_text": "Reach me at [EMAIL]; my SSN is [SSN].",
+            "dlp_result": "DLP-QTN-7K2F9Q",
+        },
+    },
+    ("data-privacy", "summary"): {
+        # public / internal skip the redact node → no pii_count.
+        "public": {
+            "classification": "public",
+            "rationale": "Marketing copy with no personal data.",
+            "requester": "comms-team",
+            "audit_result": "DLP-AUD-5F8B1A",
+        },
+        "internal": {
+            "classification": "internal",
+            "rationale": "Roadmap discussion; company-confidential only.",
+            "requester": "eng-leads",
+            "audit_result": "DLP-AUD-2D7C4B",
+        },
+        "regulated": {
+            "classification": "regulated",
+            "rationale": "Contains employee identifiers.",
+            "requester": "hr-ops",
+            "audit_result": "DLP-AUD-9C4D2E",
+            "pii_count": 2,
+        },
+    },
+    ("content-publishing", "rejected"): {
+        # flagged at either review → never reached the human gate → no
+        # `decision` (the cases.yaml final_state_lacks assertion).
+        "compliance-flagged": {
+            "verdict": "flag",
+            "notes": "Medical cure claim: guaranteed to cure arthritis.",
+        },
+        "brand-flagged": {
+            "verdict": "flag",
+            "notes": "Tone is off-brand: aggressive competitor bashing.",
+        },
+        # both reviews passed, the human approver declined.
+        "human-rejected": {
+            "verdict": "pass",
+            "notes": "Brand voice ok.",
+            "decision": "reject",
+        },
+    },
+}
+
+_RENDER_CASES = [
+    pytest.param(scenario, agent, input_data, id=f"{scenario}-{agent}-{path}")
+    for (scenario, agent), paths in sorted(_CONVERGED_AGENT_PATH_INPUTS.items())
+    for path, input_data in paths.items()
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("scenario", "agent", "input_data"), _RENDER_CASES)
+def test_converged_agent_prompt_renders_per_path(
+    scenario: str, agent: str, input_data: dict[str, Any]
+) -> None:
+    bundle = load_agent(DEPLOYABLES / scenario / "agents" / agent)
+    bundle.input_validator.validate(input_data)
+    # StrictUndefined: an unguarded path-exclusive key raises UndefinedError.
+    rendered = bundle.render_prompt(input_data)
+    # Guards must SHOW a key when the path provides it, not just not-crash.
+    for value in input_data.values():
+        assert str(value) in rendered
