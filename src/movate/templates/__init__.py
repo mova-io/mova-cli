@@ -286,6 +286,24 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Low-confidence human escalation with RESUME-WITH-FEEDBACK (runtime: temporal). A triage agent drafts an answer + a calibrated numeric confidence; a DECISION node routes confidence ≥ 0.8 straight to finalize (no second LLM judging the first), everything else pauses at the review HUMAN gate (output_contract [decision, feedback]) — the reviewer's feedback merges into state and the finalize agent incorporates it (ADR 094/098/099).",  # noqa: E501
         "triage → DECISION(confidence) → {finalize | [HUMAN review + feedback]} → finalize | rejected",  # noqa: E501
     ),
+    "external-api-failure": (
+        "pattern_external_api_failure",
+        True,
+        "Retries + fallback provider with OBSERVABLE activity retries (runtime: temporal). A flaky TOOL entrypoint records one ledger attempt row per invocation and raises while attempts <= fail_times — so ledger rows = Temporal retry attempts (max 3); transient failures recover via the durable retry (the fallback provider serves them), exhaustion fails the workflow loudly with zero downstream record rows (ADR 094/097/098).",  # noqa: E501
+        "TOOL flaky-call ⟳3 → DECISION(provider_ok) → shared TOOL record → notify | failed",
+    ),
+    "partial-failure-recovery": (
+        "pattern_partial_failure_recovery",
+        True,
+        "Three-step pipeline whose flaky middle step proves completed steps are NEVER re-executed on retry (runtime: temporal). step1/step3 share ONE parameterized sim-step skill (ADR 097 D1 input literals + output_key); the flaky step2 records an attempt row per invocation and succeeds on the durable retry — the ledger shows step1 exactly once next to step2's two attempts (ADR 097/098).",  # noqa: E501
+        "TOOL step-one → TOOL step-two ⟳3 → TOOL step-three → notify",
+    ),
+    "long-running-research": (
+        "pattern_long_running_research",
+        True,
+        "Scheduled incremental research — the ADR 100 D1 cron-schedule shape (runtime: temporal). The schedule is the durable outer loop, each fire runs ONE idempotent increment: a research agent drafts findings, a TOOL node appends the auditable research-log row (increment in the payload), and a DECISION routes increment gte 3 into the final report (earlier increments get a light ack) — no week-long sleeping workflow (ADR 094/097/100).",  # noqa: E501
+        "research → TOOL append → DECISION(increment) → {final-report | ack}",
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

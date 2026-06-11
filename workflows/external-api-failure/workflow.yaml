@@ -1,0 +1,66 @@
+api_version: movate/v1
+kind: Workflow
+name: external-api-failure
+version: 0.1.0
+description: >
+  External-API failure handling, durable on Temporal — scenario #13 of the
+  30-use-case certification program and the first scenario built to make
+  TEMPORAL'S ACTIVITY RETRY POLICY OBSERVABLE. The entrypoint is a TOOL node
+  (ADR 097) calling the workflow-local `flaky-call` python skill: each
+  invocation appends one `{system: external-api, action: attempt}` row to the
+  shared sim side-effect ledger BEFORE deciding its fate, then RAISES while
+  its own per-run attempt count is <= the input's `fail_times` — so the
+  ledger's attempt rows ARE the activity attempts. Temporal retries the
+  failed activity under the compiled `_RETRY_POLICY` (maximum_attempts=3,
+  ADR 054 D9): `fail_times: 1` fails once and succeeds on the durable retry
+  (2 rows, the retry proof); `fail_times >= 3` exhausts the budget and the
+  workflow lands a terminal ERROR fact (3 rows — the cap, observable). On
+  success the skill reports which provider served (`primary` on the first
+  attempt, `fallback` after a retry) and a deterministic `decision` node
+  (ADR 094) routes `provider_ok` truthy into the shared record→notify tail —
+  the `sim-record` TOOL node writes the one `{system: external-api, action:
+  record}` row; the decision's `failed` default is the structural fail-safe
+  (no case routes there: a skill success always carries provider_ok=true and
+  a failure surfaces as the activity retry/error instead). Self-contained
+  (bundled into the temporal-worker image): the skills carry their own
+  impl.py next to skill.yaml, so the worker imports them from the baked
+  workflows/ tree. Mirrors certification/scenarios/external-api-failure.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: call
+nodes:
+  # The flaky external call (ADR 097): one deterministic skill step whose
+  # failures are REAL activity failures — Temporal's retry policy (max 3
+  # attempts) is what turns fail_times=1 into a success and fail_times>=3
+  # into a terminal error. Attempt rows in the ledger = attempts taken.
+  - id: call
+    type: tool
+    skill: flaky-call
+  # Deterministic provider routing (ADR 094): a successful call always
+  # carries provider_ok=true → the record/notify tail. The `failed` default
+  # is the fail-safe for a malformed skill result — deliberate, and
+  # deliberately unreachable in the certification cases (a flaky-call
+  # FAILURE never reaches this node; it retries or errors the workflow).
+  - id: provider-check
+    type: decision
+    cases:
+      - when: {field: provider_ok, op: truthy}
+        to: record
+    default: failed
+  # --- success tail (ADR 098): ONE record TOOL node (the auditable
+  # --- side-effect — exactly one row regardless of how many attempts the
+  # --- call took) followed by ONE LLM notify.
+  - id: record
+    type: tool
+    skill: sim-record
+  - {id: notify, type: agent, ref: ./agents/notify}
+  - {id: failed, type: agent, ref: ./agents/failed}
+edges:
+  - {from: call, to: provider-check}
+  - {from: record, to: notify}
+tags:
+  - temporal
+  - decision
+  - tool
+  - retries
+  - certification

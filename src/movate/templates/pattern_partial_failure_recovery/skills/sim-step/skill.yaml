@@ -1,0 +1,34 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-step
+version: 0.1.0
+description: >-
+  Simulate one reliable pipeline step: records one auditable
+  `{system: pipeline, action: <step>}` row to the shared sim_side_effects
+  ledger (same DB MDK itself uses) and returns a one-line completion. The
+  step name comes from the tool node's `input:` literal map (ADR 097 D1), so
+  one skill serves step1 and step3 — and the recovery proof can pin each
+  step's row count independently of the flaky middle step's retries.
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `sim-step.impl` imports
+  from the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-step.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - pipeline
+  - simulation
+  - certification

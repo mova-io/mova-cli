@@ -68,7 +68,7 @@ block per case:
 
 | capability | asserts |
 | --- | --- |
-| `durable-execution` | a terminal `workflow_run` fact with the expected status appeared within the timeout (across pause/resume on Temporal) |
+| `durable-execution` | a terminal `workflow_run` fact with the expected status appeared within the timeout (across pause/resume on Temporal). A case may expect `status: error` (B4 — e.g. retry exhaustion): the job segment is then allowed to end `error` too — the workflow started, failed durably, and the terminal ERROR fact is the assertion target |
 | `decision-routing` | the fact's `route` equals the expectation — honestly `null` for the expense workflow, whose decision node routes without writing `tier`/`route` into state — plus `final_state_has`/`final_state_lacks` markers from the workflow-runs list (e.g. `erp_result` present only on approve paths, absent on reject) |
 | `hitl` | the run paused **at the expected node** (the `?status=paused` queue) and the signalled decision resumed it; cases with no gate record an honest skip. A step with `wait_timeout: true` (ADR 062 D4 — the approval-timeout scenario) instead observes the pause and deliberately does **not** signal: the gate's durable timer must fire and route the run itself, and the next pause/fact poll waits it out. Such cases set a per-case `timeout_s` to budget the real wall clock above the suite defaults |
 | `cost` | `fact.cost_usd > 0` — only when a case opts in. The expense cases do **not**: workflow_run facts carry `cost_usd=0` by design (per-node rollup is a reader-side join, ADR 096) and the Temporal path emits no per-node `run` facts yet, so the column shows SKIP rather than a green-washed pass |

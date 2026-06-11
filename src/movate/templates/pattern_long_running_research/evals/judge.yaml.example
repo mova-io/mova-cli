@@ -1,0 +1,24 @@
+# LLM-as-judge for the Long Running Research workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the increment's terminal text against the expected outcome: a
+# mid-series increment must acknowledge the append and a continuing series
+# (ack_note); the closing increment must present a concluded final report.
+# Used as the CI eval-gate the pattern's governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the increment's terminal output against the expected outcome.
+    1.0 = correct increment behavior (mid-series: findings logged + series
+          continues; closing: a final report naming the topic and stating
+          the series is complete) and matches the expectation
+    0.5 = correct behavior but missing the topic/continuation detail
+    0.0 = wrong outcome (e.g. a final report on a mid-series increment),
+          contradicts the expectation, or hallucinated
+
+threshold: 0.7

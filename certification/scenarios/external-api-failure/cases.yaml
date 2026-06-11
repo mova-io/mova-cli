@@ -1,0 +1,90 @@
+# Certification cases — external-api-failure (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `external-api-failure`
+# workflow (workflows/external-api-failure — 5 nodes: the `flaky-call` TOOL
+# entrypoint whose impl appends one `{system: external-api, action: attempt}`
+# ledger row per invocation and RAISES while its per-run attempt count is
+# <= the input's fail_times; a deterministic `provider-check` decision on
+# `provider_ok`; the `sim-record` TOOL node writing the one
+# `{system: external-api, action: record}` row; and the notify/failed LLM
+# tails). The whole point: the ledger's attempt rows ARE Temporal's activity
+# attempts under the compiled _RETRY_POLICY (maximum_attempts=3, ADR 054 D9)
+# — the driver reads the retry policy's behavior out of the audit trail.
+#
+# HONESTY NOTES — same contract as itsm-request/cases.yaml:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state, so the fact's route is None. The branch is proven by
+#   the `final_state` markers (api_result/record_result merge only on the
+#   success tail) and the ledger rows instead.
+# * `status: error` on retry-exhaustion is REAL: the third failed attempt
+#   exhausts the activity retry budget, the compiled workflow's terminal
+#   persist writes the ERROR record, and the job segment ends `error` (the
+#   driver's expected-error launch path, added append-style for this batch).
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 by design
+#   (ADR 096) and the Temporal path emits no per-node run facts yet.
+# * side-effects — attempt rows = activity attempts (1 / 2 / 3); the record
+#   row lands exactly once on success paths and NEVER on the exhaustion path
+#   (the decision tail was never reached). Evaluated only when the shared DB
+#   is reachable (MOVATE_PG_URL/MOVATE_DB_URL — SKIP otherwise).
+# * `governance: allow` on the SUCCESS cases only — the retry-exhaustion run
+#   errors before any LLM agent executes, so the case deliberately does not
+#   assert a governance effect (honest skip) rather than guessing what the
+#   skill-gate-only path stamps.
+# * the `failed` decision default is deliberately uncovered: a flaky-call
+#   FAILURE surfaces as the activity retry/error, never as provider_ok=false
+#   — the default exists as the structural fail-safe for a malformed skill
+#   result.
+
+scenario: external-api-failure
+target: external-api-failure # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- control: the primary provider answers on the first attempt — exactly
+  # --- ONE attempt row, one record row, no retry consumed.
+  - name: no-failure
+    input:
+      request: currency-rates
+      fail_times: 0
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [api_result, record_result, summary]
+      side_effects:
+        - { system: external-api, action: attempt, times: 1 }
+        - { system: external-api, action: record, times: 1 }
+
+  # --- THE RETRY PROOF: the first attempt raises, Temporal's durable retry
+  # --- re-runs the activity, the second attempt succeeds via the fallback
+  # --- provider. TWO attempt rows — the retry policy made observable — and
+  # --- still exactly ONE record row (the business effect happened once).
+  - name: transient-failure
+    input:
+      request: shipment-status
+      fail_times: 1
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [api_result, record_result, summary]
+      side_effects:
+        - { system: external-api, action: attempt, times: 2 }
+        - { system: external-api, action: record, times: 1 }
+
+  # --- retry exhaustion: fail_times=5 can never be satisfied within the
+  # --- policy's 3 attempts — exactly THREE attempt rows (the budget, spent
+  # --- and visible), then the activity error fails the workflow: terminal
+  # --- ERROR fact, no record row, no success-tail state markers.
+  - name: retry-exhaustion
+    input:
+      request: fraud-screening
+      fail_times: 5
+    expect:
+      status: error
+      route: null
+      final_state_lacks: [api_result, record_result, summary]
+      side_effects:
+        - { system: external-api, action: attempt, times: 3 }
+      no_side_effects:
+        - { system: external-api, action: record }

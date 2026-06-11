@@ -46,6 +46,9 @@ ALL_PATTERNS = [
     "purchase-order",
     "approval-timeout",
     "human-escalation",
+    "external-api-failure",
+    "partial-failure-recovery",
+    "long-running-research",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 
