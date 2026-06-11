@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["audit_result"],"properties":{"audit_result":{"type":"string"}}}

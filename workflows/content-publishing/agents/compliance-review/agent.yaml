@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: compliance-review
+version: 0.1.0
+description: >-
+  First review stage: flags content with compliance problems (unverifiable
+  absolute claims, medical/financial promises, discriminatory language,
+  personal data). Verdict enum is schema-pinned; the prompt carries explicit
+  flag/pass calibration examples.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

@@ -608,3 +608,127 @@ def test_launch_failure_emits_durable_execution_fail_metric(
     case = _case()
     _driver(FakeRuntime(job_status="error")).run_case(_spec(case), case)
     assert emitted == [("expense-approval", "durable-execution", "fail")]
+
+
+# ---------------------------------------------------------------------------
+# final_state_contains / final_state_omits — the B2 value-level markers
+# (additive driver extension; key-presence behavior above is untouched)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_final_state_contains_and_omits_parse_through_loader(tmp_path: Path) -> None:
+    spec = load_scenario_spec(
+        _write_cases(
+            tmp_path,
+            "scenario: pii\ntarget: pii\ncases:\n"
+            "  - name: a\n    input: {document: x}\n"
+            "    expect:\n      status: success\n"
+            "      final_state_contains: {redacted_text: ['[EMAIL]', '[SSN]']}\n"
+            "      final_state_omits: {redacted_text: ['jane@example.com']}\n",
+        )
+    )
+    expect = spec.cases[0].expect
+    assert expect.final_state_contains == (("redacted_text", ("[EMAIL]", "[SSN]")),)
+    assert expect.final_state_omits == (("redacted_text", ("jane@example.com",)),)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("body", "fragment"),
+    [
+        (
+            "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
+            "    expect: {status: success, final_state_contains: [x]}\n",
+            "must be a mapping of state key",
+        ),
+        (
+            "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
+            "    expect: {status: success, final_state_contains: {k: []}}\n",
+            "NON-EMPTY list",
+        ),
+        (
+            "scenario: s\ntarget: t\ncases:\n  - name: a\n    input: {}\n"
+            "    expect: {status: success, final_state_omits: {k: [3]}}\n",
+            "every substring must be a non-empty string",
+        ),
+    ],
+)
+def test_final_state_substring_spec_validation_errors(
+    tmp_path: Path, body: str, fragment: str
+) -> None:
+    with pytest.raises(CaseSpecError, match=fragment):
+        load_scenario_spec(_write_cases(tmp_path, body))
+
+
+def _contains_case(
+    contains: tuple[tuple[str, tuple[str, ...]], ...] = (),
+    omits: tuple[tuple[str, tuple[str, ...]], ...] = (),
+) -> CaseSpec:
+    return _case(
+        "pii-document",
+        expect=CaseExpect(
+            status="success",
+            route=None,
+            final_state_contains=contains,
+            final_state_omits=omits,
+        ),
+    )
+
+
+@pytest.mark.unit
+def test_final_state_contains_passes_on_masked_tokens() -> None:
+    fake = FakeRuntime(final_state={"redacted_text": "Reach me at [EMAIL]; SSN [SSN]."})
+    case = _contains_case(
+        contains=(("redacted_text", ("[EMAIL]", "[SSN]")),),
+        omits=(("redacted_text", ("jane.doe@example.com", "123-45-6789")),),
+    )
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["decision-routing"].status == "pass"
+    assert "4 value-level marker(s) verified" in result.outcomes["decision-routing"].note
+
+
+@pytest.mark.unit
+def test_final_state_contains_fails_when_token_missing() -> None:
+    fake = FakeRuntime(final_state={"redacted_text": "Reach me at [EMAIL] only."})
+    case = _contains_case(contains=(("redacted_text", ("[EMAIL]", "[SSN]")),))
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["decision-routing"].status == "fail"
+    assert "[SSN]" in result.outcomes["decision-routing"].note
+
+
+@pytest.mark.unit
+def test_final_state_contains_fails_when_key_absent() -> None:
+    fake = FakeRuntime(final_state={"summary": "done"})
+    case = _contains_case(contains=(("redacted_text", ("[EMAIL]",)),))
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["decision-routing"].status == "fail"
+    assert "lacks 'redacted_text'" in result.outcomes["decision-routing"].note
+
+
+@pytest.mark.unit
+def test_final_state_omits_fails_when_raw_value_survives() -> None:
+    fake = FakeRuntime(final_state={"redacted_text": "Reach me at jane.doe@example.com."})
+    case = _contains_case(omits=(("redacted_text", ("jane.doe@example.com",)),))
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["decision-routing"].status == "fail"
+    assert "jane.doe@example.com" in result.outcomes["decision-routing"].note
+
+
+@pytest.mark.unit
+def test_final_state_omits_trivially_passes_when_key_absent() -> None:
+    # Absence is final_state_lacks's job; omits must not double-fail it.
+    fake = FakeRuntime(final_state={"summary": "done"})
+    case = _contains_case(omits=(("redacted_text", ("123-45-6789",)),))
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["decision-routing"].status == "pass"
+
+
+@pytest.mark.unit
+def test_final_state_contains_stringifies_non_string_values() -> None:
+    # A non-string state value is JSON-stringified before the substring check
+    # (deterministic, sorted keys — no repr quoting surprises).
+    fake = FakeRuntime(final_state={"provision": {"ref": "ITSM-1", "ok": True}})
+    case = _contains_case(contains=(("provision", ('"ref": "ITSM-1"',)),))
+    result = _driver(fake).run_case(_spec(case), case)
+    assert result.outcomes["decision-routing"].status == "pass"

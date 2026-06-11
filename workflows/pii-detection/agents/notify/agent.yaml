@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: notify
+version: 0.1.0
+description: >-
+  Summarizes the disposition of a scanned document (quarantined vs stored
+  clean). Sees ONLY the redacted text — the input schema deliberately
+  excludes the original document.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

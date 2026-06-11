@@ -1,0 +1,2 @@
+{"input": {"content": "Our new dashboard ships dark mode, faster exports, and a redesigned sharing flow. Available to all workspace plans today.", "channel": "blog"}, "expected": {"summary": "Cleared compliance, brand review and final approval, and was published with a publication reference."}}
+{"input": {"content": "Try MiraclePure today — clinically guaranteed to cure arthritis in 7 days, 100% risk-free!", "channel": "blog"}, "expected": {"summary": "Not published: compliance review flagged the medical guarantee claim."}}

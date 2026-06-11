@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"channel":{"type":"string"},"publish_result":{"type":"string"}}}

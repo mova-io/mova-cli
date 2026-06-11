@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["channel"],"properties":{"channel":{"type":"string"},"run_id":{"type":"string"}}}

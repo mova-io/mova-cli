@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"classification":{"type":"string"},"rationale":{"type":"string"},"requester":{"type":"string"},"audit_result":{"type":"string"},"pii_count":{"type":"integer"}}}

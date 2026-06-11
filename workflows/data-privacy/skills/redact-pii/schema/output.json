@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["redacted_text","pii_found","pii_count"],"properties":{"redacted_text":{"type":"string"},"pii_found":{"type":"boolean"},"pii_count":{"type":"integer","minimum":0}}}

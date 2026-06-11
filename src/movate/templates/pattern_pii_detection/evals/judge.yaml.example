@@ -1,0 +1,26 @@
+# LLM-as-judge for the PII Detection workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the final ``summary`` against the expected disposition: a PII-bearing
+# document must read as quarantined with the right identifier kinds masked; a
+# clean document must read as stored clean. The summary must NEVER contain a
+# raw identifier (that alone is a 0.0). Used as the CI eval-gate the pattern's
+# governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's final summary against the expected outcome.
+    1.0 = correct disposition (quarantined vs stored clean), the masked
+          identifier kinds are named correctly, a reference id is included,
+          and NO raw email/SSN/phone value appears anywhere in the summary
+    0.5 = correct disposition but missing the identifier kinds or the
+          reference id
+    0.0 = wrong disposition, contradicts the expectation, or ANY raw
+          identifier value leaks into the summary
+
+threshold: 0.7

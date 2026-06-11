@@ -1,0 +1,6 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "document":{"type":"string"},"source":{"type":"string"},
+  "redacted_text":{"type":"string"},"pii_found":{"type":"boolean"},
+  "pii_count":{"type":"integer"},
+  "dlp_result":{"type":"string"},"store_result":{"type":"string"},
+  "summary":{"type":"string"}}}
