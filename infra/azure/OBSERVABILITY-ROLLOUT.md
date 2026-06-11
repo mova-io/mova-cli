@@ -49,3 +49,41 @@ az containerapp update -g movate-dev-rg -n movate-dev-grafana-oss \
 4. **Grafana provisioning as code**: the datasources were created via the API;
    move them to file-based provisioning (like `infra/otel-collector/grafana/...`)
    so they survive a Grafana redeploy.
+
+## Temporal namespace retention (applied 2026-06-10)
+
+The `default` namespace on the dev Temporal server shipped with a **1 day**
+workflow-execution retention TTL, silently expiring run history (the Temporal
+UI's event history + memo/provenance for a run) 24h after close. Raised
+imperatively to **30 days** on 2026-06-10:
+
+```python
+# uv run python - <<'EOF'   (needs the [temporal] extra)
+import asyncio
+from google.protobuf.duration_pb2 import Duration
+from temporalio.client import Client
+from temporalio.api.workflowservice.v1 import UpdateNamespaceRequest
+from temporalio.api.namespace.v1 import NamespaceConfig
+
+async def main() -> None:
+    client = await Client.connect(
+        "movate-dev-temporal.eastus2.cloudapp.azure.com:7233", namespace="default"
+    )
+    await client.workflow_service.update_namespace(
+        UpdateNamespaceRequest(
+            namespace="default",
+            config=NamespaceConfig(
+                workflow_execution_retention_ttl=Duration(seconds=2592000)  # 30d
+            ),
+        )
+    )
+
+asyncio.run(main())
+# EOF
+```
+
+Like everything above this was applied **imperatively**; fold it into the
+`temporal-vm` provisioning (`infra/azure/temporal-vm/`) — e.g. a
+`temporal operator namespace update --retention 720h default` step (or the
+namespace bootstrap that creates `default`) — so a re-provisioned VM does not
+quietly regress to 1-day retention.

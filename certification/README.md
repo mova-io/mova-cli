@@ -47,6 +47,14 @@ is **deferred** — it errors loudly instead of half-simulating a worker +
 Temporal stack. Exit code: `0` = no capability failed, `1` = at least one
 failure, `2` = configuration error.
 
+Every case the driver submits is stamped, at submit time, with a
+`certification: {case, scenario}` key merged into the workflow input (the
+state schemas are `additionalProperties: true`, and agents only ever see
+their input-schema projection of state, so the key changes nothing about
+execution). It lands in the run's `initial_state`, so you can **filter test
+traffic by searching the input for `certification`** — in the Temporal UI's
+workflow input, in `workflow_runs.initial_state`, and in Langfuse.
+
 The driver deliberately reads results back from
 `GET /api/v1/observability/facts?kind=workflow_run` — dogfooding the one
 integration surface the platform exposes (ADR 096) rather than internal

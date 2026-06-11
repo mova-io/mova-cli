@@ -381,6 +381,7 @@ async def run_temporal_workflow(
     mock: bool = False,
     defaults: Any = None,
     detached: bool = False,
+    memo: dict[str, Any] | None = None,
 ) -> WorkflowResult:
     """Compile ``graph`` to Temporal and execute it, returning a WorkflowResult.
 
@@ -403,6 +404,13 @@ async def run_temporal_workflow(
     Availability is assumed already checked by :func:`require_backend_available`
     at the selection point; this re-resolves the connection (cheap) so a direct
     caller still fails loud rather than connecting to nowhere.
+
+    ``memo`` (ADR 100 D4 follow-through) is attached verbatim to the Temporal
+    workflow start (``start_workflow(..., memo=...)`` on both the detached and
+    blocking paths) — non-indexed provenance metadata (e.g. ``{"mdk_origin":
+    "schedule:<name>"}``) that the Temporal UI renders on describe/list with
+    NO search-attribute registration. ``None`` (the default) ⇒ byte-identical
+    to the pre-memo call for every existing caller.
     """
     import time  # noqa: PLC0415
     from uuid import uuid4  # noqa: PLC0415
@@ -473,7 +481,7 @@ async def run_temporal_workflow(
     # keeps the inline result (the job output IS the workflow output).
     if detached and _graph_has_human_node(graph):
         final_state, status, error = await _start_on_temporal(
-            client=client, workflow_cls=workflow_cls, wf_id=wf_id, run_state=run_state
+            client=client, workflow_cls=workflow_cls, wf_id=wf_id, run_state=run_state, memo=memo
         )
     else:
         final_state, status, error = await _execute_on_temporal(
@@ -490,6 +498,7 @@ async def run_temporal_workflow(
             ],
             wf_id=wf_id,
             run_state=run_state,
+            memo=memo,
         )
 
     finished = time.monotonic()
@@ -514,13 +523,15 @@ async def _execute_on_temporal(
     activities: list[Any],
     wf_id: str,
     run_state: dict[str, Any],
+    memo: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any, Any]:
     """Run ``workflow_cls`` on an ephemeral in-process worker; map the outcome.
 
     Returns ``(final_state, WorkflowStatus, ErrorInfo|None)``. A workflow that
     raises (an activity surfaced a non-success RunResponse as an exception, per
     ``temporal_activities``) is mapped to a terminal ERROR result with the
-    failure message — NOT a silent partial success.
+    failure message — NOT a silent partial success. ``memo`` rides the start
+    (``execute_workflow`` = start + await) as Temporal UI-visible provenance.
     """
     from temporalio.worker import UnsandboxedWorkflowRunner  # noqa: PLC0415
 
@@ -545,6 +556,7 @@ async def _execute_on_temporal(
                 run_state,
                 id=wf_id,
                 task_queue=DEFAULT_TASK_QUEUE,
+                memo=memo,
             )
         except Exception as exc:  # map any workflow failure to a terminal ERROR result.
             return (
@@ -579,6 +591,7 @@ async def _start_on_temporal(
     workflow_cls: Any,
     wf_id: str,
     run_state: dict[str, Any],
+    memo: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any, Any]:
     """Start ``workflow_cls`` on Temporal NON-blocking (ADR 089 / #759).
 
@@ -603,6 +616,7 @@ async def _start_on_temporal(
             id=wf_id,
             task_queue=DEFAULT_TASK_QUEUE,
             id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+            memo=memo,
         )
     except Exception as exc:  # connect/start failure — fail loud, don't pretend paused.
         return (

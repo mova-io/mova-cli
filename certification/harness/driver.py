@@ -548,7 +548,17 @@ class SuiteDriver:
 
     def _launch(self, spec: ScenarioSpec, case: CaseSpec) -> str:
         """Submit the case; poll the job to terminal; return the workflow_run_id."""
-        job_id = self._client.submit_workflow(spec.target, case.input)
+        # Provenance marker, stamped at SUBMIT time (cases.yaml stays clean):
+        # the key rides the workflow input into initial_state — the state
+        # schemas are additionalProperties:true and agent/skill activities
+        # project state down to their input-schema properties, so it is never
+        # fed to an agent — making driver runs identifiable in the Temporal
+        # UI's workflow input, workflow_runs.initial_state, and Langfuse.
+        stamped_input = {
+            **case.input,
+            "certification": {"case": case.name, "scenario": spec.scenario},
+        }
+        job_id = self._client.submit_workflow(spec.target, stamped_input)
         job = self._poll(
             self._job_timeout_s,
             lambda: self._terminal_job(job_id),

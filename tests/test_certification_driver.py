@@ -70,6 +70,7 @@ class FakeRuntime:
         self.never_terminal = never_terminal
         self.signals: list[dict[str, Any]] = []
         self.requests: list[str] = []
+        self.submitted: list[dict[str, Any]] = []
 
     # -- handler ------------------------------------------------------------
 
@@ -77,6 +78,7 @@ class FakeRuntime:
         path = request.url.path
         self.requests.append(f"{request.method} {path}")
         if request.method == "POST" and path == "/run":
+            self.submitted.append(json.loads(request.content))
             return httpx.Response(202, json={"job_id": "job-1", "status": "queued"})
         if request.method == "GET" and path == "/jobs/job-1":
             return self._job_view()
@@ -340,6 +342,29 @@ def test_auto_tier_passes_durable_and_routing_skips_the_rest() -> None:
     assert result.outcomes["side-effects"].status == "skip"
     assert not result.failed
     assert fake.signals == []
+
+
+@pytest.mark.unit
+def test_submit_stamps_certification_provenance_into_input() -> None:
+    # The driver merges a `certification: {case, scenario}` marker into the
+    # input at SUBMIT time (cases.yaml stays clean) so test traffic is
+    # identifiable in the Temporal UI / workflow_runs.initial_state / Langfuse.
+    fake = FakeRuntime(final_state={"erp_result": "posted", "summary": "ok"})
+    case = _case()
+    _driver(fake).run_case(_spec(case), case)
+    assert len(fake.submitted) == 1
+    body = fake.submitted[0]
+    assert body["kind"] == "workflow"
+    assert body["target"] == "expense-approval"
+    # Original case input is intact, the marker is additive.
+    assert body["input"]["expense_text"] == "x"
+    assert body["input"]["amount"] == 50
+    assert body["input"]["certification"] == {
+        "case": "auto-tier",
+        "scenario": "expense-approval",
+    }
+    # The case spec itself is NOT mutated by stamping.
+    assert "certification" not in case.input
 
 
 @pytest.mark.unit
