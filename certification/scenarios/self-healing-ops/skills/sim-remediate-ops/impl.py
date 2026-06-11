@@ -1,4 +1,4 @@
-"""Simulated remediation attempt #2 for the `sim-remediate-retry` skill.
+"""Simulated remediation attempt #1 for the `sim-remediate-ops` skill.
 
 SELF-CONTAINED ON PURPOSE (ADR 097 D2). The deployed temporal-worker image
 bakes ``src/`` + ``workflows/`` + ``agents/`` only — ``certification/`` (and
@@ -11,27 +11,38 @@ asyncpg — already a shipped dependency; otherwise the SQLite file at
 side-effect asserts (``certification/harness/asserts.py``) read the row back
 from the shared DB by ``run_id``.
 
-This is the UNROLLED RETRY (mdk workflows have no cycles, so "try again" is
-a second sequential TOOL node, not a loop). The attempt-2 outcome is a PURE
-PREDICATE over the fault: only "hardware" still fails — the transient
-("stuck") faults that raced attempt #1 land on the retry. The ledger row is
-the same ``{system: ops, action: remediate}`` shape as attempt #1 with
-``attempt: 2`` in the payload, so the driver's ``times: 2`` count proves
-both attempts ran.
+WHY THE DIRECTORY IS NOT NAMED ``sim-remediate`` (cert run ar11boj, 2026-06):
+the python skill backend imports a skill as ``<dir-name>.impl`` with the dir's
+PARENT on ``sys.path``, and caches the resolved callable PER ENTRY STRING for
+the worker-process lifetime. ``workflows/incident-response/skills/sim-remediate``
+already claims the ``sim-remediate.impl:run`` entry on the shared certification
+worker — whichever scenario dispatched first poisoned the other's dispatch
+(the incident-response impl returns ``remediation_status``, not ``r1_status``,
+so this workflow's output validation failed and Temporal's retry policy
+re-ran the activity, duplicating ledger rows). A skill directory name must be
+unique across every workflow a single worker serves; ``sim-remediate-ops`` is.
+``tests/test_b9_scenarios.py`` pins this with a repo-wide duplicate-dir guard.
 
-The ledger write is FAIL-SOFT and IDEMPOTENT (the cert-run-ar11boj lesson —
-see ``sim-remediate-ops/impl.py`` for the full post-mortem): the predicate
-result is the skill's contract, the row is observability — a ledger failure
-is logged and swallowed, never raised, so a flaky DB cannot turn Temporal's
-retry policy into a duplicate-row storm. And a retried attempt (e.g. a
-timeout AFTER the commit) rebuilds the byte-identical payload, so the insert
-is suppressed when the same ``(run_id, system, action, payload)`` row
+The attempt-1 outcome is a PURE PREDICATE over the fault, so the verification
+decision downstream replays identically on Temporal: a fault containing
+"hardware" can never be fixed by software remediation, and a fault containing
+"stuck" is TRANSIENT — the first attempt races the condition and fails, only
+the retry (``sim-remediate-retry``, attempt #2) lands it. Everything else
+applies on the first attempt. The triage agent's ``remediation_action`` is
+recorded for the audit trail but never decides the outcome.
+
+The ledger write is FAIL-SOFT and IDEMPOTENT (the other ar11boj lesson): the
+predicate result is the skill's contract, the row is observability — a ledger
+failure is logged and swallowed, never raised, so a flaky DB cannot turn
+Temporal's retry policy into a duplicate-row storm. And a retried attempt
+(e.g. a timeout AFTER the commit) rebuilds the byte-identical payload, so the
+insert is suppressed when the same ``(run_id, system, action, payload)`` row
 already exists — the certification ``times:`` counts stay honest.
 
 The python skill backend puts this skill dir's PARENT on ``sys.path``
 (``movate/core/skill_backend/python.py::_resolve``), so the
-``entry: sim-remediate-retry.impl:run`` in skill.yaml resolves this file via
-a PEP 420 namespace package — hyphenated dir names are fine through
+``entry: sim-remediate-ops.impl:run`` in skill.yaml resolves this file via a
+PEP 420 namespace package — hyphenated dir names are fine through
 ``importlib.import_module``.
 
 Contract: ``run(input_payload, ctx) -> dict`` — the validated skill input
@@ -60,7 +71,7 @@ _log = logging.getLogger(__name__)
 _TABLE = "sim_side_effects"
 _SYSTEM = "ops"
 _ACTION = "remediate"
-_ATTEMPT = 2
+_ATTEMPT = 1
 
 # Same DDL as certification/harness/sim_systems.py — the row must land in the
 # identical table the harness reads.
@@ -181,13 +192,16 @@ def _record(run_id: str, payload: dict[str, Any]) -> None:
 
 
 def attempt_outcome(fault: str) -> str:
-    """The pure attempt-2 predicate: only hardware still fails — the
-    transient faults attempt #1 raced land on the retry."""
-    return "failed" if "hardware" in fault.lower() else "applied"
+    """The pure attempt-1 predicate: hardware never applies, transient
+    ("stuck") faults need the retry, everything else applies first try."""
+    lowered = fault.lower()
+    if "hardware" in lowered or "stuck" in lowered:
+        return "failed"
+    return "applied"
 
 
 def run(input_payload: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
-    """Apply remediation attempt #2; record the attempt-2 ledger row."""
+    """Apply remediation attempt #1; record the attempt-1 ledger row."""
     fault = str(input_payload.get("fault", ""))
     component = str(input_payload.get("component", ""))
     remediation_action = str(input_payload.get("remediation_action", ""))
@@ -203,4 +217,4 @@ def run(input_payload: dict[str, Any], ctx: Any = None) -> dict[str, Any]:
                 "status": status,
             },
         )
-    return {"r2_status": status}
+    return {"r1_status": status}
