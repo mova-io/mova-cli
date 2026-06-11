@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"agent_name":{"type":"string"},"quality_score":{"type":"number"},"symptom":{"type":"string"},"cause":{"type":"string"},"fix_action":{"type":"string"},"fix_status":{"type":"string"},"decision":{"type":"string"}}}

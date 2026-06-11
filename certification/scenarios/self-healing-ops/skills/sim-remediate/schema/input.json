@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["fault","component","remediation_action"],"properties":{"fault":{"type":"string"},"component":{"type":"string"},"remediation_action":{"type":"string"},"run_id":{"type":"string"}}}

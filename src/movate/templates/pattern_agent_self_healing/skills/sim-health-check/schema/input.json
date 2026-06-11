@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["agent_name"],"properties":{"agent_name":{"type":"string"},"run_id":{"type":"string"}}}

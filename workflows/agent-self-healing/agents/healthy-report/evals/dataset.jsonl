@@ -1,0 +1,2 @@
+{"input":{"agent_name":"order-tracker","quality_score":0.93,"symptom":"none"},"expected":{"summary":"Passed the health check at 0.93 — no remediation needed."}}
+{"input":{"agent_name":"faq-bot","quality_score":0.88,"symptom":"none"},"expected":{"summary":"Passed the health check at 0.88 — no remediation needed."}}
