@@ -1,0 +1,87 @@
+# Certification cases — employee-onboarding (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `employee-onboarding`
+# workflow (workflows/employee-onboarding — 5 nodes: the `plan` agent, the
+# three provisioning TOOL nodes provision-ad / provision-email /
+# provision-equipment, and the `welcome` agent). The driver submits the case
+# input via POST /run, then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * SEQUENTIAL, NOT PARALLEL — the three provisioning steps are conceptually
+#   a fan-out diamond, but ADR 092's parallel phase gate (`validate_dag`,
+#   Phase 1) admits AGENT-ONLY branches and the Temporal lowering
+#   (`_emit_fan_out_node`, Phase 2) emits every branch via
+#   `call_agent_activity`, so TOOL branches are rejected at validation (and
+#   would mis-lower even if admitted). The workflow ships as a sequential
+#   TOOL chain; tests/test_b5_scenarios.py pins the limitation so a later
+#   ADR 092 phase flips this back to the diamond deliberately.
+# * `route: null` — no decision node writes routing state on this workflow;
+#   there is only one path. The provisioning evidence is the three ledger
+#   rows + the final_state result markers.
+# * `hitl` — no human gate anywhere in this workflow; the capability is an
+#   honest SKIP on every case.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (ADR 096); same honest skip as the other scenarios.
+# * `governance: allow` everywhere — the baked catalog policy registers
+#   MODEL + COST gates on every agent run (plan + welcome), so the terminal
+#   fact's governance_effect must be non-null `allow`.
+# * side-effects — each case asserts ALL THREE provisioning rows exactly
+#   once: `{identity, provision_ad}`, `{email, provision_mailbox}`,
+#   `{itsm, order_equipment}`. Evaluated only when the shared DB is
+#   reachable (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * ROLE-KEYED EQUIPMENT — the ledger payload carries the role + resolved
+#   bundle, but the driver's side-effect matcher is (system, action, times)
+#   only, so the payload itself is asserted in unit tests
+#   (tests/test_b5_scenarios.py). The CASE-level proof rides
+#   `final_state_contains`: the equipment TOOL's result string names the
+#   role and bundle, so the engineer case pins "engineer" + the engineering
+#   bundle text in `equipment_result`.
+
+scenario: employee-onboarding
+target: employee-onboarding # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- the standard path: a non-engineering hire gets the default bundle;
+  # --- all three systems record exactly one provisioning row and the
+  # --- welcome summary lands in final state.
+  - name: standard-onboarding
+    input:
+      employee: Jordan Lee
+      role: account-manager
+      start_date: "2026-07-01"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [accounts_needed, ad_result, email_result, equipment_result, summary]
+      final_state_contains:
+        equipment_result: ["standard issue bundle"]
+      side_effects:
+        - { system: identity, action: provision_ad, times: 1 }
+        - { system: email, action: provision_mailbox, times: 1 }
+        - { system: itsm, action: order_equipment, times: 1 }
+
+  # --- the role-keyed path: an engineer's equipment order must reflect the
+  # --- role — the TOOL's deterministic bundle map picks the engineering
+  # --- workstation, visible in the equipment_result state value (and, in
+  # --- unit tests, in the ledger payload).
+  - name: engineer-role
+    input:
+      employee: Priya Nair
+      role: engineer
+      start_date: "2026-07-15"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [accounts_needed, ad_result, email_result, equipment_result, summary]
+      final_state_contains:
+        equipment_result: ["engineer", "engineering workstation bundle"]
+      side_effects:
+        - { system: identity, action: provision_ad, times: 1 }
+        - { system: email, action: provision_mailbox, times: 1 }
+        - { system: itsm, action: order_equipment, times: 1 }

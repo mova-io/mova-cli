@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["ticket_result"],"properties":{"ticket_result":{"type":"string"}}}

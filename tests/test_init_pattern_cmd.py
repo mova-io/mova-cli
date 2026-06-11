@@ -41,6 +41,9 @@ WORKFLOW_PATTERNS = [
     "pii-detection",
     "data-privacy",
     "content-publishing",
+    "employee-onboarding",
+    "incident-response",
+    "cross-system-action",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 

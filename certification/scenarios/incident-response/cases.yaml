@@ -1,0 +1,128 @@
+# Certification cases — incident-response (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `incident-response`
+# workflow (workflows/incident-response — 7 nodes: the `diagnose` agent, a
+# `decision` node on its calibrated confidence, the `sim-remediate` TOOL,
+# the `verify` agent, a `decision` node on its resolved boolean, ONE
+# `escalate` HUMAN gate shared by both escalation reasons, and ONE notify
+# agent). The driver submits the case input via POST /run, resumes any
+# expected HUMAN pause via the signal endpoint, then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# TRIGGER BINDING (ADR 100) — this scenario is the trigger-shaped one: its
+# input ({alert: {service, severity, message}}) is exactly what a webhook
+# trigger created with `--event-key alert` feeds it. The suite drives the
+# runs via POST /run (the same JobRecord path a fired trigger enqueues, so
+# the coverage transfers); live webhook delivery is deliberately NOT part of
+# these cases. The verified registration commands live in
+# workflows/incident-response/README.md, and
+# tests/test_b5_scenarios.py smoke-tests the registration + event→state
+# mapping through the real CLI + core helpers.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * CONFIDENCE IS LLM-SCORED — the decision nodes route deterministically,
+#   but the confidence they read comes from the diagnose agent under an
+#   explicit calibration rubric (0.9 when the alert message names the fault,
+#   0.3 when it is vague, never in between — the human-escalation scenario's
+#   proven pattern). Case inputs are written far inside each band.
+# * THE FAILED-REMEDIATION PATH IS DETERMINISTIC — sim-remediate returns
+#   status `failed` when the alert MESSAGE names a fault automation cannot
+#   fix (hardware/physical/manual-intervention markers), keyed off the case
+#   input, never off LLM output. The verify agent then mirrors the machine
+#   status into `resolved` under a strict rubric.
+# * `route: null` — the decision nodes pick the next node but write NOTHING
+#   into workflow state; the branch is proven instead via the observed pause
+#   (or its absence), final_state markers (remediation_result/status_note
+#   only when remediation ran; decision only when the gate signalled), and
+#   the ops ledger row (present only when remediation was attempted).
+# * `status: success` for ALL cases, including escalations — an escalation
+#   is a route, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (ADR 096); same honest skip as the other scenarios.
+# * `governance: allow` everywhere — the baked catalog policy registers
+#   MODEL + COST gates on every agent run, so the terminal fact's
+#   governance_effect must be non-null `allow`.
+# * side-effects — the remediated cases assert the ops ATTEMPT row exactly
+#   once (recorded for failed attempts too — the audit trail of what
+#   automation did); the low-confidence case asserts its ABSENCE (automation
+#   must not have touched the system on an uncertain diagnosis). Evaluated
+#   only when the shared DB is reachable (MOVATE_PG_URL/MOVATE_DB_URL — the
+#   driver SKIPs otherwise).
+
+scenario: incident-response
+target: incident-response # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- high confidence + remediable fault: diagnose (0.9) → remediate
+  # --- (applied) → verify (resolved) → notify. No pause anywhere — a wrong
+  # --- pause starves the fact poll and fails durable-execution.
+  - name: high-confidence-auto-remediated
+    input:
+      alert:
+        service: payments-api
+        severity: high
+        message: >-
+          Connection pool exhausted on payments-api: 100% of the pool in
+          use and requests queueing since deploy 2026-06-09.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [root_cause, remediation_status, remediation_result, status_note, summary]
+      final_state_lacks: [decision]
+      final_state_contains:
+        remediation_status: ["applied"]
+      side_effects:
+        - { system: ops, action: remediate, times: 1 }
+
+  # --- vague alert: diagnose (0.3) → escalate HUMAN directly. The on-call
+  # --- ack routes to notify; automation never touched the ops system.
+  - name: low-confidence-escalated
+    input:
+      alert:
+        service: checkout
+        severity: medium
+        message: >-
+          Intermittent 500s observed on checkout over the last hour, no
+          clear pattern, cause unclear.
+    hitl:
+      - node: escalate
+        decision: { decision: ack }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [root_cause, decision, summary]
+      final_state_lacks: [remediation_result, status_note]
+      no_side_effects:
+        - { system: ops, action: remediate }
+
+  # --- clearly-diagnosed but UNREMEDIABLE fault: diagnose (0.9 — the
+  # --- message names the failing component) → remediate (the message's
+  # --- "hardware fault" marker makes the attempt FAIL deterministically) →
+  # --- verify (resolved=false) → escalate → ack → notify. The attempt row
+  # --- is still on the ledger: automation tried, and the audit trail says
+  # --- so.
+  - name: remediation-failed-escalated
+    input:
+      alert:
+        service: db-cluster
+        severity: critical
+        message: >-
+          Primary disk array degraded on node db-7 — hardware fault
+          reported by the controller; automated failover stuck.
+    hitl:
+      - node: escalate
+        decision: { decision: ack }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [root_cause, remediation_status, remediation_result, status_note, decision, summary]
+      final_state_contains:
+        remediation_status: ["failed"]
+      side_effects:
+        - { system: ops, action: remediate, times: 1 }

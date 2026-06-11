@@ -1,0 +1,46 @@
+api_version: movate/v1
+kind: Workflow
+name: employee-onboarding
+version: 0.1.0
+description: >
+  New-hire provisioning across three systems — scenario #6 of the
+  30-use-case certification program (B5 cross-system batch). A `plan` agent
+  summarizes what the hire needs, then THREE TOOL nodes (ADR 097) provision
+  deterministically — the AD account (`identity` ledger row), the mailbox
+  (`email` row), and the role-keyed equipment bundle (`itsm` row; the bundle
+  is a fixed map in the skill, never a model decision) — and a `welcome`
+  agent summarizes what was provisioned. DELIBERATELY A SEQUENTIAL CHAIN,
+  not the fan-out diamond the provisioning steps are conceptually: ADR 092's
+  parallel phase gate (`validate_dag`, Phase 1) admits AGENT-ONLY branches,
+  and the Temporal lowering (`_emit_fan_out_node`, Phase 2) emits every
+  branch via `call_agent_activity` — TOOL nodes inside a fan-out are
+  rejected at validation and would mis-lower even if admitted. When a later
+  ADR 092 phase admits TOOL branches, the three provision nodes become the
+  canonical diamond (their output keys are already disjoint, so the default
+  last_wins join is safe). The skill names resolve through the scenario's
+  project registry (project.yaml marker → skills/). Mirrors
+  workflows/employee-onboarding.
+state_schema: ../../state.json
+entrypoint: plan
+nodes:
+  # The planning LLM is descriptive only: the provisioning set + order below
+  # is fixed in the graph — the model cannot widen it.
+  - {id: plan, type: agent, ref: ../../agents/plan}
+  # --- the provisioning TOOL chain (ADR 097 — deterministic ledger rows, no
+  # --- LLM). Sequential on purpose: see the fan-out note in the description.
+  - id: provision-ad
+    type: tool
+    skill: sim-provision-ad
+  - id: provision-email
+    type: tool
+    skill: sim-provision-email
+  - id: provision-equipment
+    type: tool
+    skill: sim-provision-equipment
+  # The welcome summary runs after ALL three results merged into state.
+  - {id: welcome, type: agent, ref: ../../agents/welcome}
+edges:
+  - {from: plan, to: provision-ad}
+  - {from: provision-ad, to: provision-email}
+  - {from: provision-email, to: provision-equipment}
+  - {from: provision-equipment, to: welcome}

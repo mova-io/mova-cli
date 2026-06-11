@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["resolved","status_note"],"properties":{"resolved":{"type":"boolean"},"status_note":{"type":"string"}}}

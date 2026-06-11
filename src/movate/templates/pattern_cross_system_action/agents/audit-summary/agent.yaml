@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: audit-summary
+version: 0.1.0
+description: >-
+  Writes the audit trail for the completed cross-system action: one summary
+  naming all four system touches and their references, in execution order.
+  Runs AFTER the four TOOL nodes, so every result key is always present.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

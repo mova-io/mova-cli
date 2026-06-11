@@ -1,0 +1,21 @@
+api_version: movate/v1
+kind: Project
+name: cross-system-action
+version: 0.1.0
+
+# Governance gates for the scenario (ADR 093 / ADR 096) — mirrors
+# workflows/cross-system-action/policy.yaml. The deployed worker loads the
+# baked catalog policy from its WORKDIR (/opt/movate/project.yaml) via
+# `load_project_config()`; with the block present the Executor's governance
+# shadow evaluates the MODEL + COST gates on every agent run and the edges
+# stamp `observability_facts.governance_effect` — the column the suite's
+# `governance` capability asserts (expected `allow`: the allowlist matches
+# the agents' provider and the cost ceiling sits above the default per-run
+# budget of 1.0, so gates evaluate without warning/denying). This file also
+# serves as the project MARKER for the scenario: the tool nodes' compile-time
+# skill resolution (ADR 097 D2) walks up from workflows/chain/ to this root
+# and finds skills/sim-crm-update, skills/sim-erp-update, skills/sim-ticket
+# and skills/sim-notify-email in the project registry.
+policy:
+  allowed_providers: [openai, anthropic]
+  max_cost_per_run_usd: 5.00

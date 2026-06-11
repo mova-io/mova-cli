@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["remediation_status","remediation_result"],"properties":{"root_cause":{"type":"string"},"remediation_status":{"type":"string"},"remediation_result":{"type":"string"}}}

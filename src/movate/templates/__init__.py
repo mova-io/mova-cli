@@ -304,6 +304,24 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Multi-stage content review chain + HITL final gate (runtime: temporal). Calibrated compliance-review and brand-review agents each feed a DECISION node failing safe to a shared rejected agent; content passing BOTH still publishes nothing until a HUMAN gate routes its own approve/reject decision (ADR 099) into the sim-publish TOOL's auditable cms ledger row (ADR 094/097/098/099).",  # noqa: E501
         "compliance → DECISION → brand → DECISION → [HUMAN routes approve|reject] → TOOL publish → notify | rejected",  # noqa: E501
     ),
+    "employee-onboarding": (
+        "pattern_employee_onboarding",
+        True,
+        "New-hire provisioning across three systems (runtime: temporal). A descriptive plan agent feeds THREE deterministic TOOL nodes — AD account, mailbox, and a role-keyed equipment bundle (a fixed map in the skill, never a model decision) — each recording an auditable ledger row, then a welcome agent summarizes. Sequential by phase-gate design: ADR 092 parallel graphs are agent-only today, so the conceptual fan-out diamond ships as a chain (ADR 092/097).",  # noqa: E501
+        "plan → TOOL provision-ad → TOOL provision-email → TOOL provision-equipment → welcome",
+    ),
+    "incident-response": (
+        "pattern_incident_response",
+        True,
+        "Event-driven incident diagnosis + remediation + escalation (runtime: temporal). A calibrated-confidence diagnose agent feeds a DECISION node (gte 0.7 → the sim-remediate TOOL, whose applied/failed status is deterministic on the alert and whose ATTEMPT is always an auditable ops ledger row); a verify agent mirrors the machine status into a second DECISION; both escalation reasons converge on ONE HUMAN gate routing its own ack (fallback notify — a human can delay closure, never wedge it). Trigger-shaped input for ADR 100 (--event-key alert) (ADR 094/097/098/099/100).",  # noqa: E501
+        "diagnose → DECISION(confidence) → {TOOL remediate → verify → DECISION(resolved) → notify | [HUMAN escalate routes ack] → notify}",  # noqa: E501
+    ),
+    "cross-system-action": (
+        "pattern_cross_system_action",
+        True,
+        "Coordinated multi-system action with an audit trail (runtime: temporal). A descriptive plan agent feeds FOUR deterministic TOOL nodes in a FIXED order — CRM (salesforce) → ERP (sap) → ticket (servicenow) → email — each recording its own auditable ledger row; the order guarantee is structural (a strict sequential chain, one activity at a time), and an audit-summary agent writes the one record naming all four references (ADR 097).",  # noqa: E501
+        "plan → TOOL crm-update → TOOL erp-update → TOOL create-ticket → TOOL send-email → audit-summary",  # noqa: E501
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

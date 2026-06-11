@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: plan
+version: 0.1.0
+description: >-
+  Summarizes which accounts and resources the new hire needs — a human-readable
+  provisioning plan. The plan is DESCRIPTIVE only: the provisioning steps that
+  follow are fixed TOOL nodes, so the model cannot add, drop, or reorder them.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

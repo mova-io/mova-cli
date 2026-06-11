@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["employee","role","start_date"],"properties":{"employee":{"type":"string"},"role":{"type":"string"},"start_date":{"type":"string"}}}

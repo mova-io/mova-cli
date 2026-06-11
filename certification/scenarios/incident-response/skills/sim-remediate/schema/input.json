@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["alert","remediation"],"properties":{"alert":{"type":"object"},"remediation":{"type":"string"},"run_id":{"type":"string"}}}
