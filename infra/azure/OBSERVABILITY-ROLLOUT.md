@@ -87,3 +87,31 @@ Like everything above this was applied **imperatively**; fold it into the
 `temporal operator namespace update --retention 720h default` step (or the
 namespace bootstrap that creates `default`) — so a re-provisioned VM does not
 quietly regress to 1-day retention.
+
+## Certification ACA Job: movate-cert-suite (captured 2026-06-11)
+
+The certification suite (`certification/run_suite.py`) now has an in-env home:
+the **movate-cert-suite** Container Apps Job in `movate-dev-rg` (created
+imperatively 2026-06-11, env `movate-dev-cae`). Running the suite *inside* the
+environment is what makes it fully observable:
+
+* **side-effects column lights up** — the suite can reach Postgres directly to
+  verify scenario side-effects, which a laptop run cannot;
+* **cert metrics actually ship** — `mdk.certification.scenario` goes out via
+  OTLP to `movate-dev-otelcol` (internal ingress only), filling the Grafana
+  scenario x capability matrix.
+
+Manual trigger (certification is an explicit gate, not a cron); 1h replica
+timeout; `replicaRetryLimit: 0` so a failed run surfaces as a failed execution
+instead of silently re-running. Start a run with:
+
+```bash
+az containerapp job start -g movate-dev-rg -n movate-cert-suite
+```
+
+**Bicep now captures it**: `infra/azure/containerapp-cert-job.bicep`
+(standalone declaration — not yet wired into `main.bicep`, so the CI bicep job
+does not compile it; build it directly with
+`az bicep build --file infra/azure/containerapp-cert-job.bicep`). Secrets
+(`pg-dsn`, `dev-key`) are `@secure()` params matching how the live job was
+created, image pull via the shared `movate-dev-worker-mi` UAI.
