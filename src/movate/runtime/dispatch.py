@@ -320,6 +320,17 @@ class WorkerDispatch:
             storage=self._storage,
             tracer=tracer,
             tenant_id=job.tenant_id,
+            # ADR 093 — eval sub-executors swap the provider (mock vs live)
+            # but must keep the worker's governance wiring: thread the SAME
+            # policies/guardrails the main run path's executor enforces, so
+            # the gates (and the legacy policy checks they shadow) evaluate
+            # on eval runs too. Previously omitted → eval jobs ran fully
+            # permissive (the gap documented when governance was wired at
+            # the executor edge, task #45).
+            policy=self._executor.policy,
+            runtime_policy=self._executor.runtime_policy,
+            skill_policy=self._executor.skill_policy,
+            guardrails=self._executor.guardrails,
         )
 
         try:
@@ -749,6 +760,13 @@ class WorkerDispatch:
             storage=self._storage,
             tracer=build_tracer(),
             tenant_id=job.tenant_id,
+            # ADR 093 — same governance threading as _execute_eval: the bench
+            # sub-executor must enforce/shadow the worker's policies, not run
+            # permissive (task #45).
+            policy=self._executor.policy,
+            runtime_policy=self._executor.runtime_policy,
+            skill_policy=self._executor.skill_policy,
+            guardrails=self._executor.guardrails,
         )
 
         # Quality scoring is opt-in: only when the submission carried both

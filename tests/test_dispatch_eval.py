@@ -198,3 +198,79 @@ async def test_execute_job_continues_trace_context_without_crash(
     )
     outcome = await dispatch.execute_job(agent_job)
     assert outcome.status == JobStatus.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# Governance threading (task #45): the eval sub-executor inherits the worker
+# executor's policies, so governance gates evaluate on eval runs too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_eval_job_threads_policy_so_gates_evaluate(
+    tmp_path: Path, storage: InMemoryStorage, pricing
+) -> None:
+    """Regression for the documented gap: ``_execute_eval`` built its
+    sub-executor WITHOUT the policies the main run path threads, so eval jobs
+    ran fully permissive (no gates, no governance decisions). With a
+    non-permissive ModelPolicy on the worker's executor, the eval run must
+    now record a governance effect into the ambient scope — proof the gates
+    evaluated on the eval sub-executor."""
+    from movate.core.config import ModelPolicy  # noqa: PLC0415
+    from movate.governance.effects import governance_effect_scope  # noqa: PLC0415
+
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    provider = JudgeStubProvider(agent_response='{"message": "Hello!"}', judge_score=0.9)
+    executor = Executor(
+        provider=provider,
+        pricing=pricing,
+        storage=storage,
+        tracer=NullTracer(),
+        # Non-permissive (scaffold agent's provider is allowed) ⇒ the
+        # governance engine is live and the MODEL gate evaluates → allow.
+        policy=ModelPolicy(allowed_providers=["openai"]),
+    )
+    dispatch = WorkerDispatch(
+        storage=storage,
+        executor=executor,
+        agents=[bundle],
+        use_mock_for_eval=True,
+    )
+
+    with governance_effect_scope() as scope:
+        outcome = await dispatch.execute_job(_make_job(target="demo"))
+
+    assert outcome.status == JobStatus.SUCCESS
+    assert scope.effect == "allow"  # gates evaluated on the eval sub-executor
+
+
+@pytest.mark.unit
+async def test_eval_job_permissive_policy_records_no_effect(
+    tmp_path: Path, storage: InMemoryStorage, pricing
+) -> None:
+    """Negative control: a fully permissive worker executor ⇒ no engine, no
+    gates, no recorded effect — byte-for-byte the prior eval behavior."""
+    from movate.governance.effects import governance_effect_scope  # noqa: PLC0415
+
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    provider = JudgeStubProvider(agent_response='{"message": "Hello!"}', judge_score=0.9)
+    executor = Executor(
+        provider=provider,
+        pricing=pricing,
+        storage=storage,
+        tracer=NullTracer(),
+    )
+    dispatch = WorkerDispatch(
+        storage=storage,
+        executor=executor,
+        agents=[bundle],
+        use_mock_for_eval=True,
+    )
+
+    with governance_effect_scope() as scope:
+        outcome = await dispatch.execute_job(_make_job(target="demo"))
+
+    assert outcome.status == JobStatus.SUCCESS
+    assert scope.effect is None
