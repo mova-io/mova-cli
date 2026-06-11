@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["retrieved_docs","top_score"],"properties":{"retrieved_docs":{"type":"array","items":{"type":"object"}},"top_score":{"type":"number","minimum":0,"maximum":1}}}

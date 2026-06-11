@@ -49,6 +49,8 @@ ALL_PATTERNS = [
     "pii-detection",
     "data-privacy",
     "content-publishing",
+    "rag-debug",
+    "kb-refresh",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

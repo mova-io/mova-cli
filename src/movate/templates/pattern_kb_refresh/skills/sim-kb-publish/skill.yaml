@@ -1,0 +1,36 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-kb-publish
+version: 0.1.0
+description: >-
+  Simulate publishing a validated knowledge-base refresh: records one
+  auditable `{system: kb, action: publish}` row to the shared
+  sim_side_effects ledger (same DB MDK itself uses) and returns a one-line
+  confirmation with the chunk count. Named sim-kb-publish (not sim-publish)
+  because the python backend resolves skill entries by MODULE name and the
+  content-publishing scenario already ships a `sim-publish.impl` — a unique
+  module name keeps a long-lived worker from importing the wrong impl.
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `sim-kb-publish.impl` imports
+  from the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-kb-publish.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - kb
+  - publication
+  - simulation
+  - certification

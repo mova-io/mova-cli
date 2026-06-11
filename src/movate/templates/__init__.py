@@ -304,6 +304,18 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Multi-stage content review chain + HITL final gate (runtime: temporal). Calibrated compliance-review and brand-review agents each feed a DECISION node failing safe to a shared rejected agent; content passing BOTH still publishes nothing until a HUMAN gate routes its own approve/reject decision (ADR 099) into the sim-publish TOOL's auditable cms ledger row (ADR 094/097/098/099).",  # noqa: E501
         "compliance → DECISION → brand → DECISION → [HUMAN routes approve|reject] → TOOL publish → notify | rejected",  # noqa: E501
     ),
+    "rag-debug": (
+        "pattern_rag_debug",
+        True,
+        "RAG with the retrieval stage as an auditable step (runtime: temporal). A retrieve TOOL node (deterministic keyword scoring over an inline KB, auditable vectorstore ledger row — no embeddings, no LLM) feeds a DECISION node routing top_score ≥ 0.5 to a strictly-grounded answer agent; lower scores route to a diagnose agent explaining the low score + suggesting a query reformulation — the failure mode is a route, not an error (ADR 094/097).",  # noqa: E501
+        "TOOL retrieve → DECISION(top_score) → {answer | diagnose}",
+    ),
+    "kb-refresh": (
+        "pattern_kb_refresh",
+        True,
+        "Validated knowledge-base refresh (runtime: temporal). An ingest TOOL node (fixed chunking rule, auditable kb ledger row) feeds a validate agent judging the ingest SUMMARY into {ok, note}; a DECISION node routes ok=true into the sim-kb-publish TOOL (auditable publish row) and failures into a HUMAN ack gate with NO retry route (acyclic by design) — both paths converging on ONE guarded notify tail (ADR 094/097/098/099).",  # noqa: E501
+        "TOOL ingest → validate → DECISION(ok) → {TOOL publish | [HUMAN ack]} → notify",
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

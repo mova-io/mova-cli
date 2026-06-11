@@ -1,0 +1,2 @@
+{"input":{"ingest_result":{"doc_count":2,"chunk_count":5,"empty_docs":0,"reference":"KB-ING-A1B2C3"}},"expected":{"ok":true,"note":"Ingested 2 documents into 5 chunks with no empty documents."}}
+{"input":{"ingest_result":{"doc_count":1,"chunk_count":0,"empty_docs":1,"reference":"KB-ING-D4E5F6"}},"expected":{"ok":false,"note":"1 of 1 submitted documents had empty text (empty_docs is 1, chunk_count is 0), so the refresh fails validation."}}

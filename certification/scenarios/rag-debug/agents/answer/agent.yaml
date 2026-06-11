@@ -1,0 +1,13 @@
+api_version: movate/v1
+kind: Agent
+name: answer
+version: 0.1.0
+description: >-
+  Composes a grounded answer STRICTLY from the retrieved documents — reached
+  only when the retrieval score cleared the decision node's threshold.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

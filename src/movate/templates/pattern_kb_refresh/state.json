@@ -1,0 +1,6 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "documents":{"type":"array","items":{"type":"object"}},
+  "ingest_result":{"type":"object"},
+  "ok":{"type":"boolean"},"note":{"type":"string"},
+  "decision":{"type":"string"},
+  "publish_result":{"type":"string"},"summary":{"type":"string"}}}

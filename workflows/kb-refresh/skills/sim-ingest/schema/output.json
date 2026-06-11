@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["ingest_result"],"properties":{"ingest_result":{"type":"object","required":["doc_count","chunk_count","empty_docs","reference"],"properties":{"doc_count":{"type":"integer","minimum":0},"chunk_count":{"type":"integer","minimum":0},"empty_docs":{"type":"integer","minimum":0},"reference":{"type":"string"}}}}}

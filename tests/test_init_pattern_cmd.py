@@ -41,6 +41,8 @@ WORKFLOW_PATTERNS = [
     "pii-detection",
     "data-privacy",
     "content-publishing",
+    "rag-debug",
+    "kb-refresh",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 

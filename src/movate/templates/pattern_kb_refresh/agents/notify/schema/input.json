@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"ok":{"type":"boolean"},"note":{"type":"string"},"ingest_result":{"type":"object"},"publish_result":{"type":"string"},"decision":{"type":"string"}}}
