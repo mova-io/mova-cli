@@ -1,0 +1,13 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: human-escalation
+kind: workflow
+description: 'Low-confidence human escalation with RESUME-WITH-FEEDBACK (runtime: temporal).
+  A triage agent drafts an answer + a calibrated numeric confidence; a DECISION node routes
+  confidence ≥ 0.8 straight to finalize (no second LLM judging the first), everything else
+  pauses at the review HUMAN gate (output_contract [decision, feedback]) — the reviewer''s
+  feedback merges into state and the finalize agent incorporates it (ADR 094/098/099).'
+topology: triage → DECISION(confidence) → {finalize | [HUMAN review + feedback]} → finalize
+  | rejected

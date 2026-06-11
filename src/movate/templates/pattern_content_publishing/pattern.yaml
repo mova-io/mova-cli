@@ -1,0 +1,13 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: content-publishing
+kind: workflow
+description: 'Multi-stage content review chain + HITL final gate (runtime: temporal). Calibrated
+  compliance-review and brand-review agents each feed a DECISION node failing safe to a shared
+  rejected agent; content passing BOTH still publishes nothing until a HUMAN gate routes its
+  own approve/reject decision (ADR 099) into the sim-publish TOOL''s auditable cms ledger
+  row (ADR 094/097/098/099).'
+topology: compliance → DECISION → brand → DECISION → [HUMAN routes approve|reject] → TOOL
+  publish → notify | rejected

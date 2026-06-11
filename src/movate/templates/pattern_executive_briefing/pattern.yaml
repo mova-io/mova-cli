@@ -1,0 +1,14 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: executive-briefing
+kind: workflow
+description: 'Scheduled multi-source executive digest (runtime: temporal), CRON-BORN per ADR
+  100 (mdk schedule set --cron). A SEQUENTIAL chain of two TOOL nodes (entrypoint fan-out
+  is not available for TOOL nodes) runs the workflow-local sim-gather-metrics / sim-gather-incidents
+  python skills (auditable gather ledger rows, no network IO); the ONE composing digest agent
+  writes the briefing strictly from the gathered results and emits a risk_count a DECISION
+  node routes — risky briefings escalate via flag, clean ones file via archive (ADR 094/097/100).'
+topology: TOOL gather-metrics → TOOL gather-incidents → digest → DECISION(risk_count) → {flag
+  | archive}

@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: multi-agent-investigation
+kind: workflow
+description: 'Multi-agent investigation over the PARALLEL FAN-OUT/FAN-IN diamond (runtime:
+  temporal, ADR 092). A plan agent decomposes the question, THREE calibrated specialist sims
+  (web/kb/data) research it CONCURRENTLY — durable asyncio.gather on Temporal — each writing
+  its own disjoint findings key, and ONE synthesize agent joins the branches into {conclusion,
+  confidence}, explicitly acknowledging disagreement between sources.'
+topology: plan → FAN-OUT {web ∥ kb ∥ data} → FAN-IN synthesize

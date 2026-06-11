@@ -1,0 +1,14 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: promotion-pipeline
+kind: workflow
+description: 'Staged promotion gates in ONE workflow (runtime: temporal). A DECISION node
+  routes the CI-named stage (no LLM; unknown stages fail safe): test runs the sim-run-tests
+  TOOL; staging records eval evidence (TOOL) THEN pauses at a HUMAN sign-off gate (ADR 099);
+  production pauses at a HUMAN approval gate FIRST — the sim-deploy TOOL''s promote_prod ledger
+  row is reachable ONLY via its approve route. One stage per run (not a loop), shared notify/rejected
+  tails (ADR 094/097/098/099).'
+topology: DECISION(stage) → {TOOL tests | TOOL eval → [HUMAN signoff] | [HUMAN approval] →
+  TOOL deploy} → notify | rejected

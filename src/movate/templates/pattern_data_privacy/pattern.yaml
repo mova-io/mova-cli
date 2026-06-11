@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: data-privacy
+kind: workflow
+description: 'Classify → policy-route → AUDITED storage (runtime: temporal). A calibrated
+  enum-pinned classify agent feeds a DECISION node routing public/internal/regulated; regulated
+  documents are masked by the redact-pii TOOL first; ALL paths converge on one sim-audit-store
+  TOOL recording the classification-keyed audit row no path can skip (ADR 094/097/098).'
+topology: classify → DECISION(classification) → {TOOL redact → TOOL audit-store | TOOL audit-store}
+  → summary

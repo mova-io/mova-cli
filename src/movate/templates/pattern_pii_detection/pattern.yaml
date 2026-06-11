@@ -1,0 +1,11 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: pii-detection
+kind: workflow
+description: 'PII document scanning + masking (runtime: temporal). A deterministic redact-pii
+  TOOL node (anchored regexes, no LLM) masks emails/SSNs/phones to [EMAIL]/[SSN]/[PHONE];
+  a DECISION node routes pii_found to a quarantine or clean-store TOOL (auditable dlp ledger
+  rows), converging on ONE notify agent that sees only the redacted text (ADR 094/097/098).'
+topology: TOOL redact → DECISION(pii_found) → {TOOL quarantine | TOOL store-clean} → notify

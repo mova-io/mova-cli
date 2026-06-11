@@ -1,0 +1,13 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: employee-onboarding
+kind: workflow
+description: 'New-hire provisioning across three systems (runtime: temporal). A descriptive
+  plan agent feeds THREE deterministic TOOL nodes — AD account, mailbox, and a role-keyed
+  equipment bundle (a fixed map in the skill, never a model decision) — each recording an
+  auditable ledger row, then a welcome agent summarizes. Sequential by phase-gate design:
+  ADR 092 parallel graphs are agent-only today, so the conceptual fan-out diamond ships as
+  a chain (ADR 092/097).'
+topology: plan → TOOL provision-ad → TOOL provision-email → TOOL provision-equipment → welcome

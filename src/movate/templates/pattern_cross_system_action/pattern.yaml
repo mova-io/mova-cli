@@ -1,0 +1,13 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: cross-system-action
+kind: workflow
+description: 'Coordinated multi-system action with an audit trail (runtime: temporal). A descriptive
+  plan agent feeds FOUR deterministic TOOL nodes in a FIXED order — CRM (salesforce) → ERP
+  (sap) → ticket (servicenow) → email — each recording its own auditable ledger row; the order
+  guarantee is structural (a strict sequential chain, one activity at a time), and an audit-summary
+  agent writes the one record naming all four references (ADR 097).'
+topology: plan → TOOL crm-update → TOOL erp-update → TOOL create-ticket → TOOL send-email
+  → audit-summary

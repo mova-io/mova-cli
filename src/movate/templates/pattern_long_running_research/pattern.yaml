@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: long-running-research
+kind: workflow
+description: 'Scheduled incremental research — the ADR 100 D1 cron-schedule shape (runtime:
+  temporal). The schedule is the durable outer loop, each fire runs ONE idempotent increment:
+  a research agent drafts findings, a TOOL node appends the auditable research-log row (increment
+  in the payload), and a DECISION routes increment gte 3 into the final report (earlier increments
+  get a light ack) — no week-long sleeping workflow (ADR 094/097/100).'
+topology: research → TOOL append → DECISION(increment) → {final-report | ack}

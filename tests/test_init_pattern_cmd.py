@@ -25,43 +25,15 @@ import pytest
 from typer.testing import CliRunner
 
 from movate.cli.main import app
+from movate.templates import list_patterns, pattern_is_workflow
 
 runner = CliRunner(mix_stderr=False)
 
-WORKFLOW_PATTERNS = [
-    "task-oriented",
-    "goal-oriented",
-    "monitor",
-    "simulation",
-    "expense-approval",
-    "itsm-request",
-    "purchase-order",
-    "approval-timeout",
-    "human-escalation",
-    "pii-detection",
-    "data-privacy",
-    "content-publishing",
-    "multi-agent-investigation",
-    "multi-agent-business-process",
-    "external-api-failure",
-    "partial-failure-recovery",
-    "long-running-research",
-    "agent-deploy-approval",
-    "agent-benchmark",
-    "continuous-eval",
-    "promotion-pipeline",
-    "ab-testing",
-    "employee-onboarding",
-    "incident-response",
-    "cross-system-action",
-    "executive-briefing",
-    "ops-center",
-    "rag-debug",
-    "kb-refresh",
-    "agent-self-healing",
-    "self-healing-ops",
-]
-ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
+# Derived from the auto-discovered registry (not a hand-maintained list): the
+# CLI scaffold smoke must cover whatever actually ships. The deletion guard
+# (an explicit literal name list) lives in tests/test_pattern_templates.py.
+WORKFLOW_PATTERNS = [name for name in list_patterns() if pattern_is_workflow(name)]
+ALL_PATTERNS = list_patterns()
 
 # A unified mock response: every node's required output key + a router `label`.
 # Each pattern node's output schema is additionalProperties:true with a single
@@ -131,6 +103,8 @@ def test_init_pattern_chatbot_scaffolds_agent(
     # name substituted (no placeholder left behind).
     assert "__AGENT_NAME__" not in agent_yaml.read_text()
     assert "max_cost_usd_per_run" in agent_yaml.read_text()
+    # registry metadata is NOT part of the user scaffold.
+    assert not (proj / "agents" / "mybot" / "pattern.yaml").exists()
 
 
 @pytest.mark.unit
@@ -180,6 +154,8 @@ def test_init_pattern_workflow_scaffolds_bundle(
     assert (bundle / "state.json").is_file()
     assert (bundle / "agents").is_dir()
     assert (bundle / "GOVERNANCE.md").is_file()
+    # registry metadata is NOT part of the user scaffold.
+    assert not (bundle / "pattern.yaml").exists()
     # workflow name set to the operator-provided name.
     assert f"name: {name}\n" in wf_yaml.read_text()
 
