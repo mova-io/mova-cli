@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["step"],"properties":{"step":{"type":"string"},"request":{"type":"string"},"run_id":{"type":"string"}}}

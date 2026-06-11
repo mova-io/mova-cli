@@ -1,0 +1,72 @@
+# Certification cases — partial-failure-recovery (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `partial-failure-recovery`
+# workflow (workflows/partial-failure-recovery — 4 nodes: three sequential
+# TOOL nodes step-one/step-two/step-three + one LLM notify). step-one and
+# step-three call the shared `sim-step` skill (ADR 097 D1 literal input map
+# names the step; outputs namespaced via output_key), each writing exactly
+# one `{system: pipeline, action: step1|step3}` ledger row. step-two calls
+# `sim-step-flaky`: one `{system: pipeline, action: step2_attempt}` row per
+# invocation, a RAISE while attempts <= fail_times, and the one
+# `{system: pipeline, action: step2}` row ONLY on the succeeding invocation.
+#
+# THE ASSERTION (scenario #15's whole point): on the mid-pipeline transient
+# failure, step1 is recorded EXACTLY ONCE (times: 1) while step2's attempt
+# rows show 2 tries — Temporal re-ran only the FAILED activity under the
+# compiled _RETRY_POLICY (maximum_attempts=3, ADR 054 D9); the completed
+# step-one activity's result replayed from history and its side effect was
+# never re-executed. The ledger is the proof, not an internal trace.
+#
+# HONESTY NOTES — same contract as itsm-request/cases.yaml:
+#
+# * `route: null` — no decision/router writes into state; the pipeline is
+#   purely sequential. The path is proven by the namespaced step deltas
+#   (final_state step1/step2/step3) and the ledger rows.
+# * `status: success` for BOTH cases — fail_times=1 is recovered BY DESIGN
+#   (the retry succeeds); the unrecoverable shape is external-api-failure's
+#   retry-exhaustion case, not this scenario's.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 by design
+#   (ADR 096) and the Temporal path emits no per-node run facts yet.
+# * side-effects evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — SKIP otherwise).
+# * `governance: allow` — the notify agent runs on every path, so the MODEL
+#   + COST gates evaluate on both cases.
+
+scenario: partial-failure-recovery
+target: partial-failure-recovery # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- control: nothing fails — every step exactly once, one attempt.
+  - name: clean-run
+    input:
+      request: nightly-batch
+      fail_times: 0
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [step1, step2, step3, summary]
+      side_effects:
+        - { system: pipeline, action: step1, times: 1 }
+        - { system: pipeline, action: step2_attempt, times: 1 }
+        - { system: pipeline, action: step2, times: 1 }
+        - { system: pipeline, action: step3, times: 1 }
+
+  # --- THE RECOVERY PROOF: step 2's first attempt raises; Temporal retries
+  # --- ONLY that activity. step1 times: 1 is the assertion that the
+  # --- completed step was NOT re-executed while step2_attempt times: 2
+  # --- shows the failed one was — and step3 ran once, after the recovery.
+  - name: mid-pipeline-transient-failure
+    input:
+      request: invoice-export
+      fail_times: 1
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [step1, step2, step3, summary]
+      side_effects:
+        - { system: pipeline, action: step1, times: 1 }
+        - { system: pipeline, action: step2_attempt, times: 2 }
+        - { system: pipeline, action: step2, times: 1 }
+        - { system: pipeline, action: step3, times: 1 }

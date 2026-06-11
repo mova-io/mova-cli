@@ -1,0 +1,2 @@
+{"input": {"topic": "vector databases", "increment": 1}, "expected": {"ack_note": "Increment 1 findings were appended; the series continues."}}
+{"input": {"topic": "vector databases", "increment": 3}, "expected": {"final_report": "Research on vector databases is concluded; the series is complete."}}

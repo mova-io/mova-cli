@@ -598,7 +598,18 @@ class SuiteDriver:
     # ------------------------------------------------------------- case phases
 
     def _launch(self, spec: ScenarioSpec, case: CaseSpec) -> str:
-        """Submit the case; poll the job to terminal; return the workflow_run_id."""
+        """Submit the case; poll the job to terminal; return the workflow_run_id.
+
+        A case with ``expect.status: error`` (B4 — e.g. retry exhaustion on
+        the external-api-failure scenario) legitimately ends its job segment
+        as ``error``: the workflow STARTED, failed durably, and persisted a
+        terminal ERROR record (its workflow_run_id rides ``result_run_id``
+        either way). Such a job is accepted here and the terminal-fact poll
+        still asserts the expected ``error`` status/type. ``success`` stays
+        accepted too (a detached/HITL segment can end ``success`` while the
+        fact later reads ``error``). Every other case keeps the strict
+        ``success``-only contract — byte-identical behavior.
+        """
         # Provenance marker, stamped at SUBMIT time (cases.yaml stays clean):
         # the key rides the workflow input into initial_state — the state
         # schemas are additionalProperties:true and agent/skill activities
@@ -616,7 +627,8 @@ class SuiteDriver:
             f"job {job_id} to reach a terminal status",
         )
         status = str(job.get("status"))
-        assert status == "success", (
+        allowed = {"success", "error"} if case.expect.status == "error" else {"success"}
+        assert status in allowed, (
             f"job {job_id} ended {status!r} (error={job.get('error')}) — "
             "the workflow never started or its first segment failed"
         )

@@ -1,0 +1,11 @@
+api_version: movate/v1
+kind: Agent
+name: final-report
+version: 0.1.0
+description: Compiles the final report on the closing increment of a research series.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

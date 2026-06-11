@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["request"],"properties":{"request":{"type":"string"},"provider":{"type":"string"},"api_result":{"type":"string"},"run_id":{"type":"string"}}}

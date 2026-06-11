@@ -51,6 +51,9 @@ ALL_PATTERNS = [
     "content-publishing",
     "multi-agent-investigation",
     "multi-agent-business-process",
+    "external-api-failure",
+    "partial-failure-recovery",
+    "long-running-research",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 
