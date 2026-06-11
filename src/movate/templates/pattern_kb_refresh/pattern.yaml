@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: kb-refresh
+kind: workflow
+description: 'Validated knowledge-base refresh (runtime: temporal). An ingest TOOL node (fixed
+  chunking rule, auditable kb ledger row) feeds a validate agent judging the ingest SUMMARY
+  into {ok, note}; a DECISION node routes ok=true into the sim-kb-publish TOOL (auditable
+  publish row) and failures into a HUMAN ack gate with NO retry route (acyclic by design)
+  — both paths converging on ONE guarded notify tail (ADR 094/097/098/099).'
+topology: TOOL ingest → validate → DECISION(ok) → {TOOL publish | [HUMAN ack]} → notify

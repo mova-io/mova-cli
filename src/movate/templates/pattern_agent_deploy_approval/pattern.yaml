@@ -1,0 +1,14 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: agent-deploy-approval
+kind: workflow
+description: 'Eval-gated agent promotion with a HUMAN release gate (runtime: temporal). An
+  eval-runner TOOL node (ADR 097 — honestly a calibrated simulation of an mdk eval run, scores
+  deterministic per fixture, auditable eval ledger row) feeds a DECISION node gating eval_score
+  ≥ 0.85 (no LLM); passing candidates still pause at a HUMAN gate routing its own approve/reject
+  decision (ADR 099) before the sim-promote TOOL records the registry ledger row; every rejected
+  exit converges on ONE rejected-with-report agent (ADR 094/097/098/099).'
+topology: TOOL eval-run → DECISION(score) → [HUMAN routes approve|reject] → TOOL promote →
+  notify | rejected

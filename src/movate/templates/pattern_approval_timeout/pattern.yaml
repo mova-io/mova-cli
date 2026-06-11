@@ -1,0 +1,13 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: approval-timeout
+kind: workflow
+description: 'Approval with DURABLE TIMEOUT + escalation (runtime: temporal) — the live shape
+  of ADR 062 D4. The primary HUMAN gate carries a 90s durable deadline whose expiry escalates
+  to a second HUMAN gate (the alternate approver); ITS expiry fails safe to rejected — silence
+  can never fulfil. Fulfilment is a TOOL node calling the workflow-local sim-fulfill python
+  skill (ADR 097); both approve paths converge on the shared fulfill→notify tail (ADR 062/097/098/099).'
+topology: '[HUMAN primary ⏲90s] → on_timeout → [HUMAN escalation ⏲90s] → shared TOOL fulfill
+  → notify | rejected'

@@ -1,0 +1,9 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: goal-oriented
+kind: workflow
+description: 'Bounded supervisor loop: a worker iterates while a JUDGE/GATE checks the goal,
+  exiting on satisfaction or a max-iterations cap.'
+topology: SUPERVISOR → (worker → JUDGE/GATE) x2 → done

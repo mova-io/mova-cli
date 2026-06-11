@@ -1,0 +1,13 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: itsm-request
+kind: workflow
+description: 'ITSM service-request fulfilment over a parameterized catalog (runtime: temporal).
+  A DECISION node routes the portal''s auto_approved flag (no LLM); needs-approval services
+  pause at ONE HUMAN gate routing its own approve/reject decision (ADR 099); fulfilment is
+  a TOOL node calling the workflow-local sim-provision python skill (ADR 097) — auto + approve
+  paths converge on the shared provision→notify tail (ADR 094/097/098/099).'
+topology: DECISION(auto_approved) → [HUMAN routes approve|reject] → shared TOOL provision
+  → notify | rejected

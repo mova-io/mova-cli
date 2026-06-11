@@ -1,0 +1,14 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: ab-testing
+kind: workflow
+description: 'Deterministic A/B traffic split (runtime: temporal). An assign-variant TOOL
+  node (ADR 097) assigns the variant from the SHA-256 parity of the user_id (no randomness,
+  no salted builtin hash — same user, same variant, every replay) with an auditable assign
+  ledger row; a DECISION node routes to one of two arms whose prompt files are BYTE-IDENTICAL
+  and whose agent.yaml model params are the only difference; both arms converge on the sim-record-outcome
+  TOOL recording which variant served (ADR 094/097/098).'
+topology: TOOL assign → DECISION(variant) → {variant-a | variant-b} → TOOL record-outcome
+  → notify

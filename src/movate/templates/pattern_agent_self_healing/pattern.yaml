@@ -1,0 +1,14 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: agent-self-healing
+kind: workflow
+description: 'An agent detects its own degraded output quality and heals (runtime: temporal).
+  The sim-health-check TOOL node measures canned quality metrics (no LLM self-grading); a
+  DECISION node routes the 0.8 threshold; a diagnose agent names cause + fix but the sim-apply-fix
+  TOOL decides applied/failed deterministically (a model-drift symptom can never self-fix);
+  a failed fix pauses at a HUMAN ack gate before the incident report — no cycles, a failed
+  fix can only escalate (ADR 094/097/098/099).'
+topology: TOOL health-check → DECISION(quality) → {healthy | diagnose → TOOL apply-fix → DECISION
+  → {verified | [HUMAN ack] → incident}}
