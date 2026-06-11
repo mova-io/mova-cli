@@ -1,0 +1,95 @@
+# Certification cases — human-escalation (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `human-escalation` workflow
+# (workflows/human-escalation — 5 nodes: a triage LLM agent emitting
+# {answer, confidence}, a deterministic `decision` node routing
+# `confidence gte 0.8` straight to finalize, a `review` HUMAN gate
+# (output_contract [decision, feedback]) for everything else, and the
+# finalize/rejected tail — finalize INCORPORATES the reviewer's feedback when
+# present, the resume-with-feedback loop).
+#
+# LIVE-LLM ROUTING, HONEST PROMPT ENGINEERING. Unlike the sibling scenarios,
+# the branch taken here depends on a REAL model output: the triage prompt
+# pins calibration (0.9+ ONLY for unambiguous single-fact questions; ≤0.4 for
+# anything subjective/ambiguous/speculative; never in between) and the case
+# inputs are crafted to sit far on either side of the 0.8 threshold. A
+# miscalibrated triage shows up as a pause that should not exist (failing the
+# auto case's fact poll) or a missing pause (failing the review cases' hitl
+# phase) — exactly what this scenario certifies.
+#
+# HONESTY NOTES — same contract as itsm-request/cases.yaml:
+#
+# * `route: null` — the decision node writes nothing into state; the branch
+#   is proven by the observed pause (review vs none) and `final_state`
+#   markers (`final_answer` only ever set by finalize; `feedback` only merged
+#   by a review signal; `summary` only set by rejected).
+# * `status: success` for ALL cases — "rejected" is a route, not an error.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 by design
+#   (ADR 096) and the Temporal path emits no per-node run facts yet.
+# * NO side-effect expectations — this scenario has no tool node by design
+#   (it isolates confidence routing + feedback threading); the sibling
+#   purchase-order / approval-timeout scenarios cover the sim ledger.
+# * `governance: allow` everywhere — the baked catalog policy registers
+#   MODEL + COST gates on every agent run; the terminal fact's
+#   `governance_effect` must be non-null and `allow`.
+# * the review gate's output_contract is [decision, feedback] and the signal
+#   endpoint 422s on a missing contract key — every signal carries BOTH keys
+#   (the reject uses feedback to state the rejection reason).
+
+scenario: human-escalation
+target: human-escalation # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- high confidence: one unambiguous single fact — triage must emit
+  # --- confidence ≥0.9, the decision node skips review, finalize runs with
+  # --- no feedback. Terminal success WITHOUT any signal is the routing
+  # --- evidence; `feedback` must never appear in state.
+  - name: high-confidence-auto
+    input:
+      question: "What is the chemical symbol for gold?"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [answer, confidence, final_answer]
+      final_state_lacks: [feedback, summary]
+
+  # --- low confidence + approve-with-feedback: a subjective question forces
+  # --- confidence ≤0.4 → pause at review; the approve signal carries
+  # --- feedback that finalize must incorporate (resume-with-feedback). The
+  # --- merged `feedback` key in final_state proves the contract merge.
+  - name: low-confidence-review-approve
+    input:
+      question: "What's the best database for our new analytics project?"
+    hitl:
+      - node: review
+        decision:
+          decision: approve
+          feedback: >-
+            Say the choice depends on the workload, then name one columnar
+            warehouse option and one Postgres-based option.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [answer, confidence, final_answer, feedback]
+      final_state_lacks: [summary]
+
+  # --- low confidence + reject: the reviewer declines the speculative draft;
+  # --- the run lands on rejected (summary set, final_answer never set).
+  - name: low-confidence-reject
+    input:
+      question: "Should we migrate everything to microservices next quarter?"
+    hitl:
+      - node: review
+        decision:
+          decision: reject
+          feedback: >-
+            Too speculative — we can't answer a strategy question without the
+            team's context. Decline it.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [summary, feedback]
+      final_state_lacks: [final_answer]

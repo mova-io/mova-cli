@@ -1,0 +1,2 @@
+{"input": {"question": "What is the chemical symbol for gold?"}, "expected": {"final_answer": "Au — answered automatically, no review needed."}}
+{"input": {"question": "What's the best database for our new analytics project?"}, "expected": {"final_answer": "A reviewed answer incorporating the reviewer's feedback (it depends on the workload; one columnar and one Postgres-based option named)."}}

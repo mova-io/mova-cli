@@ -1,0 +1,105 @@
+# Certification cases — approval-timeout (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `approval-timeout` workflow
+# (workflows/approval-timeout — 5 nodes: a primary HUMAN gate with a DURABLE
+# 90s deadline whose expiry escalates to a second HUMAN gate for the alternate
+# approver, whose OWN 90s expiry fails safe to rejected; approvals converge on
+# a fulfill TOOL node + notify, rejects/expiries on one rejected node). This
+# is the first live exercise of ADR 062 D4 durable timeouts.
+#
+# THE TIMEOUT CHOREOGRAPHY. `wait_timeout: true` on an hitl step tells the
+# driver to observe the pause at that node and deliberately NOT signal — the
+# Temporal timer must fire and route the run by itself. The driver's next
+# pause poll excludes the already-seen node, so it naturally waits out the
+# 90s deadline until the run pauses at the ESCALATION gate (or, when the last
+# step is a wait_timeout, the terminal-fact poll waits out the final expiry).
+# The timeout cases really take 90s/180s of wall clock — `timeout_s` raises
+# that case's pause + fact poll budgets above the suite defaults.
+#
+# HONESTY NOTES — same contract as itsm-request/cases.yaml:
+#
+# * `route: null` — nothing writes a `route`/`tier` state key; the branch is
+#   proven by the observed pauses and the `final_state` markers (fulfilled
+#   paths merge the TOOL node's `fulfill_result` AND a `decision`; the
+#   both-time-out path merges NEITHER — nobody ever decided).
+# * `status: success` for ALL cases — a timeout expiry takes the on_timeout
+#   ROUTE (ADR 062 D4); it is not a workflow error.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 by design
+#   (ADR 096) and the Temporal path emits no per-node run facts yet.
+# * side-effects — the fulfill TOOL node records exactly one
+#   `{system: fulfillment, action: fulfill}` row per approved run; the
+#   both-time-out case asserts the ABSENCE of that row (the TOOL node must
+#   never run when nobody approves). Evaluated only when the shared DB is
+#   reachable (MOVATE_PG_URL/MOVATE_DB_URL — SKIP otherwise).
+# * `governance: allow` everywhere — the baked catalog policy registers
+#   MODEL + COST gates on every agent run; the terminal fact's
+#   `governance_effect` must be non-null and `allow`.
+
+scenario: approval-timeout
+target: approval-timeout # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- the control: the primary approver answers in time — the durable timer
+  # --- never fires. Signalled immediately on the first observed pause.
+  - name: primary-approves
+    input:
+      request: vpn-exception
+      requester: jane.doe
+      details: "Temporary VPN exception for the vendor audit week"
+    hitl:
+      - node: primary-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [fulfill_result, summary, decision]
+      side_effects:
+        - { system: fulfillment, action: fulfill, times: 1 }
+
+  # --- ADR 062 D4 live: observe the FIRST pause and do NOT signal it; the
+  # --- 90s durable timer fires, the run routes itself into the escalation
+  # --- gate, the driver detects the SECOND pause and signals approve there.
+  # --- ~90s of real wall clock — timeout_s covers it with headroom.
+  - name: primary-times-out-then-escalation-approves
+    input:
+      request: prod-db-access
+      requester: raj.patel
+      details: "Read replica access for the incident postmortem"
+    timeout_s: 300
+    hitl:
+      - node: primary-approval
+        wait_timeout: true
+      - node: escalation-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [fulfill_result, summary, decision]
+      side_effects:
+        - { system: fulfillment, action: fulfill, times: 1 }
+
+  # --- both gates expire (≥180s of real wall clock): primary's timer routes
+  # --- to escalation, escalation's timer fails safe to rejected. NO decision
+  # --- was ever delivered (final_state lacks `decision`) and the TOOL node
+  # --- never ran (no fulfill row, no fulfill_result marker).
+  - name: both-time-out
+    input:
+      request: badge-area-extension
+      requester: li.wei
+      details: "After-hours lab access — both approvers are out this week"
+    timeout_s: 420
+    hitl:
+      - node: primary-approval
+        wait_timeout: true
+      - node: escalation-approval
+        wait_timeout: true
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [summary]
+      final_state_lacks: [fulfill_result, decision]
+      no_side_effects:
+        - { system: fulfillment, action: fulfill }

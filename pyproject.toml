@@ -547,15 +547,18 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 python_version = "3.11"
 strict = true
 files = ["src/movate"]
-# Workflow-pattern template SKILLS: each ships an impl.py inside a hyphenated
-# skill dir (ADR 097 D2 — the python backend imports it via a PEP 420
-# namespace package at runtime). The hyphen stops mypy's module-name walk, so
-# every such file maps to the same top-level module "impl" and trips the
-# duplicate-module check once more than one pattern ships skills. They are
-# scaffold DATA, not library code — the canonical copies under workflows/ are
-# unit-tested (tests/test_itsm_scenario.py, tests/test_b2_scenarios.py) and
-# byte-identity with the template copies is asserted there too.
-exclude = ['src/movate/templates/pattern_.*/skills/.*/impl\.py$']
+# Workflow-pattern templates bundle self-contained skill impls under
+# hyphenated dirs (skills/sim-create-po/impl.py, ADR 097 D2). The hyphen is
+# not a valid identifier segment, so mypy maps every such file to the bare
+# module "impl" — two or more patterns with bundled skills collide as
+# "Duplicate module named 'impl'". These are template DATA (scaffold copies of
+# the never-type-checked workflows/<scenario>/skills/ originals), not library
+# code; their behavior is pinned by tests/test_itsm_scenario.py and
+# tests/test_b1_scenarios.py, which import and exercise them directly.
+# (also pins B2's pattern skills; canonical copies under workflows/ are
+# unit-tested by tests/test_itsm_scenario.py, test_b1_scenarios.py,
+# test_b2_scenarios.py, with template byte-identity asserted there.)
+exclude = ['^src/movate/templates/pattern_[^/]+/skills/']
 
 [[tool.mypy.overrides]]
 module = [

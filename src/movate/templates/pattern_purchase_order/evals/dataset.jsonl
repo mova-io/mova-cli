@@ -1,0 +1,2 @@
+{"input": {"item": "usb-c-docking-station", "requester": "jane.doe", "amount": 240, "details": "Docking station for the new hire's desk"}, "expected": {"summary": "Created automatically with a PO reference."}}
+{"input": {"item": "gpu-workstation", "requester": "ana.silva", "amount": 12500, "details": "ML workstation for the perception team"}, "expected": {"summary": "Approved by the manager and the director, then created with a PO reference."}}

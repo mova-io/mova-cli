@@ -1,0 +1,5 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "question":{"type":"string"},"answer":{"type":"string"},
+  "confidence":{"type":"number"},"decision":{"type":"string"},
+  "feedback":{"type":"string"},
+  "final_answer":{"type":"string"},"summary":{"type":"string"}}}
