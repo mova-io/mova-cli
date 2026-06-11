@@ -1,0 +1,13 @@
+api_version: movate/v1
+kind: Agent
+name: rejected
+version: 0.1.0
+description: >-
+  Notifies the requester that a request was rejected — by an explicit
+  approver decision or because every approval gate timed out.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

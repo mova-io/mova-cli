@@ -1,0 +1,66 @@
+api_version: movate/v1
+kind: Workflow
+name: approval-timeout
+version: 0.1.0
+description: >
+  Approval with durable timeout + escalation, durable on Temporal — scenario
+  #14 of the 30-use-case certification program and the FIRST LIVE EXERCISE of
+  ADR 062 D4 durable timeouts. The request pauses at the primary HUMAN gate
+  (ADR 099 — the gate routes its own structured `decision`): approve →
+  fulfilment, reject → rejected. If the primary approver does not respond
+  within 90 seconds the DURABLE timer fires and the run takes `on_timeout`
+  into the escalation HUMAN gate (the alternate approver) — same routes, its
+  own 90-second deadline, and ITS timeout fails safe to rejected (nobody
+  decided → nothing fulfilled). Fulfilment is a TOOL node (ADR 097): the
+  workflow-local `sim-fulfill` python skill records the
+  `{system: fulfillment, action: fulfill}` row to the sim side-effect ledger
+  deterministically — no LLM, no wrapper agent. Both approve paths CONVERGE
+  on the shared fulfill→notify tail and every reject/timeout-expiry lands on
+  ONE rejected node (exclusive convergence, ADR 098 — the timeout legs are
+  compiler-injected synthetic `human-timeout` edges). The skill name resolves
+  through the scenario's project registry (project.yaml marker ->
+  skills/sim-fulfill/). Mirrors workflows/approval-timeout.
+state_schema: ../../state.json
+entrypoint: primary-approval
+nodes:
+  # The primary gate: a durable 90s deadline (ADR 062 D4 — only the Temporal
+  # backend honors it; native waits forever). No response in time → the run
+  # advances itself into the escalation gate, no poller, no signal.
+  - id: primary-approval
+    type: human
+    prompt: >
+      Approve this fulfilment request (primary approver)? Respond with
+      `decision` set to exactly "approve" or "reject" — any other wording is
+      treated as reject. No response within 90 seconds escalates to the
+      alternate approver.
+    output_contract: [decision]
+    routes: {approve: fulfill, reject: rejected}
+    fallback: rejected
+    timeout: 90
+    on_timeout: escalation-approval
+  # The escalation gate (the alternate approver): same vocabulary, its own
+  # 90s deadline — and ITS expiry fails safe to rejected (ADR 062 D4 +
+  # ADR 099: timeout wins; routes apply only to a delivered decision).
+  - id: escalation-approval
+    type: human
+    prompt: >
+      The primary approver did not respond in time. Approve this fulfilment
+      request (alternate approver)? Respond with `decision` set to exactly
+      "approve" or "reject" — any other wording is treated as reject. No
+      response within 90 seconds rejects the request.
+    output_contract: [decision]
+    routes: {approve: fulfill, reject: rejected}
+    fallback: rejected
+    timeout: 90
+    on_timeout: rejected
+  # --- shared tail (ADR 098): both approve paths converge on ONE fulfill
+  # --- TOOL node (ADR 097 — deterministic skill execution, no LLM) followed
+  # --- by ONE LLM notify; every reject AND every timeout expiry lands on ONE
+  # --- rejected node.
+  - id: fulfill
+    type: tool
+    skill: sim-fulfill
+  - {id: notify, type: agent, ref: ../../agents/notify}
+  - {id: rejected, type: agent, ref: ../../agents/rejected}
+edges:
+  - {from: fulfill, to: notify}

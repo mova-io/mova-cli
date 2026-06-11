@@ -1,0 +1,138 @@
+# Certification cases — purchase-order (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `purchase-order` workflow
+# (workflows/purchase-order — 7 nodes: a deterministic `decision` node tiering
+# on the amount, ONE manager HUMAN gate, a deterministic `escalate-check`
+# decision that CHAINS >5000 orders into the director HUMAN gate (sequential
+# approval chain — scenario #8's whole point), a create-po TOOL node calling
+# the workflow-local `sim-create-po` python skill, and the shared
+# notify/rejected tail). The driver submits the case input via POST /run,
+# resumes each expected HUMAN pause IN ORDER via the signal endpoint (the
+# chain cases pause twice — manager first, then director), then reads the run
+# back from GET /api/v1/observability/facts (ADR 096) and asserts per
+# capability.
+#
+# HONESTY NOTES — same contract as itsm-request/cases.yaml:
+#
+# * `route: null` — the decision nodes pick the next node but write NOTHING
+#   into workflow state, so the fact's route is None. The branch is proven by
+#   the observed pause nodes and the `final_state` markers instead (every
+#   created-PO path merges the TOOL node's `po_result`, the reject paths
+#   never do).
+# * `status: success` for ALL cases, including the rejects — "rejected" is a
+#   route, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 by design
+#   (ADR 096) and the Temporal path emits no per-node run facts yet.
+# * side-effects — the create-po TOOL node (ADR 097) records exactly one
+#   `{system: erp, action: create_po}` row per created PO; the reject cases
+#   assert the ABSENCE of that row — in `chain-director-reject` the manager
+#   ALREADY APPROVED, so the absence proves the chain's second gate really
+#   sits between the first approve and the side effect. Evaluated only when
+#   the shared DB is reachable (MOVATE_PG_URL/MOVATE_DB_URL — SKIP otherwise).
+# * `governance: allow` everywhere — the baked catalog policy registers
+#   MODEL + COST gates on every agent run; the terminal fact's
+#   `governance_effect` must be non-null and `allow`.
+
+scenario: purchase-order
+target: purchase-order # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- auto tier (≤500): decision node → create-po TOOL → notify. No HUMAN
+  # --- gate; terminal success without any signal IS the routing evidence,
+  # --- and the ledger row proves the TOOL node executed.
+  - name: auto-approve-small
+    input:
+      item: usb-c-docking-station
+      requester: jane.doe
+      amount: 240
+      details: "Docking station for the new hire's desk"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [po_result, summary]
+      side_effects:
+        - { system: erp, action: create_po, times: 1 }
+
+  # --- manager tier (500 < amount ≤ 5000): ONE pause at the manager gate;
+  # --- approve → escalate-check routes ≤5000 straight to the shared
+  # --- create-po/notify tail (no director involved).
+  - name: manager-approve
+    input:
+      item: standing-desk
+      requester: raj.patel
+      amount: 1800
+      details: "Ergonomic standing desk, physio recommendation on file"
+    hitl:
+      - node: manager-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [po_result, summary]
+      side_effects:
+        - { system: erp, action: create_po, times: 1 }
+
+  - name: manager-reject
+    input:
+      item: conference-room-tv
+      requester: li.wei
+      amount: 3200
+      details: "Second TV for the small huddle room"
+    hitl:
+      - node: manager-approval
+        decision: { decision: reject }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [summary]
+      final_state_lacks: [po_result]
+      no_side_effects:
+        - { system: erp, action: create_po }
+
+  # --- chained tier (>5000): TWO sequential pauses — manager first, then
+  # --- (only after the manager approves) the director. Both must approve
+  # --- before the TOOL node runs.
+  - name: chain-both-approve
+    input:
+      item: gpu-workstation
+      requester: ana.silva
+      amount: 12500
+      details: "ML workstation for the perception team"
+    hitl:
+      - node: manager-approval
+        decision: { decision: approve }
+      - node: director-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [po_result, summary]
+      side_effects:
+        - { system: erp, action: create_po, times: 1 }
+
+  # --- the chain's teeth: the manager APPROVED, the director rejected — the
+  # --- PO must never be created (no erp row, no po_result marker), proving
+  # --- the second gate really gates the side effect.
+  - name: chain-director-reject
+    input:
+      item: lidar-test-rig
+      requester: sam.okafor
+      amount: 8800
+      details: "Bench rig for the Q3 sensor evaluation"
+    hitl:
+      - node: manager-approval
+        decision: { decision: approve }
+      - node: director-approval
+        decision: { decision: reject }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [summary]
+      final_state_lacks: [po_result]
+      no_side_effects:
+        - { system: erp, action: create_po }

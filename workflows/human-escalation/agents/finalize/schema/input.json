@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"question":{"type":"string"},"answer":{"type":"string"},"feedback":{"type":"string"}}}

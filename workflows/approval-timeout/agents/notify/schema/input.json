@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"request":{"type":"string"},"requester":{"type":"string"},"fulfill_result":{"type":"string"}}}

@@ -43,6 +43,9 @@ ALL_PATTERNS = [
     "simulation",
     "expense-approval",
     "itsm-request",
+    "purchase-order",
+    "approval-timeout",
+    "human-escalation",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

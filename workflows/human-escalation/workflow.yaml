@@ -1,0 +1,66 @@
+api_version: movate/v1
+kind: Workflow
+name: human-escalation
+version: 0.1.0
+description: >
+  Low-confidence human escalation, durable on Temporal — scenario #24 of the
+  30-use-case certification program: the resume-with-feedback loop. A triage
+  LLM agent answers the question AND self-scores a numeric `confidence`; a
+  deterministic `decision` node (ADR 094) routes `confidence gte 0.8`
+  straight to the finalize agent, everything else pauses durably at the
+  `review` HUMAN gate (ADR 099 — output_contract [decision, feedback]; the
+  gate routes its own structured `decision`: approve→finalize,
+  reject→rejected, prose fails safe to rejected). The reviewer's `feedback`
+  merges into state on signal, and the finalize agent's prompt INCORPORATES
+  it when present — the human's guidance shapes the final answer
+  (resume-with-feedback). Auto + approve paths CONVERGE on ONE finalize agent
+  and every reject lands on ONE rejected node (exclusive convergence,
+  ADR 098). No tool node here — the scenario isolates confidence routing +
+  feedback-threading; side-effect certification lives in the sibling
+  purchase-order / approval-timeout scenarios. Mirrors
+  certification/scenarios/human-escalation.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: triage
+nodes:
+  # The only LLM before the gate: answer + a calibrated numeric confidence.
+  - id: triage
+    type: agent
+    ref: ./agents/triage
+  # Deterministic confidence routing (ADR 094): the threshold is a pure
+  # numeric predicate over the triage output — no second LLM judging the
+  # first.
+  - id: confidence-check
+    type: decision
+    cases:
+      - when: {field: confidence, op: gte, value: 0.8}
+        to: finalize
+    default: review
+  # The review gate: a human reads the draft answer and either approves it
+  # (optionally steering the finalize agent via `feedback`) or rejects it.
+  # BOTH contract keys are required at signal time (the endpoint 422s on a
+  # missing key) — send feedback with the reject too.
+  - id: review
+    type: human
+    prompt: >
+      The triage agent is not confident in its draft answer. Review it:
+      respond with `decision` set to exactly "approve" or "reject" (any other
+      wording is treated as reject) AND `feedback` — guidance the finalize
+      agent must incorporate on approve (use it to state the rejection reason
+      on reject).
+    output_contract: [decision, feedback]
+    routes: {approve: finalize, reject: rejected}
+    fallback: rejected
+  # --- shared tail (ADR 098): the high-confidence auto path and the
+  # --- reviewed-and-approved path converge on ONE finalize agent (whose
+  # --- prompt threads the reviewer's feedback in when present); every reject
+  # --- lands on ONE rejected node.
+  - {id: finalize, type: agent, ref: ./agents/finalize}
+  - {id: rejected, type: agent, ref: ./agents/rejected}
+edges:
+  - {from: triage, to: confidence-check}
+tags:
+  - temporal
+  - decision
+  - hitl
+  - certification

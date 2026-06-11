@@ -1,0 +1,2 @@
+{"input": {"request": "vpn-exception", "requester": "jane.doe", "details": "Temporary VPN exception for the vendor audit week"}, "expected": {"summary": "Approved by the primary approver and fulfilled with a fulfilment reference."}}
+{"input": {"request": "badge-area-extension", "requester": "li.wei", "details": "After-hours lab access — both approvers are out this week"}, "expected": {"summary": "Rejected because no approver responded in time; nothing was fulfilled."}}

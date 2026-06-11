@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: finalize
+version: 0.1.0
+description: >-
+  Produces the final answer — from the triage draft alone on the
+  high-confidence auto path, or incorporating the reviewer's feedback after
+  an approved human review (resume-with-feedback).
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}
