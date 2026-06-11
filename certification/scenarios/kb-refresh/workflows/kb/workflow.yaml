@@ -1,0 +1,70 @@
+api_version: movate/v1
+kind: Workflow
+name: kb-refresh
+version: 0.1.0
+description: >
+  Knowledge-base refresh — scenario #23 of the 30-use-case certification
+  program (B7 RAG/KB batch). The refresh story: NOTHING REACHES THE KB
+  WITHOUT A VALIDATED, AUDITABLE INGEST. The entry `ingest` TOOL node
+  (ADR 097) runs the scenario-local `sim-ingest` python skill —
+  deterministic counting + a FIXED chunking rule (one chunk per 40 words; an
+  empty document yields 0 chunks and counts in empty_docs) — recording one
+  `{system: kb, action: ingest}` ledger row and merging `ingest_result` into
+  state. The `validate` agent judges that SUMMARY and emits {ok, note}; a
+  deterministic `decision` node (ADR 094) routes `ok eq true` → the
+  `sim-kb-publish` TOOL (one `{system: kb, action: publish}` ledger row),
+  else → the `escalate` HUMAN gate (ADR 099 — output_contract [decision],
+  routes ack→notify, fallback notify: ANY response acknowledges; there is
+  deliberately NO retry route back to ingest — the graph stays acyclic).
+  Both paths CONVERGE on ONE notify agent (exclusive convergence, ADR 098)
+  whose prompt GUARDS the path-exclusive keys (`publish_result`,
+  `decision`). The skill names resolve through the scenario's project
+  registry (project.yaml marker → skills/). Mirrors workflows/kb-refresh.
+state_schema: ../../state.json
+entrypoint: ingest
+nodes:
+  # Deterministic ingestion FIRST (ADR 097): counting + the fixed chunking
+  # rule replay identically, and the ledger row makes the ingest auditable
+  # before anything judges it.
+  - id: ingest
+    type: tool
+    skill: sim-ingest
+  # The only LLM before the gate: judge the ingest SUMMARY (never the
+  # documents) against fixed rules and emit the routing boolean.
+  - {id: validate, type: agent, ref: ../../agents/validate}
+  # Deterministic quality routing (ADR 094): the validator already decided —
+  # no second LLM in the control path.
+  - id: quality-gate
+    type: decision
+    cases:
+      - when: {field: ok, op: eq, value: true}
+        to: publish
+    default: escalate
+  # --- publish path (ADR 097 — deterministic ledger row, no LLM).
+  - id: publish
+    type: tool
+    skill: sim-kb-publish
+  # The failure gate: a human acknowledges the failed refresh. The gate
+  # routes its OWN decision (ADR 099) — ack→notify, and the fallback is ALSO
+  # notify (any wording acknowledges; silence is the only thing that holds
+  # the run). There is NO retry route back to ingest by design: the graph is
+  # acyclic — fix the source documents and submit a NEW refresh run.
+  - id: escalate
+    type: human
+    prompt: >
+      The knowledge-base refresh FAILED validation (see `note` in the run
+      state). Respond with `decision` set to exactly "ack" to acknowledge
+      the failed refresh — any other wording is also treated as an
+      acknowledgement. The refresh is NOT retried automatically: fix the
+      source documents and submit a new refresh run.
+    output_contract: [decision]
+    routes: {ack: notify}
+    fallback: notify
+  # --- shared tail (ADR 098): published + acknowledged-failure paths
+  # --- converge on ONE notify agent whose prompt guards the path-exclusive
+  # --- keys (publish_result, decision).
+  - {id: notify, type: agent, ref: ../../agents/notify}
+edges:
+  - {from: ingest, to: validate}
+  - {from: validate, to: quality-gate}
+  - {from: publish, to: notify}

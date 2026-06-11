@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"query":{"type":"string"},"retrieved_docs":{"type":"array","items":{"type":"object"}}}}

@@ -1,0 +1,53 @@
+api_version: movate/v1
+kind: Workflow
+name: rag-debug
+version: 0.1.0
+description: >
+  RAG retrieval debugging, durable on Temporal — scenario #11 of the
+  30-use-case certification program (B7 RAG/KB batch). The debugging story:
+  EVERY retrieval stage is an auditable, replayable step — not a hidden
+  library call. The entry `retrieve` TOOL node (ADR 097) runs the
+  workflow-local `sim-retrieve` python skill — deterministic keyword scoring
+  over a small inline knowledge base (stdlib only: no embeddings, no
+  network, no LLM) — recording one `{system: vectorstore, action: retrieve}`
+  ledger row and merging `retrieved_docs` + `top_score` into state. A
+  deterministic `decision` node (ADR 094) routes on the score:
+  `top_score gte 0.5` → the `answer` agent (composes the answer STRICTLY
+  from retrieved_docs); below → the `diagnose` agent (explains WHY retrieval
+  scored low and suggests a query reformulation) — the failure mode is a
+  first-class route, not an error. Both routes are terminal; there is NO
+  shared report tail on purpose: the two outputs share no state keys, so a
+  converged tail would need every path-exclusive key guarded (ADR 098 kept
+  simple). Self-contained (bundled into the temporal-worker image): the
+  skill carries its own impl.py next to skill.yaml, so the worker imports it
+  from the baked workflows/ tree. Mirrors certification/scenarios/rag-debug.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: retrieve
+nodes:
+  # Deterministic retrieval FIRST (ADR 097): keyword scoring over the inline
+  # KB replays identically on Temporal, and the ledger row makes the
+  # retrieval stage auditable — the point of the scenario.
+  - id: retrieve
+    type: tool
+    skill: sim-retrieve
+  # Deterministic score routing (ADR 094): the retriever already scored the
+  # match — no LLM in the control path, and a low score is a ROUTE.
+  - id: score-gate
+    type: decision
+    cases:
+      - when: {field: top_score, op: gte, value: 0.5}
+        to: answer
+    default: diagnose
+  # --- terminal routes: a grounded answer on a good retrieval, a retrieval
+  # --- diagnosis on a bad one. Each agent is the only consumer of its keys.
+  - {id: answer, type: agent, ref: ./agents/answer}
+  - {id: diagnose, type: agent, ref: ./agents/diagnose}
+edges:
+  - {from: retrieve, to: score-gate}
+tags:
+  - temporal
+  - decision
+  - tool
+  - rag
+  - certification

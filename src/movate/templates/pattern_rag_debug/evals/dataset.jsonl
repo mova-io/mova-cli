@@ -1,0 +1,2 @@
+{"input": {"query": "How do I reset my corporate password?"}, "expected": {"answer": "Grounded in the password-reset document: open the self-service portal, choose reset password, confirm the code sent to your phone."}}
+{"input": {"query": "zebra cantaloupe spaceship maintenance"}, "expected": {"diagnosis": "Top retrieval score 0.0 — the question is outside the IT-helpdesk corpus; a covered-topic reformulation is suggested."}}

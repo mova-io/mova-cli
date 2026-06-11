@@ -1,0 +1,27 @@
+# LLM-as-judge for the RAG Retrieval Debugging workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the terminal output against the expected route: a good retrieval
+# must yield an answer grounded ONLY in the retrieved documents (with the
+# right source ids); a bad retrieval must yield a diagnosis naming the low
+# score and a usable query reformulation — never a fabricated answer. Used
+# as the CI eval-gate the pattern's governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's terminal output against the expected outcome.
+    1.0 = the right route's deliverable: a grounded answer supported by the
+          retrieved documents (sources listed and used), or a diagnosis that
+          names the low retrieval score and suggests a corpus-matching
+          reformulation
+    0.5 = the right route but a weak deliverable (answer partially
+          ungrounded, or diagnosis without a usable reformulation)
+    0.0 = the wrong route's deliverable, an answer not supported by the
+          retrieved documents, or hallucinated content
+
+threshold: 0.7

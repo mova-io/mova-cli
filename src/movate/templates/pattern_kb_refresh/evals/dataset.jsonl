@@ -1,0 +1,2 @@
+{"input": {"documents": [{"id": "doc-onboarding", "text": "New engineers get their laptop, badge and accounts on day one. The onboarding buddy walks them through the dev environment setup, the deploy pipeline and the on-call rotation during the first week."}]}, "expected": {"summary": "Published: 1 document ingested into 1 chunk, with the publication reference."}}
+{"input": {"documents": [{"id": "doc-empty", "text": ""}]}, "expected": {"summary": "NOT published: the submitted document had empty text, so validation failed and the operator acknowledged the failed refresh."}}

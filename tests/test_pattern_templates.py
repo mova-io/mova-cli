@@ -64,6 +64,8 @@ ALL_PATTERNS = [
     "cross-system-action",
     "executive-briefing",
     "ops-center",
+    "rag-debug",
+    "kb-refresh",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

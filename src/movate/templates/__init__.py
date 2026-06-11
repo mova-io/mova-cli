@@ -394,6 +394,18 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "AI ops-center daily summary over the unified observability reporting surface (runtime: temporal, ADR 096). A fetch-facts TOOL node returns canned observability_facts-shaped rows (echoing the real GET /api/v1/observability/facts endpoint it would query — never network IO); the ONE summarize agent counts totals/failures/top risks strictly from the rows; a DECISION node pages a HUMAN gate on failure_count > 0 (ack → report, fallback report — fail-open: a page can delay the daily report, never kill it), clean windows report directly (ADR 094/096/097/098/099).",  # noqa: E501
         "TOOL fetch-facts → summarize → DECISION(failure_count) → {[HUMAN page ack] → report | report}",  # noqa: E501
     ),
+    "rag-debug": (
+        "pattern_rag_debug",
+        True,
+        "RAG with the retrieval stage as an auditable step (runtime: temporal). A retrieve TOOL node (deterministic keyword scoring over an inline KB, auditable vectorstore ledger row — no embeddings, no LLM) feeds a DECISION node routing top_score ≥ 0.5 to a strictly-grounded answer agent; lower scores route to a diagnose agent explaining the low score + suggesting a query reformulation — the failure mode is a route, not an error (ADR 094/097).",  # noqa: E501
+        "TOOL retrieve → DECISION(top_score) → {answer | diagnose}",
+    ),
+    "kb-refresh": (
+        "pattern_kb_refresh",
+        True,
+        "Validated knowledge-base refresh (runtime: temporal). An ingest TOOL node (fixed chunking rule, auditable kb ledger row) feeds a validate agent judging the ingest SUMMARY into {ok, note}; a DECISION node routes ok=true into the sim-kb-publish TOOL (auditable publish row) and failures into a HUMAN ack gate with NO retry route (acyclic by design) — both paths converging on ONE guarded notify tail (ADR 094/097/098/099).",  # noqa: E501
+        "TOOL ingest → validate → DECISION(ok) → {TOOL publish | [HUMAN ack]} → notify",
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

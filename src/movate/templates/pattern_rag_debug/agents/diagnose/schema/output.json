@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["diagnosis","suggested_query"],"properties":{"diagnosis":{"type":"string"},"suggested_query":{"type":"string"}}}

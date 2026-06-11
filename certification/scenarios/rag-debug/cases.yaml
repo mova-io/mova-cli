@@ -1,0 +1,84 @@
+# Certification cases — rag-debug (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `rag-debug` workflow
+# (workflows/rag-debug — 4 nodes: a `retrieve` TOOL node calling the
+# workflow-local `sim-retrieve` python skill (deterministic keyword scoring
+# over an inline 5-document IT-helpdesk KB), a deterministic `decision` node
+# on `top_score gte 0.5`, and the terminal `answer` / `diagnose` agents).
+# Two cases route to the grounded answer, one to the retrieval diagnosis —
+# the scenario's point is that LOW RETRIEVAL QUALITY IS A ROUTE, not an
+# error. The driver submits the case input via POST /run (no HUMAN gate in
+# this workflow — no signals), then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state; the fact builder surfaces `route` only from a
+#   `tier`/`route` state key, so the fact's route is None here. We assert
+#   that explicitly and prove the branch via `final_state` markers instead:
+#   the answer path merges {answer, sources}, the diagnose path merges
+#   {diagnosis, suggested_query} — each pair is exclusive to its route.
+# * `status: success` for ALL cases, including the low-score one — a failed
+#   retrieval terminates at the `diagnose` agent successfully; the diagnosis
+#   IS the scenario's deliverable on that route.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096); the driver
+#   records the capability as SKIP with that note.
+# * side-effects — EVERY case asserts exactly ONE positive
+#   `{system: vectorstore, action: retrieve}` ledger row: the retrieve TOOL
+#   node (ADR 097) records the retrieval deterministically on every path
+#   (including the miss — an audited zero-hit retrieval is the debugging
+#   evidence). Evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * `governance: allow` everywhere — the baked catalog policy (mirrored by
+#   workflows/rag-debug/policy.yaml) registers MODEL + COST gates on every
+#   agent run, so the terminal fact's `governance_effect` must be NON-NULL
+#   and `allow`.
+
+scenario: rag-debug
+target: rag-debug # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- high-score retrievals: every content keyword (or 3 of 4) lands in
+  # --- one document → top_score ≥ 0.5 → the grounded answer route. The
+  # --- diagnose keys must NOT appear.
+  - name: password-reset-hit
+    input:
+      query: "How do I reset my corporate password?"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [retrieved_docs, top_score, answer, sources]
+      final_state_lacks: [diagnosis, suggested_query]
+      side_effects:
+        - { system: vectorstore, action: retrieve, times: 1 }
+
+  - name: expense-report-hit
+    input:
+      query: "What is the deadline to submit an expense report?"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [retrieved_docs, top_score, answer, sources]
+      final_state_lacks: [diagnosis, suggested_query]
+      side_effects:
+        - { system: vectorstore, action: retrieve, times: 1 }
+
+  # --- the zero-hit retrieval: no content keyword matches any document →
+  # --- top_score 0.0 → the diagnose route. The answer keys must NOT appear,
+  # --- and the retrieval is STILL audited (one ledger row) — the auditable
+  # --- miss is the debugging story.
+  - name: nonsense-query-miss
+    input:
+      query: "zebra cantaloupe spaceship maintenance"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [retrieved_docs, top_score, diagnosis, suggested_query]
+      final_state_lacks: [answer, sources]
+      side_effects:
+        - { system: vectorstore, action: retrieve, times: 1 }

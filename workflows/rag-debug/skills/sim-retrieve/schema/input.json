@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["query"],"properties":{"query":{"type":"string"},"run_id":{"type":"string"}}}

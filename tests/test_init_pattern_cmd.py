@@ -56,6 +56,8 @@ WORKFLOW_PATTERNS = [
     "cross-system-action",
     "executive-briefing",
     "ops-center",
+    "rag-debug",
+    "kb-refresh",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 
