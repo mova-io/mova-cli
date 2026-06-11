@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: partial-failure-recovery
+kind: workflow
+description: 'Three-step pipeline whose flaky middle step proves completed steps are NEVER
+  re-executed on retry (runtime: temporal). step1/step3 share ONE parameterized sim-step skill
+  (ADR 097 D1 input literals + output_key); the flaky step2 records an attempt row per invocation
+  and succeeds on the durable retry — the ledger shows step1 exactly once next to step2''s
+  two attempts (ADR 097/098).'
+topology: TOOL step-one → TOOL step-two ⟳3 → TOOL step-three → notify

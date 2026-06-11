@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["severity","remediation_action"],"properties":{"severity":{"type":"string","enum":["low","medium","high","critical"]},"remediation_action":{"type":"string"}}}

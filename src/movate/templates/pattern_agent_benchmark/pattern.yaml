@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: agent-benchmark
+kind: workflow
+description: 'Two-config benchmark of the SAME task (runtime: temporal). Two candidate agents
+  share the same prompt TEXT but differ in agent.yaml model params (the configs under test),
+  running SEQUENTIALLY with disjoint output keys; a compare judge scores BOTH (required output
+  keys — it cannot ignore one) and picks the enum-pinned winner (a|b); the sim-record-benchmark
+  TOOL records the auditable eval/benchmark ledger row (ADR 097).'
+topology: candidate-a → candidate-b → compare → TOOL record-benchmark → notify

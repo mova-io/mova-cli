@@ -1,0 +1,9 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: task-oriented
+kind: workflow
+description: 'Bounded supervisor fan-out: a planner decomposes into a fixed, capped task set,
+  then collects.'
+topology: SUPERVISOR → task-a → task-b → collector

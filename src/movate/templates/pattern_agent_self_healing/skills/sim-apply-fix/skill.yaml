@@ -1,0 +1,33 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-apply-fix
+version: 0.1.0
+description: >-
+  Simulate the agent registry applying a diagnosed fix to a degraded agent:
+  deterministically returns `fix_status` ("applied", unless the symptom is
+  model drift — the one fault class self-healing cannot fix, which "failed"s)
+  and records one auditable `{system: agent_registry, action: apply_fix}` row
+  to the shared sim_side_effects ledger (same DB MDK itself uses).
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `sim-apply-fix.impl` imports
+  from the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-apply-fix.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - remediation
+  - simulation
+  - certification

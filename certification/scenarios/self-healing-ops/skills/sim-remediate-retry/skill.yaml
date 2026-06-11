@@ -1,0 +1,34 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-remediate-retry
+version: 0.1.0
+description: >-
+  Simulate remediation attempt #2 — the unrolled retry (mdk workflows have
+  NO cycles): deterministically returns `r2_status` ("applied" for the
+  transient faults attempt #1 raced, "failed" for "hardware" faults that
+  software remediation can never fix) and records one auditable `{system:
+  ops, action: remediate}` row (attempt: 2 in the payload) to the shared
+  sim_side_effects ledger (same DB MDK itself uses). SELF-CONTAINED for the
+  deployed temporal-worker image (ADR 097 D2): the implementation lives in
+  impl.py next to this file — the python backend puts the skill dir's
+  parent on sys.path, so `sim-remediate-retry.impl` imports from the baked
+  workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-remediate-retry.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - remediation
+  - simulation
+  - certification

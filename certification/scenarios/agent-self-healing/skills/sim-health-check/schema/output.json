@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["quality_score","symptom"],"properties":{"quality_score":{"type":"number","minimum":0,"maximum":1},"symptom":{"type":"string"}}}

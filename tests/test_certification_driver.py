@@ -54,6 +54,8 @@ class FakeRuntime:
         route: str | None = None,
         final_state: dict[str, Any] | None = None,
         cost_usd: float = 0.0,
+        node_costs: list[float] | None = None,
+        foreign_node_costs: list[float] | None = None,
         governance_effect: str | None = None,
         job_status: str = "success",
         job_polls_before_terminal: int = 1,
@@ -64,6 +66,12 @@ class FakeRuntime:
         self.route = route
         self.final_state = final_state if final_state is not None else {"summary": "done"}
         self.cost_usd = cost_usd
+        # Per-node kind=run facts correlated to wfr-1 (attributes.workflow_run_id)
+        # — what the Temporal activities emit; the driver sums these (ADR 096).
+        self.node_costs = list(node_costs or [])
+        # kind=run facts belonging to a DIFFERENT workflow run — must be
+        # excluded by the driver's client-side join.
+        self.foreign_node_costs = list(foreign_node_costs or [])
         self.governance_effect = governance_effect
         self.job_status = job_status
         self.job_polls_before_terminal = job_polls_before_terminal
@@ -92,6 +100,8 @@ class FakeRuntime:
                 self.pending_pauses.pop(0)
             return httpx.Response(202, json={"job_id": "job-2", "status": "queued"})
         if request.method == "GET" and path == "/api/v1/observability/facts":
+            if request.url.params.get("kind") == "run":
+                return httpx.Response(200, json=self._run_facts_listing())
             return httpx.Response(200, json=self._facts_listing())
         return httpx.Response(404, json={"detail": f"unexpected {request.method} {path}"})
 
@@ -145,6 +155,36 @@ class FakeRuntime:
             "error_type": None,
         }
         return {"facts": [fact], "count": 1}
+
+    def _run_facts_listing(self) -> dict[str, Any]:
+        """``kind=run`` facts — the per-node spend the Temporal activities emit."""
+        facts = [
+            {
+                "fact_id": f"run:r-{i}",
+                "kind": "run",
+                "source_id": f"r-{i}",
+                "agent": f"node-{i}",
+                "status": "success",
+                "runtime": "temporal",
+                "cost_usd": cost,
+                "attributes": {"provider": "mock", "workflow_run_id": "wfr-1"},
+            }
+            for i, cost in enumerate(self.node_costs)
+        ]
+        facts.extend(
+            {
+                "fact_id": f"run:other-{i}",
+                "kind": "run",
+                "source_id": f"other-{i}",
+                "agent": "noise",
+                "status": "success",
+                "runtime": "temporal",
+                "cost_usd": cost,
+                "attributes": {"provider": "mock", "workflow_run_id": "wfr-OTHER"},
+            }
+            for i, cost in enumerate(self.foreign_node_costs)
+        )
+        return {"facts": facts, "count": len(facts)}
 
 
 def _driver(fake: FakeRuntime, **kwargs: Any) -> SuiteDriver:
@@ -207,8 +247,11 @@ def test_shipped_expense_cases_parse() -> None:
     # error) and honestly expect route=None (nothing writes tier/route).
     assert all(c.expect.status == "success" for c in spec.cases)
     assert all(c.expect.route is None for c in spec.cases)
-    # Cost is an honest skip everywhere (workflow_run facts carry 0 by design).
-    assert all(c.expect.cost is False for c in spec.cases)
+    # Cost asserted on every APPROVE path (the Temporal activities emit
+    # per-node run facts; the driver sums them — ADR 096 reader-side join).
+    # The reject path stays unasserted (the approve tail is the evidence).
+    assert all(c.expect.cost is True for c in (auto, manager, director))
+    assert reject.expect.cost is False
     # Governance: every case asserts the bundled policy's gates evaluated and
     # allowed (non-null effect == 'allow' on the terminal fact).
     assert all(c.expect.governance == "allow" for c in spec.cases)
@@ -459,12 +502,37 @@ def test_final_state_lacks_marker_fails_routing_when_branch_leaked() -> None:
 
 
 @pytest.mark.unit
-def test_cost_expectation_passes_and_fails_on_fact_cost_usd() -> None:
+def test_cost_sums_per_node_run_facts_for_the_workflow_run() -> None:
+    """Cost = the reader-side join (ADR 096): sum the ``kind=run`` facts
+    whose attributes.workflow_run_id matches; foreign runs' facts excluded."""
     case = _case(expect=CaseExpect(status="success", route=None, cost=True))
-    zero = _driver(FakeRuntime(cost_usd=0.0)).run_case(_spec(case), case)
-    assert zero.outcomes["cost"].status == "fail"
-    spent = _driver(FakeRuntime(cost_usd=0.0042)).run_case(_spec(case), case)
+    spent = _driver(FakeRuntime(node_costs=[0.0042, 0.0013], foreign_node_costs=[9.99])).run_case(
+        _spec(case), case
+    )
     assert spent.outcomes["cost"].status == "pass"
+    assert "cost_usd=0.005500" in spent.outcomes["cost"].note
+    assert "2 run fact(s)" in spent.outcomes["cost"].note  # the 9.99 noise excluded
+
+
+@pytest.mark.unit
+def test_cost_fails_when_no_run_facts_or_zero_spend() -> None:
+    case = _case(expect=CaseExpect(status="success", route=None, cost=True))
+    # No per-node run facts at all → the worker image is stale; fail loudly.
+    missing = _driver(FakeRuntime()).run_case(_spec(case), case)
+    assert missing.outcomes["cost"].status == "fail"
+    assert "no kind=run facts" in missing.outcomes["cost"].note
+    # Facts exist but carry zero spend → the metering is broken; fail.
+    zero = _driver(FakeRuntime(node_costs=[0.0, 0.0])).run_case(_spec(case), case)
+    assert zero.outcomes["cost"].status == "fail"
+    assert "sum(cost_usd)=0" in zero.outcomes["cost"].note
+
+
+@pytest.mark.unit
+def test_cost_skips_when_case_does_not_opt_in() -> None:
+    case = _case()  # expect.cost is False
+    result = _driver(FakeRuntime(node_costs=[0.0042])).run_case(_spec(case), case)
+    assert result.outcomes["cost"].status == "skip"
+    assert result.outcomes["cost"].note.startswith("case does not assert cost")
 
 
 # ---------------------------------------------------------------------------

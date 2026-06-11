@@ -13,9 +13,11 @@ Covers the four layers of the feature:
   missing-metrics / runtime-None defaults.
 * **Edges** — the dispatch agent path writes a fact next to
   ``record_run_usage`` and is FAIL-SOFT (a raising
-  ``save_observability_fact`` never fails the job); the API route
-  (``GET /api/v1/observability/facts``) is tenant-scoped, filtered, and
-  read-scope gated.
+  ``save_observability_fact`` never fails the job); the Temporal agent
+  activity emits the per-node run fact (runtime='temporal',
+  attributes.workflow_run_id correlation) with the same fail-soft posture;
+  the API route (``GET /api/v1/observability/facts``) is tenant-scoped,
+  filtered, and read-scope gated.
 """
 
 from __future__ import annotations
@@ -44,6 +46,14 @@ from movate.core.models import (
     TurnRecord,
     WorkflowRunRecord,
     WorkflowStatus,
+)
+from movate.core.workflow.temporal_activities import (
+    _get_context as _get_activity_context,
+)
+from movate.core.workflow.temporal_activities import (
+    _write_run_fact_failsoft,
+    call_agent_activity,
+    configure_activities,
 )
 from movate.providers.mock import MockProvider
 from movate.providers.pricing import load_pricing
@@ -619,6 +629,139 @@ async def test_dispatch_run_fact_governance_effect_null_without_policy(
     facts = await storage.list_observability_facts(tenant_id="tenant-a")
     assert len(facts) == 1
     assert facts[0].governance_effect is None
+
+
+# ---------------------------------------------------------------------------
+# Temporal activity edge — per-node run facts (ADR 096 follow-through)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_fact_from_run_record_runtime_and_workflow_correlation() -> None:
+    """The builder's additive knobs: ``runtime`` (default 'native' — rule 5,
+    the dispatch edge is byte-for-byte unchanged) and the workflow_run_id
+    correlation riding ``attributes`` for workflow-spawned runs only."""
+    standalone = fact_from_run_record(_make_run_record())
+    assert standalone.runtime == "native"
+    assert "workflow_run_id" not in standalone.attributes
+
+    record = _make_run_record().model_copy(update={"workflow_run_id": "wfr-77"})
+    fact = fact_from_run_record(record, runtime="temporal")
+    assert fact.runtime == "temporal"
+    assert fact.attributes["workflow_run_id"] == "wfr-77"
+    assert fact.fact_id == "run:run-1"  # the idempotent "<kind>:<source_id>" key
+
+
+def _configure_temporal_activities(storage: InMemoryStorage, *, tenant_id: str) -> None:
+    configure_activities(
+        storage=storage,
+        pricing=load_pricing(),
+        tracer=NullTracer(),
+        provider=MockProvider(),
+        tenant_id=tenant_id,
+    )
+
+
+@pytest.mark.unit
+async def test_temporal_agent_activity_writes_run_fact(
+    scaffolded_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Temporal agent activity emits the per-node run fact: same shape as
+    the dispatch edge's, stamped runtime='temporal', correlated to the parent
+    workflow run via attributes.workflow_run_id (ADR 096)."""
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "hi"}')
+    storage = InMemoryStorage()
+    await storage.init()
+    _configure_temporal_activities(storage, tenant_id="tenant-a")
+
+    data = await call_agent_activity(
+        "step1", str(scaffolded_agent / "alpha"), {"text": "hi"}, "wfr-77"
+    )
+    # The governed activity also folds the run's governance effect into the
+    # state delta (cross-process persistence fix) — pop it before comparing.
+    assert data.pop("_mdk_governance_effect", None) in ("allow", None)
+    assert data == {"message": "hi"}
+
+    facts = await storage.list_observability_facts(tenant_id="tenant-a", kind="run")
+    assert len(facts) == 1
+    fact = facts[0]
+    record = next(r for r in storage.runs if r.run_id == fact.source_id)
+    assert fact.fact_id == f"run:{record.run_id}"
+    assert fact.kind == "run"
+    assert fact.runtime == "temporal"
+    assert fact.agent == "alpha"
+    assert fact.node_id == "step1"
+    assert fact.status == "success"
+    assert fact.attributes["workflow_run_id"] == "wfr-77"
+    # The flattened columns mirror the persisted record's metrics blob.
+    assert fact.cost_usd == pytest.approx(record.metrics.cost_usd)
+    assert fact.tokens_in == record.metrics.tokens.input
+    assert fact.tokens_out == record.metrics.tokens.output
+
+
+@pytest.mark.unit
+async def test_temporal_agent_activity_fact_failure_is_failsoft(
+    scaffolded_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 096 D3 on the Temporal path: a raising save_observability_fact
+    NEVER fails the activity — the node's output still merges into workflow
+    state and the authoritative RunRecord is untouched."""
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "hi"}')
+    storage = InMemoryStorage()
+    await storage.init()
+
+    async def _explode(fact: ObservabilityFact) -> None:
+        raise RuntimeError("facts table missing")
+
+    monkeypatch.setattr(storage, "save_observability_fact", _explode)
+    _configure_temporal_activities(storage, tenant_id="tenant-a")
+
+    data = await call_agent_activity(
+        "step1", str(scaffolded_agent / "alpha"), {"text": "hi"}, "wfr-77"
+    )
+    # The governed activity also folds the run's governance effect into the
+    # state delta (cross-process persistence fix) — pop it before comparing.
+    assert data.pop("_mdk_governance_effect", None) in ("allow", None)
+    assert data == {"message": "hi"}
+    assert storage.runs, "the authoritative RunRecord must persist regardless"
+
+
+@pytest.mark.unit
+async def test_temporal_run_fact_rederivation_upserts_one_row(
+    scaffolded_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-deriving the fact for the SAME run_id (e.g. a re-walked write) is an
+    idempotent upsert on fact_id='run:<run_id>' — never a duplicate row. (A
+    Temporal RETRY of the activity is a NEW executor run with its own run_id,
+    metered per-attempt by design — ADR 054 D11 — so it is a separate fact.)"""
+    monkeypatch.setenv("MOVATE_MOCK_RESPONSE", '{"message": "hi"}')
+    storage = InMemoryStorage()
+    await storage.init()
+    _configure_temporal_activities(storage, tenant_id="tenant-a")
+
+    await call_agent_activity("step1", str(scaffolded_agent / "alpha"), {"text": "hi"}, "wfr-77")
+    facts = await storage.list_observability_facts(tenant_id="tenant-a", kind="run")
+    assert len(facts) == 1
+
+    await _write_run_fact_failsoft(
+        _get_activity_context(), facts[0].source_id, tenant_id="tenant-a", governance_effect=None
+    )
+    facts = await storage.list_observability_facts(tenant_id="tenant-a", kind="run")
+    assert len(facts) == 1, "same run_id re-derived must upsert, not duplicate"
+
+
+@pytest.mark.unit
+async def test_temporal_run_fact_helper_missing_record_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unknown / empty run_id derives nothing and never raises."""
+    storage = InMemoryStorage()
+    await storage.init()
+    _configure_temporal_activities(storage, tenant_id="tenant-a")
+    ctx = _get_activity_context()
+    await _write_run_fact_failsoft(ctx, "", tenant_id="tenant-a", governance_effect=None)
+    await _write_run_fact_failsoft(ctx, "nope", tenant_id="tenant-a", governance_effect=None)
+    assert await storage.list_observability_facts(tenant_id="tenant-a") == []
 
 
 # ---------------------------------------------------------------------------

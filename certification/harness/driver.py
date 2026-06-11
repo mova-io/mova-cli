@@ -31,9 +31,11 @@ Capabilities (one ``certify`` block each, per case):
   approve paths).
 * ``hitl`` — every expected pause was observed *at the expected node* and the
   signal resumed it.
-* ``cost`` — ``fact.cost_usd > 0``; only when the case opts in (workflow_run
-  facts carry 0 by design — ADR 096 — and the Temporal path emits no
-  per-node run facts yet, so scenario specs mark this honest skip).
+* ``cost`` — the summed ``cost_usd`` of the run's per-node ``kind=run``
+  facts (joined client-side on ``attributes.workflow_run_id``) is > 0; only
+  when the case opts in via ``expect.cost``. The workflow_run fact itself
+  carries 0 by design — ADR 096 makes the rollup the reader's join, and the
+  driver is that reader.
 * ``governance`` — the terminal fact's ``governance_effect`` is non-null (a
   governance gate actually evaluated on the run — the deployed worker loaded
   the bundled policy) AND matches the case's expected effect (``allow`` /
@@ -536,6 +538,26 @@ class RuntimeApiClient:
         resp.raise_for_status()
         return list(resp.json().get("facts", []))
 
+    def list_run_facts_for_workflow_run(self, workflow_run_id: str) -> list[dict[str, Any]]:
+        """The per-node ``kind=run`` facts of one workflow run (ADR 096).
+
+        The facts API has no ``workflow_run_id`` filter (run facts carry the
+        correlation in ``attributes.workflow_run_id``, the bounded escape
+        hatch), so this lists the newest ``kind=run`` facts and joins
+        client-side — the ADR 096 reader-side rollup. ``limit`` is the API
+        max; the driver calls this immediately after the run's terminal fact
+        appears, so its node facts are at the head of the newest-first list.
+        """
+        resp = self._request(
+            "GET", "/api/v1/observability/facts", params={"kind": "run", "limit": 500}
+        )
+        resp.raise_for_status()
+        return [
+            fact
+            for fact in resp.json().get("facts", [])
+            if (fact.get("attributes") or {}).get("workflow_run_id") == workflow_run_id
+        ]
+
 
 # ---------------------------------------------------------------------------
 # The driver
@@ -837,27 +859,47 @@ class SuiteDriver:
         else:
             outcomes["decision-routing"] = CapabilityOutcome("skip", "no terminal fact to assert")
 
-        outcomes["cost"] = self._cost_outcome(spec, case, fact_holder)
+        outcomes["cost"] = self._cost_outcome(spec, case, fact_holder, workflow_run_id)
         outcomes["governance"] = self._governance_outcome(spec, case, fact_holder)
         outcomes["side-effects"] = self._side_effects_outcome(spec, case, workflow_run_id)
         return CaseResult(case.name, workflow_run_id, outcomes)
 
     def _cost_outcome(
-        self, spec: ScenarioSpec, case: CaseSpec, fact: dict[str, Any]
+        self, spec: ScenarioSpec, case: CaseSpec, fact: dict[str, Any], workflow_run_id: str
     ) -> CapabilityOutcome:
+        """Cost = the sum of the run's per-node ``kind=run`` facts.
+
+        The workflow_run fact deliberately carries ``cost_usd=0`` (ADR 096:
+        the rollup is the READER'S join over the per-node run facts, never a
+        second source of truth on the workflow fact) — so the driver IS that
+        reader: it joins ``kind=run`` facts on ``attributes.workflow_run_id``
+        (the Temporal activities stamp it) and asserts the summed spend is
+        visible. No polling needed: every node activity writes its run fact
+        before the workflow proceeds, so by the time the terminal
+        workflow_run fact (asserted above) exists, the node facts do too.
+        """
         if not case.expect.cost:
             return CapabilityOutcome(
                 "skip",
-                "case does not assert cost (workflow_run facts carry cost_usd=0 by "
-                "design — ADR 096; no per-node run facts on the Temporal path yet)",
+                "case does not assert cost (e.g. an all-deterministic path with "
+                "no LLM spend, or a scenario not yet opted in via expect.cost)",
             )
         if not fact:
             return CapabilityOutcome("skip", "no terminal fact to assert")
 
         def _cost() -> str | None:
-            cost = float(fact.get("cost_usd") or 0.0)
-            assert cost > 0, f"fact.cost_usd={cost} — LLM spend not visible on the fact"
-            return f"cost_usd={cost}"
+            run_facts = self._client.list_run_facts_for_workflow_run(workflow_run_id)
+            assert run_facts, (
+                f"no kind=run facts correlated to workflow run {workflow_run_id} — "
+                "the Temporal activities did not emit per-node run facts "
+                "(is the deployed WORKER image current?)"
+            )
+            total = sum(float(f.get("cost_usd") or 0.0) for f in run_facts)
+            assert total > 0, (
+                f"sum(cost_usd)={total} across {len(run_facts)} run fact(s) — "
+                "LLM spend not visible on the per-node facts"
+            )
+            return f"cost_usd={total:.6f} across {len(run_facts)} run fact(s)"
 
         return self._certified(spec.scenario, "cost", _cost)
 

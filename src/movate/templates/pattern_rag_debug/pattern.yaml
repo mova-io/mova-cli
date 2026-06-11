@@ -1,0 +1,12 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: rag-debug
+kind: workflow
+description: 'RAG with the retrieval stage as an auditable step (runtime: temporal). A retrieve
+  TOOL node (deterministic keyword scoring over an inline KB, auditable vectorstore ledger
+  row — no embeddings, no LLM) feeds a DECISION node routing top_score ≥ 0.5 to a strictly-grounded
+  answer agent; lower scores route to a diagnose agent explaining the low score + suggesting
+  a query reformulation — the failure mode is a route, not an error (ADR 094/097).'
+topology: TOOL retrieve → DECISION(top_score) → {answer | diagnose}

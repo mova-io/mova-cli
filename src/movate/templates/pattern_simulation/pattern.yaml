@@ -1,0 +1,9 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: simulation
+kind: workflow
+description: 'Bounded multi-agent simulation: a FIXED roster of two participants under a supervisor,
+  hard-capped turns, terminating JUDGE. NOT a swarm.'
+topology: SUPERVISOR → (A → B → JUDGE) x2 → done

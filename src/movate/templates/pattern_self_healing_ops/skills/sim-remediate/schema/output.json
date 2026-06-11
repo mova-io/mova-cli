@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["r1_status"],"properties":{"r1_status":{"type":"string","enum":["applied","failed"]}}}

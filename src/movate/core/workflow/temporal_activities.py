@@ -347,6 +347,53 @@ def _executor_for(ctx: ActivityContext, state: dict[str, Any]) -> Any:
     )
 
 
+async def _write_run_fact_failsoft(
+    ctx: ActivityContext,
+    run_id: str,
+    *,
+    tenant_id: str,
+    governance_effect: str | None,
+) -> None:
+    """Derive + persist the per-node ``run`` fact for one agent execution (ADR 096).
+
+    The Temporal counterpart of the dispatch edge's run-fact derivation
+    (``runtime/dispatch.py``): the Executor has already persisted the
+    authoritative :class:`RunRecord`, so this reads it back and projects it
+    via the SAME :func:`fact_from_run_record` builder, stamped
+    ``runtime="temporal"``. The record's ``workflow_run_id`` rides
+    ``attributes`` so readers can join per-node spend (``cost_usd`` /
+    tokens) back to the parent ``workflow_run`` fact — which deliberately
+    carries cost 0 (the rollup is the reader's join, ADR 096).
+
+    Idempotency: ``fact_id = "run:<run_id>"`` makes re-writes of the same
+    record an upsert. A Temporal RETRY of the activity is a NEW Executor
+    run (its own run_id + RunRecord — each attempt is metered as its own
+    attempt, ADR 054 D11), so each attempt lands as its own fact, mirroring
+    the native metering posture; nothing double-counts a single record.
+
+    Fail-soft end to end (ADR 096 D3): a read or write failure logs and
+    never touches the activity outcome. ACTIVITY-SIDE ONLY — never called
+    from workflow code (Temporal determinism).
+    """
+    from movate.runtime.facts import (  # noqa: PLC0415
+        fact_from_run_record,
+        write_fact_failsoft,
+    )
+
+    try:
+        if not run_id:
+            return
+        record = await ctx.storage.get_run(run_id, tenant_id=tenant_id)
+        if record is None:
+            return
+        await write_fact_failsoft(
+            ctx.storage,
+            fact_from_run_record(record, governance_effect=governance_effect, runtime="temporal"),
+        )
+    except Exception:
+        _log.warning("observability_fact_derive_failed run_id=%s", run_id, exc_info=True)
+
+
 def _fold_state_effect(state: dict[str, Any], effect: str | None) -> str | None:
     """Fold this node's governance ``effect`` into the run's state-carried one.
 
@@ -442,6 +489,14 @@ async def call_agent_activity(
             )
         finally:
             record_run_effect(run_id, gov_scope.effect)
+    # ADR 096 — the per-node run fact, emitted BEFORE the status check so a
+    # failed node's spend is visible too (native-dispatch parity). Fail-soft.
+    await _write_run_fact_failsoft(
+        ctx,
+        response.run_id,
+        tenant_id=_resolve_tenant_id(ctx, state),
+        governance_effect=gov_scope.effect,
+    )
     if response.status != "success":
         # Surface as an exception so Temporal's retry policy (emitted by the
         # compiler) can retry per D11/D4, instead of silently merging a
@@ -699,6 +754,14 @@ async def call_gate_activity(
             )
         finally:
             record_run_effect(run_id, gov_scope.effect)
+    # ADR 096 — the classifier execution is an LLM spend like any agent
+    # node; its run fact lands the same way (fail-soft, runtime=temporal).
+    await _write_run_fact_failsoft(
+        ctx,
+        response.run_id,
+        tenant_id=_resolve_tenant_id(ctx, state),
+        governance_effect=gov_scope.effect,
+    )
     if response.status != "success":
         raise RuntimeError(
             f"gate node {node_id!r} classifier {classifier_agent!r} failed: "
@@ -774,6 +837,14 @@ async def call_judge_activity(
             )
         finally:
             record_run_effect(run_id, gov_scope.effect)
+    # ADR 096 — the judge execution is an LLM spend like any agent node;
+    # its run fact lands the same way (fail-soft, runtime=temporal).
+    await _write_run_fact_failsoft(
+        ctx,
+        response.run_id,
+        tenant_id=_resolve_tenant_id(ctx, state),
+        governance_effect=gov_scope.effect,
+    )
     if response.status != "success":
         # Surface as an exception so Temporal's retry policy (emitted by the
         # compiler) can retry, mirroring the agent activity's posture.

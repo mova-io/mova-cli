@@ -64,6 +64,7 @@ from movate.core.agent_schema_utils import check_adr023_retrieval as _check_adr0
 from movate.core.config import PROJECT_MARKER_FILES as _PROJECT_MARKERS
 from movate.core.paths import project_state_dir
 from movate.templates import (
+    PATTERN_METADATA_FILE,
     PATTERN_TEMPLATES,
     get_pattern_path,
     get_template_path,
@@ -3829,7 +3830,9 @@ def _scaffold_pattern_agent(*, pattern: str, name: str, dest: Path, force: bool)
         raise typer.Exit(code=2)
     if dest.exists() and force:
         shutil.rmtree(dest)
-    shutil.copytree(src, dest)
+    # pattern.yaml is registry metadata (auto-discovery seam in
+    # movate.templates), not part of the user-facing scaffold — exclude it.
+    shutil.copytree(src, dest, ignore=shutil.ignore_patterns(PATTERN_METADATA_FILE))
     yaml_path = dest / "agent.yaml"
     yaml_path.write_text(yaml_path.read_text().replace("__AGENT_NAME__", name))
 
@@ -3889,7 +3892,9 @@ def _scaffold_pattern_workflow(
         raise typer.Exit(code=2)
     if dest.exists() and force:
         shutil.rmtree(dest)
-    shutil.copytree(src, dest)
+    # pattern.yaml is registry metadata (auto-discovery seam in
+    # movate.templates), not part of the user-facing scaffold — exclude it.
+    shutil.copytree(src, dest, ignore=shutil.ignore_patterns(PATTERN_METADATA_FILE))
 
     # Set the workflow's name to the operator-provided name (the template ships
     # a generic pattern name) so `mdk run <name>` resolves it.

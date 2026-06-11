@@ -1,0 +1,14 @@
+# Pattern registry metadata — consumed by movate.templates at import time
+# to build PATTERN_TEMPLATES (auto-discovery; no central dict to edit).
+# NOT copied into user scaffolds by `mdk init --pattern` (the name
+# `pattern.yaml` is reserved + excluded from the copy).
+name: ops-center
+kind: workflow
+description: 'AI ops-center daily summary over the unified observability reporting surface
+  (runtime: temporal, ADR 096). A fetch-facts TOOL node returns canned observability_facts-shaped
+  rows (echoing the real GET /api/v1/observability/facts endpoint it would query — never network
+  IO); the ONE summarize agent counts totals/failures/top risks strictly from the rows; a
+  DECISION node pages a HUMAN gate on failure_count > 0 (ack → report, fallback report — fail-open:
+  a page can delay the daily report, never kill it), clean windows report directly (ADR 094/096/097/098/099).'
+topology: TOOL fetch-facts → summarize → DECISION(failure_count) → {[HUMAN page ack] → report
+  | report}
