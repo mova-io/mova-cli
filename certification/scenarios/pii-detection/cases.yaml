@@ -1,0 +1,144 @@
+# Certification cases — pii-detection (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `pii-detection` workflow
+# (workflows/pii-detection — 5 nodes: the deterministic `redact-pii` TOOL
+# node at entry, a `decision` node on its `pii_found` output, the
+# `sim-dlp`/`sim-store` disposition TOOL nodes, and ONE shared notify agent
+# that sees only the redacted text). The driver submits the case input via
+# POST /run, then reads the run back from GET /api/v1/observability/facts
+# (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state; the branch is proven instead via final_state markers
+#   (dlp_result only on the quarantine path, store_result only on the clean
+#   path) and the sim ledger (quarantine vs store_clean rows).
+# * REDACTION PROOF — `final_state_contains` asserts the masked tokens
+#   ([EMAIL]/[SSN]/[PHONE]) are present in `redacted_text`, and
+#   `final_state_omits` asserts the RAW values are NOT in `redacted_text`.
+#   Both matchers are deliberately scoped to the `redacted_text` key: the
+#   ORIGINAL `document` key legitimately remains in final state (workflow
+#   state merge is additive — nodes cannot delete input keys), so a global
+#   "raw SSN nowhere in final_state" assertion would be dishonest. The
+#   isolation guarantee is structural instead: the notify agent's input
+#   schema omits `document`, so the one LLM call never saw it.
+# * `hitl` — no human gate anywhere in this workflow; the capability is an
+#   honest SKIP on every case.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (ADR 096); same honest skip as the other scenarios.
+# * `governance: allow` everywhere — the baked catalog policy registers
+#   MODEL + COST gates on every agent run (one notify call per run), so the
+#   terminal fact's governance_effect must be non-null `allow`.
+# * side-effects — every case asserts BOTH directions: the disposition row
+#   its path must record AND the absence of the other path's row. Evaluated
+#   only when the shared DB is reachable (MOVATE_PG_URL/MOVATE_DB_URL — the
+#   driver SKIPs otherwise).
+#
+# INPUT-GUARDRAIL GAP (ADR 093 `ModelPolicy.input_guardrails`) — investigated
+# for this batch and deliberately NOT a case. What a guardrail-tripping case
+# would need before it is honest on the Temporal path:
+#
+#   1. The guardrail (`prompt_injection`) runs inside the Executor BEFORE any
+#      provider call and raises GuardrailViolationError → run status
+#      `safety_blocked`. But `call_agent_activity` surfaces ANY non-success
+#      run as a RuntimeError, Temporal retries it x3 (_RETRY_POLICY in the
+#      compiled module — pointless for a deterministic detector), and the
+#      compiled workflow's except-arm persists the terminal fact as plain
+#      status='error' (the safety distinction is erased; only the error
+#      STRING carries "prompt injection detected: pattern=...").
+#   2. The job for a failed workflow ends status='error', and the driver's
+#      launch phase hard-asserts job status == 'success' — so an
+#      expected-error case cannot even reach the fact-assert phase without a
+#      driver change (accept an expected-error job when expect.status is
+#      'error'). Deferred: PR #837 is queued on driver.py; no refactors here.
+#   3. The policy is PROCESS-WIDE (one baked /opt/movate/project.yaml for the
+#      whole catalog): enabling input_guardrails there would scan every
+#      string input of EVERY scenario on the shared dev runtime — a
+#      `pretend you are`/`ignore previous instructions` phrase inside another
+#      suite's test document would start erroring unrelated cases. A
+#      guardrail scenario needs its own deployment (or per-workflow policy
+#      resolution) first.
+#   4. There is NO governance evidence to assert: the guardrail is not an
+#      ADR 093 gate — it records no governance decision, and a blocked entry
+#      agent means no gate evaluated at all, so the fact's governance_effect
+#      would be NULL, not 'allow'/'warn'.
+#
+#   The honest assertion set, once 2+3 land: expect.status: error + an
+#   error-marker match on the fact (needs a small `error_contains` matcher),
+#   side-effects: no quarantine/store row (the workflow died at the agent),
+#   governance: SKIP with an explicit note.
+
+scenario: pii-detection
+target: pii-detection # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- clean path: redact finds nothing → decision default → store-clean
+  # --- TOOL → notify. The ledger must show store_clean and NO quarantine.
+  - name: clean-document
+    input:
+      document: >-
+        Onboarding guide: how to request a laptop, book a desk, and find the
+        engineering handbook in the wiki. Nothing in this page is personal
+        data — it is published to every new joiner.
+      source: wiki/onboarding-guide
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [redacted_text, store_result, summary]
+      final_state_lacks: [dlp_result]
+      side_effects:
+        - { system: dlp, action: store_clean, times: 1 }
+      no_side_effects:
+        - { system: dlp, action: quarantine }
+
+  # --- PII path: all three identifier kinds present. The quarantine row is
+  # --- recorded, the masked tokens appear in redacted_text, and the RAW
+  # --- email/SSN/phone values must NOT survive in redacted_text.
+  - name: pii-document
+    input:
+      document: >-
+        Escalation from Jane Doe: reach me at jane.doe@example.com or
+        (555) 123-4567. My SSN is 123-45-6789 — please update my payroll
+        record before Friday.
+      source: hr/escalation-4821
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [redacted_text, dlp_result]
+      final_state_lacks: [store_result]
+      final_state_contains:
+        redacted_text: ["[EMAIL]", "[PHONE]", "[SSN]"]
+      final_state_omits:
+        redacted_text: ["jane.doe@example.com", "(555) 123-4567", "123-45-6789"]
+      side_effects:
+        - { system: dlp, action: quarantine, times: 1 }
+      no_side_effects:
+        - { system: dlp, action: store_clean }
+
+  # --- mixed document: ONE email inside otherwise-clean text. Still the
+  # --- quarantine path (any PII quarantines), the non-PII prose survives
+  # --- masking verbatim, and the raw address does not.
+  - name: mixed-document
+    input:
+      document: >-
+        Reminder: the all-hands moves to Thursday this week. For badge
+        issues contact security@example.com; everything else in this note
+        is public knowledge.
+      source: comms/all-hands-note
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [redacted_text, dlp_result]
+      final_state_lacks: [store_result]
+      final_state_contains:
+        redacted_text: ["[EMAIL]", "the all-hands moves to Thursday"]
+      final_state_omits:
+        redacted_text: ["security@example.com"]
+      side_effects:
+        - { system: dlp, action: quarantine, times: 1 }
+      no_side_effects:
+        - { system: dlp, action: store_clean }

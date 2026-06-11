@@ -1,0 +1,63 @@
+api_version: movate/v1
+kind: Workflow
+name: data-privacy
+version: 0.1.0
+description: >
+  Classify → policy-route → AUDITED storage, durable on Temporal — scenario
+  #30 of the 30-use-case certification program (B2 governance/redaction
+  batch). The compliance story: EVERY path leaves an audit row. A calibrated
+  `classify` agent (enum-pinned output: public / internal / regulated, with
+  explicit per-class examples in the prompt) feeds a deterministic `decision`
+  node (ADR 094) that routes on the classification value: regulated documents
+  are first masked by the workflow-local `redact-pii` TOOL (ADR 097 — three
+  anchored regexes, no LLM, the same skill pii-detection ships) and then —
+  like the internal and public paths — land on ONE shared `sim-audit-store`
+  TOOL node (exclusive convergence, ADR 098) that records the
+  classification-keyed `{system: dlp, action: store_<classification>}` ledger
+  row. One summary agent closes the run; it sees the masked text only.
+  Self-contained (bundled into the temporal-worker image): both skills carry
+  their own impl.py next to skill.yaml, so the worker imports them from the
+  baked workflows/ tree. Mirrors certification/scenarios/data-privacy.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: classify
+nodes:
+  # The ONE judgment call in the workflow — calibrated + enum-pinned. The
+  # routing itself stays deterministic (next node).
+  - {id: classify, type: agent, ref: ./agents/classify}
+  # Deterministic policy routing (ADR 094) on the pinned classification enum.
+  # The `internal` case and the default both land on the shared audit-store —
+  # written out explicitly so the route table reads as the policy: regulated
+  # → redact first; internal → audited store; anything else IS public (the
+  # enum admits nothing else).
+  - id: route
+    type: decision
+    cases:
+      - when: {field: classification, op: eq, value: regulated}
+        to: redact
+      - when: {field: classification, op: eq, value: internal}
+        to: audit-store
+    default: audit-store
+  # Deterministic masking on the regulated path (ADR 097): same anchored-regex
+  # skill as pii-detection — no LLM ever sees the unmasked identifiers
+  # downstream of this node.
+  - id: redact
+    type: tool
+    skill: redact-pii
+  # --- shared tail (ADR 098): all THREE classifications converge on ONE
+  # --- audit-store TOOL node (ADR 097) whose ledger action is derived 1:1
+  # --- from the classification — the audit row no path can skip.
+  - id: audit-store
+    type: tool
+    skill: sim-audit-store
+  - {id: summary, type: agent, ref: ./agents/summary}
+edges:
+  - {from: classify, to: route}
+  - {from: redact, to: audit-store}
+  - {from: audit-store, to: summary}
+tags:
+  - temporal
+  - decision
+  - tool
+  - governance
+  - certification

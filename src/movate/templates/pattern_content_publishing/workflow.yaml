@@ -1,0 +1,80 @@
+api_version: movate/v1
+kind: Workflow
+name: content-publishing
+version: 0.1.0
+description: >
+  Multi-stage content review chain with a HUMAN final gate, durable on
+  Temporal — scenario #2 of the 30-use-case certification program (B2
+  governance/redaction batch). Two calibrated review agents run in sequence —
+  `compliance-review` (legal/regulatory risk) then `brand-review` (brand
+  voice), each emitting the same enum-pinned {verdict: pass|flag, notes}
+  contract — and after EACH one a deterministic `decision` node (ADR 094)
+  routes on the verdict: `pass` continues, anything else fails safe to the
+  shared `rejected` agent (the gate cannot invent a third outcome). Content
+  that passes BOTH reviews still publishes nothing until the `final-approval`
+  HUMAN gate routes its own structured decision (ADR 099 — approve→publish,
+  reject→rejected, any other wording fails safe to rejected). Publication is
+  a TOOL node (ADR 097): the workflow-local `sim-publish` python skill
+  records the `{system: cms, action: publish}` ledger row deterministically —
+  the row the certification suite asserts exists exactly once on the approved
+  path and never on any flagged/rejected path. NOTE the state contract: both
+  review agents write the SAME `verdict`/`notes` keys — each decision gate
+  reads the verdict written immediately before it, and the `rejected` agent
+  always relays the LATEST notes (exclusive convergence, ADR 098).
+  Self-contained: the skill carries its own impl.py next to skill.yaml
+  (workflow-local, so a temporal-worker image bakes it for free). Point
+  sim-publish at your real CMS to go live. Mirrors
+  workflows/content-publishing.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: compliance-review
+nodes:
+  # Stage 1 — compliance. The agent judges; the ROUTING stays deterministic
+  # (next node), and an out-of-vocabulary verdict can only fail safe.
+  - {id: compliance-review, type: agent, ref: ./agents/compliance-review}
+  - id: compliance-gate
+    type: decision
+    cases:
+      - when: {field: verdict, op: eq, value: pass}
+        to: brand-review
+    default: rejected
+  # Stage 2 — brand voice. Overwrites verdict/notes; its gate reads the NEW
+  # verdict (sequential state semantics, documented above).
+  - {id: brand-review, type: agent, ref: ./agents/brand-review}
+  - id: brand-gate
+    type: decision
+    cases:
+      - when: {field: verdict, op: eq, value: pass}
+        to: final-approval
+    default: rejected
+  # Final gate — a HUMAN routes their own decision (ADR 099): trim+casefold
+  # exact match, no LLM; prose answers fail safe to rejected. Nothing reaches
+  # the CMS without this signal.
+  - id: final-approval
+    type: human
+    prompt: >
+      Both reviews passed. Publish this content? Respond with `decision` set
+      to exactly "approve" or "reject" — any other wording is treated as
+      reject.
+    output_contract: [decision]
+    routes: {approve: publish, reject: rejected}
+    fallback: rejected
+  # --- approved tail: ONE publish TOOL node (ADR 097 — deterministic ledger
+  # --- row, no LLM) then ONE notify agent; every flagged/rejected exit lands
+  # --- on the single rejected agent (ADR 098).
+  - id: publish
+    type: tool
+    skill: sim-publish
+  - {id: notify, type: agent, ref: ./agents/notify}
+  - {id: rejected, type: agent, ref: ./agents/rejected}
+edges:
+  - {from: compliance-review, to: compliance-gate}
+  - {from: brand-review, to: brand-gate}
+  - {from: publish, to: notify}
+tags:
+  - temporal
+  - decision
+  - hitl
+  - tool
+  - governance
+  - certification

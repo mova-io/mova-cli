@@ -1,0 +1,104 @@
+# Certification cases — data-privacy (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `data-privacy` workflow
+# (workflows/data-privacy — 5 nodes: a calibrated enum-pinned `classify`
+# agent, a deterministic `decision` node on the classification, the
+# `redact-pii` TOOL on the regulated leg, ONE shared `sim-audit-store` TOOL,
+# and a summary agent). One case per classification; the COMPLIANCE-TRAIL
+# assertion is that EVERY path records exactly one classification-keyed
+# audit row — and never another classification's row. The driver submits the
+# case input via POST /run, then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * CLASSIFICATION IS AN LLM JUDGMENT — the routing is only as deterministic
+#   as the calibrated prompt + the enum-pinned output schema. The case
+#   inputs are deliberately unambiguous archetypes of the prompt's own
+#   calibration examples; a misclassification fails the case loudly via the
+#   WRONG audit-row action (the no_side_effects guards), which is exactly
+#   the regression signal the scenario exists to give.
+# * `route: null` — the decision node writes nothing into state; the branch
+#   is proven via the audit row's action and the redaction markers instead.
+# * REDACTION PROOF (regulated case) — `final_state_contains`/`_omits` are
+#   scoped to `redacted_text`; the ORIGINAL `document` key legitimately
+#   remains in final state (additive state merge). The isolation guarantee
+#   is structural: the summary agent's input schema omits `document`.
+# * `hitl` — no human gate in this workflow; honest SKIP on every case.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 (ADR 096).
+# * `governance: allow` everywhere — two MODEL+COST-gated agent runs per
+#   case (classify + summary); the terminal fact's governance_effect must be
+#   non-null `allow`.
+# * side-effects — evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+
+scenario: data-privacy
+target: data-privacy # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- public: decision default → audit-store records store_public. No
+  # --- redaction (no redacted_text in final state), no other store_* row.
+  - name: public-document
+    input:
+      document: >-
+        FOR IMMEDIATE RELEASE: Acme Corp announces its annual developer
+        conference, open to the public, with registration starting next
+        month on the company website.
+      requester: pr.team
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [classification, audit_result, summary]
+      final_state_lacks: [redacted_text]
+      side_effects:
+        - { system: dlp, action: store_public, times: 1 }
+      no_side_effects:
+        - { system: dlp, action: store_internal }
+        - { system: dlp, action: store_regulated }
+
+  # --- internal: explicit decision case → audit-store records
+  # --- store_internal. Still no redaction.
+  - name: internal-document
+    input:
+      document: >-
+        Platform team sync notes: we agreed to move the storage migration to
+        next sprint, the rollout flag stays off until the load test passes,
+        and the design review is rescheduled to Thursday.
+      requester: eng.lead
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [classification, audit_result, summary]
+      final_state_lacks: [redacted_text]
+      side_effects:
+        - { system: dlp, action: store_internal, times: 1 }
+      no_side_effects:
+        - { system: dlp, action: store_public }
+        - { system: dlp, action: store_regulated }
+
+  # --- regulated: decision → redact TOOL → audit-store records
+  # --- store_regulated. The masked tokens are in redacted_text and the RAW
+  # --- identifiers are not; exactly one regulated audit row.
+  - name: regulated-document
+    input:
+      document: >-
+        HR onboarding record for the new hire in payroll group 7: SSN
+        078-05-1120, personal email pat.kim@example.com, contact phone
+        (555) 867-5309. File under restricted access.
+      requester: hr.ops
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [classification, redacted_text, audit_result, summary]
+      final_state_contains:
+        redacted_text: ["[SSN]", "[EMAIL]", "[PHONE]"]
+      final_state_omits:
+        redacted_text: ["078-05-1120", "pat.kim@example.com", "(555) 867-5309"]
+      side_effects:
+        - { system: dlp, action: store_regulated, times: 1 }
+      no_side_effects:
+        - { system: dlp, action: store_public }
+        - { system: dlp, action: store_internal }

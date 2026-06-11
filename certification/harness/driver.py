@@ -49,6 +49,7 @@ leaves the process when an OTLP sink is configured (in-env runs).
 from __future__ import annotations
 
 import functools
+import json
 import os
 import time
 from collections.abc import Callable, Mapping
@@ -130,6 +131,19 @@ class CaseExpect:
     final_state_lacks: tuple[str, ...] = ()
     side_effects: tuple[SideEffectExpect, ...] = ()
     no_side_effects: tuple[SideEffectExpect, ...] = ()
+    final_state_contains: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    """Value-level markers: ``(state_key, (substring, ...))`` pairs — every
+    substring must appear in the key's (stringified) final-state value. The
+    redaction scenarios use it to prove masked tokens ([EMAIL]/[SSN]) made it
+    into ``redacted_text``. Appended after the original key-presence matchers
+    (rule 5 — additive only)."""
+    final_state_omits: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    """The negative twin: no listed substring may appear in the key's value
+    (raw PII must NOT survive in ``redacted_text``). Scoped to ONE key on
+    purpose — the original input document legitimately remains in state, so a
+    global "nowhere in final_state" check would be dishonest. A key absent
+    from final state trivially omits everything (absence itself is
+    ``final_state_lacks``'s job)."""
 
 
 @dataclass(frozen=True)
@@ -177,6 +191,8 @@ _EXPECT_KEYS = frozenset(
         "final_state_lacks",
         "side_effects",
         "no_side_effects",
+        "final_state_contains",
+        "final_state_omits",
     }
 )
 _HITL_KEYS = frozenset({"node", "decision", "wait_timeout"})
@@ -216,6 +232,27 @@ def _parse_str_list(raw: Any, where: str) -> tuple[str, ...]:
     return tuple(raw)
 
 
+def _parse_state_substrings(raw: Any, where: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Parse a ``{state_key: [substring, ...]}`` mapping (contains/omits)."""
+    _require(isinstance(raw, dict), where, "must be a mapping of state key → list of substrings")
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for key, subs in raw.items():
+        w = f"{where}.{key}"
+        _require(isinstance(key, str) and bool(key), w, "state key must be a non-empty string")
+        _require(
+            isinstance(subs, list) and bool(subs),
+            w,
+            "must be a NON-EMPTY list of substrings (an empty list asserts nothing)",
+        )
+        _require(
+            all(isinstance(s, str) and bool(s) for s in subs),
+            w,
+            "every substring must be a non-empty string",
+        )
+        out.append((str(key), tuple(subs)))
+    return tuple(out)
+
+
 def _parse_expect(raw: Any, where: str) -> CaseExpect:
     _require(isinstance(raw, dict), where, "`expect` must be a mapping")
     _check_keys(raw, _EXPECT_KEYS, where)
@@ -249,6 +286,12 @@ def _parse_expect(raw: Any, where: str) -> CaseExpect:
         ),
         no_side_effects=_parse_effects(
             raw.get("no_side_effects", []), f"{where}.no_side_effects", action_required=False
+        ),
+        final_state_contains=_parse_state_substrings(
+            raw.get("final_state_contains", {}), f"{where}.final_state_contains"
+        ),
+        final_state_omits=_parse_state_substrings(
+            raw.get("final_state_omits", {}), f"{where}.final_state_omits"
         ),
     )
 
@@ -361,6 +404,14 @@ class CaseResult:
     @property
     def failed(self) -> bool:
         return any(o.status == "fail" for o in self.outcomes.values())
+
+
+def _stringify_state_value(value: Any) -> str:
+    """One total rule for substring matching: strings as-is, everything else
+    via ``json.dumps`` (deterministic, no repr quoting surprises)."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, default=str, sort_keys=True)
 
 
 def side_effects_db_configured(env: Mapping[str, str] | None = None) -> bool:
@@ -610,7 +661,12 @@ class SuiteDriver:
         expected, actual = case.expect.route, fact.get("route")
         assert actual == expected, f"fact.route={actual!r}, expected {expected!r}"
         notes: list[str] = [f"route={actual!r}"]
-        if case.expect.final_state_has or case.expect.final_state_lacks:
+        if (
+            case.expect.final_state_has
+            or case.expect.final_state_lacks
+            or case.expect.final_state_contains
+            or case.expect.final_state_omits
+        ):
             row = self._client.find_workflow_run(workflow_run_id)
             assert row is not None, (
                 f"run {workflow_run_id} not found in the workflow-runs list "
@@ -631,6 +687,33 @@ class SuiteDriver:
                 f"final_state has {list(case.expect.final_state_has)}, "
                 f"lacks {list(case.expect.final_state_lacks)}"
             )
+            # Value-level markers (additive — see CaseExpect). Non-string
+            # values are JSON-stringified so a substring check is total.
+            checked = 0
+            for key, substrings in case.expect.final_state_contains:
+                assert key in final_state, (
+                    f"final_state lacks {key!r} — cannot assert it contains "
+                    f"{list(substrings)} (keys: {sorted(final_state)})"
+                )
+                text = _stringify_state_value(final_state[key])
+                for sub in substrings:
+                    checked += 1
+                    assert sub in text, (
+                        f"final_state[{key!r}] does not contain {sub!r} — e.g. a "
+                        f"masked token missing from the redacted text (value: {text[:300]!r})"
+                    )
+            for key, substrings in case.expect.final_state_omits:
+                if key not in final_state:
+                    continue  # absence trivially omits; final_state_lacks asserts absence
+                text = _stringify_state_value(final_state[key])
+                for sub in substrings:
+                    checked += 1
+                    assert sub not in text, (
+                        f"final_state[{key!r}] unexpectedly contains {sub!r} — e.g. a "
+                        f"raw PII value that must have been masked"
+                    )
+            if checked:
+                notes.append(f"{checked} value-level marker(s) verified")
         return "; ".join(notes)
 
     def _assert_side_effects(self, case: CaseSpec, workflow_run_id: str) -> str | None:

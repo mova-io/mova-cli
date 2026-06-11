@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["document"],"properties":{"document":{"type":"string"}}}

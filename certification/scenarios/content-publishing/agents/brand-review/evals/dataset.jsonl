@@ -1,0 +1,2 @@
+{"input":{"content":"Honestly, CompetitorCorp's product is total garbage. Ours is obviously better — just buy it already!!!","channel":"social"},"expected":{"verdict":"flag","notes":"x"}}
+{"input":{"content":"Our new dashboard ships dark mode and faster exports.","channel":"blog"},"expected":{"verdict":"pass","notes":"x"}}

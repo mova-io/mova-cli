@@ -1,0 +1,51 @@
+api_version: movate/v1
+kind: Workflow
+name: pii-detection
+version: 0.1.0
+description: >
+  PII document scanning + masking — scenario #3 of the 30-use-case
+  certification program (B2 governance/redaction batch). The governance
+  story: REDACTION IS NEVER AN LLM'S JOB. The entry `redact` TOOL node
+  (ADR 097) runs the scenario-local `redact-pii` python skill — three
+  anchored stdlib regexes masking emails/US SSNs/phone numbers to
+  [EMAIL]/[SSN]/[PHONE] tokens, unit-tested character by character — so the
+  masking replays identically and its completeness is provable. A
+  deterministic `decision` node (ADR 094) routes on the skill's `pii_found`
+  flag: PII → the `sim-dlp` TOOL records a `{system: dlp, action:
+  quarantine}` ledger row; clean → the `sim-store` TOOL records
+  `store_clean`. Both paths CONVERGE on ONE notify agent (exclusive
+  convergence, ADR 098) whose input schema deliberately EXCLUDES the
+  original document — the only LLM call in the workflow sees the redacted
+  text only. The skill names resolve through the scenario's project registry
+  (project.yaml marker → skills/). Mirrors workflows/pii-detection.
+state_schema: ../../state.json
+entrypoint: redact
+nodes:
+  # Deterministic redaction FIRST (ADR 097): everything downstream — the
+  # routing decision and the one LLM call — sees masked text only.
+  - id: redact
+    type: tool
+    skill: redact-pii
+  # Deterministic disposition routing (ADR 094): the redactor already counted
+  # the matches — no LLM in the control path.
+  - id: gate
+    type: decision
+    cases:
+      - when: {field: pii_found, op: eq, value: true}
+        to: quarantine
+    default: store-clean
+  # --- disposition TOOL nodes (ADR 097 — deterministic ledger rows, no LLM):
+  # --- quarantine on the PII path, clean-store on the clean path.
+  - id: quarantine
+    type: tool
+    skill: sim-dlp
+  - id: store-clean
+    type: tool
+    skill: sim-store
+  # --- shared tail (ADR 098): both dispositions converge on ONE notify agent
+  # --- that sees ONLY redacted_text (its input schema omits `document`).
+  - {id: notify, type: agent, ref: ../../agents/notify}
+edges:
+  - {from: redact, to: gate}
+  - {from: quarantine, to: notify}
+  - {from: store-clean, to: notify}

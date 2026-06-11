@@ -38,6 +38,9 @@ WORKFLOW_PATTERNS = [
     "purchase-order",
     "approval-timeout",
     "human-escalation",
+    "pii-detection",
+    "data-privacy",
+    "content-publishing",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 

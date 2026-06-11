@@ -1,0 +1,3 @@
+{"input":{"document":"FOR IMMEDIATE RELEASE: Acme Corp announces a public developer conference.","requester":"pr.team"},"expected":{"classification":"public","rationale":"x"}}
+{"input":{"document":"Platform team sync notes: migration moved to next sprint.","requester":"eng.lead"},"expected":{"classification":"internal","rationale":"x"}}
+{"input":{"document":"HR record: SSN 078-05-1120, personal email pat@example.com.","requester":"hr.ops"},"expected":{"classification":"regulated","rationale":"x"}}

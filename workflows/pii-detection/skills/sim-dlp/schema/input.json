@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["source"],"properties":{"source":{"type":"string"},"pii_count":{"type":"integer","minimum":0},"run_id":{"type":"string"}}}

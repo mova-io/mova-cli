@@ -555,6 +555,9 @@ files = ["src/movate"]
 # the never-type-checked workflows/<scenario>/skills/ originals), not library
 # code; their behavior is pinned by tests/test_itsm_scenario.py and
 # tests/test_b1_scenarios.py, which import and exercise them directly.
+# (also pins B2's pattern skills; canonical copies under workflows/ are
+# unit-tested by tests/test_itsm_scenario.py, test_b1_scenarios.py,
+# test_b2_scenarios.py, with template byte-identity asserted there.)
 exclude = ['^src/movate/templates/pattern_[^/]+/skills/']
 
 [[tool.mypy.overrides]]

@@ -1,0 +1,125 @@
+# Certification cases — content-publishing (driven by
+# certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `content-publishing`
+# workflow (workflows/content-publishing — 8 nodes: compliance-review →
+# decision gate → brand-review → decision gate → final-approval HUMAN gate
+# with direct decision routes → publish TOOL → notify, with every flagged/
+# rejected exit converging on ONE rejected agent). The driver submits the
+# case input via POST /run, resumes any expected HUMAN pause via the signal
+# endpoint, then reads the run back from GET /api/v1/observability/facts
+# (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * REVIEW VERDICTS ARE LLM JUDGMENTS — the flagged cases use deliberately
+#   flagrant inputs that are near-verbatim archetypes of the prompts' own
+#   calibration examples (medical-guarantee claim for compliance, competitor
+#   bashing + shouting for brand). A wrong verdict fails the case loudly:
+#   either an unexpected pause appears (the driver's fact poll times out) or
+#   the publish ledger row exists where it must not.
+# * "NO PAUSE" IS ASSERTED STRUCTURALLY on the flagged cases: they declare
+#   no `hitl` steps, so the case only passes if a terminal fact appears
+#   WITHOUT any signal — a run wrongly paused at the gate would never
+#   produce one (fact-poll timeout → durable-execution FAIL). `decision`
+#   in final_state_lacks doubles that proof: only the human gate merges a
+#   `decision` key into state.
+# * `route: null` — the decision nodes write nothing into state; branches
+#   are proven via final_state markers (publish_result only on the approved
+#   path) + the cms/publish ledger row (or its required absence).
+# * `status: success` for ALL cases, including flagged/rejected — rejection
+#   is a route, not a workflow error.
+# * `hitl` — only the fully-approved and human-rejected cases reach the
+#   gate; the flagged cases record the capability as an honest SKIP.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 (ADR 096).
+# * `governance: allow` everywhere — 2-3 MODEL+COST-gated agent runs per
+#   case; the terminal fact's governance_effect must be non-null `allow`.
+# * side-effects — the ONE row that matters: `{system: cms, action:
+#   publish}` exactly once on the approved path, and its ABSENCE on every
+#   other path (including human-rejected, where BOTH reviews passed —
+#   proving the human gate, not the reviews, is what stands between content
+#   and the CMS). Evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+
+scenario: content-publishing
+target: content-publishing # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- the full happy path: pass + pass + human approve → publish TOOL →
+  # --- notify. Exactly one cms/publish ledger row.
+  - name: clean-content-approved
+    input:
+      content: >-
+        Our new dashboard ships dark mode, faster exports, and a redesigned
+        sharing flow. Available to all workspace plans today — see the
+        changelog for details.
+      channel: blog
+    hitl:
+      - node: final-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [publish_result, summary]
+      side_effects:
+        - { system: cms, action: publish, times: 1 }
+
+  # --- stage-1 stop: a flagrant medical-guarantee claim. The compliance
+  # --- gate fails safe to rejected — no brand review pause, no human gate
+  # --- (final_state lacks `decision`), and NO publish row.
+  - name: compliance-flagged
+    input:
+      content: >-
+        Try MiraclePure today — clinically guaranteed to cure arthritis in
+        7 days, 100% risk-free or your money back!
+      channel: blog
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [summary, notes]
+      final_state_lacks: [publish_result, decision]
+      no_side_effects:
+        - { system: cms, action: publish }
+
+  # --- stage-2 stop: clean on compliance (no claims, nothing unlawful) but
+  # --- flagrantly off-brand (competitor bashing + shouting + pressure).
+  # --- Same expectations: terminal without a pause, no publish row.
+  - name: brand-flagged
+    input:
+      content: >-
+        Honestly, CompetitorCorp's product is total garbage. Ours is
+        obviously better — stop wasting your money and just buy it
+        already!!!
+      channel: social
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [summary, notes]
+      final_state_lacks: [publish_result, decision]
+      no_side_effects:
+        - { system: cms, action: publish }
+
+  # --- the HUMAN veto: BOTH reviews pass, the approver rejects. The pause
+  # --- at final-approval + the reject signal are observed, the run still
+  # --- ends success (rejection is a route), and the publish row must NOT
+  # --- exist — the gate, not the reviews, guards the CMS.
+  - name: human-rejected
+    input:
+      content: >-
+        We benchmarked 2x faster report generation than our previous
+        release, and the new exports page is live for every plan.
+      channel: blog
+    hitl:
+      - node: final-approval
+        decision: { decision: reject }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [summary]
+      final_state_lacks: [publish_result]
+      no_side_effects:
+        - { system: cms, action: publish }

@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: classify
+version: 0.1.0
+description: >-
+  Classifies a document as public / internal / regulated for policy-routed
+  storage. The output enum is schema-pinned and the prompt carries explicit
+  calibration examples per class.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

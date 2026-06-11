@@ -46,6 +46,9 @@ ALL_PATTERNS = [
     "purchase-order",
     "approval-timeout",
     "human-escalation",
+    "pii-detection",
+    "data-privacy",
+    "content-publishing",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

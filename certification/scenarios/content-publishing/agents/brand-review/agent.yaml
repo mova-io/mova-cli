@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: brand-review
+version: 0.1.0
+description: >-
+  Second review stage: flags content that violates the brand voice
+  (competitor disparagement, insults/profanity, shouting, fear-based
+  pressure). Runs only after compliance passes. Verdict enum is
+  schema-pinned; the prompt carries explicit flag/pass calibration examples.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}
