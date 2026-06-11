@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["summary","totals","failure_count","failures","top_risks"],"properties":{"summary":{"type":"string"},"totals":{"type":"object"},"failure_count":{"type":"integer"},"failures":{"type":"array","items":{"type":"string"}},"top_risks":{"type":"array","items":{"type":"string"}}}}

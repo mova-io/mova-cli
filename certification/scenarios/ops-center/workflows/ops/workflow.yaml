@@ -1,0 +1,63 @@
+api_version: movate/v1
+kind: Workflow
+name: ops-center
+version: 0.1.0
+description: >
+  AI ops-center daily summary — scenario #27 of the 30-use-case certification
+  program (B8 reporting batch). The reporting surface IS the subject here
+  (ADR 096): the entry `fetch-facts` TOOL node (ADR 097) runs the
+  scenario-local `sim-fetch-facts` python skill, which returns canned,
+  replay-identical observability_facts-shaped rows (the same flat columns
+  GET /api/v1/observability/facts serves) and records one auditable
+  `{system: observability, action: fetch_facts}` ledger row. The skill
+  accepts the real facts endpoint as an optional `facts_endpoint` input but
+  NEVER does network IO — it echoes the endpoint it would have queried in
+  `facts_source`. The ONE summarizing LLM call (`summarize`) writes totals /
+  failures / top risks strictly from the rows and emits a `failure_count`
+  the deterministic `decision` node (ADR 094) routes on: failures present →
+  the `page` HUMAN gate (ADR 099) pauses durably until the on-call
+  acknowledges (`ack` → report; any other wording falls back to report — a
+  page can delay the daily report, never kill it); a clean window goes
+  straight to the `report` agent. Both paths CONVERGE on ONE report agent
+  (exclusive convergence, ADR 098), whose prompt guards the path-exclusive
+  `decision` key. Mirrors workflows/ops-center.
+state_schema: ../../state.json
+entrypoint: fetch-facts
+nodes:
+  # Deterministic facts pull FIRST (ADR 097): the only LLM call downstream
+  # sees exactly the rows this skill returned. The skill name resolves
+  # through the scenario's project registry (project.yaml marker →
+  # skills/sim-fetch-facts/).
+  - id: fetch-facts
+    type: tool
+    skill: sim-fetch-facts
+  # The ONE summarizing LLM call: rows in, structured ops summary
+  # (totals/failure_count/failures/top_risks) out.
+  - {id: summarize, type: agent, ref: ../../agents/summarize}
+  # Deterministic paging decision (ADR 094): the summary already counted
+  # the failures — no LLM in the control path.
+  - id: gate
+    type: decision
+    cases:
+      - when: {field: failure_count, op: gt, value: 0}
+        to: page
+    default: report
+  # The on-call page (ADR 099): the gate routes its OWN decision —
+  # trim+casefold exact match, no LLM. FAIL-OPEN on purpose: `ack` and any
+  # other wording both land on report — a page can delay the daily report,
+  # never kill it.
+  - id: page
+    type: human
+    prompt: >
+      The ops summary counted one or more failed runs. Acknowledge the page?
+      Respond with `decision` set to exactly "ack" — any other wording still
+      proceeds to the daily report.
+    output_contract: [decision]
+    routes: {ack: report}
+    fallback: report
+  # --- shared tail (ADR 098): paged + clean paths converge on ONE report
+  # --- agent whose prompt guards the path-exclusive `decision` key.
+  - {id: report, type: agent, ref: ../../agents/report}
+edges:
+  - {from: fetch-facts, to: summarize}
+  - {from: summarize, to: gate}

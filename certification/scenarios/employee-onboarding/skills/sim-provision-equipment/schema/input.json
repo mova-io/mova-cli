@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["employee","role"],"properties":{"employee":{"type":"string"},"role":{"type":"string"},"run_id":{"type":"string"}}}

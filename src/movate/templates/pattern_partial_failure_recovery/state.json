@@ -1,0 +1,4 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "request":{"type":"string"},"fail_times":{"type":"number"},
+  "step1":{"type":"object"},"step2":{"type":"object"},"step3":{"type":"object"},
+  "summary":{"type":"string"}}}

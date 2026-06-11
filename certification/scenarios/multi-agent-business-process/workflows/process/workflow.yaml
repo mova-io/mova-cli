@@ -1,0 +1,46 @@
+api_version: movate/v1
+kind: Workflow
+name: multi-agent-business-process
+version: 0.1.0
+description: >
+  Multi-agent business process under a bounded SUPERVISOR, durable on
+  Temporal — scenario #17 of the 30-use-case certification program, the
+  first live exercise of the ADR 092 D4 managerial primitive (Phase 3a/3b).
+  A `supervisor` node runs the `process-manager` agent in a bounded
+  delegation loop: each round the manager reads the gathered state and
+  names the next specialist from its FIXED allowlist — `research` (account
+  context), `pricing` (rate-card quote), `compliance` (regulatory
+  assessment), each a calibrated sim producing its own JSON findings key —
+  or the sentinel `done`. The loop is hard-capped at `max_delegations: 4`
+  (three consultations + the closing `done`), the allowlist is structural
+  (an out-of-roster choice ends the loop — the manager cannot reach beyond
+  its roster), and the delegation loop is INTERNAL to the one node, so the
+  graph stays linear/acyclic. On Temporal it lowers to a deterministic
+  `for _ in range(max_delegations)` loop of manager + allowlisted
+  specialist activities (ADR 092 Phase 3b / #805). After the supervisor, a
+  `proposal` agent composes the final deliverable from the three findings
+  and `notify` confirms it to the requester. No human gate and no tool node
+  by design: the scenario isolates the supervisor primitive. Mirrors
+  workflows/multi-agent-business-process.
+state_schema: ../../state.json
+entrypoint: supervisor
+nodes:
+  # The bounded managerial primitive (ADR 092 D4): manager + FIXED specialist
+  # allowlist + hard delegation cap. The manager's `next` output (the
+  # decision_field default) picks the next specialist or `done`; specialists
+  # merge their findings keys into state between rounds.
+  - id: supervisor
+    type: supervisor
+    manager: ../../agents/process-manager
+    specialists:
+      research: ../../agents/research
+      pricing: ../../agents/pricing
+      compliance: ../../agents/compliance
+    max_delegations: 4
+  # --- post-loop tail: compose the deliverable from the gathered findings,
+  # --- then confirm to the requester.
+  - {id: proposal, type: agent, ref: ../../agents/proposal}
+  - {id: notify, type: agent, ref: ../../agents/notify}
+edges:
+  - {from: supervisor, to: proposal}
+  - {from: proposal, to: notify}

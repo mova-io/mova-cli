@@ -1,0 +1,1 @@
+{"input":{"question":"How many cloud regions is Atlas deployed in?","scope":"Establish the region count."},"expected":{"kb_findings":"[kb] KB-0871 records Atlas production running in 3 regions: us-east, eu-west, ap-south."}}

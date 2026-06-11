@@ -1,0 +1,11 @@
+api_version: movate/v1
+kind: Agent
+name: notify
+version: 0.1.0
+description: Confirms to the requester that the proposal deliverable is ready.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

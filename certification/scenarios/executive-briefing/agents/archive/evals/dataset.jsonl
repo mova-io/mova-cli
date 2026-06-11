@@ -1,0 +1,2 @@
+{"input": {"period": "daily", "headline": "Daily agent operations ran at a 99.2% success rate, inside budget, with zero open incidents."}, "expected": {"archive_note": "Filed with no risk flags: a clean 99.2% success-rate day inside budget."}}
+{"input": {"period": "weekly", "headline": "Weekly agent operations held a 99% success rate with no open incidents."}, "expected": {"archive_note": "Filed with no risk flags: a clean week at a 99% success rate."}}

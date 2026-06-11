@@ -1,0 +1,66 @@
+api_version: movate/v1
+kind: Workflow
+name: agent-deploy-approval
+version: 0.1.0
+description: >
+  Eval-gated agent promotion with a HUMAN release gate — scenario
+  #4 of the 30-use-case certification program (B6 eval/lifecycle batch). A
+  candidate agent version enters as data; the `eval-run` TOOL node (ADR 097)
+  executes the scenario-local `eval-runner` python skill — HONESTLY a calibrated
+  SIMULATION of an `mdk eval` run (the real eval machinery is too heavy to
+  drive inside a workflow activity): scores come deterministically from the
+  input's enum-pinned `fixture` key and the skill records the
+  `{system: eval, action: run}` ledger row WITH the scores. A deterministic
+  `decision` node (ADR 094) gates on `eval_score gte 0.85`: below-threshold
+  candidates go straight to `rejected` carrying the eval report
+  (rejected-with-report — no pause, no promotion possible); passing
+  candidates still promote NOTHING until the `promote-approval` HUMAN gate
+  routes its own structured decision (ADR 099 — approve→promote,
+  reject→rejected, prose fails safe to rejected). Promotion is the
+  `sim-promote` TOOL node: its `{system: registry, action: promote}` ledger
+  row is the row the certification suite asserts exists exactly once on the
+  approved path and never on a failed eval or a human veto.
+  The skill names resolve through the scenario's project registry
+  (project.yaml marker → skills/). Mirrors workflows/agent-deploy-approval.
+state_schema: ../../state.json
+entrypoint: eval-run
+nodes:
+  # The eval evidence (ADR 097): deterministic scores keyed by the
+  # enum-pinned fixture + the auditable eval/run ledger row. No LLM feeds
+  # the gate.
+  - id: eval-run
+    type: tool
+    skill: eval-runner
+  # Deterministic score gate (ADR 094): a pure numeric predicate over the
+  # eval output — a below-threshold candidate can NEVER reach the human
+  # gate, let alone the registry.
+  - id: score-gate
+    type: decision
+    cases:
+      - when: {field: eval_score, op: gte, value: 0.85}
+        to: promote-approval
+    default: rejected
+  # The release gate: a human routes their own decision (ADR 099) —
+  # trim+casefold exact match, no LLM; prose answers fail safe to rejected.
+  # Nothing reaches the registry without this signal.
+  - id: promote-approval
+    type: human
+    prompt: >
+      The candidate version passed its eval run (see eval_report). Promote
+      it in the model registry? Respond with `decision` set to exactly
+      "approve" or "reject" — any other wording is treated as reject.
+    output_contract: [decision]
+    routes: {approve: promote, reject: rejected}
+    fallback: rejected
+  # --- approved tail: ONE promote TOOL node (ADR 097 — deterministic
+  # --- registry ledger row, no LLM) then ONE notify agent; every rejected
+  # --- exit (failed eval OR human veto) lands on the single rejected agent
+  # --- that relays the eval report (ADR 098 — rejected-with-report).
+  - id: promote
+    type: tool
+    skill: sim-promote
+  - {id: notify, type: agent, ref: ../../agents/notify}
+  - {id: rejected, type: agent, ref: ../../agents/rejected}
+edges:
+  - {from: eval-run, to: score-gate}
+  - {from: promote, to: notify}

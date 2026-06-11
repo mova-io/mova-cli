@@ -1,0 +1,85 @@
+# Certification cases — multi-agent-business-process (driven by
+# certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED
+# `multi-agent-business-process` workflow
+# (workflows/multi-agent-business-process — 3 nodes: the ADR 092 D4
+# SUPERVISOR node running the `process-manager` manager in a bounded
+# delegation loop over the FIXED specialist allowlist research / pricing /
+# compliance (max_delegations: 4 — on Temporal a deterministic
+# `for _ in range(4)` loop of manager + allowlisted specialist activities),
+# then the `proposal` composer and `notify`). The driver submits the case
+# input via POST /run, then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability. No
+# HUMAN gate on any path — `hitl` is an honest SKIP for this scenario.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * THE DELEGATION PROOF: `research_findings`, `pricing_quote`, and
+#   `compliance_assessment` appear in final_state ONLY if the manager
+#   actually delegated to each specialist and the loop merged its output
+#   (the keys exist nowhere else); `proposal`/`summary` prove the post-loop
+#   tail ran after the supervisor exited. Key presence across all three
+#   specialists is exactly what the bounded supervisor must produce.
+# * `route: null` — no router/decision node writes a route key into state,
+#   so the fact's route is None. Asserted explicitly. (The manager's `next`
+#   key DOES merge into state — its final value is the sentinel `done` —
+#   but the fact builder only surfaces `tier`/`route`.)
+# * CONTENT is not driver-assertable: `final_state_has` checks key
+#   PRESENCE. "The proposal mentions pricing + compliance" is enforced by
+#   the proposal prompt (it MUST carry the quote figures + every compliance
+#   condition) and scored by the eval/judge rubric (see the pattern
+#   template's evals/judge.yaml.example); the driver proves the proposal was
+#   composed FROM all three findings being present. Stated rather than
+#   green-washed.
+# * `status: success` for both cases — a compliance-heavy request produces
+#   a conditions-laden assessment, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 by design
+#   (ADR 096) and the Temporal path emits no per-node run facts yet.
+# * side-effects — NONE by design: no tool node on this workflow (the
+#   scenario isolates the supervisor primitive); the capability records SKIP.
+# * `governance: allow` everywhere — the baked catalog policy registers
+#   MODEL + COST gates on every agent run (manager turns, specialists,
+#   proposal, notify); the terminal fact's `governance_effect` must be
+#   non-null and `allow`.
+
+scenario: multi-agent-business-process
+target: multi-agent-business-process # deployed workflow name for POST /run
+
+cases:
+  # --- standard request: a plain commercial deal. The manager must consult
+  # --- all three specialists (research → pricing → compliance) before
+  # --- `done`; the compliance sim's checklist finds no special obligations
+  # --- beyond the standard DPA. The assert proves every consultation merged
+  # --- and the proposal/notify tail ran.
+  - name: standard-request
+    input:
+      request: >-
+        Prepare a proposal for Acme Logistics: 120 Atlas Enterprise seats,
+        US-hosted, standard commercial terms, target start next quarter.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [research_findings, pricing_quote, compliance_assessment, proposal, summary]
+
+  # --- compliance-heavy request: patient data + EU residency are hard
+  # --- requirements, hitting the compliance sim's checklist where it bites
+  # --- (HIPAA ⇒ Enterprise tier + signed BAA precondition; EU residency ⇒
+  # --- eu-west pinning + DPA). Same delegation-topology assert; the
+  # --- conditions landing in the proposal text is judge-rubric territory
+  # --- (see the honesty notes above).
+  - name: compliance-heavy-request
+    input:
+      request: >-
+        Prepare a proposal for Meridian Health: 80 Atlas Enterprise seats
+        for a hospital network handling patient data — HIPAA obligations
+        and EU data residency for their Irish subsidiary are hard
+        requirements.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [research_findings, pricing_quote, compliance_assessment, proposal, summary]

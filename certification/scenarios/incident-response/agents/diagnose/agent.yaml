@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: diagnose
+version: 0.1.0
+description: >-
+  Diagnoses the alert: names the most likely root cause, proposes a
+  remediation, and self-scores a calibrated numeric confidence — the value
+  the workflow's deterministic decision node routes on (gte 0.7 →
+  auto-remediate, else → human escalation).
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

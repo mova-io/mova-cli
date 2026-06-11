@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["winner","rationale","score_a","score_b"],"properties":{"winner":{"type":"string","enum":["a","b"]},"rationale":{"type":"string"},"score_a":{"type":"number","minimum":0,"maximum":1},"score_b":{"type":"number","minimum":0,"maximum":1}}}

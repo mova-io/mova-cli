@@ -1,0 +1,68 @@
+api_version: movate/v1
+kind: Workflow
+name: multi-agent-investigation
+version: 0.1.0
+description: >
+  Multi-agent investigation over a PARALLEL FAN-OUT/FAN-IN diamond, durable
+  on Temporal — scenario #9 of the 30-use-case certification program, the
+  first live exercise of ADR 092 Phases 1+2. A `plan` agent decomposes the
+  question into a research scope, then FANS OUT (`kind: fan_out`) to THREE
+  specialist agents that run CONCURRENTLY — `web-researcher` (public
+  sources), `kb-researcher` (internal knowledge base), `data-analyst`
+  (telemetry warehouse), each a calibrated sim answering ONLY from its own
+  embedded corpus and writing a clearly-labeled findings key — and FANS IN
+  (`kind: fan_in`, default last_wins join: the three findings keys are
+  disjoint, so the barrier merge is clobber-free) on ONE `synthesize` agent
+  that merges the three findings into {conclusion, confidence}, explicitly
+  acknowledging any disagreement between the sources. The canonical
+  single-node-branch diamond, so on Temporal the branches lower to durable
+  `asyncio.gather` parallelism (ADR 092 Phase 2 / D3) and on native to the
+  Phase 1 block executor — same joined state on both backends. No human
+  gate and no tool node by design: the pattern isolates the parallel
+  primitive. Swap each specialist's embedded corpus for your real
+  sources (search API, KB retrieval, warehouse queries) to go live.
+  Mirrors workflows/multi-agent-investigation.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: plan
+nodes:
+  # The fan-out node: decomposes the question into the scope the three
+  # specialists each receive (they read the post-plan state snapshot).
+  - id: plan
+    type: agent
+    ref: ./agents/plan
+  # --- the FIXED specialist roster (ADR 092 D5: the branch count is a
+  # --- structural bound — exactly three fan_out edges, widening it is a
+  # --- reviewable edit to this file). Each branch is a SINGLE agent node
+  # --- (the canonical diamond Temporal Phase 2 lowers to asyncio.gather)
+  # --- writing its own disjoint findings key.
+  - id: web-researcher
+    type: agent
+    ref: ./agents/web-researcher
+  - id: kb-researcher
+    type: agent
+    ref: ./agents/kb-researcher
+  - id: data-analyst
+    type: agent
+    ref: ./agents/data-analyst
+  # The fan-in (join) node: merges the three findings into the conclusion,
+  # acknowledging conflicts between sources when they disagree.
+  - id: synthesize
+    type: agent
+    ref: ./agents/synthesize
+edges:
+  # Fan-out (ADR 092): plan opens its three specialist branches CONCURRENTLY.
+  - {from: plan, to: web-researcher, kind: fan_out}
+  - {from: plan, to: kb-researcher, kind: fan_out}
+  - {from: plan, to: data-analyst, kind: fan_out}
+  # Fan-in: the branches reconverge on synthesize. Their outputs
+  # (web_findings / kb_findings / data_findings) are disjoint, so the
+  # default last_wins join merges all three into state before synthesize.
+  - {from: web-researcher, to: synthesize, kind: fan_in}
+  - {from: kb-researcher, to: synthesize, kind: fan_in}
+  - {from: data-analyst, to: synthesize, kind: fan_in}
+tags:
+  - temporal
+  - parallel
+  - fan-out
+  - certification

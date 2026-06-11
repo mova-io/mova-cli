@@ -1,0 +1,37 @@
+# Governance policy bundled with the agent-deploy-approval certification deployable
+# (ADR 093 / ADR 096) — same wiring as workflows/itsm-request/policy.yaml.
+#
+# HOW IT IS LOADED. `load_project_config()` (movate/core/config.py) reads the
+# project base file from the process CWD — the container's WORKDIR is
+# /opt/movate, and the Dockerfile bakes ONE policy file there (as
+# `project.yaml`, the loader's canonical base-file name). The baked policy is
+# process-wide and applies to the WHOLE catalog (agents/ + workflows/),
+# agent-deploy-approval included — this file exists so the scenario is self-describing
+# and stays deployable standalone (bake it instead when shipping a
+# agent-deploy-approval-only image). Both the API (`movate serve`) and the workers
+# (`movate worker`, `movate worker --backend temporal` via
+# `configure_activities`, #822) resolve their ModelPolicy from the baked copy.
+#
+# WHAT IT DOES. With this block present the Executor's ADR 093 governance
+# shadow is built (model + cost + runtime + skill gates, default warn-mode
+# rollout) and every run records a governance decision — which the execution
+# edges project onto `observability_facts.governance_effect` (deny > warn >
+# allow; NULL when no gate evaluated). That is the column the certification
+# suite's `governance` capability asserts (expected `allow`).
+#
+# SCOPE. Both constraints below are deliberately satisfied by every bundled
+# agent, so the gates evaluate (effect = `allow`) without ever blocking a run:
+#
+# * `allowed_providers` covers the catalog's primary models (openai/...) AND
+#   fallbacks (anthropic/...). A provider outside the list is an enforced
+#   PolicyViolationError at Executor entry — extend the list before baking an
+#   agent on a new provider.
+# * `max_cost_per_run_usd` sits well above the default agent budget
+#   (`budget.max_cost_usd_per_run` = 1.0), so the COST gate evaluates every
+#   run but never warns or denies. The agent-deploy-approval paths make
+#   at most ONE model call (notify OR rejected — the eval TOOL, the
+#   score gate, the HUMAN routing, and the promote TOOL are all
+#   deterministic).
+policy:
+  allowed_providers: [openai, anthropic]
+  max_cost_per_run_usd: 5.00

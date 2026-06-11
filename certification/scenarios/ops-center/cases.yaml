@@ -1,0 +1,84 @@
+# Certification cases — ops-center (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `ops-center` workflow
+# (workflows/ops-center — 5 nodes: a fetch-facts TOOL node calling the
+# workflow-local `sim-fetch-facts` python skill, the ONE summarizing
+# `summarize` agent, a deterministic `decision` node on the summary's
+# `failure_count`, the `page` HUMAN gate, and the shared `report` tail).
+# The `profile` knob keys the skill's canned observability_facts-shaped rows
+# so each route is reached deterministically: `degraded` includes two
+# non-success rows (the summarize agent must count failure_count 2 → page),
+# `steady` is all-success (failure_count 0 → report directly). The optional
+# `facts_endpoint` input documents the REAL reporting surface
+# (GET /api/v1/observability/facts, ADR 096) — the sim never does network IO
+# and echoes the endpoint it would have queried in `facts_source`.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state; the fact builder surfaces `route` only from a
+#   `tier`/`route` state key, so the fact's route is None here. We assert
+#   that explicitly and prove the branch instead via (a) the observed pause
+#   node (page vs none) and (b) `final_state` markers: only the paged path
+#   merges the gate's `decision` into state.
+# * `status: success` for BOTH cases — a paged window still terminates at
+#   the report agent successfully; paging is a route, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096); the driver
+#   records the capability as SKIP with that note.
+# * side-effects — POSITIVE ledger rows on BOTH paths: the fetch-facts TOOL
+#   node runs unconditionally at the entrypoint, so every run must record
+#   exactly one `{system: observability, action: fetch_facts}` row via the
+#   self-contained skill (impl.py baked into the worker image inside
+#   workflows/ops-center/skills/). Evaluated only when the shared DB is
+#   reachable (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * `governance: allow` everywhere — the baked catalog policy (mirrored by
+#   workflows/ops-center/policy.yaml) registers MODEL + COST gates on every
+#   agent run, so the terminal fact's `governance_effect` must be NON-NULL
+#   and `allow`.
+
+scenario: ops-center
+target: ops-center # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- degraded profile: the canned rows include one failed workflow_run
+  # --- (SkillError) and one failed run (timeout, governance warn) — the
+  # --- summarize agent must count failure_count 2, the gate pages the
+  # --- on-call, and the `ack` decision routes to the shared report tail.
+  # --- The gate's decision merges into state (final_state_has).
+  - name: degraded-facts-paged
+    input:
+      window: "24h"
+      profile: degraded
+    hitl:
+      - node: page
+        decision: { decision: ack }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [facts, facts_source, summary, failure_count, decision, daily_report]
+      side_effects:
+        - { system: observability, action: fetch_facts, times: 1 }
+
+  # --- steady profile: every canned row succeeded — failure_count 0, the
+  # --- gate's default goes straight to report. NO hitl declared (a pause
+  # --- would starve the terminal-fact poll and fail durable-execution), no
+  # --- `decision` in final state, and the explicit `facts_endpoint` input
+  # --- must be echoed verbatim in `facts_source` (the sim's no-network-IO
+  # --- contract: it reports what it WOULD have queried).
+  - name: steady-facts-direct
+    input:
+      window: "24h"
+      profile: steady
+      facts_endpoint: "https://ops.example.com/api/v1/observability/facts"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [facts, facts_source, summary, failure_count, daily_report]
+      final_state_lacks: [decision]
+      final_state_contains:
+        facts_source: ["https://ops.example.com/api/v1/observability/facts"]
+      side_effects:
+        - { system: observability, action: fetch_facts, times: 1 }

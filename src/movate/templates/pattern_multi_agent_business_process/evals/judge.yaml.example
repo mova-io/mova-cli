@@ -1,0 +1,31 @@
+# LLM-as-judge for the Multi-Agent Business Process workflow. Rename to
+# ``judge.yaml`` to enable.
+#
+# Scores the final ``proposal`` against the expected deliverable: it must
+# restate the scope, carry the pricing quote's figures, and carry every
+# compliance condition the assessment requires (HIPAA/BAA, EU residency,
+# DPA — or state that none beyond standard terms apply). Used as the CI
+# eval-gate the pattern's governance leans on — this rubric is where "the
+# proposal mentions pricing + compliance" is actually scored (the
+# certification driver asserts state-key presence only).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the composed proposal against the expected deliverable.
+    1.0 = the proposal restates what the customer is buying, includes the
+          pricing figures from the quote (per-seat rate and discounted
+          total), and includes every required compliance condition from
+          the assessment (or explicitly states none beyond standard terms
+          apply) without inventing terms
+    0.5 = scope + pricing present but a required compliance condition is
+          missing or vague (or vice versa)
+    0.0 = wrong scope, invented pricing/terms, or required compliance
+          conditions dropped
+
+threshold: 0.7

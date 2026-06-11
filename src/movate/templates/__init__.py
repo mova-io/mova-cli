@@ -304,6 +304,96 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Multi-stage content review chain + HITL final gate (runtime: temporal). Calibrated compliance-review and brand-review agents each feed a DECISION node failing safe to a shared rejected agent; content passing BOTH still publishes nothing until a HUMAN gate routes its own approve/reject decision (ADR 099) into the sim-publish TOOL's auditable cms ledger row (ADR 094/097/098/099).",  # noqa: E501
         "compliance → DECISION → brand → DECISION → [HUMAN routes approve|reject] → TOOL publish → notify | rejected",  # noqa: E501
     ),
+    "multi-agent-investigation": (
+        "pattern_multi_agent_investigation",
+        True,
+        "Multi-agent investigation over the PARALLEL FAN-OUT/FAN-IN diamond (runtime: temporal, ADR 092). A plan agent decomposes the question, THREE calibrated specialist sims (web/kb/data) research it CONCURRENTLY — durable asyncio.gather on Temporal — each writing its own disjoint findings key, and ONE synthesize agent joins the branches into {conclusion, confidence}, explicitly acknowledging disagreement between sources.",  # noqa: E501
+        "plan → FAN-OUT {web ∥ kb ∥ data} → FAN-IN synthesize",
+    ),
+    "multi-agent-business-process": (
+        "pattern_multi_agent_business_process",
+        True,
+        "Multi-agent business process under the bounded SUPERVISOR primitive (runtime: temporal, ADR 092 D4). A process-manager agent delegates across a FIXED specialist allowlist (research/pricing/compliance — calibrated sims with JSON contracts) in a loop hard-capped at max_delegations, then a proposal agent composes the deliverable and notify confirms it — managerial delegation WITH structural bounds, not a swarm.",  # noqa: E501
+        "SUPERVISOR(manager ⇒ research|pricing|compliance, ≤4) → proposal → notify",
+    ),
+    "external-api-failure": (
+        "pattern_external_api_failure",
+        True,
+        "Retries + fallback provider with OBSERVABLE activity retries (runtime: temporal). A flaky TOOL entrypoint records one ledger attempt row per invocation and raises while attempts <= fail_times — so ledger rows = Temporal retry attempts (max 3); transient failures recover via the durable retry (the fallback provider serves them), exhaustion fails the workflow loudly with zero downstream record rows (ADR 094/097/098).",  # noqa: E501
+        "TOOL flaky-call ⟳3 → DECISION(provider_ok) → shared TOOL record → notify | failed",
+    ),
+    "partial-failure-recovery": (
+        "pattern_partial_failure_recovery",
+        True,
+        "Three-step pipeline whose flaky middle step proves completed steps are NEVER re-executed on retry (runtime: temporal). step1/step3 share ONE parameterized sim-step skill (ADR 097 D1 input literals + output_key); the flaky step2 records an attempt row per invocation and succeeds on the durable retry — the ledger shows step1 exactly once next to step2's two attempts (ADR 097/098).",  # noqa: E501
+        "TOOL step-one → TOOL step-two ⟳3 → TOOL step-three → notify",
+    ),
+    "long-running-research": (
+        "pattern_long_running_research",
+        True,
+        "Scheduled incremental research — the ADR 100 D1 cron-schedule shape (runtime: temporal). The schedule is the durable outer loop, each fire runs ONE idempotent increment: a research agent drafts findings, a TOOL node appends the auditable research-log row (increment in the payload), and a DECISION routes increment gte 3 into the final report (earlier increments get a light ack) — no week-long sleeping workflow (ADR 094/097/100).",  # noqa: E501
+        "research → TOOL append → DECISION(increment) → {final-report | ack}",
+    ),
+    "agent-deploy-approval": (
+        "pattern_agent_deploy_approval",
+        True,
+        "Eval-gated agent promotion with a HUMAN release gate (runtime: temporal). An eval-runner TOOL node (ADR 097 — honestly a calibrated simulation of an mdk eval run, scores deterministic per fixture, auditable eval ledger row) feeds a DECISION node gating eval_score ≥ 0.85 (no LLM); passing candidates still pause at a HUMAN gate routing its own approve/reject decision (ADR 099) before the sim-promote TOOL records the registry ledger row; every rejected exit converges on ONE rejected-with-report agent (ADR 094/097/098/099).",  # noqa: E501
+        "TOOL eval-run → DECISION(score) → [HUMAN routes approve|reject] → TOOL promote → notify | rejected",  # noqa: E501
+    ),
+    "agent-benchmark": (
+        "pattern_agent_benchmark",
+        True,
+        "Two-config benchmark of the SAME task (runtime: temporal). Two candidate agents share the same prompt TEXT but differ in agent.yaml model params (the configs under test), running SEQUENTIALLY with disjoint output keys; a compare judge scores BOTH (required output keys — it cannot ignore one) and picks the enum-pinned winner (a|b); the sim-record-benchmark TOOL records the auditable eval/benchmark ledger row (ADR 097).",  # noqa: E501
+        "candidate-a → candidate-b → compare → TOOL record-benchmark → notify",
+    ),
+    "continuous-eval": (
+        "pattern_continuous_eval",
+        True,
+        "ONE increment of a scheduled production-quality sampling pipeline (runtime: temporal; cadence lives in the ADR 100 scheduler, not a loop). A calibrated scorer agent scores one sampled interaction 0-1; a DECISION node applies the 0.6 floor (no LLM): regressions record an auditable quality_alert ledger row (TOOL, ADR 097) + an escalation summary, healthy samples record their score + a one-line ack — every increment leaves a ledger row (ADR 094/097/100).",  # noqa: E501
+        "scorer → DECISION(score) → {TOOL alert → escalate | TOOL record → ack}",
+    ),
+    "promotion-pipeline": (
+        "pattern_promotion_pipeline",
+        True,
+        "Staged promotion gates in ONE workflow (runtime: temporal). A DECISION node routes the CI-named stage (no LLM; unknown stages fail safe): test runs the sim-run-tests TOOL; staging records eval evidence (TOOL) THEN pauses at a HUMAN sign-off gate (ADR 099); production pauses at a HUMAN approval gate FIRST — the sim-deploy TOOL's promote_prod ledger row is reachable ONLY via its approve route. One stage per run (not a loop), shared notify/rejected tails (ADR 094/097/098/099).",  # noqa: E501
+        "DECISION(stage) → {TOOL tests | TOOL eval → [HUMAN signoff] | [HUMAN approval] → TOOL deploy} → notify | rejected",  # noqa: E501
+    ),
+    "ab-testing": (
+        "pattern_ab_testing",
+        True,
+        "Deterministic A/B traffic split (runtime: temporal). An assign-variant TOOL node (ADR 097) assigns the variant from the SHA-256 parity of the user_id (no randomness, no salted builtin hash — same user, same variant, every replay) with an auditable assign ledger row; a DECISION node routes to one of two arms whose prompt files are BYTE-IDENTICAL and whose agent.yaml model params are the only difference; both arms converge on the sim-record-outcome TOOL recording which variant served (ADR 094/097/098).",  # noqa: E501
+        "TOOL assign → DECISION(variant) → {variant-a | variant-b} → TOOL record-outcome → notify",
+    ),
+    "employee-onboarding": (
+        "pattern_employee_onboarding",
+        True,
+        "New-hire provisioning across three systems (runtime: temporal). A descriptive plan agent feeds THREE deterministic TOOL nodes — AD account, mailbox, and a role-keyed equipment bundle (a fixed map in the skill, never a model decision) — each recording an auditable ledger row, then a welcome agent summarizes. Sequential by phase-gate design: ADR 092 parallel graphs are agent-only today, so the conceptual fan-out diamond ships as a chain (ADR 092/097).",  # noqa: E501
+        "plan → TOOL provision-ad → TOOL provision-email → TOOL provision-equipment → welcome",
+    ),
+    "incident-response": (
+        "pattern_incident_response",
+        True,
+        "Event-driven incident diagnosis + remediation + escalation (runtime: temporal). A calibrated-confidence diagnose agent feeds a DECISION node (gte 0.7 → the sim-remediate TOOL, whose applied/failed status is deterministic on the alert and whose ATTEMPT is always an auditable ops ledger row); a verify agent mirrors the machine status into a second DECISION; both escalation reasons converge on ONE HUMAN gate routing its own ack (fallback notify — a human can delay closure, never wedge it). Trigger-shaped input for ADR 100 (--event-key alert) (ADR 094/097/098/099/100).",  # noqa: E501
+        "diagnose → DECISION(confidence) → {TOOL remediate → verify → DECISION(resolved) → notify | [HUMAN escalate routes ack] → notify}",  # noqa: E501
+    ),
+    "cross-system-action": (
+        "pattern_cross_system_action",
+        True,
+        "Coordinated multi-system action with an audit trail (runtime: temporal). A descriptive plan agent feeds FOUR deterministic TOOL nodes in a FIXED order — CRM (salesforce) → ERP (sap) → ticket (servicenow) → email — each recording its own auditable ledger row; the order guarantee is structural (a strict sequential chain, one activity at a time), and an audit-summary agent writes the one record naming all four references (ADR 097).",  # noqa: E501
+        "plan → TOOL crm-update → TOOL erp-update → TOOL create-ticket → TOOL send-email → audit-summary",  # noqa: E501
+    ),
+    "executive-briefing": (
+        "pattern_executive_briefing",
+        True,
+        "Scheduled multi-source executive digest (runtime: temporal), CRON-BORN per ADR 100 (mdk schedule set --cron). A SEQUENTIAL chain of two TOOL nodes (entrypoint fan-out is not available for TOOL nodes) runs the workflow-local sim-gather-metrics / sim-gather-incidents python skills (auditable gather ledger rows, no network IO); the ONE composing digest agent writes the briefing strictly from the gathered results and emits a risk_count a DECISION node routes — risky briefings escalate via flag, clean ones file via archive (ADR 094/097/100).",  # noqa: E501
+        "TOOL gather-metrics → TOOL gather-incidents → digest → DECISION(risk_count) → {flag | archive}",  # noqa: E501
+    ),
+    "ops-center": (
+        "pattern_ops_center",
+        True,
+        "AI ops-center daily summary over the unified observability reporting surface (runtime: temporal, ADR 096). A fetch-facts TOOL node returns canned observability_facts-shaped rows (echoing the real GET /api/v1/observability/facts endpoint it would query — never network IO); the ONE summarize agent counts totals/failures/top risks strictly from the rows; a DECISION node pages a HUMAN gate on failure_count > 0 (ack → report, fallback report — fail-open: a page can delay the daily report, never kill it), clean windows report directly (ADR 094/096/097/098/099).",  # noqa: E501
+        "TOOL fetch-facts → summarize → DECISION(failure_count) → {[HUMAN page ack] → report | report}",  # noqa: E501
+    ),
     "rag-debug": (
         "pattern_rag_debug",
         True,

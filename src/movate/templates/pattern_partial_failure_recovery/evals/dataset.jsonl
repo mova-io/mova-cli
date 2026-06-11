@@ -1,0 +1,2 @@
+{"input": {"request": "nightly-batch", "fail_times": 0}, "expected": {"summary": "All three pipeline steps completed on the first attempt."}}
+{"input": {"request": "invoice-export", "fail_times": 1}, "expected": {"summary": "All three steps completed; step 2 succeeded on attempt 2 after an automatic retry."}}

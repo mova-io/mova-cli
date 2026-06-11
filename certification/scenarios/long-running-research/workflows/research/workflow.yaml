@@ -1,0 +1,52 @@
+api_version: movate/v1
+kind: Workflow
+name: long-running-research
+version: 0.1.0
+description: >
+  Scheduled incremental research, durable on Temporal — scenario #5 of the
+  30-use-case certification program and the certification dogfood of ADR 100
+  D1 cron schedules. The LONG-RUNNING shape is deliberately inverted: instead
+  of one workflow that sleeps for days, each scheduled fire runs ONE
+  INCREMENT of the research (input {topic, increment}) — the cron schedule
+  (`mdk schedule set long-running-research -k workflow --cron ...`) is the
+  durable outer loop, the workflow is the idempotent body. The `research`
+  agent drafts this increment's {findings, summary}; the
+  `sim-append-findings` TOOL node (ADR 097) appends the one auditable
+  `{system: research, action: append}` row (payload carries the increment) to
+  the shared sim side-effect ledger — the accumulating research log; then a
+  deterministic `decision` node (ADR 094) routes `increment gte 3` into the
+  `final-report` agent (the wrap-up increment) and every earlier increment to
+  a light `ack` agent. The skill name resolves through the scenario's
+  project registry (project.yaml marker -> skills/sim-append-findings/).
+  Mirrors workflows/long-running-research.
+state_schema: ../../state.json
+entrypoint: research
+nodes:
+  # This increment's research draft — the only unconditional LLM call.
+  - {id: research, type: agent, ref: ../../agents/research}
+  # The accumulating side effect (ADR 097): one append row per increment,
+  # payload carries {topic, increment} so the ledger reads as the research
+  # log a scheduler-driven series builds up run by run.
+  - id: append
+    type: tool
+    skill: sim-append-findings
+  # Deterministic finality routing (ADR 094): the third increment (and any
+  # later catch-up fire) produces the final report; earlier increments just
+  # acknowledge — no LLM in the control path.
+  - id: finality-check
+    type: decision
+    cases:
+      - when: {field: increment, op: gte, value: 3}
+        to: final-report
+    default: ack
+  - {id: final-report, type: agent, ref: ../../agents/final-report}
+  - {id: ack, type: agent, ref: ../../agents/ack}
+edges:
+  - {from: research, to: append}
+  - {from: append, to: finality-check}
+tags:
+  - temporal
+  - decision
+  - tool
+  - schedules
+  - certification

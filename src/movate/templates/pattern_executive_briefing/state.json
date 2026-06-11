@@ -1,0 +1,6 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "period":{"type":"string"},"profile":{"type":"string"},
+  "metrics":{"type":"object"},"incidents":{"type":"array"},
+  "headline":{"type":"string"},"sections":{"type":"array"},
+  "risk_flags":{"type":"array"},"risk_count":{"type":"integer"},
+  "escalation":{"type":"string"},"archive_note":{"type":"string"}}}

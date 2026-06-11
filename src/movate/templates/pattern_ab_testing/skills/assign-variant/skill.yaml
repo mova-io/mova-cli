@@ -1,0 +1,32 @@
+api_version: movate/v1
+kind: Skill
+
+name: assign-variant
+version: 0.1.0
+description: >-
+  Deterministic A/B traffic split: assigns variant "a" when the
+  SHA-256 of the user_id is even, "b" when odd — NO randomness, NO
+  salted builtin hash(), so the same user always lands on the same
+  variant on every worker and every replay. Records one auditable
+  `{system: ab, action: assign}` row (user_id + variant) to the shared
+  sim_side_effects ledger. SELF-CONTAINED for the deployed
+  temporal-worker image (ADR 097 D2): the implementation lives in
+  impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "assign-variant.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - ab-testing
+  - simulation
+  - certification

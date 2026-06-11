@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"window":{"type":"string"},"facts":{"type":"array"},"facts_source":{"type":"string"}}}

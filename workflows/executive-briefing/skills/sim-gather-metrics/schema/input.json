@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"period":{"type":"string"},"profile":{"type":"string","enum":["steady","degraded"]},"run_id":{"type":"string"}}}

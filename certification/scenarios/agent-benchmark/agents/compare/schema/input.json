@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["task","response_a","response_b"],"properties":{"task":{"type":"string"},"response_a":{"type":"string"},"response_b":{"type":"string"}}}

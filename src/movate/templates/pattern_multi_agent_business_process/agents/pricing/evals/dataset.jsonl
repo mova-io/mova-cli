@@ -1,0 +1,1 @@
+{"input":{"request":"Prepare a proposal for Acme Logistics: 120 Atlas Enterprise seats, US-hosted, standard commercial terms."},"expected":{"pricing_quote":"[pricing] 120 seats at $30/user/month = $43,200/year list; $36,720/year after the 15% annual discount. Onboarding fee waived at 100+ seats."}}

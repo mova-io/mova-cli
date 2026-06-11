@@ -1,0 +1,60 @@
+api_version: movate/v1
+kind: Workflow
+name: partial-failure-recovery
+version: 0.1.0
+description: >
+  Partial-failure recovery in a multi-step pipeline, durable on Temporal —
+  scenario #15 of the 30-use-case certification program. Three sequential
+  TOOL nodes (ADR 097) form the pipeline; the middle one is FLAKY by design.
+  `step-one` and `step-three` call the shared workflow-local `sim-step`
+  python skill (parameterized via the ADR 097 D1 `input:` literal map; their
+  outputs are namespaced with `output_key` so the deltas never collide),
+  each recording exactly one `{system: pipeline, action: step1|step3}` row
+  to the shared sim side-effect ledger. `step-two` calls `sim-step-flaky`:
+  every invocation appends one `{system: pipeline, action: step2_attempt}`
+  row, RAISES while its own per-run attempt count is <= the input's
+  `fail_times`, and records the one `{system: pipeline, action: step2}` row
+  ONLY on the invocation that succeeds. THE PROOF: with `fail_times: 1` the
+  ledger shows step1 exactly ONCE, step2_attempt TWICE, step2 and step3 once
+  — Temporal replayed only the FAILED activity under the compiled
+  `_RETRY_POLICY` (maximum_attempts=3, ADR 054 D9); the completed step-one
+  activity's result came back from history and was never re-executed.
+  The skill names resolve through the scenario's project registry
+  (project.yaml marker -> skills/sim-step/, skills/sim-step-flaky/).
+  Mirrors workflows/partial-failure-recovery.
+state_schema: ../../state.json
+entrypoint: step-one
+nodes:
+  # Step 1 — completes on the first attempt and must NEVER re-execute when
+  # step 2 fails: its single ledger row is the recovery proof's first half.
+  - id: step-one
+    type: tool
+    skill: sim-step
+    input:
+      step: {literal: step1}
+      request: request
+    output_key: step1
+  # Step 2 — the flaky middle: attempt rows = activity attempts (Temporal
+  # retries THIS activity only); the step2 row lands once, on the success.
+  - id: step-two
+    type: tool
+    skill: sim-step-flaky
+    output_key: step2
+  # Step 3 — runs only after step 2 finally succeeds; exactly one row.
+  - id: step-three
+    type: tool
+    skill: sim-step
+    input:
+      step: {literal: step3}
+      request: request
+    output_key: step3
+  - {id: notify, type: agent, ref: ../../agents/notify}
+edges:
+  - {from: step-one, to: step-two}
+  - {from: step-two, to: step-three}
+  - {from: step-three, to: notify}
+tags:
+  - temporal
+  - tool
+  - retries
+  - certification

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["user_id"],"properties":{"user_id":{"type":"string"},"run_id":{"type":"string"}}}

@@ -8,8 +8,8 @@ Source: {{ input.source }}
 PII found: {{ input.pii_found }}
 PII values masked: {{ input.pii_count }}
 Redacted text: {{ input.redacted_text }}
-Quarantine result (only set when PII was found): {{ input.dlp_result }}
-Clean-store result (only set when no PII was found): {{ input.store_result }}
+{% if input.dlp_result is defined %}Quarantine result (only set when PII was found): {{ input.dlp_result }}{% endif %}
+{% if input.store_result is defined %}Clean-store result (only set when no PII was found): {{ input.store_result }}{% endif %}
 
 Return a JSON object with exactly one key:
 - `summary`: one or two sentences stating the disposition — quarantined with

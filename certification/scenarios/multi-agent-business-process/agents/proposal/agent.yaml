@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: proposal
+version: 0.1.0
+description: >-
+  Composes the final proposal deliverable from the three specialists'
+  findings — the account context, the pricing quote, and the compliance
+  conditions.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

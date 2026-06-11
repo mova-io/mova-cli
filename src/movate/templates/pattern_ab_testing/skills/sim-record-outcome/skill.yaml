@@ -1,0 +1,31 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-record-outcome
+version: 0.1.0
+description: >-
+  Record one A/B experiment outcome (which variant served the request)
+  as an auditable `{system: ab, action: record_outcome}` row in the
+  shared sim_side_effects ledger and return a one-line confirmation.
+  The certification suite asserts the row exists exactly once per run,
+  alongside the matching assign row. SELF-CONTAINED for the deployed
+  temporal-worker image (ADR 097 D2): the implementation lives in
+  impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-record-outcome.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - ab-testing
+  - simulation
+  - certification

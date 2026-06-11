@@ -1,0 +1,16 @@
+api_version: movate/v1
+kind: Agent
+name: verify
+version: 0.1.0
+description: >-
+  Verifies the remediation outcome: reads the ops system's deterministic
+  remediation_status and reports `resolved` accordingly — the boolean the
+  workflow's deterministic decision node routes on (true → notify, false →
+  human escalation). The verifier may never claim resolution the ops system
+  did not report.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

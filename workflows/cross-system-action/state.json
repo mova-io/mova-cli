@@ -1,0 +1,5 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "action_request":{"type":"string"},"steps":{"type":"string"},
+  "crm_result":{"type":"string"},"erp_result":{"type":"string"},
+  "ticket_result":{"type":"string"},"email_result":{"type":"string"},
+  "summary":{"type":"string"}}}

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["daily_report"],"properties":{"daily_report":{"type":"string"}}}

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["remediation_status","remediation_result"],"properties":{"remediation_status":{"type":"string","enum":["applied","failed"]},"remediation_result":{"type":"string"}}}

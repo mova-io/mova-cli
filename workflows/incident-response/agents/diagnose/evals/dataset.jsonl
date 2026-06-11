@@ -1,0 +1,1 @@
+{"input":{"alert":{"service":"x","severity":"high","message":"connection pool exhausted"}},"expected":{"root_cause":"x","confidence":0.9,"remediation":"x"}}

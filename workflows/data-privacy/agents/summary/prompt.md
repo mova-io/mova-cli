@@ -8,8 +8,8 @@ token and do not repeat any personal identifier.
 Classification: {{ input.classification }}
 Classification rationale: {{ input.rationale }}
 Requested by: {{ input.requester }}
-Audit-store result: {{ input.audit_result }}
-PII values masked (only set on the regulated path): {{ input.pii_count }}
+{% if input.audit_result is defined %}Audit-store result: {{ input.audit_result }}{% endif %}
+{% if input.pii_count is defined %}PII values masked (only set on the regulated path): {{ input.pii_count }}{% endif %}
 
 Return a JSON object with exactly one key:
 - `summary`: one or two sentences for the requester stating the

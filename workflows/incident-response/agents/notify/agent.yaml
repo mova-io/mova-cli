@@ -1,0 +1,16 @@
+api_version: movate/v1
+kind: Agent
+name: notify
+version: 0.1.0
+description: >-
+  Writes the incident closure note. Reached from THREE exclusive paths
+  (auto-remediated, low-confidence escalation acknowledged, remediation-failed
+  escalation acknowledged), so the remediation/verification/acknowledgement
+  keys are conditionally present — the prompt defaults each one explicitly
+  rather than assuming a path.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

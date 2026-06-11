@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["score_result"],"properties":{"score_result":{"type":"string"}}}
