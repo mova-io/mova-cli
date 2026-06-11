@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["facts","facts_source"],"properties":{"facts":{"type":"array","items":{"type":"object"}},"facts_source":{"type":"string"}}}

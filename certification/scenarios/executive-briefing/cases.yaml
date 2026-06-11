@@ -1,0 +1,83 @@
+# Certification cases — executive-briefing (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `executive-briefing`
+# workflow (workflows/executive-briefing — 6 nodes: a SEQUENTIAL chain of two
+# gather TOOL nodes calling the workflow-local `sim-gather-metrics` /
+# `sim-gather-incidents` python skills, the ONE composing `digest` agent, a
+# deterministic `decision` node on the digest's `risk_count`, and the
+# flag/archive terminal tails). The workflow is CRON-BORN in production
+# (ADR 100 D1 — see workflows/executive-briefing/README.md for the exact
+# `mdk schedule set --cron` binding); the suite drives the SAME definition via
+# POST /run, which is the point: a schedule tick enqueues the identical
+# JobRecord. The `profile` knob keys the skills' canned data so each route is
+# reached deterministically: `degraded` breaches the digest's risk rules
+# (success-rate floor + cost budget + two open incidents), `steady` trips
+# none of them.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state; the fact builder surfaces `route` only from a
+#   `tier`/`route` state key, so the fact's route is None here. We assert
+#   that explicitly and prove the branch via `final_state` markers instead:
+#   the risky path merges the flag agent's `escalation`, the clean path the
+#   archive agent's `archive_note` — each case asserts its own marker AND
+#   the absence of the other path's.
+# * `status: success` for BOTH cases — escalation is a route, not a workflow
+#   error.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096); the driver
+#   records the capability as SKIP with that note.
+# * side-effects — POSITIVE ledger rows on BOTH paths: the sequential gather
+#   chain runs unconditionally before the digest, so every run must record
+#   exactly one `{system: metrics, action: gather}` AND one
+#   `{system: incidents, action: gather}` row via the self-contained skills
+#   (impl.py baked into the worker image inside
+#   workflows/executive-briefing/skills/). Evaluated only when the shared DB
+#   is reachable (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * `governance: allow` everywhere — the baked catalog policy (mirrored by
+#   workflows/executive-briefing/policy.yaml) registers MODEL + COST gates on
+#   every agent run, so the terminal fact's `governance_effect` must be
+#   NON-NULL and `allow`.
+# * no `hitl` anywhere — the workflow has no HUMAN gate; a pause would starve
+#   the terminal-fact poll and fail the case.
+
+scenario: executive-briefing
+target: executive-briefing # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- degraded profile: the canned metrics breach the success-rate floor
+  # --- (0.91 < 0.95) AND the cost budget ($71.25 > $60.00), and two canned
+  # --- incidents are open — the digest must count risk flags > 0, so the
+  # --- risk-gate routes to the flag agent (escalation in state, no archive
+  # --- note).
+  - name: degraded-period-escalated
+    input:
+      period: daily
+      profile: degraded
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [metrics, incidents, headline, risk_count, escalation]
+      final_state_lacks: [archive_note]
+      side_effects:
+        - { system: metrics, action: gather, times: 1 }
+        - { system: incidents, action: gather, times: 1 }
+
+  # --- steady profile: the canned metrics sit inside every bound and the
+  # --- incident list is EMPTY — the digest must count ZERO risk flags, so
+  # --- the risk-gate's default files the briefing via the archive agent.
+  - name: steady-period-archived
+    input:
+      period: daily
+      profile: steady
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [metrics, incidents, headline, risk_count, archive_note]
+      final_state_lacks: [escalation]
+      side_effects:
+        - { system: metrics, action: gather, times: 1 }
+        - { system: incidents, action: gather, times: 1 }

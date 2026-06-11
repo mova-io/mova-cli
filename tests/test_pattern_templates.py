@@ -49,6 +49,8 @@ ALL_PATTERNS = [
     "pii-detection",
     "data-privacy",
     "content-publishing",
+    "executive-briefing",
+    "ops-center",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

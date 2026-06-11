@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["headline","sections","risk_flags","risk_count"],"properties":{"headline":{"type":"string"},"sections":{"type":"array","items":{"type":"object"}},"risk_flags":{"type":"array","items":{"type":"string"}},"risk_count":{"type":"integer"}}}
