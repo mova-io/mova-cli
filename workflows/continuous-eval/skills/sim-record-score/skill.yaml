@@ -1,0 +1,31 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-record-score
+version: 0.1.0
+description: >-
+  Record one healthy sampled quality score as an auditable
+  `{system: eval, action: record_score}` row in the shared
+  sim_side_effects ledger and return a one-line confirmation. The
+  certification suite asserts this row exists exactly once on the
+  healthy path and NEVER on a regression sample. SELF-CONTAINED for
+  the deployed temporal-worker image (ADR 097 D2): the implementation
+  lives in impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-record-score.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - eval
+  - simulation
+  - certification

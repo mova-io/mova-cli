@@ -1,0 +1,2 @@
+{"input": {"candidate": "support-triage", "version": "2026.6.10.3", "fixture": "passing"}, "expected": {"summary": "Passed its eval (0.93) and was promoted in the model registry after human approval, with a promotion reference."}}
+{"input": {"candidate": "support-triage", "version": "2026.6.10.4", "fixture": "failing"}, "expected": {"summary": "Not promoted: the eval scored 0.41 against the 0.85 threshold; the eval report details the regression."}}

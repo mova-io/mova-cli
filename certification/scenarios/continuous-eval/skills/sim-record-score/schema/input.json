@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["score"],"properties":{"score":{"type":"number"},"run_id":{"type":"string"}}}

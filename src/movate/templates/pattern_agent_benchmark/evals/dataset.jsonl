@@ -1,0 +1,2 @@
+{"input": {"task": "Summarize in EXACTLY one sentence of at most 20 words: the team shipped dark mode, faster exports, and a redesigned sharing flow."}, "expected": {"summary": "Names one winner (a or b) with a comparative rationale and confirms the verdict was recorded with a benchmark reference."}}
+{"input": {"task": "Write a short, friendly product tagline for a reusable coffee cup aimed at commuters."}, "expected": {"summary": "Names one winner (a or b) with a comparative rationale and confirms the verdict was recorded with a benchmark reference."}}

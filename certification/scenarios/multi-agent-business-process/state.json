@@ -1,0 +1,5 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "request":{"type":"string"},"next":{"type":"string"},
+  "research_findings":{"type":"string"},"pricing_quote":{"type":"string"},
+  "compliance_assessment":{"type":"string"},
+  "proposal":{"type":"string"},"summary":{"type":"string"}}}

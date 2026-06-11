@@ -453,6 +453,31 @@ class RuntimeApiClient:
             transport=transport,
         )
 
+    # The deployed API rate-limits the polling endpoints (HTTP 429) when the
+    # suite drives many scenarios concurrently against one ingress. A 429 is
+    # back-pressure, not a verdict — retry with backoff (honouring Retry-After)
+    # instead of failing the capability row.
+    _RATE_LIMIT_RETRIES = 5
+    _HTTP_TOO_MANY_REQUESTS = 429
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        for attempt in range(self._RATE_LIMIT_RETRIES + 1):
+            resp = self._http.request(method, url, **kwargs)
+            if (
+                resp.status_code != self._HTTP_TOO_MANY_REQUESTS
+                or attempt == self._RATE_LIMIT_RETRIES
+            ):
+                return resp
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                # An explicit Retry-After (even 0) is authoritative; only an
+                # absent/garbled header falls back to linear backoff.
+                delay = float(retry_after) if retry_after is not None else 2.0 * (attempt + 1)
+            except ValueError:
+                delay = 2.0 * (attempt + 1)
+            time.sleep(delay)
+        return resp  # pragma: no cover — loop always returns
+
     def close(self) -> None:
         self._http.close()
 
@@ -464,28 +489,30 @@ class RuntimeApiClient:
 
     def submit_workflow(self, target: str, input_state: dict[str, Any]) -> str:
         """``POST /run`` → the queued job id."""
-        resp = self._http.post(
-            "/run", json={"kind": "workflow", "target": target, "input": input_state}
+        resp = self._request(
+            "POST", "/run", json={"kind": "workflow", "target": target, "input": input_state}
         )
         resp.raise_for_status()
         return str(resp.json()["job_id"])
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         """``GET /jobs/{id}`` → the job view."""
-        resp = self._http.get(f"/jobs/{job_id}")
+        resp = self._request("GET", f"/jobs/{job_id}")
         resp.raise_for_status()
         return dict(resp.json())
 
     def list_paused_runs(self) -> list[dict[str, Any]]:
         """``GET /api/v1/workflow-runs?status=paused`` — the HITL queue."""
-        resp = self._http.get("/api/v1/workflow-runs", params={"status": "paused", "limit": 100})
+        resp = self._request(
+            "GET", "/api/v1/workflow-runs", params={"status": "paused", "limit": 100}
+        )
         resp.raise_for_status()
         return list(resp.json().get("workflow_runs", []))
 
     def find_workflow_run(self, workflow_run_id: str) -> dict[str, Any] | None:
         """Locate one run via the LIST endpoint (the single-run GET 404s on
         the deployed runtime, so it is deliberately not used)."""
-        resp = self._http.get("/api/v1/workflow-runs", params={"limit": 100})
+        resp = self._request("GET", "/api/v1/workflow-runs", params={"limit": 100})
         resp.raise_for_status()
         for row in resp.json().get("workflow_runs", []):
             if row.get("workflow_run_id") == workflow_run_id:
@@ -494,8 +521,8 @@ class RuntimeApiClient:
 
     def signal(self, workflow_run_id: str, decision: dict[str, Any]) -> dict[str, Any]:
         """``POST /api/v1/workflow-runs/{id}/signal`` — resume a paused run."""
-        resp = self._http.post(
-            f"/api/v1/workflow-runs/{workflow_run_id}/signal", json={"decision": decision}
+        resp = self._request(
+            "POST", f"/api/v1/workflow-runs/{workflow_run_id}/signal", json={"decision": decision}
         )
         resp.raise_for_status()
         return dict(resp.json())
@@ -505,7 +532,7 @@ class RuntimeApiClient:
         params: dict[str, Any] = {"kind": "workflow_run", "limit": 200}
         if workflow:
             params["workflow"] = workflow
-        resp = self._http.get("/api/v1/observability/facts", params=params)
+        resp = self._request("GET", "/api/v1/observability/facts", params=params)
         resp.raise_for_status()
         return list(resp.json().get("facts", []))
 
@@ -598,7 +625,18 @@ class SuiteDriver:
     # ------------------------------------------------------------- case phases
 
     def _launch(self, spec: ScenarioSpec, case: CaseSpec) -> str:
-        """Submit the case; poll the job to terminal; return the workflow_run_id."""
+        """Submit the case; poll the job to terminal; return the workflow_run_id.
+
+        A case with ``expect.status: error`` (B4 — e.g. retry exhaustion on
+        the external-api-failure scenario) legitimately ends its job segment
+        as ``error``: the workflow STARTED, failed durably, and persisted a
+        terminal ERROR record (its workflow_run_id rides ``result_run_id``
+        either way). Such a job is accepted here and the terminal-fact poll
+        still asserts the expected ``error`` status/type. ``success`` stays
+        accepted too (a detached/HITL segment can end ``success`` while the
+        fact later reads ``error``). Every other case keeps the strict
+        ``success``-only contract — byte-identical behavior.
+        """
         # Provenance marker, stamped at SUBMIT time (cases.yaml stays clean):
         # the key rides the workflow input into initial_state — the state
         # schemas are additionalProperties:true and agent/skill activities
@@ -616,7 +654,8 @@ class SuiteDriver:
             f"job {job_id} to reach a terminal status",
         )
         status = str(job.get("status"))
-        assert status == "success", (
+        allowed = {"success", "error"} if case.expect.status == "error" else {"success"}
+        assert status in allowed, (
             f"job {job_id} ended {status!r} (error={job.get('error')}) — "
             "the workflow never started or its first segment failed"
         )

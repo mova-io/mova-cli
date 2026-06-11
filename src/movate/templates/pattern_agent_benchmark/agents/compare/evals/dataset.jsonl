@@ -1,0 +1,1 @@
+{"input":{"task":"Summarize in ONE sentence: the team shipped dark mode.","response_a":"The team shipped dark mode.","response_b":"Dark mode! It is here. Everyone is excited about it."},"expected":{"winner":"a","rationale":"x","score_a":0.9,"score_b":0.5}}

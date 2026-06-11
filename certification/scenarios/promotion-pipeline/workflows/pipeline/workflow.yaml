@@ -1,0 +1,83 @@
+api_version: movate/v1
+kind: Workflow
+name: promotion-pipeline
+version: 0.1.0
+description: >
+  Staged promotion gates in ONE workflow — scenario #22 of the
+  30-use-case certification program (B6 eval/lifecycle batch). A
+  deterministic `decision` node (ADR 094) routes the CI-named `stage` —
+  test / staging / production, unknown values fail safe to rejected — onto
+  three stage-routed paths (deliberately NOT a loop: each run executes one
+  stage, the CI system advances the stage between runs). TEST runs the
+  `sim-run-tests` TOOL (ADR 097 — one `{system: pipeline, action:
+  stage_test}` ledger row, no human). STAGING records eval evidence FIRST
+  (`sim-stage-eval`, one `{system: eval, action: stage_eval}` row) and
+  THEN pauses at the `staging-signoff` HUMAN gate that routes its own
+  structured decision (ADR 099 — evidence before judgment). PRODUCTION
+  inverts the order: the `prod-approval` HUMAN gate comes FIRST and the
+  `sim-deploy` TOOL's `{system: pipeline, action: promote_prod}` row is
+  reachable ONLY through its approve route — the graph, not a convention,
+  keeps unapproved changes out of production. All stage successes converge
+  on ONE notify agent and every reject on ONE rejected agent (ADR 098).
+  The skill names resolve through the scenario's project registry
+  (project.yaml marker → skills/). Mirrors workflows/promotion-pipeline.
+state_schema: ../../state.json
+entrypoint: stage-gate
+nodes:
+  # Deterministic stage routing (ADR 094): ONE workflow, three stage-routed
+  # paths (not a loop) — the CI system names the stage, the router is pure,
+  # and an unknown stage can only fail safe to rejected.
+  - id: stage-gate
+    type: decision
+    cases:
+      - when: {field: stage, op: eq, value: test}
+        to: run-tests
+      - when: {field: stage, op: eq, value: staging}
+        to: stage-eval
+      - when: {field: stage, op: eq, value: production}
+        to: prod-approval
+    default: rejected
+  # --- test stage: the cheap automatic gate — one auditable stage_test
+  # --- ledger row (ADR 097), no human involved.
+  - id: run-tests
+    type: tool
+    skill: sim-run-tests
+  # --- staging stage: eval evidence FIRST (the stage_eval ledger row),
+  # --- THEN a human signs off reading it (ADR 099) — evidence before
+  # --- judgment, and silence/prose can only fail safe.
+  - id: stage-eval
+    type: tool
+    skill: sim-stage-eval
+  - id: staging-signoff
+    type: human
+    prompt: >
+      The staging eval completed (see stage_eval_result). Sign off this
+      change at staging? Respond with `decision` set to exactly "approve"
+      or "reject" — any other wording is treated as reject.
+    output_contract: [decision]
+    routes: {approve: notify, reject: rejected}
+    fallback: rejected
+  # --- production stage: the human gate comes FIRST — nothing touches
+  # --- production without the approve signal; the promote_prod ledger row
+  # --- is reachable ONLY through it.
+  - id: prod-approval
+    type: human
+    prompt: >
+      Promote this change to PRODUCTION? Respond with `decision` set to
+      exactly "approve" or "reject" — any other wording is treated as
+      reject.
+    output_contract: [decision]
+    routes: {approve: deploy, reject: rejected}
+    fallback: rejected
+  - id: deploy
+    type: tool
+    skill: sim-deploy
+  # --- shared tail (ADR 098): all three stage successes converge on ONE
+  # --- notify agent; every reject (human veto or unknown stage) lands on
+  # --- ONE rejected agent.
+  - {id: notify, type: agent, ref: ../../agents/notify}
+  - {id: rejected, type: agent, ref: ../../agents/rejected}
+edges:
+  - {from: run-tests, to: notify}
+  - {from: stage-eval, to: staging-signoff}
+  - {from: deploy, to: notify}

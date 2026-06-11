@@ -1,0 +1,1 @@
+{"input":{"question":"How many cloud regions is Atlas deployed in?","scope":"Establish the region count."},"expected":{"web_findings":"[web] The press release states Atlas is generally available in 3 cloud regions (US, EU, APAC)."}}

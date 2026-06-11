@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["scope"],"properties":{"scope":{"type":"string"}}}

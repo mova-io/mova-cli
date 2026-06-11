@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: compare
+version: 0.1.0
+description: >-
+  Benchmark judge: scores BOTH candidate responses against the task
+  (0-1 each) and picks the winner. The winner vocabulary is
+  enum-pinned (a|b); both per-candidate scores are REQUIRED output
+  keys, so the judge must engage with both responses.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

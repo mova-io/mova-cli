@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"score":{"type":"number"},"issues":{"type":"string"},"alert_result":{"type":"string"}}}

@@ -1,0 +1,1 @@
+{"input":{"question":"How many cloud regions is Atlas deployed in?","web_findings":"[web] 3 regions (US, EU, APAC).","kb_findings":"[kb] KB-0871: 3 regions.","data_findings":"[data] 3 regions observed."},"expected":{"conclusion":"All three sources agree: Atlas is deployed in 3 regions.","confidence":0.95}}

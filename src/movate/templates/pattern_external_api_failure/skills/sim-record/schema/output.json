@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["record_result"],"properties":{"record_result":{"type":"string"}}}

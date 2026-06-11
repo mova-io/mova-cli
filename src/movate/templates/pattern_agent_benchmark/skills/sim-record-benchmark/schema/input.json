@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["winner","score_a","score_b"],"properties":{"task":{"type":"string"},"winner":{"type":"string","enum":["a","b"]},"score_a":{"type":"number"},"score_b":{"type":"number"},"run_id":{"type":"string"}}}

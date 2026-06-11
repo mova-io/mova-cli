@@ -1,0 +1,2 @@
+{"input":{"request":"Prepare a proposal for 120 Atlas Enterprise seats."},"expected":{"next":"research"}}
+{"input":{"request":"Prepare a proposal for 120 Atlas Enterprise seats.","research_findings":"[research] 120 seats, standard terms.","pricing_quote":"[pricing] $36,720/yr.","compliance_assessment":"[compliance] No blockers."},"expected":{"next":"done"}}

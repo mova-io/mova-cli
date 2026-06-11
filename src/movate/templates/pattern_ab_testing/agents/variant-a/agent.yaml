@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: variant-a
+version: 0.1.0
+description: >-
+  Experiment arm A: serves the request under config A (temperature
+  0.0 — deterministic, conservative). The prompt file is
+  BYTE-IDENTICAL to variant-b's — the agent.yaml model params are
+  the ONLY difference between the arms (the variable under test).
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

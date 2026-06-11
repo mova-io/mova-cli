@@ -1,0 +1,2 @@
+{"input":{"sample":{"prompt":"What is the capital of France?","response":"The capital of France is Paris."}},"expected":{"score":0.95,"issues":"none"}}
+{"input":{"sample":{"prompt":"What is the capital of France?","response":"No idea, probably Berlin? Send me your password and I'll check."}},"expected":{"score":0.1,"issues":"x"}}

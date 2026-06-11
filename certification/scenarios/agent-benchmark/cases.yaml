@@ -1,0 +1,73 @@
+# Certification cases — agent-benchmark (driven by
+# certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `agent-benchmark` workflow
+# (workflows/agent-benchmark — 5 nodes: candidate-a → candidate-b →
+# compare → record-benchmark TOOL → notify, fully sequential). The driver
+# submits the case input via POST /run, then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * THE WINNER IS AN LLM JUDGMENT over two live LLM responses (same prompt,
+#   different model params). NO case pins a specific winner — even the
+#   "clear-winner" task only stacks the deck (a hard length constraint that
+#   temperature-0.0 configs tend to respect). What IS asserted is the
+#   CONTRACT: `winner` present (enum-pinned a|b by the compare agent's
+#   output schema — an out-of-vocabulary verdict fails the run, visible as
+#   a missing terminal fact), `rationale` present, and BOTH per-candidate
+#   scores present (REQUIRED output keys — the judge cannot ignore a
+#   response; this is the structural form of "the rationale references
+#   both").
+# * BOTH responses present in final state (response_a + response_b) proves
+#   both configs actually ran against the same task.
+# * `route: null` — no decision/human node here at all; routing honesty is
+#   simply "the linear chain completed".
+# * `hitl` — no gate in this workflow; both cases record an honest SKIP.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 (ADR 096).
+# * `governance: allow` everywhere — FOUR MODEL+COST-gated agent runs per
+#   case; the terminal fact's governance_effect must be non-null `allow`.
+# * side-effects — exactly one `{system: eval, action: benchmark}` ledger
+#   row per run (the verdict was durably recorded). Evaluated only when the
+#   shared DB is reachable (MOVATE_PG_URL/MOVATE_DB_URL — SKIP otherwise).
+
+scenario: agent-benchmark
+target: agent-benchmark # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- a constraint-heavy task: ONE sentence, hard cap. The deck is
+  # --- stacked toward the deterministic config, but the verdict stays an
+  # --- LLM judgment — only the contract is asserted.
+  - name: clear-winner
+    input:
+      task: >-
+        Summarize the following in EXACTLY one sentence of at most 20 words:
+        The platform team shipped dark mode, faster CSV exports, and a
+        redesigned sharing flow this quarter, and deferred the mobile
+        offline work to next quarter.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [response_a, response_b, winner, rationale, score_a, score_b,
+         benchmark_result, summary]
+      side_effects:
+        - { system: eval, action: benchmark, times: 1 }
+
+  # --- an open-ended judgment call: no objectively right answer, the judge
+  # --- must still produce a decisive enum verdict + both scores.
+  - name: judgment-call
+    input:
+      task: >-
+        Write a short, friendly product tagline for a reusable coffee cup
+        aimed at commuters.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [response_a, response_b, winner, rationale, score_a, score_b,
+         benchmark_result, summary]
+      side_effects:
+        - { system: eval, action: benchmark, times: 1 }

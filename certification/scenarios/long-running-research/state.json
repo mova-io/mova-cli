@@ -1,0 +1,5 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "topic":{"type":"string"},"increment":{"type":"number"},
+  "findings":{"type":"string"},"summary":{"type":"string"},
+  "append_result":{"type":"string"},
+  "final_report":{"type":"string"},"ack_note":{"type":"string"}}}

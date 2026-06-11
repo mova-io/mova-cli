@@ -1,0 +1,32 @@
+# LLM-as-judge for the Multi-Agent Investigation workflow. Rename to
+# ``judge.yaml`` to enable.
+#
+# Scores the final ``conclusion`` (+ ``confidence``) against the expected
+# synthesis: a consensus question must state the agreed answer; a
+# conflicting-sources question must EXPLICITLY acknowledge the disagreement,
+# name the conflicting sources, and carry a reduced confidence. Used as the
+# CI eval-gate the pattern's governance leans on — this rubric is where
+# "the conclusion acknowledges the conflict" is actually scored (the
+# certification driver asserts state-key presence only).
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the investigation's final conclusion against the expected synthesis.
+    1.0 = the conclusion states the correct synthesis: on consensus
+          questions the agreed answer (noting the sources are consistent);
+          on conflicting-sources questions it explicitly acknowledges the
+          disagreement, names the differing sources/figures, offers a
+          plausible reconciliation, and the confidence is appropriately
+          low (<= 0.6 on conflict, >= 0.9 on consensus)
+    0.5 = correct answer but the conflict acknowledgment or the confidence
+          calibration is missing/partial
+    0.0 = wrong answer, silently picks one conflicting source, or
+          hallucinates facts beyond the specialists' findings
+
+threshold: 0.7
