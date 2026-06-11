@@ -205,6 +205,31 @@ async def test_execute_on_temporal_threads_memo_and_defaults_to_none() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_execute_on_temporal_strips_state_carried_governance_effect() -> None:
+    """ADR 096 cross-process fix: the reserved governance-effect state key
+    (folded into deltas by the governed activities) is observability plumbing
+    — it must not surface in the job result / CLI final state."""
+    pytest.importorskip("temporalio")
+    from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
+    from movate.runtime.workflow_backend import _execute_on_temporal  # noqa: PLC0415
+
+    client = _ExecutingClient()
+    final, status, error = await _execute_on_temporal(
+        client=client,
+        worker_cls=_NoopWorker,
+        workflow_cls=_FakeWorkflowCls,
+        activities=[],
+        wf_id="run-gov",
+        run_state={"x": 1, RUN_EFFECT_STATE_KEY: "allow"},
+    )
+    assert status == WorkflowStatus.SUCCESS
+    assert error is None
+    assert RUN_EFFECT_STATE_KEY not in final
+    assert final["x"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_dispatch_passes_job_origin_as_memo(monkeypatch: pytest.MonkeyPatch) -> None:
     """`_run_workflow_on_backend` stamps `{"mdk_origin": job.origin}` as the
     memo for schedule:/trigger:-originated jobs, and NO memo (None) for a

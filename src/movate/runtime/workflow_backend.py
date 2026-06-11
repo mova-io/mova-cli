@@ -570,6 +570,13 @@ async def _execute_on_temporal(
             )
 
     final_state = result if isinstance(result, dict) else {"result": result}
+    # The state-carried governance effect (ADR 096 cross-process fix — see
+    # movate.governance.effects.RUN_EFFECT_STATE_KEY) is observability
+    # plumbing, not workflow output: strip it so job results / CLI display
+    # match the native runner's state byte-for-byte.
+    from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
+
+    final_state.pop(RUN_EFFECT_STATE_KEY, None)
     return final_state, WorkflowStatus.SUCCESS, None
 
 

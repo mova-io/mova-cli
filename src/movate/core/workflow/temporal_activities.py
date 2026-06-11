@@ -303,6 +303,31 @@ def _executor_for(ctx: ActivityContext, state: dict[str, Any]) -> Any:
     )
 
 
+def _fold_state_effect(state: dict[str, Any], effect: str | None) -> str | None:
+    """Fold this node's governance ``effect`` into the run's state-carried one.
+
+    ADR 096 cross-process fix: the run-effect registry is process-local, but
+    the shared ``mdk-workflows`` task queue is polled by EVERY worker (the
+    dispatch path's ephemeral in-process worker AND any long-lived
+    ``mdk worker --backend temporal``), so a run's activities are load-balanced
+    across processes — the activity that recorded an effect and the persist
+    activity that stamps the terminal fact routinely land on different workers,
+    and the registry entry is absent where the fact is written (the observed
+    governance_effect=NULL on fast runs). Workflow state rides Temporal
+    history, so an effect folded into the returned state delta under
+    :data:`RUN_EFFECT_STATE_KEY` reaches the persist/pause activities
+    deterministically, regardless of placement.
+
+    Returns the most severe of the effect already carried in ``state`` and
+    this node's ``effect`` — ``None`` when neither exists (callers then add
+    no key, keeping ungoverned runs' state byte-for-byte unchanged).
+    """
+    from movate.governance.effects import RUN_EFFECT_STATE_KEY, most_severe  # noqa: PLC0415
+
+    prior = state.get(RUN_EFFECT_STATE_KEY)
+    return most_severe(prior if isinstance(prior, str) else None, effect)
+
+
 def _project_state(state: dict[str, Any], bundle: Any) -> dict[str, Any]:
     """Filter ``state`` to the keys the agent's input schema names.
 
@@ -381,7 +406,19 @@ async def call_agent_activity(
             f"agent node {node_id!r} ({ref}) failed: "
             f"{response.error.message if response.error else response.status}"
         )
-    return dict(response.data)
+    data = dict(response.data)
+    # ADR 096 cross-process fix (see _fold_state_effect): carry the folded
+    # effect in the returned delta so it rides Temporal history to the
+    # persist/pause activities even when they run on a different worker
+    # process than this one. The registry record above remains the
+    # same-process fast path (and covers nodes whose results don't merge
+    # into state). No gate observed ⇒ no key ⇒ state unchanged.
+    folded = _fold_state_effect(state, gov_scope.effect)
+    if folded is not None:
+        from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
+
+        data[RUN_EFFECT_STATE_KEY] = folded
+    return data
 
 
 @_activity.defn  # type: ignore[untyped-decorator]
@@ -512,7 +549,16 @@ async def call_skill_activity(
                 f"[{exc.type.value}] {exc.message}"
             ) from exc
         ctx.tracer.set_attribute(span, "tool.outcome", "success")
-        return merge_tool_output(dict(output), output_key)
+        delta = merge_tool_output(dict(output), output_key)
+        # ADR 096 cross-process fix (see _fold_state_effect): the SKILL gate's
+        # effect rides the returned state delta to the persist/pause
+        # activities, surviving multi-worker activity placement.
+        folded = _fold_state_effect(state, gov_scope.effect)
+        if folded is not None:
+            from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
+
+            delta[RUN_EFFECT_STATE_KEY] = folded
+        return delta
     finally:
         ctx.tracer.end_span(span)
 
@@ -758,8 +804,12 @@ async def call_human_activity(
     # workflow_runs. Fail-soft + lazy import (the helper logs and never
     # raises; the pause record above is already durable). The governance
     # effect collected so far is PEEKED, not consumed — the run resumes and
-    # the terminal persist still needs the registry entry.
-    from movate.governance.effects import peek_run_effect  # noqa: PLC0415
+    # the terminal persist still needs the registry entry. The state-carried
+    # effect (RUN_EFFECT_STATE_KEY, see _fold_state_effect) is folded in too:
+    # it covers activities that ran on a different worker process, whose
+    # effects this process's registry never saw. It stays in paused_state on
+    # purpose — the resume continues accumulating from it.
+    from movate.governance.effects import most_severe, peek_run_effect  # noqa: PLC0415
     from movate.runtime.facts import (  # noqa: PLC0415
         fact_from_workflow_run,
         write_fact_failsoft,
@@ -767,7 +817,10 @@ async def call_human_activity(
 
     await write_fact_failsoft(
         ctx.storage,
-        fact_from_workflow_run(record, governance_effect=peek_run_effect(run_id)),
+        fact_from_workflow_run(
+            record,
+            governance_effect=most_severe(peek_run_effect(run_id), _fold_state_effect(state, None)),
+        ),
     )
 
     # Escalate to the approval channel (ADR 083) — parity with the native
@@ -819,8 +872,15 @@ async def persist_workflow_result_activity(
         WorkflowRunRecord,
         WorkflowStatus,
     )
+    from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
 
     ctx = _get_context()
+    # ADR 096 cross-process fix: pop the state-carried governance effect (see
+    # _fold_state_effect) BEFORE persisting — it is observability plumbing,
+    # not workflow output, so the durable record's final_state stays clean.
+    clean_final_state = dict(final_state)
+    raw_carried = clean_final_state.pop(RUN_EFFECT_STATE_KEY, None)
+    state_effect = raw_carried if isinstance(raw_carried, str) else None
     record = WorkflowRunRecord(
         workflow_run_id=run_id,
         tenant_id=_resolve_tenant_id(ctx, final_state),
@@ -828,7 +888,7 @@ async def persist_workflow_result_activity(
         workflow_version=workflow_version,
         status=WorkflowStatus(status),
         initial_state=dict(initial_state),
-        final_state=dict(final_state),
+        final_state=clean_final_state,
         error=(
             ErrorInfo(type="temporal_workflow_error", message=error) if error is not None else None
         ),
@@ -840,14 +900,15 @@ async def persist_workflow_result_activity(
     # the same persist edge as the record (the detached-HITL path never
     # returns through the dispatch edge, so dispatch can't cover it). The
     # fact_id upsert overwrites any prior PAUSED fact under the same id.
-    # The run's governance effect (most severe across every activity this
-    # worker process ran for it — ADR 096) is CONSUMED here: the run is
-    # terminal, the registry slot is freed. Best-effort by design: activities
-    # that executed on a different worker process recorded their effect
-    # there; the COALESCE upsert keeps a previously stamped value when this
-    # write carries none. Fail-soft + lazy import: a fact hiccup never fails
-    # the terminal persist.
-    from movate.governance.effects import consume_run_effect  # noqa: PLC0415
+    # The run's governance effect is the most severe of (a) this process's
+    # registry entry (CONSUMED — the run is terminal, the slot is freed) and
+    # (b) the state-carried effect popped above, which rides Temporal history
+    # and therefore survives activities landing on OTHER worker processes —
+    # the cross-process gap that produced terminal facts with a NULL effect
+    # on fast runs. The COALESCE upsert still keeps a previously stamped
+    # value when this write carries none. Fail-soft + lazy import: a fact
+    # hiccup never fails the terminal persist.
+    from movate.governance.effects import consume_run_effect, most_severe  # noqa: PLC0415
     from movate.runtime.facts import (  # noqa: PLC0415
         fact_from_workflow_run,
         write_fact_failsoft,
@@ -855,7 +916,10 @@ async def persist_workflow_result_activity(
 
     await write_fact_failsoft(
         ctx.storage,
-        fact_from_workflow_run(record, governance_effect=consume_run_effect(run_id)),
+        fact_from_workflow_run(
+            record,
+            governance_effect=most_severe(consume_run_effect(run_id), state_effect),
+        ),
     )
 
     # Operational signal (ADR 082): durable workflows never hit the native
