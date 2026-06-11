@@ -3,9 +3,9 @@ content was NOT published. It was stopped by one of: the compliance review,
 the brand review, or the final human approver. Some context fields below may
 be empty depending on where it stopped.
 
-Latest review verdict: {{ input.verdict }}
-Latest review notes: {{ input.notes }}
-Final approver decision (only set if it reached the human gate): {{ input.decision }}
+{% if input.verdict is defined %}Latest review verdict: {{ input.verdict }}{% endif %}
+{% if input.notes is defined %}Latest review notes: {{ input.notes }}{% endif %}
+{% if input.decision is defined %}Final approver decision (only set if it reached the human gate): {{ input.decision }}{% endif %}
 
 How to read the context: if the approver decision says "reject", both reviews
 passed and the human approver declined it; otherwise the latest review notes
