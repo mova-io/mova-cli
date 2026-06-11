@@ -20,11 +20,13 @@
 # * `status: success` for ALL cases, including director-reject — the rejected
 #   branch still terminates at the `rejected` agent successfully; "rejected"
 #   is a route, not a workflow error.
-# * `cost: false` everywhere — workflow_run facts deliberately carry
-#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096), and the
-#   Temporal path does not emit per-node `run` facts yet, so cost is not
-#   assertable for this scenario. The driver records the capability as SKIP
-#   with that note rather than green-washing it.
+# * `cost: true` on the approve paths — the Temporal agent activities emit
+#   per-node `run` facts (runtime=temporal, with the workflow_run_id riding
+#   attributes), and the driver sums their cost_usd — the ADR 096 reader-side
+#   join (workflow_run facts still deliberately carry cost_usd=0). Every
+#   approve path executes LLM agents (post-erp/finalize), so summed spend > 0
+#   is honestly assertable. The reject path also spends (the rejected agent)
+#   but is left unasserted — the approve tail is the canonical cost evidence.
 # * side-effects — the deployed erp-poster agent does not call the sim-erp
 #   skill (it returns an LLM confirmation only), so a POSITIVE erp.submit
 #   expectation would always fail; only the reject case asserts the ledger
@@ -55,6 +57,7 @@ cases:
     expect:
       status: success
       route: null
+      cost: true
       governance: allow
       final_state_has: [erp_result, summary]
 
@@ -69,6 +72,7 @@ cases:
     expect:
       status: success
       route: null
+      cost: true
       governance: allow
       final_state_has: [erp_result, summary]
 
@@ -83,6 +87,7 @@ cases:
     expect:
       status: success
       route: null
+      cost: true
       governance: allow
       final_state_has: [erp_result, summary]
 

@@ -3,10 +3,11 @@
 Pure mapping helpers: each builder flattens one authoritative record
 (:class:`RunRecord` / :class:`WorkflowRunRecord`) into the denormalized
 :class:`ObservabilityFact` row the mova-io platform reads. No I/O here —
-the edge writers (``runtime/dispatch.py``, the Temporal persist/pause
-activities) call :func:`write_fact_failsoft`, which wraps the one storage
-call in the ADR 096 D3 contract: a fact-write failure logs a warning and
-NEVER fails the run.
+the edge writers (``runtime/dispatch.py``; the Temporal persist/pause
+activities for workflow facts and the agent/gate/judge activities for
+per-node run facts) call :func:`write_fact_failsoft`, which wraps the one
+storage call in the ADR 096 D3 contract: a fact-write failure logs a
+warning and NEVER fails the run.
 
 Facts are DERIVED (ADR 096 D4): ``fact_id = "<kind>:<source_id>"`` makes
 every write an idempotent upsert, so re-deriving from the same record
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def fact_from_run_record(
-    record: RunRecord, *, governance_effect: str | None = None
+    record: RunRecord, *, governance_effect: str | None = None, runtime: str = "native"
 ) -> ObservabilityFact:
     """Flatten one agent :class:`RunRecord` into its fact row.
 
@@ -43,6 +44,15 @@ def fact_from_run_record(
     around the run) because ``runs`` stays untouched by design — the effect
     is a facts-only projection, never a column on the authoritative record.
     ``None`` ⇒ no gate evaluated (the column's honest NULL).
+
+    ``runtime`` names the backend that owned the execution: the dispatch
+    edge keeps the ``"native"`` default (byte-for-byte the prior behavior —
+    rule 5, additive keyword); the Temporal activities pass ``"temporal"``.
+
+    A workflow-spawned run (``record.workflow_run_id`` set) surfaces that id
+    in ``attributes["workflow_run_id"]`` so readers can join per-node spend
+    back to the parent ``workflow_run`` fact — the ADR 096 reader-side
+    rollup ("summing is the reader's join"). Standalone runs omit the key.
     """
     metrics = record.metrics
     attributes: dict[str, object] = {
@@ -54,6 +64,8 @@ def fact_from_run_record(
     # one that produced the final answer. Legacy/no-turn records omit it.
     if record.turns:
         attributes["model"] = record.turns[-1].model
+    if record.workflow_run_id:
+        attributes["workflow_run_id"] = record.workflow_run_id
     return ObservabilityFact(
         fact_id=f"run:{record.run_id}",
         kind="run",
@@ -64,7 +76,7 @@ def fact_from_run_record(
         agent=record.agent,
         node_id=record.node_id,
         status=record.status.value,
-        runtime="native",
+        runtime=runtime,
         route=None,
         cost_usd=metrics.cost_usd,
         tokens_in=metrics.tokens.input,
