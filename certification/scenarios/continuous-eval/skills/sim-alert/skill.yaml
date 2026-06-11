@@ -1,0 +1,31 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-alert
+version: 0.1.0
+description: >-
+  Raise a simulated quality alert for a below-floor sampled score:
+  records one auditable `{system: eval, action: quality_alert}` row
+  (score + issues) to the shared sim_side_effects ledger and returns a
+  one-line confirmation. The certification suite asserts this row
+  exists exactly once on the regression path and NEVER on a healthy
+  sample. SELF-CONTAINED for the deployed temporal-worker image
+  (ADR 097 D2): the implementation lives in impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-alert.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - eval
+  - simulation
+  - certification

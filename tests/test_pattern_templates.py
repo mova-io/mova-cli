@@ -49,6 +49,11 @@ ALL_PATTERNS = [
     "pii-detection",
     "data-privacy",
     "content-publishing",
+    "agent-deploy-approval",
+    "agent-benchmark",
+    "continuous-eval",
+    "promotion-pipeline",
+    "ab-testing",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

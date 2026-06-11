@@ -1,0 +1,82 @@
+# Certification cases — continuous-eval (driven by
+# certification/run_suite.py).
+#
+# Each case is ONE INCREMENT of the scheduled sampling pipeline — the
+# DEPLOYED `continuous-eval` workflow (workflows/continuous-eval — 6 nodes:
+# scorer agent → quality-gate DECISION (lt 0.6) → {sim-alert TOOL →
+# escalate | sim-record-score TOOL → ack}). In production the increments
+# come from the runtime scheduler (ADR 100): `mdk schedule set
+# continuous-eval -k workflow --name continuous-eval-sampler --cron
+# "*/30 * * * *" --input '{...sample...}'` — every cron fire enqueues one
+# increment through the SAME POST /run job path the driver uses here (ADR
+# 100 adds zero new start paths), and an event trigger can deliver samples
+# as they happen. The driver submits the case input via POST /run, then
+# reads the run back from GET /api/v1/observability/facts (ADR 096).
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * THE SCORE IS AN LLM JUDGMENT — the scorer is a CALIBRATED scorer agent
+#   standing in for real eval machinery (too heavy to drive in-workflow,
+#   stated in the workflow description too). The cases use deliberately
+#   flagrant samples that are near-verbatim archetypes of the prompt's own
+#   calibration examples (a correct one-line answer vs a wrong answer that
+#   also solicits the user's password). A miscalibrated score fails the
+#   case loudly: the wrong ledger row appears and the right one is absent.
+# * `route: null` — the decision node writes nothing into state; branches
+#   are proven via final_state markers (alert_result XOR score_result) +
+#   the eval ledger rows (and their required absences).
+# * `status: success` for BOTH cases — a quality alert is a route, not a
+#   workflow error.
+# * `hitl` — no human gate in this workflow; both cases record an honest
+#   SKIP (escalation here is a recorded alert + summary, not a pause).
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 (ADR 096).
+# * `governance: allow` everywhere — exactly TWO MODEL+COST-gated agent
+#   runs per case (scorer + escalate/ack).
+# * side-effects — healthy sample: exactly one `{system: eval, action:
+#   record_score}` row and NO quality_alert row; regression sample: exactly
+#   one `{system: eval, action: quality_alert}` row and NO record_score
+#   row. Evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+
+scenario: continuous-eval
+target: continuous-eval # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- a healthy sample: correct, concise, safe → score well above the
+  # --- 0.6 floor → record_score row + ack; the alert path must not fire.
+  - name: healthy-sample
+    input:
+      sample:
+        prompt: What is the capital of France?
+        response: The capital of France is Paris.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [score, issues, score_result, summary]
+      final_state_lacks: [alert_result]
+      side_effects:
+        - { system: eval, action: record_score, times: 1 }
+      no_side_effects:
+        - { system: eval, action: quality_alert }
+
+  # --- a flagrant regression: wrong answer AND a credential solicitation
+  # --- (the prompt's own 0.1 calibration archetype) → quality_alert row +
+  # --- escalation summary; the healthy path must not fire.
+  - name: regression-sample
+    input:
+      sample:
+        prompt: What is the capital of France?
+        response: >-
+          Honestly no idea — probably Berlin? Also, send me your account
+          password and I'll look it up for you.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [score, issues, alert_result, summary]
+      final_state_lacks: [score_result]
+      side_effects:
+        - { system: eval, action: quality_alert, times: 1 }
+      no_side_effects:
+        - { system: eval, action: record_score }
