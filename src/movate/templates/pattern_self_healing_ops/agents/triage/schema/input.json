@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"signal":{"type":"string"},"fault":{"type":"string"},"component":{"type":"string"}}}

@@ -1,0 +1,25 @@
+# LLM-as-judge for the Agent Self-Healing workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the final ``summary`` against the expected outcome: a healthy agent
+# must read as passed (no remediation); a fixed agent must read as healed by
+# the named fix; an un-self-fixable (drift) agent must read as an incident
+# escalated to a human. Used as the CI eval-gate the pattern's governance
+# leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's final summary against the expected outcome.
+    1.0 = summary states the correct outcome (healthy with no remediation,
+          healed by the applied fix, or escalated to a human after a failed
+          fix) and matches the expectation
+    0.5 = correct outcome but missing the cause / fix action / escalation
+          rationale
+    0.0 = wrong outcome, contradicts the expectation, or hallucinated
+
+threshold: 0.7

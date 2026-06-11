@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["fix_status"],"properties":{"fix_status":{"type":"string","enum":["applied","failed"]}}}

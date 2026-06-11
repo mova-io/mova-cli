@@ -1,0 +1,3 @@
+{"input": {"signal": "checkout-latency-spike"}, "expected": {"summary": "Self-healing resolved the fault on the first remediation attempt."}}
+{"input": {"signal": "queue-backlog-alarm"}, "expected": {"summary": "Self-healing resolved the transient fault on the second (retry) attempt."}}
+{"input": {"signal": "disk-failure-alert"}, "expected": {"summary": "Both remediation attempts failed; the hardware fault is escalated to a human operator."}}
