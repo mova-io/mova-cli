@@ -892,6 +892,7 @@ async def call_human_activity(
     activity returns nothing; its effect is the persisted checkpoint.
     """
     from movate.core.models import WorkflowRunRecord, WorkflowStatus  # noqa: PLC0415
+    from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
 
     ctx = _get_context()
     human_task = {
@@ -899,16 +900,26 @@ async def call_human_activity(
         "output_contract": list(output_contract),
         "approvers": list(approvers),
     }
+    # ADR 096 cross-process fix: pop the state-carried governance effect (see
+    # _fold_state_effect) BEFORE persisting — the paused record's state
+    # surfaces through the HITL API (GET /workflow-runs?status=paused), so the
+    # internal key must not appear there. The LIVE workflow keeps the key in
+    # its own state (this activity persists a copy), so the resumed segment —
+    # which continues from Temporal workflow memory, not from this record —
+    # keeps accumulating from it.
+    clean_state = dict(state)
+    raw_carried = clean_state.pop(RUN_EFFECT_STATE_KEY, None)
+    state_effect = raw_carried if isinstance(raw_carried, str) else None
     record = WorkflowRunRecord(
         workflow_run_id=run_id,
         tenant_id=_resolve_tenant_id(ctx, state),
         workflow=workflow_name,
         workflow_version=workflow_version,
         status=WorkflowStatus.PAUSED,
-        initial_state=dict(state),
-        final_state=dict(state),
+        initial_state=dict(clean_state),
+        final_state=dict(clean_state),
         paused_node_id=node_id,
-        paused_state=dict(state),
+        paused_state=dict(clean_state),
         human_task=human_task,
         runtime="temporal",
     )
@@ -920,10 +931,9 @@ async def call_human_activity(
     # raises; the pause record above is already durable). The governance
     # effect collected so far is PEEKED, not consumed — the run resumes and
     # the terminal persist still needs the registry entry. The state-carried
-    # effect (RUN_EFFECT_STATE_KEY, see _fold_state_effect) is folded in too:
-    # it covers activities that ran on a different worker process, whose
-    # effects this process's registry never saw. It stays in paused_state on
-    # purpose — the resume continues accumulating from it.
+    # effect (RUN_EFFECT_STATE_KEY, popped above before the record write) is
+    # folded in too: it covers activities that ran on a different worker
+    # process, whose effects this process's registry never saw.
     from movate.governance.effects import most_severe, peek_run_effect  # noqa: PLC0415
     from movate.runtime.facts import (  # noqa: PLC0415
         fact_from_workflow_run,
@@ -934,7 +944,7 @@ async def call_human_activity(
         ctx.storage,
         fact_from_workflow_run(
             record,
-            governance_effect=most_severe(peek_run_effect(run_id), _fold_state_effect(state, None)),
+            governance_effect=most_severe(peek_run_effect(run_id), state_effect),
         ),
     )
 

@@ -241,8 +241,10 @@ async def test_persist_activity_folds_registry_and_state_effects() -> None:
 
 @pytest.mark.unit
 async def test_pause_activity_reads_state_carried_effect_when_registry_empty() -> None:
-    """Same cross-process coverage on the pause fact — and the key STAYS in
-    paused_state so the resumed segment keeps accumulating from it."""
+    """Same cross-process coverage on the pause fact — the EFFECT lands on the
+    fact, while the reserved key is stripped from the persisted pause record
+    (its state surfaces through the HITL API; the LIVE workflow state keeps
+    the key, so the resumed segment still accumulates from it)."""
     storage = await _configured_storage()
 
     run_id = "wfr-gov-xproc-3"
@@ -266,4 +268,6 @@ async def test_pause_activity_reads_state_carried_effect_when_registry_empty() -
     record = await storage.get_workflow_run(run_id, tenant_id="local")
     assert record is not None
     assert record.paused_state is not None
-    assert record.paused_state[RUN_EFFECT_STATE_KEY] == "warn"
+    # Plumbing, not user-visible state: stripped from the persisted record.
+    assert RUN_EFFECT_STATE_KEY not in record.paused_state
+    assert record.paused_state["text"] == "x"

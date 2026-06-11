@@ -424,6 +424,12 @@ class TemporalCompiler:
             "        call_judge_activity,",
             "        persist_workflow_result_activity,",
             "    )",
+            "    # ADR 096 cross-process fix: the reserved state key carrying the",
+            "    # run's folded governance effect (see temporal_activities.",
+            "    # _fold_state_effect). Observability plumbing — popped before the",
+            "    # workflow RETURNS state, so the raw Temporal result matches the",
+            "    # native runner's final_state byte-for-byte.",
+            "    from movate.governance.effects import RUN_EFFECT_STATE_KEY",
             "",
             "",
         ]
@@ -580,6 +586,10 @@ class TemporalCompiler:
             "                schedule_to_close_timeout=_SCHEDULE_TO_CLOSE,",
             "                retry_policy=_RETRY_POLICY,",
             "            )",
+            "            # The persist activity above received the keyed state (it",
+            "            # stamps the fact's governance_effect from it); the RESULT",
+            "            # must be clean — native/temporal final-state parity.",
+            "            state.pop(RUN_EFFECT_STATE_KEY, None)",
             "            return state",
             "        except Exception as _exc:",
             "            await workflow.execute_activity(",
@@ -968,6 +978,9 @@ class TemporalCompiler:
             f"        state[{nid!r}] = {method}_verdict",
             f"        state['feedback'] = {method}_verdict.get('feedback', '')",
             f"        if {method}_verdict.get('terminate'):",
+            "            # Same strip as the terminal return — the state-carried",
+            "            # governance effect is plumbing, never workflow output.",
+            "            state.pop(RUN_EFFECT_STATE_KEY, None)",
             "            return state",
         ]
         return body, {"call_judge_activity"}
