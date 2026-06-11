@@ -108,6 +108,9 @@ async def test_start_on_temporal_returns_paused_and_starts_only() -> None:
     assert status == WorkflowStatus.PAUSED
     assert error is None
     assert final == state
+    # No memo passed → forwarded as None (temporalio's own default; the
+    # pre-memo call is byte-identical).
+    assert client.started["memo"] is None
 
 
 @pytest.mark.unit
@@ -121,3 +124,136 @@ async def test_start_on_temporal_maps_start_failure_to_retryable_error() -> None
     assert error is not None
     assert error.type == "temporal_workflow_start_failed"
     assert error.retryable is True
+
+
+# ---------------------------------------------------------------------------
+# Memo provenance (ADR 100 D4 follow-through) — origin → Temporal memo.
+# ---------------------------------------------------------------------------
+
+
+class _ExecutingClient:
+    """Fake Temporal client recording execute_workflow kwargs (blocking path)."""
+
+    def __init__(self) -> None:
+        self.executed: dict[str, Any] = {}
+
+    async def execute_workflow(self, wf: Any, arg: Any, **kwargs: Any) -> Any:
+        self.executed = {"wf": wf, "arg": arg, **kwargs}
+        return dict(arg)
+
+
+class _NoopWorker:
+    """Fake temporalio Worker — accepts any wiring, no-op async context."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> _NoopWorker:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_start_on_temporal_threads_memo_to_start_workflow() -> None:
+    pytest.importorskip("temporalio")
+    client = _RecordingClient()
+    await _start_on_temporal(
+        client=client,
+        workflow_cls=_FakeWorkflowCls,
+        wf_id="run-sched",
+        run_state={"x": 1},
+        memo={"mdk_origin": "schedule:nightly-returns"},
+    )
+    assert client.started["memo"] == {"mdk_origin": "schedule:nightly-returns"}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_execute_on_temporal_threads_memo_and_defaults_to_none() -> None:
+    pytest.importorskip("temporalio")
+    from movate.runtime.workflow_backend import _execute_on_temporal  # noqa: PLC0415
+
+    client = _ExecutingClient()
+    state = {"x": 1}
+    _final, status, error = await _execute_on_temporal(
+        client=client,
+        worker_cls=_NoopWorker,
+        workflow_cls=_FakeWorkflowCls,
+        activities=[],
+        wf_id="run-trig",
+        run_state=state,
+        memo={"mdk_origin": "trigger:tr-123"},
+    )
+    assert status == WorkflowStatus.SUCCESS
+    assert error is None
+    assert client.executed["memo"] == {"mdk_origin": "trigger:tr-123"}
+
+    plain = _ExecutingClient()
+    await _execute_on_temporal(
+        client=plain,
+        worker_cls=_NoopWorker,
+        workflow_cls=_FakeWorkflowCls,
+        activities=[],
+        wf_id="run-manual",
+        run_state=state,
+    )
+    assert plain.executed["memo"] is None  # manual run — no provenance memo
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_dispatch_passes_job_origin_as_memo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_run_workflow_on_backend` stamps `{"mdk_origin": job.origin}` as the
+    memo for schedule:/trigger:-originated jobs, and NO memo (None) for a
+    manual submit — the defaulted-param compatibility contract."""
+    pytest.importorskip("temporalio")
+    pytest.importorskip("fastapi")
+    from uuid import uuid4  # noqa: PLC0415
+
+    from movate.core.executor import Executor  # noqa: PLC0415
+    from movate.core.models import JobKind, JobRecord  # noqa: PLC0415
+    from movate.providers.pricing import load_pricing  # noqa: PLC0415
+    from movate.runtime import workflow_backend  # noqa: PLC0415
+    from movate.runtime.dispatch import WorkerDispatch  # noqa: PLC0415
+    from movate.testing import InMemoryStorage, MockProvider, NullTracer  # noqa: PLC0415
+
+    captured: list[dict[str, Any] | None] = []
+
+    async def _fake_run_temporal_workflow(*args: Any, **kwargs: Any) -> Any:
+        captured.append(kwargs.get("memo"))
+        return object()  # opaque result; the caller returns it verbatim
+
+    monkeypatch.setattr(workflow_backend, "run_temporal_workflow", _fake_run_temporal_workflow)
+
+    storage = InMemoryStorage()
+    await storage.init()
+    executor = Executor(
+        provider=MockProvider(),
+        pricing=load_pricing(),
+        storage=storage,
+        tracer=NullTracer(),
+    )
+    dispatch = WorkerDispatch(storage=storage, executor=executor, use_mock_for_eval=True)
+    graph = _graph([_node("a"), _node("b")], [WorkflowEdge(from_id="a", to_id="b")])
+
+    def _job(origin: str | None) -> JobRecord:
+        return JobRecord(
+            job_id=str(uuid4()),
+            tenant_id="t",
+            kind=JobKind.WORKFLOW,
+            target="t",
+            input={"mock": True},
+            origin=origin,
+        )
+
+    await dispatch._run_workflow_on_backend(_job("schedule:nightly-returns"), graph, "temporal")
+    await dispatch._run_workflow_on_backend(_job("trigger:tr-123"), graph, "temporal")
+    await dispatch._run_workflow_on_backend(_job(None), graph, "temporal")
+    assert captured == [
+        {"mdk_origin": "schedule:nightly-returns"},
+        {"mdk_origin": "trigger:tr-123"},
+        None,
+    ]
