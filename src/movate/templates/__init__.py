@@ -334,6 +334,36 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Scheduled incremental research — the ADR 100 D1 cron-schedule shape (runtime: temporal). The schedule is the durable outer loop, each fire runs ONE idempotent increment: a research agent drafts findings, a TOOL node appends the auditable research-log row (increment in the payload), and a DECISION routes increment gte 3 into the final report (earlier increments get a light ack) — no week-long sleeping workflow (ADR 094/097/100).",  # noqa: E501
         "research → TOOL append → DECISION(increment) → {final-report | ack}",
     ),
+    "agent-deploy-approval": (
+        "pattern_agent_deploy_approval",
+        True,
+        "Eval-gated agent promotion with a HUMAN release gate (runtime: temporal). An eval-runner TOOL node (ADR 097 — honestly a calibrated simulation of an mdk eval run, scores deterministic per fixture, auditable eval ledger row) feeds a DECISION node gating eval_score ≥ 0.85 (no LLM); passing candidates still pause at a HUMAN gate routing its own approve/reject decision (ADR 099) before the sim-promote TOOL records the registry ledger row; every rejected exit converges on ONE rejected-with-report agent (ADR 094/097/098/099).",  # noqa: E501
+        "TOOL eval-run → DECISION(score) → [HUMAN routes approve|reject] → TOOL promote → notify | rejected",  # noqa: E501
+    ),
+    "agent-benchmark": (
+        "pattern_agent_benchmark",
+        True,
+        "Two-config benchmark of the SAME task (runtime: temporal). Two candidate agents share the same prompt TEXT but differ in agent.yaml model params (the configs under test), running SEQUENTIALLY with disjoint output keys; a compare judge scores BOTH (required output keys — it cannot ignore one) and picks the enum-pinned winner (a|b); the sim-record-benchmark TOOL records the auditable eval/benchmark ledger row (ADR 097).",  # noqa: E501
+        "candidate-a → candidate-b → compare → TOOL record-benchmark → notify",
+    ),
+    "continuous-eval": (
+        "pattern_continuous_eval",
+        True,
+        "ONE increment of a scheduled production-quality sampling pipeline (runtime: temporal; cadence lives in the ADR 100 scheduler, not a loop). A calibrated scorer agent scores one sampled interaction 0-1; a DECISION node applies the 0.6 floor (no LLM): regressions record an auditable quality_alert ledger row (TOOL, ADR 097) + an escalation summary, healthy samples record their score + a one-line ack — every increment leaves a ledger row (ADR 094/097/100).",  # noqa: E501
+        "scorer → DECISION(score) → {TOOL alert → escalate | TOOL record → ack}",
+    ),
+    "promotion-pipeline": (
+        "pattern_promotion_pipeline",
+        True,
+        "Staged promotion gates in ONE workflow (runtime: temporal). A DECISION node routes the CI-named stage (no LLM; unknown stages fail safe): test runs the sim-run-tests TOOL; staging records eval evidence (TOOL) THEN pauses at a HUMAN sign-off gate (ADR 099); production pauses at a HUMAN approval gate FIRST — the sim-deploy TOOL's promote_prod ledger row is reachable ONLY via its approve route. One stage per run (not a loop), shared notify/rejected tails (ADR 094/097/098/099).",  # noqa: E501
+        "DECISION(stage) → {TOOL tests | TOOL eval → [HUMAN signoff] | [HUMAN approval] → TOOL deploy} → notify | rejected",  # noqa: E501
+    ),
+    "ab-testing": (
+        "pattern_ab_testing",
+        True,
+        "Deterministic A/B traffic split (runtime: temporal). An assign-variant TOOL node (ADR 097) assigns the variant from the SHA-256 parity of the user_id (no randomness, no salted builtin hash — same user, same variant, every replay) with an auditable assign ledger row; a DECISION node routes to one of two arms whose prompt files are BYTE-IDENTICAL and whose agent.yaml model params are the only difference; both arms converge on the sim-record-outcome TOOL recording which variant served (ADR 094/097/098).",  # noqa: E501
+        "TOOL assign → DECISION(variant) → {variant-a | variant-b} → TOOL record-outcome → notify",
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

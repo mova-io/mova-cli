@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: rejected
+version: 0.1.0
+description: >-
+  Tells the release owner the candidate version was NOT promoted and
+  relays WHY — the below-threshold eval report, or the human veto after
+  a passing eval. Terminal node for every rejected path
+  (rejected-with-report).
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

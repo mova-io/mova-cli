@@ -1,0 +1,68 @@
+api_version: movate/v1
+kind: Workflow
+name: continuous-eval
+version: 0.1.0
+description: >
+  ONE increment of a scheduled production-quality sampling pipeline, durable on Temporal
+  — scenario #21 of the 30-use-case certification program (B6
+  eval/lifecycle batch). A sampled production interaction
+  ({sample: {prompt, response}}) enters as data; a calibrated `scorer`
+  agent scores it 0-1 and names the issues (HONESTY: a calibrated scorer
+  agent stands in for the real eval machinery — too heavy to drive
+  in-workflow — with calibration examples pinned on both sides of the
+  floor); a deterministic `decision` node (ADR 094) applies the 0.6 quality
+  floor: `score lt 0.6` takes the alarm path — the `sim-alert` TOOL
+  (ADR 097) records the `{system: eval, action: quality_alert}` ledger row
+  and the `escalate` agent writes the summary for the eval owner — while
+  healthy samples take the `sim-record-score` TOOL (`record_score` row)
+  into a one-line `ack`. SCHEDULING (ADR 100): in production this workflow
+  is registered on the runtime scheduler — `mdk schedule set continuous-eval
+  -k workflow --name continuous-eval-sampler --cron "*/30 * * * *" --input
+  '{...sample...}'` — and each cron fire enqueues one increment through
+  the SAME job path the certification driver uses (POST /run; ADR 100 adds
+  zero new start paths). An ADR 100 event trigger can equally deliver each
+  sampled interaction as it happens. The certification suite drives
+  exactly one such increment per case by hand.
+  Self-contained: both skills carry their own impl.py next to skill.yaml
+  (workflow-local, so a temporal-worker image bakes them for free). Point
+  sim-alert at your real paging system and sim-record-score at your real
+  metrics store to go live. Mirrors workflows/continuous-eval.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: scorer
+nodes:
+  # The calibrated scorer: 0-1 score + named issues for ONE sampled
+  # interaction. Its prompt carries explicit calibration examples on both
+  # sides of the 0.6 floor the gate below applies.
+  - {id: scorer, type: agent, ref: ./agents/scorer}
+  # Deterministic quality floor (ADR 094): a pure numeric predicate — the
+  # scorer judges, the routing stays mechanical, and only sub-0.6 scores
+  # can raise an alert.
+  - id: quality-gate
+    type: decision
+    cases:
+      - when: {field: score, op: lt, value: 0.6}
+        to: alert
+    default: record
+  # --- regression path: the auditable quality_alert ledger row (ADR 097)
+  # --- then the escalation summary for the eval owner.
+  - id: alert
+    type: tool
+    skill: sim-alert
+  - {id: escalate, type: agent, ref: ./agents/escalate}
+  # --- healthy path: the record_score ledger row then a one-line ack.
+  - id: record
+    type: tool
+    skill: sim-record-score
+  - {id: ack, type: agent, ref: ./agents/ack}
+edges:
+  - {from: scorer, to: quality-gate}
+  - {from: alert, to: escalate}
+  - {from: record, to: ack}
+tags:
+  - temporal
+  - decision
+  - tool
+  - eval
+  - lifecycle
+  - certification

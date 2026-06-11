@@ -1,0 +1,2 @@
+{"input": {"change": "checkout-service 2026.6.10", "stage": "test"}, "expected": {"summary": "The change passed the test stage with the suites green and a CI reference; no human involved."}}
+{"input": {"change": "checkout-service 2026.6.10", "stage": "production"}, "expected": {"summary": "The change was promoted to production after human approval, with a promotion reference."}}

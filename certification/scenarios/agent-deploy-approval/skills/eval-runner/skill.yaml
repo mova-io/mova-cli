@@ -1,0 +1,33 @@
+api_version: movate/v1
+kind: Skill
+
+name: eval-runner
+version: 0.1.0
+description: >-
+  Simulate one `mdk eval` run for a candidate agent version and record
+  one auditable `{system: eval, action: run}` row (with the scores) to
+  the shared sim_side_effects ledger. HONESTY: this is a CALIBRATED
+  SIMULATION — driving the real eval machinery inside a workflow
+  activity is too heavy for the certification path, so scores come
+  deterministically from the input's `fixture` key (enum-pinned;
+  unknown fixtures fail loud). SELF-CONTAINED for the deployed
+  temporal-worker image (ADR 097 D2): the implementation lives in
+  impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "eval-runner.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - eval
+  - simulation
+  - certification

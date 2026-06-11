@@ -54,6 +54,11 @@ ALL_PATTERNS = [
     "external-api-failure",
     "partial-failure-recovery",
     "long-running-research",
+    "agent-deploy-approval",
+    "agent-benchmark",
+    "continuous-eval",
+    "promotion-pipeline",
+    "ab-testing",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

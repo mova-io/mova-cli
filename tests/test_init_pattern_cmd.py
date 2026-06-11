@@ -46,6 +46,11 @@ WORKFLOW_PATTERNS = [
     "external-api-failure",
     "partial-failure-recovery",
     "long-running-research",
+    "agent-deploy-approval",
+    "agent-benchmark",
+    "continuous-eval",
+    "promotion-pipeline",
+    "ab-testing",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 

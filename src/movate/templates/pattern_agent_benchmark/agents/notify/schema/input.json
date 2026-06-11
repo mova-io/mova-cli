@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"winner":{"type":"string"},"rationale":{"type":"string"},"benchmark_result":{"type":"string"}}}
