@@ -167,6 +167,21 @@ class ActivityContext:
     ``build_local_runtime`` wires them for the local/native path. Without them
     the durable backend ran fully permissive (governance + guardrails silently
     dormant — PII/content checks did not fire on Temporal runs)."""
+    memory_store: Any = None
+    """Per-agent ``MemoryStore`` (task #46 — native-parity gap). The native
+    path's Executor (``build_local_runtime``) passes ``build_memory_store()``
+    so every successful run persists ``last_run`` memory; the Temporal
+    per-activity Executor omitted it, so agent memory silently never wrote on
+    durable runs. Activity-side only — memory writes happen inside the
+    Executor within an activity, never in workflow code, so there is no
+    determinism concern (Temporal records the activity result, not its
+    side effects)."""
+    cache: Any = None
+    """LLM response ``CacheProvider`` (task #46 — same parity gap as
+    ``memory_store``). Native passes ``build_cache()`` (NoOp unless
+    ``MOVATE_LLM_CACHE`` opts in); the durable path always ran uncached.
+    Also activity-side only: a cache hit changes nothing the workflow can
+    observe beyond the activity's recorded result."""
 
 
 _CONTEXT: ActivityContext | None = None
@@ -184,6 +199,8 @@ def configure_activities(
     runtime_policy: Any = None,
     skill_policy: Any = None,
     guardrails: Any = None,
+    memory_store: Any = None,
+    cache: Any = None,
 ) -> None:
     """Install the :class:`ActivityContext` the four activities read.
 
@@ -226,6 +243,23 @@ def configure_activities(
             skill_policy = skill_policy if skill_policy is not None else cfg.skills
             guardrails = guardrails if guardrails is not None else cfg.guardrails
 
+    # Resolve memory + cache from the SAME env-driven builders the native
+    # path's Executor construction uses (build_local_runtime: memory_store=
+    # build_memory_store(), cache=build_cache()) — task #46. Explicit args
+    # win (the test escape hatch, like ``policy``). Fail-soft: a builder
+    # hiccup degrades to the Executor's permissive defaults (no memory
+    # writes / NoOpCache), never a worker-startup failure.
+    if memory_store is None:
+        with contextlib.suppress(Exception):
+            from movate.memory import build_memory_store  # noqa: PLC0415
+
+            memory_store = build_memory_store()
+    if cache is None:
+        with contextlib.suppress(Exception):
+            from movate.core.cache import build_cache  # noqa: PLC0415
+
+            cache = build_cache()
+
     global _CONTEXT  # noqa: PLW0603 — module-global DI registry, set once at worker startup.
     _CONTEXT = ActivityContext(
         storage=storage,
@@ -238,6 +272,8 @@ def configure_activities(
         runtime_policy=runtime_policy,
         skill_policy=skill_policy,
         guardrails=guardrails,
+        memory_store=memory_store,
+        cache=cache,
     )
 
 
@@ -300,6 +336,14 @@ def _executor_for(ctx: ActivityContext, state: dict[str, Any]) -> Any:
         runtime_policy=ctx.runtime_policy,
         skill_policy=ctx.skill_policy,
         guardrails=ctx.guardrails,
+        # Task #46 — native parity: the local path's Executor gets a memory
+        # store (per-agent last_run writes) + LLM cache; the durable path
+        # omitted both, so agent memory never persisted and caching never
+        # applied on Temporal runs. Both are activity-side effects (recorded
+        # via the activity result, never workflow code) — no determinism
+        # concern. None ⇒ Executor defaults (no memory writes / NoOpCache).
+        memory_store=ctx.memory_store,
+        cache=ctx.cache,
     )
 
 

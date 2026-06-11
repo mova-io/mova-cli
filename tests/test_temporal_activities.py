@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 import movate.core.workflow.temporal_activities as ta
+from movate.core.cache import InProcessCache, NoOpCache
 from movate.core.models import ErrorInfo, Metrics, RunResponse, SkillSideEffects
 from movate.core.workflow.judge import (
     build_judge_state_value,
@@ -33,6 +34,7 @@ from movate.governance.effects import (
     consume_run_effect,
     record_scope_effect,
 )
+from movate.memory import InMemoryStore
 from movate.testing import InMemoryStorage, NullTracer
 
 # ---------------------------------------------------------------------------
@@ -436,6 +438,81 @@ async def test_judge_activity_unconfigured_raises() -> None:
     assert ta._CONTEXT is None
     with pytest.raises(RuntimeError):
         await ta.call_judge_activity("j", "/agents/judge", {}, {"answer": "x"}, "r")
+
+
+# ---------------------------------------------------------------------------
+# Task #46 — native-parity executor construction: the activity-built Executor
+# must receive the memory_store + cache the native path's Executor gets
+# (build_local_runtime passes build_memory_store() + build_cache(); the
+# durable path omitted both, so agent memory never persisted and the LLM
+# cache never applied on Temporal runs). Mirrors the task #44 policy-wiring
+# tests in test_temporal_governance_wiring.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_executor_for_threads_memory_store_and_cache() -> None:
+    """Explicit memory_store/cache on configure_activities reach the
+    per-activity Executor — the same construction parity the native path has."""
+    memory_store = InMemoryStore()
+    cache = InProcessCache()
+    ta.configure_activities(
+        storage=InMemoryStorage(),
+        pricing=object(),
+        tracer=NullTracer(),
+        provider=object(),
+        memory_store=memory_store,
+        cache=cache,
+    )
+
+    ex = ta._executor_for(ta._get_context(), {"mock": True})
+    assert ex._memory_store is memory_store
+    assert ex._cache is cache
+
+
+@pytest.mark.unit
+def test_configure_activities_defaults_memory_and_cache_from_builders(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Unset args resolve via the SAME env-driven builders the native path
+    uses (build_memory_store / build_cache) — explicit args win, like policy."""
+    # Keep the default builders hermetic: file-backed memory in tmp, cache ON.
+    monkeypatch.setenv("MOVATE_MEMORY_FILE", str(tmp_path / "memory.json"))
+    monkeypatch.setenv("MOVATE_LLM_CACHE", "memory")
+
+    ta.configure_activities(
+        storage=InMemoryStorage(),
+        pricing=object(),
+        tracer=NullTracer(),
+        provider=object(),
+    )
+
+    ctx = ta._get_context()
+    assert isinstance(ctx.memory_store, InMemoryStore)
+    assert isinstance(ctx.cache, InProcessCache)
+    ex = ta._executor_for(ctx, {"mock": True})
+    assert ex._memory_store is ctx.memory_store
+    assert ex._cache is ctx.cache
+
+
+@pytest.mark.unit
+def test_configure_activities_cache_default_off_is_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """With MOVATE_LLM_CACHE unset the builder returns NoOpCache — the
+    durable path stays byte-for-byte uncached, exactly like native."""
+    monkeypatch.setenv("MOVATE_MEMORY_FILE", str(tmp_path / "memory.json"))
+    monkeypatch.delenv("MOVATE_LLM_CACHE", raising=False)
+
+    ta.configure_activities(
+        storage=InMemoryStorage(),
+        pricing=object(),
+        tracer=NullTracer(),
+        provider=object(),
+    )
+
+    ex = ta._executor_for(ta._get_context(), {"mock": True})
+    assert isinstance(ex._cache, NoOpCache)
 
 
 # ---------------------------------------------------------------------------
