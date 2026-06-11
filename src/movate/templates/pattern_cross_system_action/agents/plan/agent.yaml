@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: plan
+version: 0.1.0
+description: >-
+  Summarizes the steps the coordinated action will take across the four
+  systems. The summary is DESCRIPTIVE only: the chain that follows is fixed
+  TOOL nodes in a fixed order (CRM → ERP → ticket → email), so the model
+  cannot add, drop, or reorder a system touch.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

@@ -51,6 +51,9 @@ WORKFLOW_PATTERNS = [
     "continuous-eval",
     "promotion-pipeline",
     "ab-testing",
+    "employee-onboarding",
+    "incident-response",
+    "cross-system-action",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 

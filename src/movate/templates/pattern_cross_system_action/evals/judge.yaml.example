@@ -1,0 +1,25 @@
+# LLM-as-judge for the Cross-System Action workflow. Rename to ``judge.yaml``
+# to enable.
+#
+# Scores the final ``summary`` as an audit record: all FOUR system touches
+# (CRM, ERP, ticket, email) must be confirmed IN ORDER, each with its
+# reference id. An omitted system or an invented fifth touch is a 0.0. Used
+# as the CI eval-gate the pattern's governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's final summary as the audit record.
+    1.0 = all four system touches confirmed in chain order (CRM, ERP,
+          ticket, email), each with its reference id
+    0.5 = all four touches confirmed but a reference id is missing or the
+          order is not stated
+    0.0 = a system touch is omitted, an extra touch is invented, or the
+          record contradicts the chain
+
+threshold: 0.7

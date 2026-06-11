@@ -1,0 +1,88 @@
+# Certification cases — cross-system-action (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `cross-system-action`
+# workflow (workflows/cross-system-action — 6 nodes: the `plan` agent, the
+# four system-touch TOOL nodes crm-update / erp-update / create-ticket /
+# send-email, and the `audit-summary` agent). The driver submits the case
+# input via POST /run, then reads the run back from
+# GET /api/v1/observability/facts (ADR 096) and asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * ORDER — THE assertion of this scenario is "all four rows, in order".
+#   The driver's case-level side-effect matcher is (system, action, times)
+#   only — it does NOT expose the ledger's row ordering — so the cases below
+#   assert the COUNTS (all four rows exactly once) and the ORDER guarantee
+#   is proven structurally instead: the graph is a strict sequential chain
+#   (pinned per copy in tests/test_b5_scenarios.py) and the Temporal
+#   lowering executes one activity at a time, so the ERP row cannot precede
+#   the CRM row. The same test module also runs the four impls in chain
+#   order against a tmp SQLite ledger and asserts the rows read back in
+#   insertion order (`ORDER BY id`) — the ledger preserves what the chain
+#   wrote. A driver-level ordered-ledger matcher would be a driver change
+#   (PRs #839/#840 are queued on driver.py); deferred, not fudged.
+# * `route: null` — no decision node writes routing state on this workflow;
+#   there is only one path.
+# * `hitl` — no human gate anywhere in this workflow; the capability is an
+#   honest SKIP on every case.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (ADR 096); same honest skip as the other scenarios.
+# * `governance: allow` on every case — the baked catalog policy registers
+#   MODEL + COST gates on every agent run (plan + audit-summary), so the
+#   terminal fact's governance_effect must be non-null `allow`. A
+#   deliberately-TRIPPING warn case was considered and rejected as
+#   dishonest: the policy live on the shared dev runtime is the ONE baked
+#   catalog file (/opt/movate/project.yaml), not this scenario's
+#   policy.yaml, so a per-scenario warn expectation would assert a policy
+#   that is not the one deployed. A warn-path case needs a scenario-scoped
+#   deployment (or per-workflow policy resolution) first — same gap the B2
+#   batch documented for input guardrails.
+# * side-effects — every case asserts all FOUR rows exactly once:
+#   `{salesforce, update_record}`, `{sap, update_vendor}`,
+#   `{servicenow, create_ticket}`, `{email, send}`. Evaluated only when the
+#   shared DB is reachable (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs
+#   otherwise).
+
+scenario: cross-system-action
+target: cross-system-action # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- the canonical chain: one offboarding request touches all four
+  # --- systems exactly once and the audit summary lands in final state.
+  - name: full-chain
+    input:
+      action_request: >-
+        Offboard contractor Alex Kim: deactivate the Salesforce account
+        record, end the SAP vendor contract, open the offboarding ticket,
+        and notify the hiring manager.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [steps, crm_result, erp_result, ticket_result, email_result, summary]
+      side_effects:
+        - { system: salesforce, action: update_record, times: 1 }
+        - { system: sap, action: update_vendor, times: 1 }
+        - { system: servicenow, action: create_ticket, times: 1 }
+        - { system: email, action: send, times: 1 }
+
+  # --- a second action shape through the same fixed chain — and the
+  # --- governance column again: gates evaluated (allow) with exactly two
+  # --- model calls on the fact's run.
+  - name: vendor-address-update
+    input:
+      action_request: >-
+        Update vendor Northwind Supply's remittance address across systems
+        after their finance team moved offices, and notify procurement.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [steps, crm_result, erp_result, ticket_result, email_result, summary]
+      side_effects:
+        - { system: salesforce, action: update_record, times: 1 }
+        - { system: sap, action: update_vendor, times: 1 }
+        - { system: servicenow, action: create_ticket, times: 1 }
+        - { system: email, action: send, times: 1 }

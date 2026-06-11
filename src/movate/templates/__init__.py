@@ -364,6 +364,24 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Deterministic A/B traffic split (runtime: temporal). An assign-variant TOOL node (ADR 097) assigns the variant from the SHA-256 parity of the user_id (no randomness, no salted builtin hash — same user, same variant, every replay) with an auditable assign ledger row; a DECISION node routes to one of two arms whose prompt files are BYTE-IDENTICAL and whose agent.yaml model params are the only difference; both arms converge on the sim-record-outcome TOOL recording which variant served (ADR 094/097/098).",  # noqa: E501
         "TOOL assign → DECISION(variant) → {variant-a | variant-b} → TOOL record-outcome → notify",
     ),
+    "employee-onboarding": (
+        "pattern_employee_onboarding",
+        True,
+        "New-hire provisioning across three systems (runtime: temporal). A descriptive plan agent feeds THREE deterministic TOOL nodes — AD account, mailbox, and a role-keyed equipment bundle (a fixed map in the skill, never a model decision) — each recording an auditable ledger row, then a welcome agent summarizes. Sequential by phase-gate design: ADR 092 parallel graphs are agent-only today, so the conceptual fan-out diamond ships as a chain (ADR 092/097).",  # noqa: E501
+        "plan → TOOL provision-ad → TOOL provision-email → TOOL provision-equipment → welcome",
+    ),
+    "incident-response": (
+        "pattern_incident_response",
+        True,
+        "Event-driven incident diagnosis + remediation + escalation (runtime: temporal). A calibrated-confidence diagnose agent feeds a DECISION node (gte 0.7 → the sim-remediate TOOL, whose applied/failed status is deterministic on the alert and whose ATTEMPT is always an auditable ops ledger row); a verify agent mirrors the machine status into a second DECISION; both escalation reasons converge on ONE HUMAN gate routing its own ack (fallback notify — a human can delay closure, never wedge it). Trigger-shaped input for ADR 100 (--event-key alert) (ADR 094/097/098/099/100).",  # noqa: E501
+        "diagnose → DECISION(confidence) → {TOOL remediate → verify → DECISION(resolved) → notify | [HUMAN escalate routes ack] → notify}",  # noqa: E501
+    ),
+    "cross-system-action": (
+        "pattern_cross_system_action",
+        True,
+        "Coordinated multi-system action with an audit trail (runtime: temporal). A descriptive plan agent feeds FOUR deterministic TOOL nodes in a FIXED order — CRM (salesforce) → ERP (sap) → ticket (servicenow) → email — each recording its own auditable ledger row; the order guarantee is structural (a strict sequential chain, one activity at a time), and an audit-summary agent writes the one record naming all four references (ADR 097).",  # noqa: E501
+        "plan → TOOL crm-update → TOOL erp-update → TOOL create-ticket → TOOL send-email → audit-summary",  # noqa: E501
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

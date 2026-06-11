@@ -1,0 +1,34 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-remediate
+version: 0.1.0
+description: >-
+  Simulate executing the diagnosed remediation against the ops system:
+  records one auditable `{system: ops, action: remediate}` row to the shared
+  sim_side_effects ledger (same DB MDK itself uses) — the ATTEMPT is recorded
+  whether or not it works — and returns a deterministic remediation_status:
+  `failed` when the alert message names a fault automation cannot fix
+  (hardware/physical/manual-intervention markers), `applied` otherwise. SELF-
+  CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend puts
+  the skill dir's parent on sys.path, so `sim-remediate.impl` imports from
+  the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-remediate.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - ops
+  - simulation
+  - certification

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["crm_result"],"properties":{"crm_result":{"type":"string"}}}

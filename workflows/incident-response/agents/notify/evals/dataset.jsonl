@@ -1,0 +1,1 @@
+{"input":{"alert":{"service":"x","severity":"high","message":"x"},"root_cause":"x","confidence":0.9,"remediation_status":"applied","status_note":"x"},"expected":{"summary":"x"}}

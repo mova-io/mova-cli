@@ -59,6 +59,9 @@ ALL_PATTERNS = [
     "continuous-eval",
     "promotion-pipeline",
     "ab-testing",
+    "employee-onboarding",
+    "incident-response",
+    "cross-system-action",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

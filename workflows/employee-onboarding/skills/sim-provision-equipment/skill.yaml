@@ -1,0 +1,33 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-provision-equipment
+version: 0.1.0
+description: >-
+  Simulate ordering the new hire's equipment: records one auditable `{system:
+  itsm, action: order_equipment}` row to the shared sim_side_effects ledger
+  (same DB MDK itself uses) — the payload carries the ROLE-KEYED bundle,
+  deterministically resolved from a fixed map (no LLM picks hardware) — and
+  returns a one-line confirmation naming the bundle and role. SELF-CONTAINED
+  for the deployed temporal-worker image (ADR 097 D2): the implementation
+  lives in impl.py next to this file — the python backend puts the skill
+  dir's parent on sys.path, so `sim-provision-equipment.impl` imports from
+  the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-provision-equipment.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - itsm
+  - simulation
+  - certification
