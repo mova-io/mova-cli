@@ -268,6 +268,24 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "ITSM service-request fulfilment over a parameterized catalog (runtime: temporal). A DECISION node routes the portal's auto_approved flag (no LLM); needs-approval services pause at ONE HUMAN gate routing its own approve/reject decision (ADR 099); fulfilment is a TOOL node calling the workflow-local sim-provision python skill (ADR 097) — auto + approve paths converge on the shared provision→notify tail (ADR 094/097/098/099).",  # noqa: E501
         "DECISION(auto_approved) → [HUMAN routes approve|reject] → shared TOOL provision → notify | rejected",  # noqa: E501
     ),
+    "pii-detection": (
+        "pattern_pii_detection",
+        True,
+        "PII document scanning + masking (runtime: temporal). A deterministic redact-pii TOOL node (anchored regexes, no LLM) masks emails/SSNs/phones to [EMAIL]/[SSN]/[PHONE]; a DECISION node routes pii_found to a quarantine or clean-store TOOL (auditable dlp ledger rows), converging on ONE notify agent that sees only the redacted text (ADR 094/097/098).",  # noqa: E501
+        "TOOL redact → DECISION(pii_found) → {TOOL quarantine | TOOL store-clean} → notify",
+    ),
+    "data-privacy": (
+        "pattern_data_privacy",
+        True,
+        "Classify → policy-route → AUDITED storage (runtime: temporal). A calibrated enum-pinned classify agent feeds a DECISION node routing public/internal/regulated; regulated documents are masked by the redact-pii TOOL first; ALL paths converge on one sim-audit-store TOOL recording the classification-keyed audit row no path can skip (ADR 094/097/098).",  # noqa: E501
+        "classify → DECISION(classification) → {TOOL redact → TOOL audit-store | TOOL audit-store} → summary",  # noqa: E501
+    ),
+    "content-publishing": (
+        "pattern_content_publishing",
+        True,
+        "Multi-stage content review chain + HITL final gate (runtime: temporal). Calibrated compliance-review and brand-review agents each feed a DECISION node failing safe to a shared rejected agent; content passing BOTH still publishes nothing until a HUMAN gate routes its own approve/reject decision (ADR 099) into the sim-publish TOOL's auditable cms ledger row (ADR 094/097/098/099).",  # noqa: E501
+        "compliance → DECISION → brand → DECISION → [HUMAN routes approve|reject] → TOOL publish → notify | rejected",  # noqa: E501
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

@@ -547,6 +547,15 @@ ignore = ["PLR0913", "PLR0915", "PLR0911"]
 python_version = "3.11"
 strict = true
 files = ["src/movate"]
+# Workflow-pattern template SKILLS: each ships an impl.py inside a hyphenated
+# skill dir (ADR 097 D2 — the python backend imports it via a PEP 420
+# namespace package at runtime). The hyphen stops mypy's module-name walk, so
+# every such file maps to the same top-level module "impl" and trips the
+# duplicate-module check once more than one pattern ships skills. They are
+# scaffold DATA, not library code — the canonical copies under workflows/ are
+# unit-tested (tests/test_itsm_scenario.py, tests/test_b2_scenarios.py) and
+# byte-identity with the template copies is asserted there too.
+exclude = ['src/movate/templates/pattern_.*/skills/.*/impl\.py$']
 
 [[tool.mypy.overrides]]
 module = [

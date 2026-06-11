@@ -1,0 +1,2 @@
+{"input":{"content":"Try MiraclePure today — clinically guaranteed to cure arthritis in 7 days, risk-free!","channel":"blog"},"expected":{"verdict":"flag","notes":"x"}}
+{"input":{"content":"Our new dashboard ships dark mode and faster exports.","channel":"blog"},"expected":{"verdict":"pass","notes":"x"}}

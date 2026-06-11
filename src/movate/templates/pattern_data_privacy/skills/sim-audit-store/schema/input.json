@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["classification"],"properties":{"classification":{"type":"string","enum":["public","internal","regulated"]},"requester":{"type":"string"},"run_id":{"type":"string"}}}

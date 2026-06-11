@@ -1,0 +1,33 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-publish
+version: 0.1.0
+description: >-
+  Simulate publishing approved content to a CMS channel: records one
+  auditable `{system: cms, action: publish}` row to the shared
+  sim_side_effects ledger (same DB MDK itself uses) and returns a one-line
+  confirmation. The certification suite asserts this row exists EXACTLY once
+  on the fully-approved path and NEVER on any flagged/rejected path.
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `sim-publish.impl` imports
+  from the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-publish.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - cms
+  - simulation
+  - certification

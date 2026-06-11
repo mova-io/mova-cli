@@ -1,0 +1,26 @@
+# LLM-as-judge for the Data Privacy workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the final ``summary`` against the expected outcome: the stated
+# classification and audit action must match the expectation (store_public /
+# store_internal / store_regulated), regulated documents must read as masked
+# before storage, and the summary must NEVER contain a raw identifier (that
+# alone is a 0.0). Used as the CI eval-gate the pattern's governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's final summary against the expected outcome.
+    1.0 = correct classification AND the matching store_<classification>
+          audit action with a reference id; regulated documents additionally
+          described as masked; NO raw SSN/email/phone value in the summary
+    0.5 = correct classification but missing the audit action/reference, or
+          a regulated document not described as masked
+    0.0 = wrong classification or audit action, contradicts the expectation,
+          or ANY raw identifier value leaks into the summary
+
+threshold: 0.7

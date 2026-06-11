@@ -35,6 +35,9 @@ WORKFLOW_PATTERNS = [
     "simulation",
     "expense-approval",
     "itsm-request",
+    "pii-detection",
+    "data-privacy",
+    "content-publishing",
 ]
 ALL_PATTERNS = ["chatbot", *WORKFLOW_PATTERNS]
 

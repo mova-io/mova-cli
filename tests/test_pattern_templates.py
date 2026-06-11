@@ -43,6 +43,9 @@ ALL_PATTERNS = [
     "simulation",
     "expense-approval",
     "itsm-request",
+    "pii-detection",
+    "data-privacy",
+    "content-publishing",
 ]
 WORKFLOW_PATTERNS = ["task-oriented", "goal-oriented", "monitor", "simulation"]
 

@@ -1,0 +1,2 @@
+{"input": {"document": "FOR IMMEDIATE RELEASE: Acme Corp announces its annual developer conference, open to the public.", "requester": "pr.team"}, "expected": {"summary": "Classified public and stored with audit action store_public."}}
+{"input": {"document": "HR onboarding record: SSN 078-05-1120, personal email pat.kim@example.com.", "requester": "hr.ops"}, "expected": {"summary": "Classified regulated, PII masked, and stored with audit action store_regulated."}}
