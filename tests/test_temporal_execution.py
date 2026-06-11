@@ -60,6 +60,7 @@ from movate.core.workflow.temporal_activities import (  # noqa: E402
     configure_activities,
     persist_workflow_result_activity,
 )
+from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: E402
 from movate.runtime.workflow_backend import (  # noqa: E402
     DEFAULT_TASK_QUEUE,
     _build_temporal_metrics_runtime,
@@ -386,6 +387,10 @@ async def test_temporal_smoke_matches_native(tmp_path: Path) -> None:
     # The conformance assertion: temporal's final state equals native's
     # (modulo the tenant_id we stamp for the activity context).
     temporal_final.pop("tenant_id", None)
+    # Runtime-stamped like tenant_id: the ADR 096 state-carried governance
+    # effect rides the raw workflow result; product surfaces (the persisted
+    # record, job output, CLI) strip it — the raw-history payload keeps it.
+    temporal_final.pop(RUN_EFFECT_STATE_KEY, None)
     assert temporal_final == native_result.final_state
 
 
@@ -537,6 +542,10 @@ async def test_temporal_fan_out_matches_native(tmp_path: Path) -> None:
         )
 
     temporal_final.pop("tenant_id", None)
+    # Runtime-stamped like tenant_id: the ADR 096 state-carried governance
+    # effect rides the raw workflow result; product surfaces (the persisted
+    # record, job output, CLI) strip it — the raw-history payload keeps it.
+    temporal_final.pop(RUN_EFFECT_STATE_KEY, None)
     assert temporal_final == native_result.final_state
 
 
@@ -688,6 +697,10 @@ async def test_temporal_supervisor_matches_native(tmp_path: Path) -> None:
         )
 
     temporal_final.pop("tenant_id", None)
+    # Runtime-stamped like tenant_id: the ADR 096 state-carried governance
+    # effect rides the raw workflow result; product surfaces (the persisted
+    # record, job output, CLI) strip it — the raw-history payload keeps it.
+    temporal_final.pop(RUN_EFFECT_STATE_KEY, None)
     assert temporal_final == native_result.final_state
 
 
@@ -843,6 +856,10 @@ async def test_temporal_human_node_pause_resume_matches_native(tmp_path: Path) -
     assert final_record.final_state.get("approved_by") == "alice"
 
     temporal_final.pop("tenant_id", None)
+    # Runtime-stamped like tenant_id: the ADR 096 state-carried governance
+    # effect rides the raw workflow result; product surfaces (the persisted
+    # record, job output, CLI) strip it — the raw-history payload keeps it.
+    temporal_final.pop(RUN_EFFECT_STATE_KEY, None)
     assert temporal_final == native_result.final_state
 
 
@@ -880,6 +897,10 @@ async def test_temporal_human_node_durable_timeout_route(tmp_path: Path) -> None
         )
 
     temporal_final.pop("tenant_id", None)
+    # Runtime-stamped like tenant_id: the ADR 096 state-carried governance
+    # effect rides the raw workflow result; product surfaces (the persisted
+    # record, job output, CLI) strip it — the raw-history payload keeps it.
+    temporal_final.pop(RUN_EFFECT_STATE_KEY, None)
     # The timeout route ran 'second' (step2 present) but no human contributed.
     assert "approved_by" not in temporal_final
     assert temporal_final.get("step1") == "alpha"

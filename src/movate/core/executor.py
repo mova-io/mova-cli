@@ -298,6 +298,28 @@ class Executor:
         """Expose the underlying tracer for callers that need to push scores."""
         return self._tracer
 
+    @property
+    def policy(self) -> ModelPolicy:
+        """The effective ModelPolicy — exposed so the dispatch edge can thread
+        the SAME policy into sub-executors it builds per job (eval/bench swap
+        the provider but must keep the worker's governance wiring, ADR 093)."""
+        return self._policy
+
+    @property
+    def runtime_policy(self) -> RuntimePolicy:
+        """The effective RuntimePolicy (see :attr:`policy` for why exposed)."""
+        return self._runtime_policy
+
+    @property
+    def skill_policy(self) -> SkillPolicy:
+        """The effective SkillPolicy (see :attr:`policy` for why exposed)."""
+        return self._skill_policy
+
+    @property
+    def guardrails(self) -> GuardrailsConfig:
+        """The effective GuardrailsConfig (see :attr:`policy` for why exposed)."""
+        return self._guardrails
+
     async def execute(
         self,
         bundle: AgentBundle,

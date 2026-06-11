@@ -25,6 +25,7 @@ import asyncio
 import collections
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -417,8 +418,17 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
     # so the notification carries an accurate "took N seconds" figure.
     started_at = time.monotonic()
 
+    # The version the new image will actually report on /healthz. When we
+    # build, that's the MOVATE_BUILD_VERSION we inject (recomputed from HEAD)
+    # — NOT plan.version (= movate.__version__, frozen at the last `uv sync`).
+    # The CalVer per-day counter diverges between the two as commits land, so
+    # waiting on plan.version after a build produces a spurious exit 124 even
+    # though the rollout succeeded. Under --skip-build the baked version is
+    # unknowable; we keep plan.version as a best guess and let the sha-suffix
+    # fallback in _healthz_version_matches absorb counter drift where it can.
+    built_version: str | None = None
     if not skip_build:
-        _run_acr_build(plan, verbose=verbose)
+        built_version = _run_acr_build(plan, verbose=verbose)
     for app_name in plan.apps_to_update:
         _run_containerapp_update(plan, app_name)
 
@@ -465,12 +475,22 @@ def deploy(  # noqa: PLR0912 — orchestrator; branch count reflects mode dispat
         )
         return
 
+    expected_version = built_version or plan.version
+    expected_sha = _image_tag_sha(plan.image_tag) or git_short_sha() or None
+    if built_version is None:
+        hint(
+            f"[dim]--skip-build: expecting version {expected_version} from the local "
+            "install — the CalVer day-counter can diverge from the deployed build "
+            "(ADR 066); a /healthz version with a matching git-sha suffix is also "
+            "accepted.[/dim]"
+        )
     asyncio.run(
         _wait_for_healthz(
             url=target_cfg.url,
-            expected_version=plan.version,
+            expected_version=expected_version,
             timeout=wait_timeout,
             plan=plan,
+            expected_sha=expected_sha,
         )
     )
     success(f"{target_name} is now serving {plan.image_tag}")
@@ -2686,8 +2706,15 @@ def _resolve_build_version() -> str:
     return movate.__version__
 
 
-def _run_acr_build(plan: DeployPlan, *, verbose: bool = False) -> None:
+def _run_acr_build(plan: DeployPlan, *, verbose: bool = False) -> str:
     """``az acr build`` — builds the image inside ACR (no local Docker).
+
+    Returns the ``MOVATE_BUILD_VERSION`` it injected — the exact version
+    string the built image's ``/healthz`` will report. The caller waits on
+    THIS value, not ``movate.__version__``: the installed metadata is frozen
+    at the last ``uv sync`` while the build-arg is recomputed from HEAD, and
+    the CalVer per-day counter diverges between the two as commits land
+    (e.g. expected 2026.6.11.3, image reports 2026.6.11.8 → spurious 124).
 
     Uses the multi-stage Dockerfile's ``runtime`` target (the worker
     Container App reuses the same image and overrides the command).
@@ -2723,6 +2750,7 @@ def _run_acr_build(plan: DeployPlan, *, verbose: bool = False) -> None:
     with live_step(f"building {plan.image_tag} in ACR…") as step:
         _stream_az(cmd, what="acr build", step=step, echo=verbose)
     err.print(f"  [green]✓[/green] image built: {plan.fq_image}")
+    return build_version
 
 
 def _run_containerapp_update(plan: DeployPlan, app_name: str) -> None:
@@ -3061,11 +3089,60 @@ def _diagnose_failed_revision(*, resource_group: str, app_name: str) -> str | No
     return None
 
 
+#: Trailing ``-<shortsha>`` of an image tag (``movate:2026.6.11.3-47d6d65f``).
+_IMAGE_TAG_SHA_RE = re.compile(r"-([0-9a-f]{7,40})$")
+#: PEP 440 local segment carrying a git sha (``2026.6.11.12+g47d6d65f.dirty``).
+_VERSION_LOCAL_SHA_RE = re.compile(r"\+g([0-9a-f]{7,40})(?:\.|$)")
+
+
+def _image_tag_sha(image_tag: str) -> str | None:
+    """Extract the trailing short-sha from an image tag, if it carries one.
+
+    Our default tags are ``movate:<calver>-<shortsha>`` (``_build_plan``);
+    operator-supplied ``--image-tag`` values may not follow that shape, in
+    which case this returns ``None`` and the caller falls back."""
+    _, _, tag = image_tag.rpartition(":")
+    m = _IMAGE_TAG_SHA_RE.search(tag)
+    return m.group(1) if m else None
+
+
+def _healthz_version_matches(seen: str, *, expected_version: str, expected_sha: str | None) -> bool:
+    """Does the version ``/healthz`` reports prove the new image is serving?
+
+    Two accepted proofs, in order of strength:
+
+    * **Exact match** on ``expected_version``. Deterministic when the caller
+      passes the ``MOVATE_BUILD_VERSION`` it just injected into the build —
+      the image reports that string verbatim.
+    * **Git-sha match**: the reported version carries a ``+g<shortsha>``
+      local segment (dirty-tree builds, ADR 066) that matches
+      ``expected_sha``. The CalVer per-day counter is NOT a stable marker —
+      it diverges across clones/sync points — so a counter mismatch alone
+      never disproves the rollout when the shas agree. Prefix-tolerant in
+      both directions (``--short`` sha length varies per repo state).
+    """
+    if seen == expected_version:
+        return True
+    if expected_sha:
+        m = _VERSION_LOCAL_SHA_RE.search(seen)
+        if m:
+            seen_sha = m.group(1).lower()
+            want = expected_sha.lower()
+            return seen_sha.startswith(want) or want.startswith(seen_sha)
+    return False
+
+
 async def _wait_for_healthz(
-    *, url: str, expected_version: str, timeout: float, plan: DeployPlan | None = None
+    *,
+    url: str,
+    expected_version: str,
+    timeout: float,
+    plan: DeployPlan | None = None,
+    expected_sha: str | None = None,
 ) -> None:
     """Poll ``GET /healthz`` until the response's ``version`` matches the
-    new deploy. ACA's rolling restart can take 30s-2min; we give it
+    new deploy (see :func:`_healthz_version_matches` for what counts as a
+    match). ACA's rolling restart can take 30s-2min; we give it
     ``timeout`` seconds, then bail with exit 124.
 
     On timeout, if ``plan`` is supplied, query the latest ACA revision and
@@ -3083,7 +3160,9 @@ async def _wait_for_healthz(
                 if r.status_code == httpx.codes.OK:
                     body = r.json()
                     seen = body.get("version", "?")
-                    if seen == expected_version:
+                    if _healthz_version_matches(
+                        seen, expected_version=expected_version, expected_sha=expected_sha
+                    ):
                         return
                     hint(f"[dim]  still seeing version {seen}, retrying...[/dim]")
             except (httpx.HTTPError, ValueError):

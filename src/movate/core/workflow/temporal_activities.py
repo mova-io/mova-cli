@@ -167,6 +167,21 @@ class ActivityContext:
     ``build_local_runtime`` wires them for the local/native path. Without them
     the durable backend ran fully permissive (governance + guardrails silently
     dormant — PII/content checks did not fire on Temporal runs)."""
+    memory_store: Any = None
+    """Per-agent ``MemoryStore`` (task #46 — native-parity gap). The native
+    path's Executor (``build_local_runtime``) passes ``build_memory_store()``
+    so every successful run persists ``last_run`` memory; the Temporal
+    per-activity Executor omitted it, so agent memory silently never wrote on
+    durable runs. Activity-side only — memory writes happen inside the
+    Executor within an activity, never in workflow code, so there is no
+    determinism concern (Temporal records the activity result, not its
+    side effects)."""
+    cache: Any = None
+    """LLM response ``CacheProvider`` (task #46 — same parity gap as
+    ``memory_store``). Native passes ``build_cache()`` (NoOp unless
+    ``MOVATE_LLM_CACHE`` opts in); the durable path always ran uncached.
+    Also activity-side only: a cache hit changes nothing the workflow can
+    observe beyond the activity's recorded result."""
 
 
 _CONTEXT: ActivityContext | None = None
@@ -184,6 +199,8 @@ def configure_activities(
     runtime_policy: Any = None,
     skill_policy: Any = None,
     guardrails: Any = None,
+    memory_store: Any = None,
+    cache: Any = None,
 ) -> None:
     """Install the :class:`ActivityContext` the four activities read.
 
@@ -226,6 +243,23 @@ def configure_activities(
             skill_policy = skill_policy if skill_policy is not None else cfg.skills
             guardrails = guardrails if guardrails is not None else cfg.guardrails
 
+    # Resolve memory + cache from the SAME env-driven builders the native
+    # path's Executor construction uses (build_local_runtime: memory_store=
+    # build_memory_store(), cache=build_cache()) — task #46. Explicit args
+    # win (the test escape hatch, like ``policy``). Fail-soft: a builder
+    # hiccup degrades to the Executor's permissive defaults (no memory
+    # writes / NoOpCache), never a worker-startup failure.
+    if memory_store is None:
+        with contextlib.suppress(Exception):
+            from movate.memory import build_memory_store  # noqa: PLC0415
+
+            memory_store = build_memory_store()
+    if cache is None:
+        with contextlib.suppress(Exception):
+            from movate.core.cache import build_cache  # noqa: PLC0415
+
+            cache = build_cache()
+
     global _CONTEXT  # noqa: PLW0603 — module-global DI registry, set once at worker startup.
     _CONTEXT = ActivityContext(
         storage=storage,
@@ -238,6 +272,8 @@ def configure_activities(
         runtime_policy=runtime_policy,
         skill_policy=skill_policy,
         guardrails=guardrails,
+        memory_store=memory_store,
+        cache=cache,
     )
 
 
@@ -300,6 +336,14 @@ def _executor_for(ctx: ActivityContext, state: dict[str, Any]) -> Any:
         runtime_policy=ctx.runtime_policy,
         skill_policy=ctx.skill_policy,
         guardrails=ctx.guardrails,
+        # Task #46 — native parity: the local path's Executor gets a memory
+        # store (per-agent last_run writes) + LLM cache; the durable path
+        # omitted both, so agent memory never persisted and caching never
+        # applied on Temporal runs. Both are activity-side effects (recorded
+        # via the activity result, never workflow code) — no determinism
+        # concern. None ⇒ Executor defaults (no memory writes / NoOpCache).
+        memory_store=ctx.memory_store,
+        cache=ctx.cache,
     )
 
 
@@ -348,6 +392,31 @@ async def _write_run_fact_failsoft(
         )
     except Exception:
         _log.warning("observability_fact_derive_failed run_id=%s", run_id, exc_info=True)
+
+
+def _fold_state_effect(state: dict[str, Any], effect: str | None) -> str | None:
+    """Fold this node's governance ``effect`` into the run's state-carried one.
+
+    ADR 096 cross-process fix: the run-effect registry is process-local, but
+    the shared ``mdk-workflows`` task queue is polled by EVERY worker (the
+    dispatch path's ephemeral in-process worker AND any long-lived
+    ``mdk worker --backend temporal``), so a run's activities are load-balanced
+    across processes — the activity that recorded an effect and the persist
+    activity that stamps the terminal fact routinely land on different workers,
+    and the registry entry is absent where the fact is written (the observed
+    governance_effect=NULL on fast runs). Workflow state rides Temporal
+    history, so an effect folded into the returned state delta under
+    :data:`RUN_EFFECT_STATE_KEY` reaches the persist/pause activities
+    deterministically, regardless of placement.
+
+    Returns the most severe of the effect already carried in ``state`` and
+    this node's ``effect`` — ``None`` when neither exists (callers then add
+    no key, keeping ungoverned runs' state byte-for-byte unchanged).
+    """
+    from movate.governance.effects import RUN_EFFECT_STATE_KEY, most_severe  # noqa: PLC0415
+
+    prior = state.get(RUN_EFFECT_STATE_KEY)
+    return most_severe(prior if isinstance(prior, str) else None, effect)
 
 
 def _project_state(state: dict[str, Any], bundle: Any) -> dict[str, Any]:
@@ -436,7 +505,19 @@ async def call_agent_activity(
             f"agent node {node_id!r} ({ref}) failed: "
             f"{response.error.message if response.error else response.status}"
         )
-    return dict(response.data)
+    data = dict(response.data)
+    # ADR 096 cross-process fix (see _fold_state_effect): carry the folded
+    # effect in the returned delta so it rides Temporal history to the
+    # persist/pause activities even when they run on a different worker
+    # process than this one. The registry record above remains the
+    # same-process fast path (and covers nodes whose results don't merge
+    # into state). No gate observed ⇒ no key ⇒ state unchanged.
+    folded = _fold_state_effect(state, gov_scope.effect)
+    if folded is not None:
+        from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
+
+        data[RUN_EFFECT_STATE_KEY] = folded
+    return data
 
 
 @_activity.defn  # type: ignore[untyped-decorator]
@@ -567,7 +648,16 @@ async def call_skill_activity(
                 f"[{exc.type.value}] {exc.message}"
             ) from exc
         ctx.tracer.set_attribute(span, "tool.outcome", "success")
-        return merge_tool_output(dict(output), output_key)
+        delta = merge_tool_output(dict(output), output_key)
+        # ADR 096 cross-process fix (see _fold_state_effect): the SKILL gate's
+        # effect rides the returned state delta to the persist/pause
+        # activities, surviving multi-worker activity placement.
+        folded = _fold_state_effect(state, gov_scope.effect)
+        if folded is not None:
+            from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
+
+            delta[RUN_EFFECT_STATE_KEY] = folded
+        return delta
     finally:
         ctx.tracer.end_span(span)
 
@@ -802,6 +892,7 @@ async def call_human_activity(
     activity returns nothing; its effect is the persisted checkpoint.
     """
     from movate.core.models import WorkflowRunRecord, WorkflowStatus  # noqa: PLC0415
+    from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
 
     ctx = _get_context()
     human_task = {
@@ -809,16 +900,26 @@ async def call_human_activity(
         "output_contract": list(output_contract),
         "approvers": list(approvers),
     }
+    # ADR 096 cross-process fix: pop the state-carried governance effect (see
+    # _fold_state_effect) BEFORE persisting — the paused record's state
+    # surfaces through the HITL API (GET /workflow-runs?status=paused), so the
+    # internal key must not appear there. The LIVE workflow keeps the key in
+    # its own state (this activity persists a copy), so the resumed segment —
+    # which continues from Temporal workflow memory, not from this record —
+    # keeps accumulating from it.
+    clean_state = dict(state)
+    raw_carried = clean_state.pop(RUN_EFFECT_STATE_KEY, None)
+    state_effect = raw_carried if isinstance(raw_carried, str) else None
     record = WorkflowRunRecord(
         workflow_run_id=run_id,
         tenant_id=_resolve_tenant_id(ctx, state),
         workflow=workflow_name,
         workflow_version=workflow_version,
         status=WorkflowStatus.PAUSED,
-        initial_state=dict(state),
-        final_state=dict(state),
+        initial_state=dict(clean_state),
+        final_state=dict(clean_state),
         paused_node_id=node_id,
-        paused_state=dict(state),
+        paused_state=dict(clean_state),
         human_task=human_task,
         runtime="temporal",
     )
@@ -829,8 +930,11 @@ async def call_human_activity(
     # workflow_runs. Fail-soft + lazy import (the helper logs and never
     # raises; the pause record above is already durable). The governance
     # effect collected so far is PEEKED, not consumed — the run resumes and
-    # the terminal persist still needs the registry entry.
-    from movate.governance.effects import peek_run_effect  # noqa: PLC0415
+    # the terminal persist still needs the registry entry. The state-carried
+    # effect (RUN_EFFECT_STATE_KEY, popped above before the record write) is
+    # folded in too: it covers activities that ran on a different worker
+    # process, whose effects this process's registry never saw.
+    from movate.governance.effects import most_severe, peek_run_effect  # noqa: PLC0415
     from movate.runtime.facts import (  # noqa: PLC0415
         fact_from_workflow_run,
         write_fact_failsoft,
@@ -838,7 +942,10 @@ async def call_human_activity(
 
     await write_fact_failsoft(
         ctx.storage,
-        fact_from_workflow_run(record, governance_effect=peek_run_effect(run_id)),
+        fact_from_workflow_run(
+            record,
+            governance_effect=most_severe(peek_run_effect(run_id), state_effect),
+        ),
     )
 
     # Escalate to the approval channel (ADR 083) — parity with the native
@@ -890,8 +997,15 @@ async def persist_workflow_result_activity(
         WorkflowRunRecord,
         WorkflowStatus,
     )
+    from movate.governance.effects import RUN_EFFECT_STATE_KEY  # noqa: PLC0415
 
     ctx = _get_context()
+    # ADR 096 cross-process fix: pop the state-carried governance effect (see
+    # _fold_state_effect) BEFORE persisting — it is observability plumbing,
+    # not workflow output, so the durable record's final_state stays clean.
+    clean_final_state = dict(final_state)
+    raw_carried = clean_final_state.pop(RUN_EFFECT_STATE_KEY, None)
+    state_effect = raw_carried if isinstance(raw_carried, str) else None
     record = WorkflowRunRecord(
         workflow_run_id=run_id,
         tenant_id=_resolve_tenant_id(ctx, final_state),
@@ -899,7 +1013,7 @@ async def persist_workflow_result_activity(
         workflow_version=workflow_version,
         status=WorkflowStatus(status),
         initial_state=dict(initial_state),
-        final_state=dict(final_state),
+        final_state=clean_final_state,
         error=(
             ErrorInfo(type="temporal_workflow_error", message=error) if error is not None else None
         ),
@@ -911,14 +1025,15 @@ async def persist_workflow_result_activity(
     # the same persist edge as the record (the detached-HITL path never
     # returns through the dispatch edge, so dispatch can't cover it). The
     # fact_id upsert overwrites any prior PAUSED fact under the same id.
-    # The run's governance effect (most severe across every activity this
-    # worker process ran for it — ADR 096) is CONSUMED here: the run is
-    # terminal, the registry slot is freed. Best-effort by design: activities
-    # that executed on a different worker process recorded their effect
-    # there; the COALESCE upsert keeps a previously stamped value when this
-    # write carries none. Fail-soft + lazy import: a fact hiccup never fails
-    # the terminal persist.
-    from movate.governance.effects import consume_run_effect  # noqa: PLC0415
+    # The run's governance effect is the most severe of (a) this process's
+    # registry entry (CONSUMED — the run is terminal, the slot is freed) and
+    # (b) the state-carried effect popped above, which rides Temporal history
+    # and therefore survives activities landing on OTHER worker processes —
+    # the cross-process gap that produced terminal facts with a NULL effect
+    # on fast runs. The COALESCE upsert still keeps a previously stamped
+    # value when this write carries none. Fail-soft + lazy import: a fact
+    # hiccup never fails the terminal persist.
+    from movate.governance.effects import consume_run_effect, most_severe  # noqa: PLC0415
     from movate.runtime.facts import (  # noqa: PLC0415
         fact_from_workflow_run,
         write_fact_failsoft,
@@ -926,7 +1041,10 @@ async def persist_workflow_result_activity(
 
     await write_fact_failsoft(
         ctx.storage,
-        fact_from_workflow_run(record, governance_effect=consume_run_effect(run_id)),
+        fact_from_workflow_run(
+            record,
+            governance_effect=most_severe(consume_run_effect(run_id), state_effect),
+        ),
     )
 
     # Operational signal (ADR 082): durable workflows never hit the native

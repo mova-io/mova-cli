@@ -677,6 +677,9 @@ async def test_temporal_agent_activity_writes_run_fact(
     data = await call_agent_activity(
         "step1", str(scaffolded_agent / "alpha"), {"text": "hi"}, "wfr-77"
     )
+    # The governed activity also folds the run's governance effect into the
+    # state delta (cross-process persistence fix) — pop it before comparing.
+    assert data.pop("_mdk_governance_effect", None) in ("allow", None)
     assert data == {"message": "hi"}
 
     facts = await storage.list_observability_facts(tenant_id="tenant-a", kind="run")
@@ -716,6 +719,9 @@ async def test_temporal_agent_activity_fact_failure_is_failsoft(
     data = await call_agent_activity(
         "step1", str(scaffolded_agent / "alpha"), {"text": "hi"}, "wfr-77"
     )
+    # The governed activity also folds the run's governance effect into the
+    # state delta (cross-process persistence fix) — pop it before comparing.
+    assert data.pop("_mdk_governance_effect", None) in ("allow", None)
     assert data == {"message": "hi"}
     assert storage.runs, "the authoritative RunRecord must persist regardless"
 

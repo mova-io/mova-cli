@@ -22,12 +22,19 @@ from typing import Any
 import pytest
 
 import movate.core.workflow.temporal_activities as ta
+from movate.core.cache import InProcessCache, NoOpCache
 from movate.core.models import ErrorInfo, Metrics, RunResponse, SkillSideEffects
 from movate.core.workflow.judge import (
     build_judge_state_value,
     derive_terminate,
     verdict_from_response_data,
 )
+from movate.governance.effects import (
+    RUN_EFFECT_STATE_KEY,
+    consume_run_effect,
+    record_scope_effect,
+)
+from movate.memory import InMemoryStore
 from movate.testing import InMemoryStorage, NullTracer
 
 # ---------------------------------------------------------------------------
@@ -335,6 +342,13 @@ async def test_call_skill_activity_forwards(monkeypatch: pytest.MonkeyPatch) -> 
         "skill-node", "/skills/my-skill", {"q": "x", "z": 1}, "run-7"
     )
 
+    # This test uses the REAL _executor_for, so when the repo's project.yaml
+    # registers governance gates the SKILL gate's effect is (intentionally)
+    # folded into the delta under the reserved key — ADR 096 cross-process
+    # fix. It's environment-dependent here, so strip it; the dedicated tests
+    # below pin the folding behavior deterministically.
+    out.pop(RUN_EFFECT_STATE_KEY, None)
+    consume_run_effect("run-7")  # registry hygiene (same incidental gate)
     assert out == {"answer": 42}
     # Input narrowed to the skill's declared schema ("q" only).
     assert captured["input"] == {"q": "x"}
@@ -424,6 +438,183 @@ async def test_judge_activity_unconfigured_raises() -> None:
     assert ta._CONTEXT is None
     with pytest.raises(RuntimeError):
         await ta.call_judge_activity("j", "/agents/judge", {}, {"answer": "x"}, "r")
+
+
+# ---------------------------------------------------------------------------
+# Task #46 — native-parity executor construction: the activity-built Executor
+# must receive the memory_store + cache the native path's Executor gets
+# (build_local_runtime passes build_memory_store() + build_cache(); the
+# durable path omitted both, so agent memory never persisted and the LLM
+# cache never applied on Temporal runs). Mirrors the task #44 policy-wiring
+# tests in test_temporal_governance_wiring.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_executor_for_threads_memory_store_and_cache() -> None:
+    """Explicit memory_store/cache on configure_activities reach the
+    per-activity Executor — the same construction parity the native path has."""
+    memory_store = InMemoryStore()
+    cache = InProcessCache()
+    ta.configure_activities(
+        storage=InMemoryStorage(),
+        pricing=object(),
+        tracer=NullTracer(),
+        provider=object(),
+        memory_store=memory_store,
+        cache=cache,
+    )
+
+    ex = ta._executor_for(ta._get_context(), {"mock": True})
+    assert ex._memory_store is memory_store
+    assert ex._cache is cache
+
+
+@pytest.mark.unit
+def test_configure_activities_defaults_memory_and_cache_from_builders(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Unset args resolve via the SAME env-driven builders the native path
+    uses (build_memory_store / build_cache) — explicit args win, like policy."""
+    # Keep the default builders hermetic: file-backed memory in tmp, cache ON.
+    monkeypatch.setenv("MOVATE_MEMORY_FILE", str(tmp_path / "memory.json"))
+    monkeypatch.setenv("MOVATE_LLM_CACHE", "memory")
+
+    ta.configure_activities(
+        storage=InMemoryStorage(),
+        pricing=object(),
+        tracer=NullTracer(),
+        provider=object(),
+    )
+
+    ctx = ta._get_context()
+    assert isinstance(ctx.memory_store, InMemoryStore)
+    assert isinstance(ctx.cache, InProcessCache)
+    ex = ta._executor_for(ctx, {"mock": True})
+    assert ex._memory_store is ctx.memory_store
+    assert ex._cache is ctx.cache
+
+
+@pytest.mark.unit
+def test_configure_activities_cache_default_off_is_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """With MOVATE_LLM_CACHE unset the builder returns NoOpCache — the
+    durable path stays byte-for-byte uncached, exactly like native."""
+    monkeypatch.setenv("MOVATE_MEMORY_FILE", str(tmp_path / "memory.json"))
+    monkeypatch.delenv("MOVATE_LLM_CACHE", raising=False)
+
+    ta.configure_activities(
+        storage=InMemoryStorage(),
+        pricing=object(),
+        tracer=NullTracer(),
+        provider=object(),
+    )
+
+    ex = ta._executor_for(ta._get_context(), {"mock": True})
+    assert isinstance(ex._cache, NoOpCache)
+
+
+# ---------------------------------------------------------------------------
+# ADR 096 cross-process fix: governed activities fold the run's governance
+# effect into their returned state delta (RUN_EFFECT_STATE_KEY) so it rides
+# Temporal history to the persist/pause activities regardless of which worker
+# PROCESS they land on (the process-local registry can't cross that boundary
+# — the shared task queue load-balances a run's activities across workers).
+# ---------------------------------------------------------------------------
+
+
+class _GovernedFakeExecutor(_FakeExecutor):
+    """Fake executor that simulates a governance gate evaluating during
+    ``execute`` (the engine records into the activity's open scope)."""
+
+    def __init__(self, response: RunResponse, effect: str) -> None:
+        super().__init__(response)
+        self._effect = effect
+
+    async def execute(self, bundle: Any, request: Any, **kwargs: Any) -> RunResponse:
+        record_scope_effect(self._effect)
+        return await super().execute(bundle, request, **kwargs)
+
+
+@pytest.mark.unit
+async def test_agent_activity_folds_gate_effect_into_returned_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The incident shape: the last node's agent gates evaluate (allow) — the
+    effect must ride the returned delta into workflow state, not only the
+    process-local registry."""
+    _configure(monkeypatch)
+    bundle = _FakeBundle(name="notify", properties={"text": {"type": "string"}})
+    fake_exec = _GovernedFakeExecutor(_ok_response({"summary": "ok"}), "allow")
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+    monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
+
+    out = await ta.call_agent_activity("notify", "/agents/notify", {"text": "hi"}, "run-gov-a")
+
+    assert out["summary"] == "ok"
+    assert out[RUN_EFFECT_STATE_KEY] == "allow"
+    # The same-process registry fast path still records it (consume cleans up).
+    assert consume_run_effect("run-gov-a") == "allow"
+
+
+@pytest.mark.unit
+async def test_agent_activity_folds_with_prior_state_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Severity-wins across nodes: a warn carried from an earlier node is not
+    downgraded by this node's allow."""
+    _configure(monkeypatch)
+    bundle = _FakeBundle(name="notify", properties={"text": {"type": "string"}})
+    fake_exec = _GovernedFakeExecutor(_ok_response({"summary": "ok"}), "allow")
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+    monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
+
+    state = {"text": "hi", RUN_EFFECT_STATE_KEY: "warn"}
+    out = await ta.call_agent_activity("notify", "/agents/notify", state, "run-gov-b")
+
+    assert out[RUN_EFFECT_STATE_KEY] == "warn"
+    consume_run_effect("run-gov-b")  # registry hygiene
+
+
+@pytest.mark.unit
+async def test_agent_activity_no_gate_no_state_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ungoverned runs stay byte-for-byte unchanged — no reserved key appears."""
+    _configure(monkeypatch)
+    bundle = _FakeBundle(name="echoer", properties={"text": {"type": "string"}})
+    fake_exec = _FakeExecutor(_ok_response({"step1": "done"}))
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: fake_exec)
+    monkeypatch.setattr("movate.core.loader.load_agent", lambda ref, *, defaults=None: bundle)
+
+    out = await ta.call_agent_activity("node-1", "/agents/echoer", {"text": "x"}, "run-gov-c")
+    assert RUN_EFFECT_STATE_KEY not in out
+    assert consume_run_effect("run-gov-c") is None
+
+
+@pytest.mark.unit
+async def test_skill_activity_carries_gate_effect_in_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SKILL gate's effect (govern_skill_dispatch) rides the tool delta."""
+    _configure(monkeypatch)
+    skill = _FakeBundle(name="sim-step", properties={"q": {"type": "string"}})
+
+    class _GovernedSkillExecutor:
+        def govern_skill_dispatch(self, **kwargs: Any) -> None:
+            record_scope_effect("warn")
+
+    async def _fake_dispatch(skill_arg: Any, input_arg: dict, ctx_arg: Any) -> dict:
+        return {"answer": 42}
+
+    monkeypatch.setattr(ta, "_executor_for", lambda ctx, state: _GovernedSkillExecutor())
+    monkeypatch.setattr("movate.core.skill_loader.load_skill", lambda ref: skill)
+    monkeypatch.setattr("movate.core.skill_backend.base.dispatch_skill", _fake_dispatch)
+
+    out = await ta.call_skill_activity("step-one", "/skills/sim-step", {"q": "x"}, "run-gov-d")
+
+    assert out["answer"] == 42
+    assert out[RUN_EFFECT_STATE_KEY] == "warn"
+    assert consume_run_effect("run-gov-d") == "warn"
 
 
 # ---------------------------------------------------------------------------

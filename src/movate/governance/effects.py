@@ -117,6 +117,19 @@ def record_scope_effect(effect: str) -> None:
 # Run-effect registry — the Temporal cross-activity bridge.
 # ---------------------------------------------------------------------------
 
+#: Reserved workflow-state key carrying the run's folded governance effect
+#: across Temporal activity boundaries. The process-local registry below is
+#: best-effort by design (see module docstring): every worker polling the
+#: shared task queue can be handed any of a run's activities, so the activity
+#: that recorded the effect and the persist activity that stamps the fact may
+#: live in different processes — the registry entry is simply absent there.
+#: State, by contrast, rides Temporal history: an activity that observed a
+#: gate folds the effect into its returned state delta under this key, and
+#: the persist/pause activities read it back deterministically regardless of
+#: placement. Stripped from the persisted record's ``final_state`` and from
+#: the in-process workflow result, so it never reaches user-visible output.
+RUN_EFFECT_STATE_KEY = "_mdk_governance_effect"
+
 _RUN_EFFECTS: OrderedDict[str, str] = OrderedDict()
 
 
@@ -150,6 +163,7 @@ def consume_run_effect(run_id: str) -> str | None:
 
 
 __all__ = [
+    "RUN_EFFECT_STATE_KEY",
     "GovernanceEffectScope",
     "consume_run_effect",
     "governance_effect_scope",

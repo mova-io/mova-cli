@@ -53,6 +53,7 @@ from movate.core.workflow.compilers.temporal import TemporalCompiler
 from movate.core.workflow.ir import NodeType
 from movate.core.workflow.spec import ToolNodeSpec
 from movate.core.workflow.tool import build_skill_input, merge_tool_output
+from movate.governance.effects import RUN_EFFECT_STATE_KEY
 from movate.testing import InMemoryStorage, NullTracer
 
 cli_runner = CliRunner(mix_stderr=False)
@@ -605,6 +606,8 @@ async def test_call_skill_activity_four_arg_backward_compat(tmp_path: Path) -> N
     out = await ta.call_skill_activity(
         "fetch", str(skill_dir), {"order_id": "o-1", "noise": 1}, "run-1"
     )
+    # ADR 096: the SKILL gate's folded effect rides the mid-flight delta — observability plumbing.
+    out.pop(RUN_EFFECT_STATE_KEY, None)
     assert out == {"order_status": "shipped", "echo": {"order_id": "o-1"}}
 
 
@@ -620,6 +623,8 @@ async def test_call_skill_activity_applies_map_and_output_key(tmp_path: Path) ->
         {"order_id": "order.id", "include_history": {"literal": True}},
         "lookup",
     )
+    # ADR 096: the SKILL gate's folded effect rides the mid-flight delta — observability plumbing.
+    delta.pop(RUN_EFFECT_STATE_KEY, None)
     # The activity returns the state DELTA — the workflow's state.update()
     # then produces the same final state native does.
     assert delta == {
@@ -707,6 +712,9 @@ async def test_parity_native_and_temporal_reach_same_state(
         node.metadata["output_key"],
     )
     state.update(delta)
+    # ADR 096: mid-flight state carries the folded governance effect; the compiled
+    # workflow pops it before returning, so mirror that strip before comparing.
+    state.pop(RUN_EFFECT_STATE_KEY, None)
 
     assert state == native.final_state
 

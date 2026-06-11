@@ -1016,6 +1016,133 @@ async def _no_sleep(_seconds: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# _healthz_version_matches — the version-match predicate (CalVer counter
+# drift, ADR 066). The per-day counter N diverges between the locally
+# installed metadata and the version baked into the image, so the wait must
+# never key on it alone.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("seen", "expected_version", "expected_sha", "matches"),
+    [
+        # Exact match — the deterministic path (expected = the injected
+        # MOVATE_BUILD_VERSION).
+        ("2026.6.11.8", "2026.6.11.8", "47d6d65f", True),
+        ("2026.6.11.8", "2026.6.11.8", None, True),
+        # Counter drift but the dirty-build local segment carries the same
+        # sha → the rollout is proven; counter mismatch is not a failure.
+        ("2026.6.11.8+g47d6d65f.dirty", "2026.6.11.3", "47d6d65f", True),
+        # Prefix tolerance both ways (`--short` sha lengths vary).
+        ("2026.6.11.8+g47d6d65f12.dirty", "2026.6.11.3", "47d6d65f", True),
+        ("2026.6.11.8+g47d6d65.dirty", "2026.6.11.3", "47d6d65f", True),
+        # Different sha → still the old image.
+        ("2026.6.11.8+gdeadbeef.dirty", "2026.6.11.3", "47d6d65f", False),
+        # No sha in the reported version (clean build) + counter mismatch →
+        # cannot prove the rollout; predicate stays false (current behavior).
+        ("2026.6.11.8", "2026.6.11.3", "47d6d65f", False),
+        # No expected sha to compare against → version string is all we have.
+        ("2026.6.11.8+g47d6d65f.dirty", "2026.6.11.3", None, False),
+        ("0+unknown", "2026.6.11.3", "47d6d65f", False),
+    ],
+)
+def test_healthz_version_matches_predicate(
+    seen: str, expected_version: str, expected_sha: str | None, matches: bool
+) -> None:
+    from movate.cli.deploy import _healthz_version_matches  # noqa: PLC0415
+
+    assert (
+        _healthz_version_matches(seen, expected_version=expected_version, expected_sha=expected_sha)
+        is matches
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("image_tag", "sha"),
+    [
+        ("movate:2026.6.11.3-47d6d65f", "47d6d65f"),  # default _build_plan shape
+        ("movate:2026.6.11.3-unknown", None),  # git_short_sha() unavailable
+        ("movate:9.9.9-test", None),  # operator tag, no sha suffix
+        ("movate:latest", None),
+        ("2026.6.11.3-abc1234", "abc1234"),  # bare tag (no repo segment)
+    ],
+)
+def test_image_tag_sha_extraction(image_tag: str, sha: str | None) -> None:
+    from movate.cli.deploy import _image_tag_sha  # noqa: PLC0415
+
+    assert _image_tag_sha(image_tag) == sha
+
+
+@pytest.mark.unit
+def test_wait_for_healthz_accepts_sha_suffix_despite_counter_drift(monkeypatch) -> None:
+    """The live failure mode: the image reports a CalVer whose per-day
+    counter differs from the locally expected one, but its ``+g<sha>`` local
+    segment matches the deployed commit → the wait returns instead of 124."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "ok", "version": "2026.6.11.8+g47d6d65f.dirty"})
+
+    _make_healthz_client_factory(httpx.MockTransport(handler), monkeypatch)
+    monkeypatch.setattr("movate.cli.deploy.asyncio.sleep", _no_sleep)
+
+    asyncio.run(
+        _wait_for_healthz(
+            url="https://example.test",
+            expected_version="2026.6.11.3",
+            timeout=30.0,
+            expected_sha="47d6d65f",
+        )
+    )
+
+
+@pytest.mark.unit
+def test_run_acr_build_returns_injected_build_version(mock_subprocess, monkeypatch) -> None:
+    """The build helper must hand back the exact MOVATE_BUILD_VERSION it
+    injected — that string (not movate.__version__) is what the new image's
+    /healthz reports, so it's what the wait keys on."""
+    from movate.cli.deploy import _run_acr_build  # noqa: PLC0415
+
+    monkeypatch.setattr("movate.cli.deploy._resolve_build_version", lambda: "2026.6.11.8")
+    plan = _build_plan(
+        target_name="prod",
+        target_cfg=_full_target(),
+        image_tag="movate:2026.6.11.3-47d6d65f",
+        skip_build=False,
+        only=None,
+    )
+    returned = _run_acr_build(plan)
+    assert returned == "2026.6.11.8"
+    build_cmd = next(c for c in mock_subprocess if c[:3] == ["az", "acr", "build"])
+    assert "MOVATE_BUILD_VERSION=2026.6.11.8" in build_cmd
+
+
+@pytest.mark.unit
+def test_cli_deploy_waits_on_built_version_not_installed_metadata(
+    deploy_env, mock_subprocess, monkeypatch
+) -> None:
+    """End-to-end wiring: after a build, the /healthz wait must receive the
+    injected build version (recomputed from HEAD), NOT plan.version
+    (movate.__version__, frozen at the last `uv sync`) — the divergence that
+    made every deploy exit 124."""
+    monkeypatch.setattr("movate.cli.deploy._resolve_build_version", lambda: "2026.6.11.8")
+    captured: dict[str, Any] = {}
+
+    async def fake_wait(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("movate.cli.deploy._wait_for_healthz", fake_wait)
+    result = runner.invoke(
+        cli_app,
+        ["deploy", "--target", "prod", "--image-tag", "movate:2026.6.11.3-47d6d65f"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert captured["expected_version"] == "2026.6.11.8"
+    assert captured["expected_sha"] == "47d6d65f"
+
+
+# ---------------------------------------------------------------------------
 # _diagnose_failed_revision + timeout-branch root-cause surfacing (item 87)
 # ---------------------------------------------------------------------------
 
@@ -1558,7 +1685,7 @@ def test_cli_deploy_verified_prints_deployed_next_steps(
     the test stays sync, then assert the verified-phase next-steps block is
     printed (✓ deployed + the doctor health line)."""
 
-    async def _instant_healthz(*, url, expected_version, timeout, plan=None):
+    async def _instant_healthz(*, url, expected_version, timeout, plan=None, expected_sha=None):
         return None
 
     monkeypatch.setattr("movate.cli.deploy._wait_for_healthz", _instant_healthz)

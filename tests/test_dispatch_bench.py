@@ -154,3 +154,44 @@ async def test_execute_bench_job_no_models(
     assert outcome.error is not None
     assert outcome.error["type"] == "bench_config"
     assert len(storage.bench) == 0
+
+
+# ---------------------------------------------------------------------------
+# Governance threading (task #45): the bench sub-executor inherits the worker
+# executor's policies — same regression coverage as test_dispatch_eval.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+async def test_bench_job_threads_policy_so_gates_evaluate(
+    tmp_path: Path, storage: InMemoryStorage, pricing
+) -> None:
+    """``_execute_bench`` previously built its sub-executor without the main
+    path's policies (the task #45 gap) — bench runs were ungoverned. With a
+    non-permissive ModelPolicy on the worker executor, the benched run must
+    record a governance effect into the ambient scope."""
+    from movate.core.config import ModelPolicy  # noqa: PLC0415
+    from movate.governance.effects import governance_effect_scope  # noqa: PLC0415
+
+    agent_dir = scaffold_agent(tmp_path / "demo")
+    bundle = load_agent(agent_dir)
+    provider = JudgeStubProvider(agent_response='{"message": "Hello!"}', judge_score=0.9)
+    executor = Executor(
+        provider=provider,
+        pricing=pricing,
+        storage=storage,
+        tracer=NullTracer(),
+        policy=ModelPolicy(allowed_providers=["openai"]),
+    )
+    dispatch = WorkerDispatch(
+        storage=storage,
+        executor=executor,
+        agents=[bundle],
+        use_mock_for_eval=True,
+    )
+
+    with governance_effect_scope() as scope:
+        outcome = await dispatch.execute_job(_make_job(target="demo"))
+
+    assert outcome.status == JobStatus.SUCCESS
+    assert scope.effect == "allow"  # gates evaluated on the bench sub-executor
