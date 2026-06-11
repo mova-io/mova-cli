@@ -304,6 +304,18 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Multi-stage content review chain + HITL final gate (runtime: temporal). Calibrated compliance-review and brand-review agents each feed a DECISION node failing safe to a shared rejected agent; content passing BOTH still publishes nothing until a HUMAN gate routes its own approve/reject decision (ADR 099) into the sim-publish TOOL's auditable cms ledger row (ADR 094/097/098/099).",  # noqa: E501
         "compliance → DECISION → brand → DECISION → [HUMAN routes approve|reject] → TOOL publish → notify | rejected",  # noqa: E501
     ),
+    "agent-self-healing": (
+        "pattern_agent_self_healing",
+        True,
+        "An agent detects its own degraded output quality and heals (runtime: temporal). The sim-health-check TOOL node measures canned quality metrics (no LLM self-grading); a DECISION node routes the 0.8 threshold; a diagnose agent names cause + fix but the sim-apply-fix TOOL decides applied/failed deterministically (a model-drift symptom can never self-fix); a failed fix pauses at a HUMAN ack gate before the incident report — no cycles, a failed fix can only escalate (ADR 094/097/098/099).",  # noqa: E501
+        "TOOL health-check → DECISION(quality) → {healthy | diagnose → TOOL apply-fix → DECISION → {verified | [HUMAN ack] → incident}}",  # noqa: E501
+    ),
+    "self-healing-ops": (
+        "pattern_self_healing_ops",
+        True,
+        "Infrastructure self-healing with two-attempt remediation (runtime: temporal). The sim-detect TOOL node maps the monitor signal onto a canned fault catalog; ONE triage agent recommends the action; 'retry on failure' is UNROLLED into two sequential remediation TOOL attempts (no cycles — the cap is structural), each verified by a DECISION node and each writing its own ops ledger row; a fault surviving both attempts pauses at a HUMAN ack gate — all three exits converge on ONE guarded closure agent (ADR 094/097/098/099).",  # noqa: E501
+        "TOOL detect → triage → TOOL remediate-1 → DECISION → {closure | TOOL remediate-2 → DECISION → {closure | [HUMAN ack] → closure}}",  # noqa: E501
+    ),
     # NOTE: the react / map-reduce / supervisor workflow patterns were reverted —
     # they were pushed directly to main substantially incomplete (sub-agents
     # missing canonical YAML schemas + judge examples; templates missing root

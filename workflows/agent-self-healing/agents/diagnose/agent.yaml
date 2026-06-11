@@ -1,0 +1,16 @@
+api_version: movate/v1
+kind: Agent
+name: diagnose
+version: 0.1.0
+description: >-
+  Names the probable cause of a degraded agent's symptom and the one fix
+  action for the registry to apply. The prompt carries an explicit
+  symptom→cause calibration table; the fix itself is applied (and its
+  outcome decided) deterministically by the sim-apply-fix TOOL node, never
+  by this agent.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

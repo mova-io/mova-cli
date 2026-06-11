@@ -1,0 +1,15 @@
+api_version: movate/v1
+kind: Agent
+name: closure
+version: 0.1.0
+description: >-
+  Closes a self-healing run with the incident summary — the ONE shared tail
+  for all three exits (attempt-1 success, attempt-2 success, acknowledged
+  escalation). Its prompt guards the path-exclusive state keys (r2_status,
+  decision) that only some paths set.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

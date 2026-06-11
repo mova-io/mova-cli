@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["agent_name","symptom","fix_action"],"properties":{"agent_name":{"type":"string"},"symptom":{"type":"string"},"fix_action":{"type":"string"},"run_id":{"type":"string"}}}

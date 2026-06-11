@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["fault","component"],"properties":{"fault":{"type":"string"},"component":{"type":"string"}}}

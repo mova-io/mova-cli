@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["signal"],"properties":{"signal":{"type":"string"},"run_id":{"type":"string"}}}

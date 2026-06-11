@@ -1,0 +1,6 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "signal":{"type":"string"},
+  "fault":{"type":"string"},"component":{"type":"string"},
+  "severity":{"type":"string"},"remediation_action":{"type":"string"},
+  "r1_status":{"type":"string"},"r2_status":{"type":"string"},
+  "decision":{"type":"string"},"summary":{"type":"string"}}}

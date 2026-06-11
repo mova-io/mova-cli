@@ -1,0 +1,16 @@
+api_version: movate/v1
+kind: Agent
+name: triage
+version: 0.1.0
+description: >-
+  Assesses a detected infrastructure fault: severity (enum-pinned) plus the
+  ONE recommended remediation action. The prompt carries explicit
+  fault→severity/action calibration examples; applying the action (and
+  judging the outcome) is the deterministic remediation TOOL nodes' job,
+  never this agent's.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

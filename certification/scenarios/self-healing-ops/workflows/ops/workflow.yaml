@@ -1,0 +1,85 @@
+api_version: movate/v1
+kind: Workflow
+name: self-healing-ops
+version: 0.1.0
+description: >
+  Infrastructure self-healing with two-attempt remediation — scenario #26 of
+  the 30-use-case certification program (B9 self-healing batch). The ops
+  story: REMEDIATION IS BOUNDED AND EVERY ATTEMPT IS LEDGERED. The entry
+  `detect` TOOL node (ADR 097) runs the scenario-local `sim-detect` python
+  skill — the canned fault catalog keyed off the monitor's `signal`,
+  recorded as a `{system: monitor, action: detect}` ledger row. ONE triage
+  agent assesses severity and recommends the remediation action; the action
+  is then APPLIED deterministically, twice at most: mdk workflows have NO
+  cycles, so "retry on failure" is unrolled in the graph as two sequential
+  TOOL attempts (`sim-remediate`, then `sim-remediate-retry`), each writing
+  its own `{system: ops, action: remediate}` row (attempt 1 / attempt 2 in
+  the payload). A deterministic `decision` node (ADR 094) verifies each
+  attempt: applied → ONE shared `closure` agent; a transient fault ("stuck"
+  consumer) fails attempt 1 and succeeds on the retry; a "hardware" fault
+  deterministically fails BOTH attempts and pauses durably at the `escalate`
+  HUMAN gate (ADR 099 — the operator acknowledges with `decision: ack`; any
+  other wording falls back the same way) before landing on the SAME closure
+  agent (exclusive convergence, ADR 098 — the closure prompt guards the keys
+  only some paths set). The skill names resolve through the scenario's
+  project registry (project.yaml marker → skills/). Mirrors
+  workflows/self-healing-ops.
+state_schema: ../../state.json
+entrypoint: detect
+nodes:
+  # Deterministic fault detection FIRST (ADR 097): the fault that drives the
+  # whole run is canned monitor data, not a model's reading of the signal.
+  - id: detect
+    type: tool
+    skill: sim-detect
+  # The ONE judgment call in the workflow: severity + the recommended
+  # remediation action. Applying it (and judging the outcome) stays
+  # deterministic — the TOOL nodes below.
+  - {id: triage, type: agent, ref: ../../agents/triage}
+  # --- remediation attempt #1 (ADR 097): deterministic outcome, ledger row
+  # --- with attempt: 1.
+  - id: remediate-1
+    type: tool
+    skill: sim-remediate
+  # Deterministic verification of attempt #1 (ADR 094).
+  - id: verify-1
+    type: decision
+    cases:
+      - when: {field: r1_status, op: eq, value: applied}
+        to: closure
+    default: remediate-2
+  # --- remediation attempt #2 — the retry, unrolled (NO cycles in mdk
+  # --- workflows): same skill shape, attempt: 2 ledger row.
+  - id: remediate-2
+    type: tool
+    skill: sim-remediate-retry
+  # Deterministic verification of attempt #2 (ADR 094): still failed →
+  # escalate to a human. The graph guarantees there is no third attempt.
+  - id: verify-2
+    type: decision
+    cases:
+      - when: {field: r2_status, op: eq, value: applied}
+        to: closure
+    default: escalate
+  # Both attempts failed: pause durably for a human operator. ONE route
+  # vocabulary ("ack") and the SAME fail-safe fallback (ADR 099): however
+  # the operator words it, the run can only land on the shared closure.
+  - id: escalate
+    type: human
+    prompt: >
+      Automated remediation FAILED twice for this infrastructure fault —
+      self-healing is out of attempts. Acknowledge the escalation: respond
+      with `decision` set to exactly "ack" (any other wording is treated as
+      ack) to close the run with the incident summary.
+    output_contract: [decision]
+    routes: {ack: closure}
+    fallback: closure
+  # --- shared tail (ADR 098): attempt-1 success, attempt-2 success, and the
+  # --- acknowledged escalation all converge on ONE closure agent (its
+  # --- prompt guards r2_status/decision — the keys only some paths set).
+  - {id: closure, type: agent, ref: ../../agents/closure}
+edges:
+  - {from: detect, to: triage}
+  - {from: triage, to: remediate-1}
+  - {from: remediate-1, to: verify-1}
+  - {from: remediate-2, to: verify-2}
