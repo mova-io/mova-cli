@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["email_result"],"properties":{"email_result":{"type":"string"}}}

@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: escalate
+version: 0.1.0
+description: >-
+  Writes the escalation summary for a quality regression: the sampled
+  score, the scorer's issues, and the alert reference — addressed to
+  the eval owner. Terminal node of the regression path.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

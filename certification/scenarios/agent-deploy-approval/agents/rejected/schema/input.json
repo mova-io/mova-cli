@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"candidate":{"type":"string"},"version":{"type":"string"},"eval_score":{"type":"number"},"eval_report":{"type":"string"},"decision":{"type":"string"}}}

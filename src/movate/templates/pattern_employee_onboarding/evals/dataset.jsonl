@@ -1,0 +1,2 @@
+{"input": {"employee": "Jordan Lee", "role": "account-manager", "start_date": "2026-07-01"}, "expected": {"summary": "AD account, mailbox and the standard issue bundle provisioned for Jordan Lee before 2026-07-01, each with a reference id."}}
+{"input": {"employee": "Priya Nair", "role": "engineer", "start_date": "2026-07-15"}, "expected": {"summary": "AD account, mailbox and the engineering workstation bundle provisioned for Priya Nair before 2026-07-15, each with a reference id."}}

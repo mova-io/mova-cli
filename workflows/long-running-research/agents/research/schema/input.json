@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["topic"],"properties":{"topic":{"type":"string"},"increment":{"type":"number"}}}

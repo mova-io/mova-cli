@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["action_request","crm_result","erp_result","ticket_result","email_result"],"properties":{"action_request":{"type":"string"},"steps":{"type":"string"},"crm_result":{"type":"string"},"erp_result":{"type":"string"},"ticket_result":{"type":"string"},"email_result":{"type":"string"}}}

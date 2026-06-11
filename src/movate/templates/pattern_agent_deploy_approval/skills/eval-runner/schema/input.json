@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["candidate","version","fixture"],"properties":{"candidate":{"type":"string"},"version":{"type":"string"},"fixture":{"type":"string","enum":["passing","failing"]},"run_id":{"type":"string"}}}

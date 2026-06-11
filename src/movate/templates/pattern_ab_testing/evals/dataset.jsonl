@@ -1,0 +1,2 @@
+{"input": {"request": "Recommend a quick healthy lunch I can make in ten minutes.", "user_id": "user-1001"}, "expected": {"summary": "Variant a served the request and the outcome was recorded with an outcome reference."}}
+{"input": {"request": "Recommend a quick healthy lunch I can make in ten minutes.", "user_id": "user-1003"}, "expected": {"summary": "Variant b served the request and the outcome was recorded with an outcome reference."}}

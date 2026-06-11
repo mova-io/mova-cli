@@ -1,0 +1,8 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "window":{"type":"string"},"profile":{"type":"string"},
+  "facts_endpoint":{"type":"string"},
+  "facts":{"type":"array"},"facts_source":{"type":"string"},
+  "summary":{"type":"string"},"totals":{"type":"object"},
+  "failure_count":{"type":"integer"},"failures":{"type":"array"},
+  "top_risks":{"type":"array"},
+  "decision":{"type":"string"},"daily_report":{"type":"string"}}}

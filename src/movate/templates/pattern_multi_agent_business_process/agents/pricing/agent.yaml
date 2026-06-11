@@ -1,0 +1,13 @@
+api_version: movate/v1
+kind: Agent
+name: pricing
+version: 0.1.0
+description: >-
+  Calibrated sim of the pricing desk: quotes ONLY from its embedded rate
+  card into a labeled JSON quote contract.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

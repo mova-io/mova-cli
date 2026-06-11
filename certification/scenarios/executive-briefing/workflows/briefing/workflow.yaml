@@ -1,0 +1,55 @@
+api_version: movate/v1
+kind: Workflow
+name: executive-briefing
+version: 0.1.0
+description: >
+  Scheduled multi-source executive digest — scenario #12 of the 30-use-case
+  certification program (B8 reporting batch). CRON-BORN by design (ADR 100
+  D1): production binds this workflow to the clock with `mdk schedule set
+  executive-briefing -k workflow --cron "0 7 * * 1-5" --tz America/New_York
+  --input '{"period": "daily"}'` — the schedule tick enqueues the same
+  JobRecord a manual POST /run produces, so nothing in the definition is
+  schedule-specific (the suite drives it via POST /run). Source gathering is
+  deterministic: entrypoint fan-out is not available for TOOL nodes, so a
+  SEQUENTIAL chain of two TOOL nodes (ADR 097) runs the scenario-local
+  `sim-gather-metrics` then `sim-gather-incidents` python skills — canned,
+  replay-identical business data keyed by the `profile` knob, one auditable
+  ledger row each ({system: metrics|incidents, action: gather}), no network
+  IO. The ONE composing LLM call (`digest`) writes the briefing STRICTLY
+  from the two gathered results and emits a `risk_count` the deterministic
+  `decision` node (ADR 094) routes on: risk_count > 0 → the `flag` agent
+  writes the escalation summary; a clean digest files via the `archive`
+  agent. Mirrors workflows/executive-briefing.
+state_schema: ../../state.json
+entrypoint: gather-metrics
+nodes:
+  # --- deterministic source gathering (ADR 097): a SEQUENTIAL tool chain —
+  # --- entrypoint fan-out is not available for TOOL nodes — each skill
+  # --- recording one auditable gather row to the sim ledger. The skill
+  # --- names resolve through the scenario's project registry (project.yaml
+  # --- marker → skills/sim-gather-*/).
+  - id: gather-metrics
+    type: tool
+    skill: sim-gather-metrics
+  - id: gather-incidents
+    type: tool
+    skill: sim-gather-incidents
+  # The ONE composing LLM call: strictly the two gathered results in, a
+  # structured briefing (headline/sections/risk_flags/risk_count) out.
+  - {id: digest, type: agent, ref: ../../agents/digest}
+  # Deterministic risk routing (ADR 094): the digest already counted its
+  # risk flags — no LLM in the control path.
+  - id: risk-gate
+    type: decision
+    cases:
+      - when: {field: risk_count, op: gt, value: 0}
+        to: flag
+    default: archive
+  # --- terminal tails: ONE escalation writer on the risky path, ONE
+  # --- archive note on the clean path (exclusive routing, ADR 098).
+  - {id: flag, type: agent, ref: ../../agents/flag}
+  - {id: archive, type: agent, ref: ../../agents/archive}
+edges:
+  - {from: gather-metrics, to: gather-incidents}
+  - {from: gather-incidents, to: digest}
+  - {from: digest, to: risk-gate}

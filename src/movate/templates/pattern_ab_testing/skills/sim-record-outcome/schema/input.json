@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["variant"],"properties":{"variant":{"type":"string","enum":["a","b"]},"user_id":{"type":"string"},"run_id":{"type":"string"}}}

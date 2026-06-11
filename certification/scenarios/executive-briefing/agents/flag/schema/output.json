@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["escalation"],"properties":{"escalation":{"type":"string"}}}

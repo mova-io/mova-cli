@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["variant","assign_result"],"properties":{"variant":{"type":"string","enum":["a","b"]},"assign_result":{"type":"string"}}}

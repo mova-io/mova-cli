@@ -1,0 +1,26 @@
+# LLM-as-judge for the Executive Briefing workflow. Rename to ``judge.yaml`` to enable.
+#
+# Scores the final escalation/archive note against the expected outcome: a
+# degraded period must read as escalated with the data's risk flags (rate
+# below floor, spend over budget, open incidents); a clean period must read
+# as filed with zero risk flags — and nothing in either may contradict the
+# gathered data. Used as the CI eval-gate the pattern's governance leans on.
+
+method: llm_judge
+
+model:
+  provider: anthropic/claude-sonnet-4-6
+  params:
+    temperature: 0.0
+
+rubric: |
+  Score the workflow's final note against the expected outcome.
+    1.0 = states the correct outcome (escalated with the risk flags actually
+          present in the gathered data, or filed clean with zero flags) and
+          matches the expectation
+    0.5 = correct outcome but missing or muddling the key risks / the clean
+          confirmation
+    0.0 = wrong outcome, contradicts the gathered data, or hallucinated
+          numbers/incidents
+
+threshold: 0.7

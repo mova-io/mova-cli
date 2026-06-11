@@ -1,0 +1,31 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-promote
+version: 0.1.0
+description: >-
+  Simulate promoting an approved candidate agent version in the model
+  registry: records one auditable `{system: registry, action: promote}`
+  row to the shared sim_side_effects ledger and returns a one-line
+  confirmation. The certification suite asserts this row exists EXACTLY
+  once on the approved path and NEVER when the eval failed or the human
+  rejected. SELF-CONTAINED for the deployed temporal-worker image
+  (ADR 097 D2): the implementation lives in impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-promote.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - registry
+  - simulation
+  - certification

@@ -1,0 +1,65 @@
+api_version: movate/v1
+kind: Workflow
+name: ab-testing
+version: 0.1.0
+description: >
+  Deterministic A/B traffic split, durable on Temporal — scenario #29 of the 30-use-case
+  certification program (B6 eval/lifecycle batch). The `assign-variant`
+  TOOL node (ADR 097) assigns the variant from the SHA-256 parity of the
+  user_id — NO randomness, and explicitly NOT Python's salted builtin
+  hash(), so the same user lands on the same variant on every worker and
+  every Temporal replay — and records the `{system: ab, action: assign}`
+  ledger row. A deterministic `decision` node (ADR 094) routes the variant
+  to one of two experiment arms: BYTE-IDENTICAL prompt files whose
+  agent.yaml model params (temperature 0.0 vs 0.9) are the ONLY difference
+  — the config delta IS the experiment, and both arms write the same
+  `response` key on exclusive paths (ADR 098). Both arms converge on the
+  `sim-record-outcome` TOOL (`{system: ab, action: record_outcome}` row
+  carrying which variant served) then ONE notify agent. The certification
+  cases pin user_ids whose hashes are precomputed to land one on each
+  variant, so the expectations are exact.
+  Self-contained (bundled into the temporal-worker image): both skills carry
+  their own impl.py next to skill.yaml. Mirrors
+  certification/scenarios/ab-testing.
+runtime: temporal
+state_schema: ./state.json
+entrypoint: assign-variant
+nodes:
+  # Deterministic traffic split (ADR 097): SHA-256 parity of the user_id —
+  # no randomness, no salted builtin hash() — plus the auditable assign
+  # ledger row. The same user lands on the same variant on every worker
+  # and every Temporal replay.
+  - id: assign-variant
+    type: tool
+    skill: assign-variant
+  # The variant route (ADR 094): a pure equality check over the assigned
+  # variant — the experiment arms are the only two destinations.
+  - id: variant-gate
+    type: decision
+    cases:
+      - when: {field: variant, op: eq, value: a}
+        to: variant-a
+    default: variant-b
+  # The two arms: BYTE-IDENTICAL prompt files, different agent.yaml model
+  # params (temperature 0.0 vs 0.9) — the config delta IS the experiment.
+  # Both write the same `response` key (exclusive paths, ADR 098).
+  - {id: variant-a, type: agent, ref: ./agents/variant-a}
+  - {id: variant-b, type: agent, ref: ./agents/variant-b}
+  # --- shared tail (ADR 098): both arms converge on ONE outcome-recorder
+  # --- TOOL (the record_outcome ledger row carries which variant served)
+  # --- then ONE notify agent.
+  - id: record-outcome
+    type: tool
+    skill: sim-record-outcome
+  - {id: notify, type: agent, ref: ./agents/notify}
+edges:
+  - {from: assign-variant, to: variant-gate}
+  - {from: variant-a, to: record-outcome}
+  - {from: variant-b, to: record-outcome}
+  - {from: record-outcome, to: notify}
+tags:
+  - temporal
+  - decision
+  - tool
+  - lifecycle
+  - certification

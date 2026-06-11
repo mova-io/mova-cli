@@ -1,0 +1,1 @@
+{"input":{"question":"How many cloud regions is Atlas deployed in?","scope":"Establish the region count."},"expected":{"data_findings":"[data] The footprint report shows active deployments across 3 regions: 61% us-east, 27% eu-west, 12% ap-south."}}

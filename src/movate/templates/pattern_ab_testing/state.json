@@ -1,0 +1,8 @@
+{"type":"object","additionalProperties":true,"properties":{
+  "request":{"type":"string"},
+  "user_id":{"type":"string"},
+  "variant":{"type":"string"},
+  "assign_result":{"type":"string"},
+  "response":{"type":"string"},
+  "outcome_result":{"type":"string"},
+  "summary":{"type":"string"}}}

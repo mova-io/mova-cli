@@ -1,0 +1,36 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-ingest
+version: 0.1.0
+description: >-
+  Simulate ingesting documents into a knowledge base: deterministically
+  counts the input documents, chunks them by a FIXED rule (one chunk per 40
+  words, ceil; an empty document yields 0 chunks and counts in empty_docs),
+  records one auditable `{system: kb, action: ingest}` row to the shared
+  sim_side_effects ledger (same DB MDK itself uses) and returns
+  `ingest_result` with {doc_count, chunk_count, empty_docs, reference} — the
+  summary the validate agent judges. SELF-CONTAINED for the deployed
+  temporal-worker image (ADR 097 D2): the implementation lives in impl.py
+  next to this file — the python backend puts the skill dir's parent on
+  sys.path, so `sim-ingest.impl` imports from the baked workflows/ tree
+  without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-ingest.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - kb
+  - ingestion
+  - simulation
+  - certification

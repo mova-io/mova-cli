@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"period":{"type":"string"},"headline":{"type":"string"},"risk_flags":{"type":"array"},"risk_count":{"type":"integer"}}}

@@ -1,0 +1,13 @@
+api_version: movate/v1
+kind: Agent
+name: diagnose
+version: 0.1.0
+description: >-
+  Explains WHY retrieval scored below the routing threshold and suggests a
+  query reformulation — the debugging output of the low-score route.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["candidate","version"],"properties":{"candidate":{"type":"string"},"version":{"type":"string"},"run_id":{"type":"string"}}}

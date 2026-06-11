@@ -1,0 +1,124 @@
+# Certification cases — kb-refresh (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `kb-refresh` workflow
+# (workflows/kb-refresh — 6 nodes: an `ingest` TOOL node calling the
+# workflow-local `sim-ingest` python skill (deterministic counting + a fixed
+# one-chunk-per-40-words rule), a `validate` agent judging the ingest
+# SUMMARY into {ok, note}, a deterministic `decision` node on `ok eq true`,
+# the `sim-kb-publish` TOOL on the pass path, ONE `escalate` HUMAN gate on
+# the fail path (ack→notify, fallback notify — NO retry route, the graph is
+# acyclic), and the shared `notify` tail). The driver submits the case input
+# via POST /run, resumes any expected HUMAN pause via the signal endpoint,
+# then reads the run back from GET /api/v1/observability/facts (ADR 096) and
+# asserts per capability.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state; the fact builder surfaces `route` only from a
+#   `tier`/`route` state key, so the fact's route is None here. We assert
+#   that explicitly and prove the branch instead via (a) the observed pause
+#   node (escalate vs none) and (b) `final_state` markers: only the publish
+#   path merges the TOOL node's `publish_result`, only the acknowledged
+#   escalation merges the gate's `decision`.
+# * `status: success` for ALL cases, including the failed refresh — the
+#   escalation path still terminates at the shared `notify` agent
+#   successfully; a failed refresh is a route, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts deliberately carry
+#   cost_usd=0 (per-node rollup is a reader-side join, ADR 096); the driver
+#   records the capability as SKIP with that note.
+# * side-effects — EVERY case asserts the positive `{system: kb, action:
+#   ingest}` row (the ingest TOOL records on every path, including the
+#   failed refresh — the audited bad ingest is the evidence); only validated
+#   refreshes add the `{system: kb, action: publish}` row, and the
+#   escalation case asserts its ABSENCE (the publish TOOL must never have
+#   run). Evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+# * `governance: allow` everywhere — the baked catalog policy (mirrored by
+#   workflows/kb-refresh/policy.yaml) registers MODEL + COST gates on every
+#   agent run, so the terminal fact's `governance_effect` must be NON-NULL
+#   and `allow`.
+
+scenario: kb-refresh
+target: kb-refresh # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- validated refreshes: every document non-empty → {ok: true} → the
+  # --- publish TOOL → notify. No HUMAN gate; terminal success without any
+  # --- signal IS the routing evidence, and BOTH ledger rows prove the TOOL
+  # --- nodes executed.
+  - name: two-docs-publish
+    input:
+      documents:
+        - id: doc-onboarding
+          text: >
+            New engineers get their laptop, badge and accounts on day one.
+            The onboarding buddy walks them through the dev environment
+            setup, the deploy pipeline and the on-call rotation during the
+            first week.
+        - id: doc-security
+          text: >
+            All laptops must run full-disk encryption and the managed
+            endpoint agent. Report a lost device to security operations
+            within four hours of noticing the loss.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [ingest_result, ok, note, publish_result, summary]
+      final_state_lacks: [decision]
+      side_effects:
+        - { system: kb, action: ingest, times: 1 }
+        - { system: kb, action: publish, times: 1 }
+
+  # A single long document: the fixed rule (one chunk per 40 words) yields
+  # MULTIPLE chunks — the chunking story on the happy path.
+  - name: long-doc-publish
+    input:
+      documents:
+        - id: doc-incident-runbook
+          text: >
+            When a production incident is declared, the on-call engineer
+            becomes the incident commander until relieved. First page the
+            service owners listed in the runbook header, then open the
+            incident channel and post the impact summary with the start
+            time. Mitigate before you investigate: roll back the most recent
+            deploy if the timeline matches, fail traffic over to the standby
+            region when error rates stay above five percent, and disable
+            non-critical features behind the kill switch. Update the status
+            page every thirty minutes until resolution, and within two
+            business days schedule the blameless postmortem and file the
+            follow-up actions in the tracker.
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [ingest_result, ok, note, publish_result, summary]
+      final_state_lacks: [decision]
+      side_effects:
+        - { system: kb, action: ingest, times: 1 }
+        - { system: kb, action: publish, times: 1 }
+
+  # --- the failed refresh: one submitted document with EMPTY text →
+  # --- ingest counts {doc_count: 1, chunk_count: 0, empty_docs: 1} →
+  # --- {ok: false} → the escalate HUMAN gate. The operator acknowledges
+  # --- (ack → notify; the gate has NO retry route by design). The publish
+  # --- row must NOT exist — the failed refresh provably published nothing.
+  - name: empty-doc-escalate
+    input:
+      documents:
+        - id: doc-empty
+          text: ""
+    hitl:
+      - node: escalate
+        decision: { decision: ack }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [ingest_result, ok, note, decision, summary]
+      final_state_lacks: [publish_result]
+      side_effects:
+        - { system: kb, action: ingest, times: 1 }
+      no_side_effects:
+        - { system: kb, action: publish }

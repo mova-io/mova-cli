@@ -1,0 +1,36 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-retrieve
+version: 0.1.0
+description: >-
+  Simulate vector-store retrieval over a small inline knowledge base:
+  deterministic keyword scoring (stdlib only — no embeddings, no network, no
+  LLM), records one auditable `{system: vectorstore, action: retrieve}` row
+  to the shared sim_side_effects ledger (same DB MDK itself uses) and returns
+  `retrieved_docs` (top-3 hits with per-document scores) + `top_score` — the
+  value the workflow's decision node routes on. A zero-hit query returns
+  top_score 0.0 (the diagnose route's input), never an error.
+  SELF-CONTAINED for the deployed temporal-worker image (ADR 097 D2): the
+  implementation lives in impl.py next to this file — the python backend
+  puts the skill dir's parent on sys.path, so `sim-retrieve.impl` imports
+  from the baked workflows/ tree without certification/ being present.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-retrieve.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - rag
+  - retrieval
+  - simulation
+  - certification

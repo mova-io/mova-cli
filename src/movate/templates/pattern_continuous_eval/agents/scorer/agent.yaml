@@ -1,0 +1,16 @@
+api_version: movate/v1
+kind: Agent
+name: scorer
+version: 0.1.0
+description: >-
+  Calibrated quality scorer for ONE sampled production interaction:
+  scores the response against the prompt on a 0-1 scale and names
+  the issues. The 0.6 floor downstream is the regression alarm —
+  the prompt carries explicit healthy/regression calibration
+  examples on both sides of it.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

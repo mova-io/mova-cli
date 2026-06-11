@@ -94,6 +94,15 @@ ENV MOVATE_AGENTS_PATH=/app/agents
 COPY workflows/ /app/workflows/
 ENV MOVATE_WORKFLOWS_PATH=/app/workflows
 
+# Certification suite (driver + scenarios) — lets an in-env runner (the ACA
+# certification Job) execute `python -m certification.run_suite --target dev`
+# from inside the environment: the shared Postgres is reachable (lights the
+# side-effects capability the laptop run must SKIP) and the OTLP collector
+# receives the mdk.certification.scenario metric behind the Grafana matrix.
+# Pure data+driver code, adds no runtime deps; PYTHONPATH=/app makes it
+# importable without changing WORKDIR.
+COPY certification/ /app/certification/
+
 # Project governance policy for the baked catalog (ADR 093/096). The config
 # loader (`load_project_config()`) reads the project base file from the
 # process CWD — which is this WORKDIR (/opt/movate), NOT /app — so the policy

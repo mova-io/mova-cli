@@ -1,0 +1,31 @@
+api_version: movate/v1
+kind: Skill
+
+name: sim-run-tests
+version: 0.1.0
+description: >-
+  Simulate the TEST stage of a promotion pipeline: records one
+  auditable `{system: pipeline, action: stage_test}` row to the shared
+  sim_side_effects ledger and returns a one-line green-suite
+  confirmation. The certification suite asserts this row exists
+  exactly once on the test-stage path and never on staging/production
+  paths. SELF-CONTAINED for the deployed temporal-worker image
+  (ADR 097 D2): the implementation lives in impl.py next to this file.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "sim-run-tests.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: mutates-state
+
+tags:
+  - pipeline
+  - simulation
+  - certification

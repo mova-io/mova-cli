@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["root_cause","confidence","remediation"],"properties":{"root_cause":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1},"remediation":{"type":"string"}}}

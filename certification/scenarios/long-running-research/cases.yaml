@@ -1,0 +1,92 @@
+# Certification cases — long-running-research (driven by certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `long-running-research`
+# workflow (workflows/long-running-research — 5 nodes: the research agent,
+# the `sim-append-findings` TOOL node writing the one `{system: research,
+# action: append}` ledger row with the increment in its payload, a
+# deterministic `finality-check` decision routing `increment gte 3` into the
+# final-report agent and earlier increments to the light ack agent).
+#
+# THE SCHEDULED SHAPE (scenario #5 / ADR 100 D1). The long-running series is
+# the CRON SCHEDULE's job, not one sleeping workflow: each scheduled fire
+# runs one increment. Register the series once —
+#
+#   mdk schedule set long-running-research -k workflow \
+#     --cron "0 7 * * *" \
+#     --input '{"topic": "vector databases", "increment": 1}'
+#
+# (or against the deployed runtime: PUT /api/v1/schedules/long-running-research
+# with {"kind": "workflow", "target": "long-running-research",
+# "cron": "0 7 * * *", "input": {...}}) — and drive it with the cron
+# entrypoint `mdk scheduler-tick` (Azure: the Container Apps Job). Every job
+# the tick enqueues carries origin="schedule:long-running-research" (ADR 100
+# D4), visible on GET /api/v1/jobs and as the Temporal memo `mdk_origin`.
+#
+# WHY THERE IS NO SCHEDULE-DRIVEN CASE HERE (the honest gap — investigated,
+# not skipped):
+#   1. The tick has NO API endpoint: the /api/v1/schedules endpoints only
+#      manage rows ("the actual run is enqueued by an external cron calling
+#      the scheduler tick"). A case would have to shell out to
+#      `mdk scheduler-tick` with MOVATE_PG_URL pointed at the deployed
+#      Postgres — an out-of-band WRITE coupling the driver deliberately
+#      doesn't have (its only DB coupling is the read-only ledger asserts).
+#   2. The provenance assert as specified ("origin appears in the facts
+#      endpoint") is unimplementable today: ObservabilityFact (ADR 096,
+#      extra=forbid) carries NO origin column and the dispatch edge does not
+#      copy job.origin into fact.attributes — origin lives on JobView
+#      (GET /jobs/{id}, GET /api/v1/jobs) and the Temporal memo only.
+#   3. The driver's case shape is declarative submit→hitl→expect; a schedule
+#      case needs a setup phase (PUT the schedule), an out-of-band tick, and
+#      a different launch discovery (find the job the TICK enqueued instead
+#      of submitting one) — a new case shape, not an append-style extension.
+# See certification/scenarios/long-running-research/README.md for the full
+# feasibility write-up + the follow-up that would close the gap.
+#
+# HONESTY NOTES — same contract as itsm-request/cases.yaml:
+#
+# * `route: null` — the decision node picks the next node but writes NOTHING
+#   into workflow state. The branch is proven by the final_state markers
+#   (final_report XOR ack_note).
+# * `status: success` for both cases — finality is a route, not an error.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 by design
+#   (ADR 096) and the Temporal path emits no per-node run facts yet.
+# * side-effects — exactly ONE append row per increment, increment in the
+#   payload. Evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — SKIP otherwise).
+# * `governance: allow` — two LLM agents run on every path, so the MODEL +
+#   COST gates evaluate on both cases.
+
+scenario: long-running-research
+target: long-running-research # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- a mid-series increment: findings appended, series continues — the
+  # --- ack tail, and NO final report yet.
+  - name: mid-increment
+    input:
+      topic: vector databases for enterprise retrieval
+      increment: 1
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [findings, summary, append_result, ack_note]
+      final_state_lacks: [final_report]
+      side_effects:
+        - { system: research, action: append, times: 1 }
+
+  # --- the closing increment (gte 3): findings still appended (the log gets
+  # --- every increment, the final one included), then the final report —
+  # --- and no ack note on this path.
+  - name: final-increment
+    input:
+      topic: vector databases for enterprise retrieval
+      increment: 3
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [findings, summary, append_result, final_report]
+      final_state_lacks: [ack_note]
+      side_effects:
+        - { system: research, action: append, times: 1 }

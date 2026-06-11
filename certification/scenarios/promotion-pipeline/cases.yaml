@@ -1,0 +1,105 @@
+# Certification cases — promotion-pipeline (driven by
+# certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `promotion-pipeline`
+# workflow (workflows/promotion-pipeline — 8 nodes: stage-gate DECISION on
+# the CI-named stage → {sim-run-tests TOOL | sim-stage-eval TOOL →
+# staging-signoff HUMAN | prod-approval HUMAN → sim-deploy TOOL} → shared
+# notify/rejected tail). ONE workflow, three stage-routed paths — each run
+# executes exactly one stage (not a loop; the CI system advances the stage
+# between runs). The driver submits the case input via POST /run, resumes
+# any expected HUMAN pause via the signal endpoint, then reads the run back
+# from GET /api/v1/observability/facts (ADR 096).
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * EVERY ROUTE IS DETERMINISTIC — the stage gate is a pure string match on
+#   the input's `stage` (no LLM anywhere before a ledger row), so each
+#   case's ledger expectations are exact: its own stage's row exactly once
+#   and the ABSENCE of both other stages' rows.
+# * "NO PAUSE" IS ASSERTED STRUCTURALLY on test-stage: it declares no
+#   `hitl` steps, so the case only passes if a terminal fact appears
+#   WITHOUT any signal; `decision` in final_state_lacks doubles that proof
+#   — only the human gates merge a `decision` key into state.
+# * THE PRODUCTION ORDERING IS GRAPH-ENFORCED: the promote_prod row is
+#   recorded by a TOOL node reachable ONLY via prod-approval's approve
+#   route — prod-promote observing the pause BEFORE the row exists is the
+#   point of the case.
+# * THE STAGING ORDERING IS THE INVERSE (evidence before judgment): the
+#   stage_eval row is recorded BEFORE the signoff pause, so it exists even
+#   though a human then signs off.
+# * `route: null` — the decision node writes nothing into state; branches
+#   are proven via final_state markers (test_result / stage_eval_result /
+#   deploy_result are mutually exclusive per stage) + the ledger rows.
+# * `status: success` for ALL cases — rejection is a route, not an error.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 (ADR 096).
+# * `governance: allow` everywhere — exactly ONE MODEL+COST-gated agent run
+#   per case (notify or rejected).
+# * side-effects evaluated only when the shared DB is reachable
+#   (MOVATE_PG_URL/MOVATE_DB_URL — the driver SKIPs otherwise).
+
+scenario: promotion-pipeline
+target: promotion-pipeline # deployed workflow name for POST /run {kind: workflow}
+
+cases:
+  # --- the test stage: fully automatic — stage_test row, no pause, and
+  # --- neither of the other stages' rows.
+  - name: test-stage
+    input:
+      change: checkout-service 2026.6.10
+      stage: test
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [test_result, summary]
+      final_state_lacks: [stage_eval_result, deploy_result, decision]
+      side_effects:
+        - { system: pipeline, action: stage_test, times: 1 }
+      no_side_effects:
+        - { system: eval, action: stage_eval }
+        - { system: pipeline, action: promote_prod }
+
+  # --- the staging stage: eval evidence FIRST (the row exists), THEN one
+  # --- pause at staging-signoff; approve completes the stage. No test or
+  # --- production rows.
+  - name: staging-signoff
+    input:
+      change: checkout-service 2026.6.10
+      stage: staging
+    hitl:
+      - node: staging-signoff
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [stage_eval_result, summary]
+      final_state_lacks: [test_result, deploy_result]
+      side_effects:
+        - { system: eval, action: stage_eval, times: 1 }
+      no_side_effects:
+        - { system: pipeline, action: stage_test }
+        - { system: pipeline, action: promote_prod }
+
+  # --- the production stage: one pause at prod-approval BEFORE anything
+  # --- touches production; approve → exactly one promote_prod row. No test
+  # --- or staging rows.
+  - name: prod-promote
+    input:
+      change: checkout-service 2026.6.10
+      stage: production
+    hitl:
+      - node: prod-approval
+        decision: { decision: approve }
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has: [deploy_result, summary]
+      final_state_lacks: [test_result, stage_eval_result]
+      side_effects:
+        - { system: pipeline, action: promote_prod, times: 1 }
+      no_side_effects:
+        - { system: pipeline, action: stage_test }
+        - { system: eval, action: stage_eval }
