@@ -1091,6 +1091,12 @@ class WorkerDispatch:
             tenant_id=job.tenant_id,
             mock=use_mock,
             detached=detached,
+            # ADR 100 D4 follow-through: surface the job's provenance stamp
+            # (``schedule:<name>`` / ``trigger:<id>``) as a Temporal memo so
+            # the UI's describe/list distinguishes scheduled/triggered runs
+            # from manual ones — no search-attribute registration needed.
+            # None (every manual submit) keeps the call byte-identical.
+            memo={"mdk_origin": job.origin} if job.origin else None,
         )
 
     async def _write_workflow_fact(
