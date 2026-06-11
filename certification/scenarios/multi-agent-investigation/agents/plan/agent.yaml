@@ -1,0 +1,13 @@
+api_version: movate/v1
+kind: Agent
+name: plan
+version: 0.1.0
+description: >-
+  Decomposes the investigation question into the research scope the three
+  parallel specialists each work from.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

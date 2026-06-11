@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: summary
+version: 0.1.0
+description: >-
+  Summarizes the policy-routed storage outcome (classification + audit
+  reference) for the requester. Sees the redacted text (when the regulated
+  path produced one) — never the original document.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

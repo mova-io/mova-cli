@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"verdict":{"type":"string"},"notes":{"type":"string"},"decision":{"type":"string"},"channel":{"type":"string"}}}

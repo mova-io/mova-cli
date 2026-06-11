@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["verdict","notes"],"properties":{"verdict":{"type":"string","enum":["pass","flag"]},"notes":{"type":"string"}}}

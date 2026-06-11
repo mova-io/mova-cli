@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"properties":{"request":{"type":"string"},"proposal":{"type":"string"}}}

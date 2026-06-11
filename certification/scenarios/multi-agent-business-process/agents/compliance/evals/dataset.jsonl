@@ -1,0 +1,1 @@
+{"input":{"request":"Prepare a proposal for Meridian Health: 80 Atlas Enterprise seats for a hospital network handling patient data."},"expected":{"compliance_assessment":"[compliance] Patient data triggers HIPAA: Enterprise tier required and a signed BAA is a precondition. The standard DPA is required."}}

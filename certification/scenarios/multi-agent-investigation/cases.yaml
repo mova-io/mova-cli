@@ -1,0 +1,77 @@
+# Certification cases — multi-agent-investigation (driven by
+# certification/run_suite.py).
+#
+# Each case is one end-to-end run of the DEPLOYED `multi-agent-investigation`
+# workflow (workflows/multi-agent-investigation — 5 agent nodes in the
+# canonical PARALLEL FAN-OUT/FAN-IN diamond, ADR 092: `plan` fans out to the
+# THREE specialist sims `web-researcher` / `kb-researcher` / `data-analyst`,
+# which run CONCURRENTLY (durable asyncio.gather on Temporal, Phase 2) and
+# fan in on `synthesize`). The driver submits the case input via POST /run,
+# then reads the run back from GET /api/v1/observability/facts (ADR 096) and
+# asserts per capability. No HUMAN gate on any path — `hitl` is an honest
+# SKIP for this scenario.
+#
+# HONESTY NOTES — what is (and is not) assertable on this workflow today:
+#
+# * THE PARALLEL PROOF: the three findings keys (`web_findings`,
+#   `kb_findings`, `data_findings`) appear in final_state ONLY if all three
+#   fan-out branches actually ran AND the fan-in barrier merged them (the
+#   keys are disjoint — last_wins is clobber-free); `conclusion`/`confidence`
+#   appear only if the join node ran AFTER them. Key presence across all
+#   three branches + the join is exactly what the diamond guarantees.
+# * `route: null` — no router/decision node writes a route key into state, so
+#   the fact's route is None. Asserted explicitly.
+# * CONTENT is not driver-assertable: `final_state_has` checks key PRESENCE.
+#   The conflicting-findings case CRAFTS its input so the embedded corpora
+#   disagree (public docs say 50 concurrent users, the internal KB records
+#   200 since v3, telemetry observed a 178 peak) and the synthesize prompt
+#   hard-requires acknowledging disagreement + capping confidence at 0.6 on
+#   conflict — but the driver proves the topology (all three findings merged,
+#   conclusion present), while conclusion WORDING is the eval/judge rubric's
+#   job (see the pattern template's evals/judge.yaml.example), not the
+#   driver's. Stated rather than green-washed.
+# * `status: success` for both cases — disagreement between sources is a
+#   synthesis outcome, not a workflow error.
+# * `cost: false` everywhere — workflow_run facts carry cost_usd=0 by design
+#   (ADR 096) and the Temporal path emits no per-node run facts yet.
+# * side-effects — NONE by design: no tool node on this workflow (the
+#   scenario isolates the parallel primitive); the capability records SKIP.
+# * `governance: allow` everywhere — the baked catalog policy registers
+#   MODEL + COST gates on every agent run (all five nodes are agents); the
+#   terminal fact's `governance_effect` must be non-null and `allow`.
+
+scenario: multi-agent-investigation
+target: multi-agent-investigation # deployed workflow name for POST /run
+
+cases:
+  # --- straightforward question: all three embedded corpora agree (3
+  # --- regions), so the synthesis is a clean consensus. The assert proves
+  # --- the diamond: every specialist's findings key AND the join's
+  # --- conclusion are in final_state.
+  - name: straightforward-question
+    input:
+      question: "How many cloud regions is Atlas deployed in?"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [scope, web_findings, kb_findings, data_findings, conclusion, confidence]
+
+  # --- synthesis-with-conflicting-findings: the input is crafted to hit the
+  # --- corpora exactly where they disagree — the stale public product page
+  # --- (50 concurrent users) vs the internal v3 release notes (200) vs the
+  # --- observed telemetry peak (178). The synthesize prompt requires the
+  # --- conclusion to name the conflicting sources and reconcile them, with
+  # --- confidence capped at 0.6 on conflict; the driver asserts the same
+  # --- diamond topology (acknowledgment wording is judge-rubric territory —
+  # --- see the honesty notes above).
+  - name: synthesis-with-conflicting-findings
+    input:
+      question: "What is the maximum number of concurrent users an Atlas workspace supports?"
+    expect:
+      status: success
+      route: null
+      governance: allow
+      final_state_has:
+        [scope, web_findings, kb_findings, data_findings, conclusion, confidence]

@@ -1,0 +1,14 @@
+api_version: movate/v1
+kind: Agent
+name: rejected
+version: 0.1.0
+description: >-
+  Tells the author the content was NOT published and relays the most recent
+  reviewer notes (or the human rejection) so they can revise. Terminal node
+  for every flagged/rejected path.
+model:
+  provider: openai/gpt-4o-mini
+  params: {temperature: 0.0}
+prompt: ./prompt.md
+schema: {input: ./schema/input.json, output: ./schema/output.json}
+evals: {dataset: ./evals/dataset.jsonl}

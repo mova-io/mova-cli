@@ -1,0 +1,33 @@
+api_version: movate/v1
+kind: Skill
+
+name: redact-pii
+version: 0.1.0
+description: >-
+  Deterministically mask PII in a document — emails → [EMAIL], hyphenated US
+  SSNs → [SSN], US phone numbers → [PHONE] — via three anchored stdlib
+  regexes; returns {redacted_text, pii_found, pii_count}. NO LLM by design:
+  redaction must replay identically and be provably complete, so the rules
+  are unit-tested character by character instead of prompted. Pure transform
+  (no DB, no network). SELF-CONTAINED for the deployed temporal-worker image
+  (ADR 097 D2): the implementation lives in impl.py next to this file — the
+  python backend puts the skill dir's parent on sys.path, so
+  `redact-pii.impl` imports from the baked workflows/ tree.
+
+schema:
+  input: ./schema/input.json
+  output: ./schema/output.json
+
+implementation:
+  kind: python
+  entry: "redact-pii.impl:run"
+
+cost:
+  per_call_usd: 0.0
+
+side_effects: read-only
+
+tags:
+  - dlp
+  - governance
+  - certification

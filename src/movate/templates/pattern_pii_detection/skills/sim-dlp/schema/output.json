@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":true,"required":["dlp_result"],"properties":{"dlp_result":{"type":"string"}}}

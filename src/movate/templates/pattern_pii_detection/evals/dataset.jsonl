@@ -1,0 +1,2 @@
+{"input": {"document": "Escalation from Jane Doe: reach me at jane.doe@example.com or (555) 123-4567. My SSN is 123-45-6789.", "source": "hr/escalation-4821"}, "expected": {"summary": "Quarantined with the email, phone number and SSN masked, with a quarantine reference."}}
+{"input": {"document": "Onboarding guide: how to request a laptop and find the engineering handbook in the wiki.", "source": "wiki/onboarding-guide"}, "expected": {"summary": "No PII found; stored as clean with a storage reference."}}
