@@ -49,6 +49,8 @@ ALL_PATTERNS = [
     "pii-detection",
     "data-privacy",
     "content-publishing",
+    "multi-agent-investigation",
+    "multi-agent-business-process",
     "agent-deploy-approval",
     "agent-benchmark",
     "continuous-eval",

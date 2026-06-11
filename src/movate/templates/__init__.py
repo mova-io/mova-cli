@@ -304,6 +304,18 @@ PATTERN_TEMPLATES: dict[str, tuple[str, bool, str, str]] = {
         "Multi-stage content review chain + HITL final gate (runtime: temporal). Calibrated compliance-review and brand-review agents each feed a DECISION node failing safe to a shared rejected agent; content passing BOTH still publishes nothing until a HUMAN gate routes its own approve/reject decision (ADR 099) into the sim-publish TOOL's auditable cms ledger row (ADR 094/097/098/099).",  # noqa: E501
         "compliance → DECISION → brand → DECISION → [HUMAN routes approve|reject] → TOOL publish → notify | rejected",  # noqa: E501
     ),
+    "multi-agent-investigation": (
+        "pattern_multi_agent_investigation",
+        True,
+        "Multi-agent investigation over the PARALLEL FAN-OUT/FAN-IN diamond (runtime: temporal, ADR 092). A plan agent decomposes the question, THREE calibrated specialist sims (web/kb/data) research it CONCURRENTLY — durable asyncio.gather on Temporal — each writing its own disjoint findings key, and ONE synthesize agent joins the branches into {conclusion, confidence}, explicitly acknowledging disagreement between sources.",  # noqa: E501
+        "plan → FAN-OUT {web ∥ kb ∥ data} → FAN-IN synthesize",
+    ),
+    "multi-agent-business-process": (
+        "pattern_multi_agent_business_process",
+        True,
+        "Multi-agent business process under the bounded SUPERVISOR primitive (runtime: temporal, ADR 092 D4). A process-manager agent delegates across a FIXED specialist allowlist (research/pricing/compliance — calibrated sims with JSON contracts) in a loop hard-capped at max_delegations, then a proposal agent composes the deliverable and notify confirms it — managerial delegation WITH structural bounds, not a swarm.",  # noqa: E501
+        "SUPERVISOR(manager ⇒ research|pricing|compliance, ≤4) → proposal → notify",
+    ),
     "agent-deploy-approval": (
         "pattern_agent_deploy_approval",
         True,
