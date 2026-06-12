@@ -146,6 +146,7 @@ from movate.cli import (  # noqa: E402
     audit_cmd,
     audit_llm_cmd,
     capabilities_cmd,
+    certify_cmd,
     compose_cmd,
     demo_cmd,
     dev_cmd,
@@ -563,6 +564,11 @@ app.add_typer(trigger_cmd.trigger_app, name="trigger", rich_help_panel=PANEL_RUN
 # rollout/lifecycle verb alongside schedule/trigger.
 app.add_typer(canary_app, name="canary", rich_help_panel=PANEL_RUN)
 app.add_typer(ci_app, name="ci", rich_help_panel=PANEL_RUN)
+# `certify` wraps the certification suite (certification/run_suite.py) — the
+# scenario x capability gate against the deployed dev runtime. Local in-process
+# run by default; `--in-env` starts + tails the Azure cert job. Lives next to
+# `ci` since both are release-gate verbs.
+app.command("certify", rich_help_panel=PANEL_RUN)(certify_cmd.certify)
 app.command("logs", rich_help_panel=PANEL_RUN)(logs_cmd.logs)
 # `monitor` is the live counterpart to the historical `costs report` /
 # `logs`. Same panel since it answers an adjacent operator question.

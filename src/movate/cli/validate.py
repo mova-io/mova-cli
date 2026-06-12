@@ -1378,6 +1378,249 @@ def _lint_state_threading(graph: WorkflowGraph) -> None:
         )
 
 
+# Jinja-reference extraction for the path-exclusive prompt-key lint (B2 class).
+# Regex-level on purpose — a full Jinja AST buys little here and the lint is
+# advisory. One pattern per guard idiom:
+#   * an ``{{ input.X ... }}`` expression (captures the expression body so a
+#     ``| default(...)`` filter inside it can be detected), and
+#   * an ``{% if input.X is defined %}`` block opener — a key guarded ANYWHERE
+#     in the template is treated as guarded everywhere (conservative: misses a
+#     ref outside the block rather than false-positive on one inside it).
+_JINJA_EXPR_RE = re.compile(r"\{\{(.+?)\}\}", re.DOTALL)
+_JINJA_INPUT_KEY_RE = re.compile(r"^\s*input\.([A-Za-z_]\w*)")
+_JINJA_DEFAULT_FILTER_RE = re.compile(r"\|\s*default\s*\(")
+_JINJA_DEFINED_GUARD_RE = re.compile(r"\{%-?\s*if\s+input\.([A-Za-z_]\w*)\s+is\s+defined")
+
+
+def _unguarded_prompt_input_keys(template: str) -> set[str]:
+    """``input.X`` keys a template references with neither guard idiom.
+
+    A reference is *guarded* when its expression carries a ``| default(...)``
+    filter, or when the key appears in an ``{% if input.X is defined %}``
+    opener anywhere in the template.
+    """
+    defined_guarded = set(_JINJA_DEFINED_GUARD_RE.findall(template))
+    unguarded: set[str] = set()
+    for m in _JINJA_EXPR_RE.finditer(template):
+        expr = m.group(1)
+        key_match = _JINJA_INPUT_KEY_RE.match(expr)
+        if key_match is None:
+            continue
+        key = key_match.group(1)
+        if key in defined_guarded or _JINJA_DEFAULT_FILTER_RE.search(expr):
+            continue
+        unguarded.add(key)
+    return unguarded
+
+
+def _lint_path_exclusive_prompt_keys(graph: WorkflowGraph) -> None:
+    """Advisory lint: prompts referencing keys not guaranteed on EVERY inbound path.
+
+    The B2 live-failure class: a converging workflow (router/judge/decision
+    legs reuniting on a shared node) where ``{{ input.X }}`` is only produced
+    on SOME paths into the node — the loader renders prompts with
+    ``StrictUndefined``, so the run crashes at runtime on the path that
+    omits X.
+
+    For each AGENT node we compute the keys guaranteed on every
+    entrypoint→node path — a forward *must*-availability dataflow: a node's
+    guaranteed-in set is the INTERSECTION of its predecessors' guaranteed-out
+    sets (guaranteed-out = guaranteed-in plus the node's produced keys), seeded
+    at the source with the external initial-state inputs (state-schema keys
+    no node produces — same heuristic as :func:`_lint_state_threading`). One
+    pass in topological order is exact on a DAG, and a key written by
+    *different* nodes on *every* branch still counts as guaranteed. An
+    unguarded ``{{ input.X }}`` reference outside the node's guaranteed-in
+    set warns (never errors — heuristic).
+
+    Deliberately conservative — silent rather than false-positive when path
+    analysis is uncertain:
+      * parallel (fan-out/fan-in) graphs — at a barrier join ALL branches
+        execute, so per-path intersection *underestimates* availability;
+      * cyclic graphs (reflection loops) — need fixpoint iteration;
+      * supervisor / intent-router / judge nodes (dynamic or undeclared
+        state writes) and agent/tool nodes whose contract failed to load are
+        treated as producing *everything* (TOP), so everything downstream of
+        them on every path is exempt rather than misreported.
+    """
+    from movate.core.workflow.ir import NodeType  # noqa: PLC0415
+
+    if declares_parallel(graph) or graph.has_cycle():
+        return
+
+    # Per-node produced keys; None = unknown/dynamic production (skip any node
+    # such a producer dominates rather than risk a false positive).
+    produced: dict[str, set[str] | None] = {}
+    bundles: dict[str, AgentBundle] = {}
+    for nid, node in graph.nodes.items():
+        if node.type is NodeType.AGENT and node.ref:
+            try:
+                bundle = load_agent(node.ref)
+            except Exception:
+                produced[nid] = None
+                continue
+            bundles[nid] = bundle
+            produced[nid] = set(bundle.output_schema.get("properties", {}).keys())
+        elif node.type is NodeType.HUMAN:
+            # The signal endpoint's 422 guarantees a delivered decision carries
+            # the output_contract keys (ADR 017 D5 / ADR 099).
+            produced[nid] = {str(k) for k in node.metadata.get("output_contract", []) if k}
+        elif node.type is NodeType.DECISION:
+            produced[nid] = set()  # pure routing — writes nothing (ADR 094)
+        elif node.type is NodeType.TOOL and node.ref:
+            try:
+                from movate.core.skill_loader import load_skill  # noqa: PLC0415
+
+                skill = load_skill(node.ref)
+            except Exception:
+                produced[nid] = None
+                continue
+            output_key = node.metadata.get("output_key")
+            produced[nid] = (
+                {str(output_key)}
+                if output_key
+                else set(skill.output_schema.get("properties", {}).keys())
+            )
+        else:
+            # SUPERVISOR (dynamic delegation), INTENT_ROUTER / JUDGE (state
+            # writes not declared in a schema we can read) — unknown.
+            produced[nid] = None
+
+    produced_by_any: set[str] = set()
+    for keys in produced.values():
+        produced_by_any |= keys or set()
+    state_props = set((getattr(graph, "state_schema", {}) or {}).get("properties", {}).keys())
+    external = state_props - produced_by_any  # initial inputs — on every path
+
+    # Must-availability dataflow over the DAG, one pass in topological order.
+    # ``None`` is TOP ("could be anything" — an unknown producer upstream):
+    # TOP intersect S = S, TOP union S = TOP, so uncertainty silences rather
+    # than misreports.
+    guaranteed_in: dict[str, set[str] | None] = {}
+    guaranteed_out: dict[str, set[str] | None] = {}
+    for nid in graph.topological_order():
+        pred_ids = [e.from_id for e in graph.predecessors(nid)]
+        if not pred_ids:
+            avail_in: set[str] | None = set(external)
+        else:
+            if any(p not in guaranteed_out for p in pred_ids):
+                return  # a predecessor outside the topo order — stay silent
+            concrete = [s for p in pred_ids if (s := guaranteed_out[p]) is not None]
+            avail_in = set.intersection(*concrete) if concrete else None
+        guaranteed_in[nid] = avail_in
+        node_produced = produced.get(nid)
+        if avail_in is None or node_produced is None:
+            guaranteed_out[nid] = None
+        else:
+            guaranteed_out[nid] = avail_in | node_produced
+
+    issues: list[str] = []
+    for nid, bundle in bundles.items():
+        guaranteed = guaranteed_in.get(nid)
+        if guaranteed is None:
+            continue  # TOP — an unknown producer upstream; stay silent
+        for key in sorted(_unguarded_prompt_input_keys(bundle.prompt_template)):
+            if key not in guaranteed:
+                issues.append(
+                    f"node {nid!r} prompt references {{{{ input.{key} }}}} but "
+                    f"{key!r} is not guaranteed on every path into the node "
+                    f"(guaranteed here: {', '.join(sorted(guaranteed)) or '∅'})"
+                )
+
+    if issues:
+        console.print(
+            "[yellow]![/yellow] path-exclusive prompt key(s) [dim](advisory — "
+            "prompts render with StrictUndefined, so a path that omits the key "
+            "crashes the node at runtime)[/dim]"
+        )
+        for issue in issues:
+            console.print(f"  [yellow]·[/yellow] {issue}")
+        console.print(
+            "[dim]  fix: guard the reference with "
+            "[bold]{% if input.<key> is defined %} … {% endif %}[/bold] or "
+            "[bold]{{ input.<key> | default('…') }}[/bold] — or produce the key "
+            "on every path into the node.[/dim]"
+        )
+
+
+def _skill_dir_contents(root: Path) -> dict[str, bytes]:
+    """Relative-path → bytes map of a skill directory, for byte-identity checks.
+
+    Hidden files and ``__pycache__`` artifacts are excluded — they are
+    development-checkout noise, not shipped skill content.
+    """
+    contents: dict[str, bytes] = {}
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root)
+        if any(part == "__pycache__" or part.startswith(".") for part in rel.parts):
+            continue
+        contents[rel.as_posix()] = p.read_bytes()
+    return contents
+
+
+def _check_cross_workflow_skill_collisions(workflow_dir: Path) -> None:
+    """ERROR on a sibling workflow claiming the same skill dir name with different content.
+
+    A skill DIRECTORY name is a process-global Python module name on the
+    shared worker: the python skill backend resolves ``<dir>.impl`` once per
+    worker process, so when two deployed workflows ship same-named skill dirs
+    with DIFFERENT implementations, one workflow silently executes the
+    other's code (the live ``sim-remediate`` failure, #853). Byte-identical
+    duplicates (the ``redact-pii`` convention — interchangeable by
+    construction) stay allowed.
+
+    Scope: sibling directories under the same workflows/ root that contain a
+    ``workflow.yaml`` (i.e. deployable workflows). This is a hard ERROR, not
+    an advisory — the collision breaks live runs.
+    """
+    skills_dir = workflow_dir / "skills"
+    if not skills_dir.is_dir():
+        return
+    workflows_root = workflow_dir.parent
+    collisions: list[tuple[Path, Path]] = []
+    try:
+        for skill_dir in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
+            for sibling in sorted(p for p in workflows_root.iterdir() if p.is_dir()):
+                if sibling.resolve() == workflow_dir.resolve():
+                    continue
+                if not (sibling / "workflow.yaml").is_file():
+                    continue  # not a deployable workflow — no shared-worker collision
+                other = sibling / "skills" / skill_dir.name
+                if not other.is_dir():
+                    continue
+                if _skill_dir_contents(skill_dir) != _skill_dir_contents(other):
+                    collisions.append((skill_dir, other))
+    except OSError as exc:
+        # Unreadable sibling tree — degrade to a warning rather than blocking
+        # validation on filesystem noise.
+        console.print(f"  [yellow]![/yellow] cross-workflow skill-name check skipped: {exc}")
+        return
+    if not collisions:
+        return
+    console.print(
+        "[red]✗ ambiguous cross-workflow skill name(s):[/red] a skill directory "
+        "name is a process-global Python module on the shared worker — the "
+        "python backend resolves [bold]<dir>.impl[/bold] once per process, so "
+        "one workflow would execute the other's code at runtime."
+    )
+    for ours, theirs in collisions:
+        console.print(
+            f"  [red]·[/red] skill [bold]{ours.name!r}[/bold] is also claimed by a "
+            f"sibling workflow with DIFFERENT contents:\n"
+            f"      [dim]{ours}[/dim]\n"
+            f"      [dim]{theirs}[/dim]"
+        )
+    console.print(
+        "[dim]  fix: rename one of them to a workflow-scoped name (e.g. the "
+        "sim-remediate → sim-remediate-ops rename in "
+        "workflows/self-healing-ops/) and update the workflow's references. "
+        "Byte-identical copies are fine — interchangeable by construction.[/dim]"
+    )
+    raise typer.Exit(code=2)
+
+
 def _validate_workflow(path: Path) -> None:
     try:
         spec, parent = load_workflow_spec(path)
@@ -1390,6 +1633,11 @@ def _validate_workflow(path: Path) -> None:
     except WorkflowCompileError as exc:
         console.print(f"[red]✗ workflow validation failed:[/red] {exc}")
         raise typer.Exit(code=2) from None
+
+    # Cross-workflow skill-name uniqueness (#853). Hard ERROR — two deployed
+    # workflows shipping same-named skill dirs with different impls means the
+    # shared worker's process-wide entry cache executes the wrong code live.
+    _check_cross_workflow_skill_collisions(parent)
 
     console.print(
         f"[green]✓[/green] {graph.name} [dim]v{graph.version}[/dim] [dim](workflow)[/dim]"
@@ -1411,6 +1659,14 @@ def _validate_workflow(path: Path) -> None:
     # than blocks. Best-effort — never break validate.
     with contextlib.suppress(Exception):  # a lint must never break validation
         _lint_state_threading(graph)
+
+    # Path-exclusive prompt-key lint (the B2 live-failure class). A converging
+    # workflow where {{ input.X }} is only produced on SOME paths into a node
+    # crashes with StrictUndefined at runtime on the path that omits X. Advisory
+    # + conservative (silent on parallel/cyclic/supervisor shapes) — and, like
+    # every lint, best-effort: never break validate.
+    with contextlib.suppress(Exception):
+        _lint_path_exclusive_prompt_keys(graph)
 
     # TOOL-node checks (ADR 097). Static SKILL gate first (D5): every tool
     # node's skill must clear the SAME SkillPolicy an agent-declared skill
