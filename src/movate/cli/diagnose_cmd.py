@@ -5,13 +5,21 @@ ADR 043 D1, CLI side. The CLI talks to a deployed runtime (the
 locally — diagnose lives in the execution plane behind the runtime
 API (``POST /api/v1/agents/{name}/diagnose``).
 
-Two subcommands:
+Three surfaces:
 
 * ``mdk diagnose <agent>`` — submit a new diagnose job and print the
   returned ``job_id`` + status URL. Use ``--wait`` to poll until
   the result is ready and pretty-print it.
 * ``mdk diagnose show <agent> <job_id>`` — fetch + render a
   previously-submitted diagnose.
+* ``mdk diagnose <workflow_run_id>`` — when the positional is
+  UUID-shaped (workflow run ids are ``str(uuid4())``, ADR 054 D6;
+  agent names are human slugs), the callback dispatches to the
+  per-run post-mortem instead: evidence-cited "what happened and
+  why" over the observability surfaces (facts API + Temporal
+  history + Langfuse + sim-ledger + local spec), collected
+  client-side with one optional LLM pass — see
+  :mod:`movate.cli.diagnose_run_cmd`.
 
 **Read-only with respect to agent state.** The diagnose phase proposes
 typed fixes; it never modifies the agent's prompt / KB / context /
@@ -22,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 import httpx
@@ -33,6 +42,7 @@ from rich.table import Table
 from movate.cli._completion import complete_agent_name
 from movate.cli._console import error, get_global_target, hint
 from movate.cli._output import TableJson
+from movate.cli.diagnose_run_cmd import run_postmortem
 from movate.core.user_config import (
     UserConfigError,
     resolve_bearer_token,
@@ -48,6 +58,18 @@ diagnose_app = typer.Typer(
         "(ADR 043 D1, read-only with respect to the agent)."
     ),
     no_args_is_help=True,
+    # A Click group defaults to allow_interspersed_args=False, which rejects
+    # options placed AFTER the positional ("mdk diagnose <id> --no-llm" →
+    # "No such command '--no-llm'"). Allow interspersed args so the natural
+    # spelling parses; subcommand resolution ("show") is unaffected.
+    context_settings={"allow_interspersed_args": True},
+)
+
+# A workflow run id is ``str(uuid4())`` (ADR 054 D6 — it doubles as the
+# Temporal workflow id); agent names are human slugs. The callback uses this
+# to dispatch ``mdk diagnose <workflow_run_id>`` to the per-run post-mortem.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 
 
@@ -56,7 +78,10 @@ def diagnose(
     ctx: typer.Context,
     agent: str = typer.Argument(
         None,
-        help="Agent name registered on the target runtime.",
+        help=(
+            "Agent name registered on the target runtime — or a workflow run id "
+            "(UUID), which dispatches to the per-run post-mortem instead."
+        ),
         shell_complete=complete_agent_name,
     ),
     window_days: int = typer.Option(
@@ -93,6 +118,22 @@ def diagnose(
     model: str | None = typer.Option(
         None, "--model", help="Optional provider/model override (e.g. openai/gpt-4o-mini)."
     ),
+    no_llm: bool = typer.Option(
+        False,
+        "--no-llm",
+        help=(
+            "(run post-mortem only) skip the LLM diagnosis pass; print the "
+            "structured evidence report."
+        ),
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help=(
+            "(run post-mortem only) emit the full {workflow_run_id, evidence, "
+            "diagnosis} JSON object."
+        ),
+    ),
     target: str | None = typer.Option(
         None,
         "--target",
@@ -118,7 +159,15 @@ def diagnose(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """Cluster recent failures for [bold]<agent>[/bold] and propose typed fixes."""
+    """Diagnose an [bold]<agent>[/bold]'s recent failures — or post-mortem ONE run.
+
+    With an agent name: cluster recent failures and propose typed fixes
+    (ADR 043, runs on the target runtime). With a workflow run id (UUID):
+    evidence-cited post-mortem of that single run — facts + Temporal history +
+    Langfuse + sim-ledger collected client-side, then one LLM pass whose every
+    claim cites evidence ids ([bold]--no-llm[/bold] for the evidence report
+    only, [bold]--json[/bold] for the machine-readable object).
+    """
     # Don't run as a default command if a subcommand was invoked
     # (e.g. ``mdk diagnose show ...``) — Typer's ``invoke_without_command``
     # callback fires either way, so guard explicitly.
@@ -127,6 +176,18 @@ def diagnose(
     if agent is None:
         error("missing AGENT argument")
         raise typer.Exit(code=2)
+
+    if _UUID_RE.match(agent):
+        # ``mdk diagnose <workflow_run_id>`` — the per-run post-mortem
+        # (collected client-side; does not touch the agent diagnoser API).
+        run_postmortem(
+            agent,
+            target=target,
+            no_llm=no_llm,
+            json_output=json_output or output_format == TableJson.JSON,
+            model=model,
+        )
+        return
 
     try:
         target_name, target_cfg = resolve_target(target or get_global_target())
