@@ -1,0 +1,283 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the OTLP -> Prometheus stream that carries mdk's OTel metrics.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "mdk certification matrix - LATEST outcome view. One cell per (scenario, capability) showing the most recent certification outcome in the selected window, derived from the harness-emitted mdk.certification.scenario counter (attrs: scenario, capability, status=pass|fail). PASS = green, FAIL = red, SKIP/grey = the pair emitted nothing in the window (the suite only emits pass or fail - a missing series means the assertion was not exercised). Companion to the 'mdk - certification' dashboard, which shows windowed pass/fail counts and the supporting golden signals.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "text",
+      "id": 100,
+      "gridPos": {"h": 5, "w": 16, "x": 0, "y": 0},
+      "title": "mdk - certification matrix (latest outcome)",
+      "options": {
+        "mode": "markdown",
+        "content": "## Certification matrix - latest outcome per scenario x capability\n\nEach row is one (scenario, capability) assertion from the certification suite (`certification/`), reduced to its **latest outcome** in the dashboard window via `mdk.certification.scenario{scenario,capability,status=pass|fail}`:\n\n- **PASS** (green) - the pair was exercised and recorded no failure.\n- **FAIL** (red) - the pair recorded at least one `status=fail` in the window. Treat as a certified-capability regression.\n- **SKIP** (grey / absent) - the pair emitted nothing in the window. The harness only emits `pass` or `fail`, so a silent pair means the assertion was not exercised (suite not run, or scenario skipped).\n\nThe state timeline below shows how each pair's outcome evolved over time; the time series tracks raw pass/fail emission volume."
+      }
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Total PASS assertions recorded in the window. Source: mdk.certification.scenario{status=pass}.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 8, "x": 16, "y": 0},
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum(increase(mdk_certification_scenario_total{status=\"pass\"}[$__range]))",
+          "legendFormat": "total PASS",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Total PASS (window)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Latest outcome per (scenario, capability) in the window. Encoding: 2 = PASS (pass recorded, no fail), 1 = FAIL (any fail recorded - fail wins over pass so a red cell never hides a regression). Pairs with no emission in the window are absent (= SKIP); the harness only emits status=pass|fail. Source: mdk.certification.scenario.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {"align": "auto", "cellOptions": {"type": "auto"}, "inspect": false},
+          "mappings": [
+            {
+              "options": {
+                "1": {"color": "red", "index": 0, "text": "FAIL"},
+                "2": {"color": "green", "index": 1, "text": "PASS"}
+              },
+              "type": "value"
+            },
+            {
+              "options": {"match": "null", "result": {"color": "#9aa0a6", "index": 2, "text": "SKIP"}},
+              "type": "special"
+            }
+          ],
+          "noValue": "SKIP",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "text", "value": null}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Outcome"},
+            "properties": [
+              {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+              {"id": "custom.align", "value": "center"}
+            ]
+          }
+        ]
+      },
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 5},
+      "id": 2,
+      "options": {
+        "showHeader": true,
+        "sortBy": [{"desc": false, "displayName": "Outcome"}]
+      },
+      "pluginVersion": "9.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "clamp_max((sum by (scenario, capability) (increase(mdk_certification_scenario_total{status=\"fail\"}[$__range])) > 0), 1) or clamp_max((sum by (scenario, capability) (increase(mdk_certification_scenario_total{status=\"pass\"}[$__range])) > 0), 1) * 2",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "refId": "Outcome"
+        }
+      ],
+      "title": "Latest outcome - scenario x capability (PASS / FAIL / SKIP)",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {"Time": true},
+            "indexByName": {"scenario": 0, "capability": 1, "Value": 2},
+            "renameByName": {
+              "scenario": "Scenario",
+              "capability": "Capability",
+              "Value": "Outcome"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Outcome per (scenario, capability) over time, evaluated on a 1h sliding window: green = PASS, red = FAIL, gaps/grey = not exercised (SKIP). Same encoding as the table above (fail wins over pass within the window). Source: mdk.certification.scenario.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "custom": {
+            "fillOpacity": 80,
+            "insertNulls": false,
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "mappings": [
+            {
+              "options": {
+                "1": {"color": "red", "index": 0, "text": "FAIL"},
+                "2": {"color": "green", "index": 1, "text": "PASS"}
+              },
+              "type": "value"
+            }
+          ],
+          "noValue": "SKIP",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "#9aa0a6", "value": null}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 17},
+      "id": 3,
+      "options": {
+        "alignValue": "left",
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "mergeValues": true,
+        "rowHeight": 0.85,
+        "showValue": "auto",
+        "tooltip": {"mode": "single", "sort": "none"}
+      },
+      "pluginVersion": "9.0.0",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "clamp_max((sum by (scenario, capability) (increase(mdk_certification_scenario_total{status=\"fail\"}[1h])) > 0), 1) or clamp_max((sum by (scenario, capability) (increase(mdk_certification_scenario_total{status=\"pass\"}[1h])) > 0), 1) * 2",
+          "legendFormat": "{{scenario}} · {{capability}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Outcome over time - scenario x capability (1h window)",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Raw certification outcome volume over time: assertions recorded per 5m, split by status. Green = pass, red = fail; flat zero = the suite is not running. Source: mdk.certification.scenario.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "showPoints": "never", "stacking": {"group": "A", "mode": "normal"}},
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "pass"},
+            "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "fail"},
+            "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]
+          }
+        ]
+      },
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 29},
+      "id": 4,
+      "options": {
+        "legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "editorMode": "code",
+          "expr": "sum by (status) (increase(mdk_certification_scenario_total[5m]))",
+          "legendFormat": "{{status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Certification outcomes over time (per 5m, by status)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["mdk", "movate", "certification", "matrix", "acceptance"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {"from": "now-7d", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "mdk - certification matrix",
+  "uid": "mdk-certification-matrix",
+  "version": 1,
+  "weekStart": ""
+}
