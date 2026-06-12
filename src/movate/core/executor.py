@@ -1291,6 +1291,17 @@ class Executor:
         try:
             return self._pricing.cost_for(provider=pricing_key, tokens=completion.tokens)
         except KeyError:
+            # Never a silent $0: a model missing from the pricing table means
+            # real spend is invisible on run records / per-node run facts
+            # (e.g. the Temporal certification suite's cost capability) —
+            # name the model loudly so the table gets updated.
+            log.warning(
+                "no pricing entry for model %r (pricing table %s) — recording "
+                "cost_usd=0.0 for this turn; real LLM spend is NOT metered. "
+                "Add the model to providers/pricing.yaml.",
+                pricing_key,
+                self._pricing.version,
+            )
             self._tracer.log_event(
                 span, {"cost_skipped": True, "reason": f"no pricing for {pricing_key!r}"}
             )
