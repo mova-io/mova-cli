@@ -346,6 +346,25 @@ async def test_langfuse_session_grouping_and_operational_tags(
     assert "tenant:local" in root["_tags"]
 
 
+@pytest.mark.unit
+async def test_root_span_carries_prompt_hash(
+    tmp_path: Path, storage: Any, pricing: PricingTable
+) -> None:
+    """ADR 102 D3 — the ``agent.execute`` root span carries ``prompt_hash``
+    as a filterable attribute (the log_event already carried the rendered
+    text, but events aren't filterable dimensions in the trace stores)."""
+    tracer = _CapturingTracer()
+    agent_dir = _write_agent(tmp_path, name="vanilla")
+    bundle = load_agent(agent_dir)
+    ex = _executor(storage, pricing, tracer)
+
+    await ex.execute(bundle, RunRequest(agent="vanilla", input={"question": "hi"}))
+
+    root = tracer.root().attributes
+    assert root["prompt_hash"] == bundle.prompt_hash
+    assert root["agent_version"] == bundle.spec.version
+
+
 # ---------------------------------------------------------------------------
 # Case 2 — multi-turn tool run: per-turn + per-skill cost retained + summed
 # ---------------------------------------------------------------------------

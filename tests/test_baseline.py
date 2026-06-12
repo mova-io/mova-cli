@@ -38,6 +38,7 @@ def _make_eval(
     sample_count: int = 10,
     total_cost_usd: float = 0.001,
     dataset_hash: str = "abc123" * 6,  # 36-char-ish, but doesn't need to be sha256-shaped
+    prompt_hash: str | None = None,
     created_at: datetime | None = None,
 ) -> EvalRecord:
     return EvalRecord(
@@ -46,6 +47,7 @@ def _make_eval(
         agent=agent,
         agent_version="0.1.0",
         dataset_hash=dataset_hash,
+        prompt_hash=prompt_hash,
         judge_method=JudgeMethod.EXACT,
         judge_provider=None,
         runs_per_case=1,
@@ -94,6 +96,21 @@ async def test_sqlite_storage_get_eval_round_trip(tmp_path: Path) -> None:
     assert got is not None
     assert got.eval_id == target.eval_id
     assert got.mean_score == pytest.approx(target.mean_score)
+    # Legacy-shaped record (no prompt_hash) reads back as None (ADR 102 D1).
+    assert got.prompt_hash is None
+    await db.close()
+
+
+@pytest.mark.unit
+async def test_sqlite_storage_eval_prompt_hash_round_trip(tmp_path: Path) -> None:
+    """ADR 102 D1: prompt_hash survives the sqlite round-trip when set."""
+    db = SqliteProvider(db_path=tmp_path / "t.db")
+    await db.init()
+    target = _make_eval(prompt_hash="f00d" * 16)
+    await db.save_eval(target)
+    got = await db.get_eval(target.eval_id, tenant_id="local")
+    assert got is not None
+    assert got.prompt_hash == "f00d" * 16
     await db.close()
 
 
@@ -129,6 +146,38 @@ def test_baseline_diff_dataset_changed_when_hash_differs() -> None:
     cur = _make_eval(dataset_hash="bbb" * 6)
     d = compute_baseline_diff(base, cur)
     assert d.dataset_changed is True
+
+
+@pytest.mark.unit
+def test_baseline_diff_prompt_changed_tristate() -> None:
+    """ADR 102 D2: changed / unchanged / unknown (either side legacy)."""
+    changed = compute_baseline_diff(_make_eval(prompt_hash="p1"), _make_eval(prompt_hash="p2"))
+    assert changed.prompt_changed is True
+    same = compute_baseline_diff(_make_eval(prompt_hash="p1"), _make_eval(prompt_hash="p1"))
+    assert same.prompt_changed is False
+    legacy_base = compute_baseline_diff(_make_eval(), _make_eval(prompt_hash="p1"))
+    assert legacy_base.prompt_changed is None
+    legacy_cur = compute_baseline_diff(_make_eval(prompt_hash="p1"), _make_eval())
+    assert legacy_cur.prompt_changed is None
+
+
+@pytest.mark.unit
+def test_prompt_change_never_enters_regression_gate() -> None:
+    """ADR 102 D2: prompt_changed is informational only — a changed prompt
+    with improved scores is NOT a regression, and a regressed run is still
+    a regression whether or not the prompt changed."""
+    improved = compute_baseline_diff(
+        _make_eval(mean_score=0.5, pass_rate=0.5, prompt_hash="p1"),
+        _make_eval(mean_score=0.9, pass_rate=0.9, prompt_hash="p2"),
+    )
+    assert improved.prompt_changed is True
+    assert improved.is_regression(tolerance=0.0) is False
+    regressed = compute_baseline_diff(
+        _make_eval(mean_score=0.9, pass_rate=0.9, prompt_hash="p1"),
+        _make_eval(mean_score=0.5, pass_rate=0.5, prompt_hash="p1"),
+    )
+    assert regressed.prompt_changed is False
+    assert regressed.is_regression(tolerance=0.0) is True
 
 
 @pytest.mark.unit
@@ -211,6 +260,14 @@ def test_regression_summary_strings() -> None:
     assert "REGRESSION" in regression_summary(d, tolerance=0.0)
     # With huge tolerance, no regression flagged.
     assert regression_summary(d, tolerance=1.0).startswith("OK")
+    # ADR 102 D2: CI logs answer the first triage question inline. Legacy
+    # rows (no prompt_hash) say "unknown"; hashed rows say yes/no.
+    assert "prompt_changed=unknown" in regression_summary(d, tolerance=0.0)
+    hashed = compute_baseline_diff(
+        _make_eval(mean_score=0.9, prompt_hash="p1"),
+        _make_eval(mean_score=0.5, prompt_hash="p2"),
+    )
+    assert "prompt_changed=yes" in regression_summary(hashed, tolerance=0.0)
 
 
 # ---------------------------------------------------------------------------

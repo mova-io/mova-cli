@@ -3159,6 +3159,16 @@ def _emit_diff_table(diff: BaselineDiff, *, regression_tolerance: float) -> None
             "dataset",
             "[yellow]changed[/yellow] [dim](hash differs from baseline)[/dim]",
         )
+    if diff.prompt_changed:
+        table.add_row(
+            "prompt",
+            "[yellow]changed[/yellow] [dim](template hash differs from baseline)[/dim]",
+        )
+    elif diff.prompt_changed is None:
+        table.add_row(
+            "prompt",
+            "[dim]unknown (baseline predates prompt_hash — ADR 102)[/dim]",
+        )
 
     if diff.is_regression(tolerance=regression_tolerance):
         verdict = f"[red]REGRESSION[/red] [dim](tolerance ±{regression_tolerance:.2f})[/dim]"
@@ -3207,6 +3217,7 @@ def _emit_json(
         "agent": summary.agent,
         "agent_version": summary.agent_version,
         "dataset_hash": summary.dataset_hash,
+        "prompt_hash": summary.prompt_hash,
         "judge_method": summary.judge.method.value,
         "judge_provider": summary.judge_provider,
         "runs_per_case": summary.runs_per_case,
@@ -3259,6 +3270,8 @@ def _emit_json(
             "sample_count_delta": diff.sample_count_delta,
             "cost_delta": diff.cost_delta,
             "dataset_changed": diff.dataset_changed,
+            # null = unknown (baseline row predates prompt_hash, ADR 102).
+            "prompt_changed": diff.prompt_changed,
             "regression": diff.is_regression(tolerance=regression_tolerance),
             "regression_tolerance": regression_tolerance,
         }

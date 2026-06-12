@@ -396,6 +396,11 @@ async def test_summary_to_record_round_trips(
     assert record.runs_per_case == 1
     assert record.gate_mode == "mean"
     assert record.sample_count == 2
+    # ADR 102 D1: the engine stamps the bundle's prompt-template hash, and
+    # it survives onto the persisted record (the prompt-version join key).
+    assert summary.prompt_hash == bundle.prompt_hash
+    assert record.prompt_hash == bundle.prompt_hash
+    assert record.prompt_hash is not None and len(record.prompt_hash) == 64  # sha256 hex
 
 
 # ---------------------------------------------------------------------------

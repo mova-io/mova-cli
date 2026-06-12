@@ -337,6 +337,9 @@ def test_fact_from_run_record_flattens_metrics() -> None:
     assert fact.attributes == {
         "provider": "mock",
         "pricing_version": "2026-01",
+        # ADR 102 D4: prompt-version identity on the integration surface.
+        "agent_version": "0.1.0",
+        "prompt_hash": "abc123",
         "model": "claude-x",
     }
 

@@ -2736,6 +2736,15 @@ class EvalRecord(BaseModel):
     back to aggregate-only comparison when either side is ``None`` — so
     pre-item-24 behaviour is byte-for-byte unchanged.
     """
+    prompt_hash: str | None = None
+    """sha256 of the agent's raw prompt template at eval time (ADR 102 D1).
+
+    The precise join key for prompt-version comparison: ``agent_version``
+    doesn't change on local prompt edits, this does. Matches the
+    ``prompt_hash`` on the :class:`RunRecord` rows the eval produced.
+    Additive + nullable: ``None`` for legacy rows and for workflow-level
+    evals (a workflow has no single prompt).
+    """
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -2871,6 +2880,10 @@ class BenchRecord(BaseModel):
     """Score aggregation across the N runs per model: ``mean`` | ``min`` | ``p10``."""
     models: list[BenchModelResult]
     """Per-model comparison rows, in the order they were benched."""
+    prompt_hash: str | None = None
+    """sha256 of the agent's raw prompt template at bench time (ADR 102 D1).
+    Same contract as :attr:`EvalRecord.prompt_hash`; ``None`` on legacy rows.
+    """
     created_at: datetime = Field(default_factory=_now)
 
 

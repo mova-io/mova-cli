@@ -400,6 +400,10 @@ class Executor:
             {
                 "agent": spec.name,
                 "agent_version": spec.version,
+                # ADR 102 D3: the filterable prompt-version dimension. The
+                # full rendered text stays on the log_event below — events
+                # aren't filterable in the trace stores, this attribute is.
+                "prompt_hash": bundle.prompt_hash,
                 "provider": effective_model.provider,
                 "tenant_id": tenant_id,
                 "job_id": job_id,

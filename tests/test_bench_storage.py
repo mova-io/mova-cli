@@ -35,12 +35,14 @@ def _make_bench(
     agent: str = "demo-agent",
     created_at: datetime | None = None,
     scored: bool = False,
+    prompt_hash: str | None = None,
 ) -> BenchRecord:
     return BenchRecord(
         bench_id=bench_id or str(uuid4()),
         tenant_id=tenant_id,
         agent=agent,
         agent_version="0.1.0",
+        prompt_hash=prompt_hash,
         input={"text": "hi"},
         judge_method=JudgeMethod.LLM_JUDGE if scored else None,
         judge_provider="anthropic/claude-haiku-4-5-20251001" if scored else None,
@@ -107,6 +109,18 @@ async def test_save_and_get_bench(storage) -> None:
     assert second.judge_skipped is True
     assert second.error_count == 1
     assert second.sample_output is None
+    # Legacy-shaped record (no prompt_hash) reads back as None (ADR 102 D1).
+    assert got.prompt_hash is None
+
+
+@pytest.mark.unit
+async def test_bench_prompt_hash_round_trip(storage) -> None:
+    """ADR 102 D1: prompt_hash survives the round-trip when set."""
+    b = _make_bench(prompt_hash="beef" * 16)
+    await storage.save_bench(b)
+    got = await storage.get_bench(b.bench_id, tenant_id="tenant-a")
+    assert got is not None
+    assert got.prompt_hash == "beef" * 16
 
 
 @pytest.mark.unit

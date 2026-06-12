@@ -871,6 +871,14 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFA
 -- target_version pattern above).
 ALTER TABLE evals ADD COLUMN IF NOT EXISTS dimension_means JSONB;
 
+-- ADR 102 D1: prompt-version join key. sha256 of the raw prompt template at
+-- eval/bench time — agent_version doesn't change on local prompt edits, this
+-- does. Nullable — NULL on pre-ADR-102 rows and on workflow-level evals (no
+-- single prompt). ADD COLUMN IF NOT EXISTS keeps it idempotent on every init
+-- (mirrors the dimension_means pattern above).
+ALTER TABLE evals ADD COLUMN IF NOT EXISTS prompt_hash TEXT;
+ALTER TABLE bench ADD COLUMN IF NOT EXISTS prompt_hash TEXT;
+
 -- ADR 018: per-tenant BYOK provider keys. One row per (tenant, provider)
 -- holding a Fernet ``ciphertext`` of the tenant's own provider key + a masked
 -- ``fingerprint`` for display. The ProviderKeyResolver decrypts ``ciphertext``
@@ -1997,10 +2005,10 @@ class PostgresProvider:
                 eval_id, tenant_id, agent, agent_version, dataset_hash,
                 judge_method, judge_provider, runs_per_case, gate_mode,
                 threshold, mean_score, pass_rate, sample_count,
-                total_cost_usd, created_at, dimension_means
+                total_cost_usd, created_at, dimension_means, prompt_hash
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16
+                $11, $12, $13, $14, $15, $16, $17
             )
             """,
             e.eval_id,
@@ -2021,6 +2029,7 @@ class PostgresProvider:
             # item 24: JSONB column; the connection codec json.dumps a dict.
             # None for legacy / exact-match records → SQL NULL → reads back None.
             e.dimension_means,
+            e.prompt_hash,
         )
 
     async def get_eval(self, eval_id: str, *, tenant_id: str) -> EvalRecord | None:
@@ -2146,9 +2155,9 @@ class PostgresProvider:
             INSERT INTO bench (
                 bench_id, tenant_id, agent, agent_version, input,
                 judge_method, judge_provider, runs_per_model, gate_mode,
-                models, created_at
+                models, created_at, prompt_hash
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
             )
             """,
             b.bench_id,
@@ -2162,6 +2171,7 @@ class PostgresProvider:
             b.gate_mode,
             [m.model_dump() for m in b.models],
             b.created_at,
+            b.prompt_hash,
         )
 
     async def get_bench(self, bench_id: str, *, tenant_id: str) -> BenchRecord | None:
@@ -6022,6 +6032,7 @@ def _row_to_bench(row: asyncpg.Record) -> BenchRecord:
         gate_mode=row["gate_mode"],
         models=[BenchModelResult.model_validate(m) for m in row["models"]],
         created_at=row["created_at"],
+        prompt_hash=row["prompt_hash"],
     )
 
 
@@ -6332,6 +6343,7 @@ def _row_to_eval(row: asyncpg.Record) -> EvalRecord:
         total_cost_usd=row["total_cost_usd"],
         created_at=row["created_at"],
         dimension_means=dict(dim_means) if dim_means is not None else None,
+        prompt_hash=row["prompt_hash"],
     )
 
 
