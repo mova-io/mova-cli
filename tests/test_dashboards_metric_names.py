@@ -62,6 +62,11 @@ _GOVERNANCE_GRAFANA = _DASHBOARDS_DIR / "grafana" / "mdk-governance.json"
 # harness-emitted ``mdk.certification.scenario`` counter, grounded by the
 # golden-signal metrics those assertions read.
 _CERT_GRAFANA = _DASHBOARDS_DIR / "grafana" / "mdk-certification.json"
+# The certification LATEST-outcome matrix (companion to mdk-certification.json's
+# windowed counts): per (scenario, capability) the most recent PASS/FAIL/SKIP,
+# a state timeline of outcomes, and the raw pass/fail volume — all derived from
+# the single harness-emitted ``mdk.certification.scenario`` counter.
+_CERT_MATRIX_GRAFANA = _DASHBOARDS_DIR / "grafana" / "mdk-certification-matrix.json"
 
 # Prometheus unit / aggregation suffixes the OTLP -> Prometheus convention
 # appends. Stripped (one layer per pass) before matching a Prometheus token
@@ -197,6 +202,12 @@ _CASES = [
         _GOVERNANCE_GRAFANA, "json", {"mdk.governance.decisions"}, id="governance-grafana"
     ),
     pytest.param(_CERT_GRAFANA, "json", _CERT_METRICS, id="certification-grafana"),
+    pytest.param(
+        _CERT_MATRIX_GRAFANA,
+        "json",
+        {"mdk.certification.scenario"},
+        id="certification-matrix-grafana",
+    ),
 ]
 
 

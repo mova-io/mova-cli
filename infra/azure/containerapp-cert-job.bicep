@@ -21,9 +21,40 @@
 // modules/containerapp-scheduler.bicep, but the secrets are passed as
 // @secure() params rather than Key Vault references — matching how the live
 // job was created (DSN + dev key set directly as job secrets).
+//
+// WEEKLY SCHEDULED VARIANT — the template is parameterized on `triggerType`
+// (Manual default, preserving the live movate-cert-suite job exactly;
+// Schedule adds scheduleTriggerConfig with the weekly cron). A job's trigger
+// type CANNOT be flipped in-place via the CLI: `az containerapp job update`
+// exposes --cron-expression ("Only supported for trigger type 'Schedule'")
+// but NO --trigger-type (that flag exists only on `job create`). So the
+// weekly run deploys as a SECOND job from this same template:
+//   az deployment group create -g movate-dev-rg \
+//     --template-file infra/azure/containerapp-cert-job.bicep \
+//     --parameters name=movate-cert-weekly triggerType=Schedule ...
+// keeping movate-cert-suite Manual for on-demand certification gates.
 
 @description('Container Apps Job name.')
 param name string = 'movate-cert-suite'
+
+@description('''
+Job trigger type. Manual (default) = the on-demand certification gate
+(the live movate-cert-suite shape). Schedule = the weekly cadence job
+(deploy with name=movate-cert-weekly — ACA cannot change a job's trigger
+type in-place, so the scheduled run is a separate job resource).
+''')
+@allowed([
+  'Manual'
+  'Schedule'
+])
+param triggerType string = 'Manual'
+
+@description('''
+Cron expression for triggerType=Schedule (UTC). Default: Mondays 14:00 UTC
+= 07:00 PDT — a weekly certification heartbeat that keeps the Grafana
+scenario x capability matrix fresh without burning LLM spend daily.
+''')
+param cronExpression string = '0 14 * * 1'
 
 @description('Azure region.')
 param location string = resourceGroup().location
@@ -82,15 +113,25 @@ resource certJob 'Microsoft.App/jobs@2024-03-01' = {
   properties: {
     environmentId: environmentId
     configuration: {
-      // Manual trigger — the suite runs on demand (operator / CI), not on
-      // a schedule: certification is an explicit gate, not a cron chore.
-      triggerType: 'Manual'
-      manualTriggerConfig: {
-        // One suite run per start; scenarios share runtime state, so a
-        // single sequential execution is the unit.
-        parallelism: 1
-        replicaCompletionCount: 1
-      }
+      // Manual (default) = on-demand gate; Schedule = the weekly cadence.
+      // Exactly one of the trigger configs is set (null = omitted in ARM);
+      // either way one suite run is the unit — scenarios share runtime
+      // state, so a single sequential execution (parallelism 1 /
+      // replicaCompletionCount 1) is required.
+      triggerType: triggerType
+      manualTriggerConfig: triggerType == 'Manual'
+        ? {
+            parallelism: 1
+            replicaCompletionCount: 1
+          }
+        : null
+      scheduleTriggerConfig: triggerType == 'Schedule'
+        ? {
+            cronExpression: cronExpression
+            parallelism: 1
+            replicaCompletionCount: 1
+          }
+        : null
       // A full suite run (all scenarios, real LLM calls) takes minutes;
       // 1h caps a wedged execution without killing a slow-but-honest one.
       replicaTimeout: 3600

@@ -115,3 +115,37 @@ does not compile it; build it directly with
 `az bicep build --file infra/azure/containerapp-cert-job.bicep`). Secrets
 (`pg-dsn`, `dev-key`) are `@secure()` params matching how the live job was
 created, image pull via the shared `movate-dev-worker-mi` UAI.
+
+### Weekly scheduled run: movate-cert-weekly
+
+The suite also runs on a **weekly cadence** — cron `0 14 * * 1` (Mondays
+14:00 UTC = 07:00 PDT) — so the Grafana certification matrix stays fresh
+without an operator remembering to start it. ACA jobs **cannot change trigger
+type in-place** (`az containerapp job update` has no `--trigger-type`; only
+`job create` does), so the weekly run is a **second job**, `movate-cert-weekly`
+(`triggerType=Schedule`), deployed from the same parameterized template —
+`movate-cert-suite` stays Manual as the on-demand gate:
+
+```bash
+az deployment group create -g movate-dev-rg \
+  --template-file infra/azure/containerapp-cert-job.bicep \
+  --parameters name=movate-cert-weekly triggerType=Schedule \
+    environmentId=<movate-dev-cae id> image=<movate:tag> \
+    userAssignedIdentityId=<movate-dev-worker-mi id> \
+    pgDsn=<dsn> devKey=<key>
+```
+
+**Pause / resume the cadence** (`az containerapp job` has no suspend verb;
+pause by parking the cron on a date that never occurs — Feb 31 — and resume
+by restoring the Monday cron; `stop` only kills an in-flight execution):
+
+```bash
+az containerapp job stop -g movate-dev-rg -n movate-cert-weekly      # stop a running execution
+az containerapp job update -g movate-dev-rg -n movate-cert-weekly \
+  --cron-expression "0 0 31 2 *"                                     # pause (never fires)
+az containerapp job update -g movate-dev-rg -n movate-cert-weekly \
+  --cron-expression "0 14 * * 1"                                     # resume weekly cadence
+```
+
+Each weekly execution emits the same `mdk.certification.scenario` metrics as a
+manual run, so a red Monday cell on the matrix is the regression signal.
