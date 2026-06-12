@@ -144,6 +144,9 @@ class BenchSummary:
     """The judge method used for quality scoring (``llm_judge``), or
     ``None`` for cost+latency-only benches. Populated by the engine
     from the configured :class:`JudgeConfig`."""
+    prompt_hash: str | None = None
+    """sha256 of the bundle's raw prompt template (ADR 102 D1) — the
+    prompt-version join key persisted onto the :class:`BenchRecord`."""
 
     def to_record(self, *, tenant_id: str = "local", bench_id: str | None = None) -> BenchRecord:
         """Flatten this summary into a persistable :class:`BenchRecord`.
@@ -165,6 +168,7 @@ class BenchSummary:
             runs_per_model=self.runs_per_model,
             gate_mode=self.gate_mode,
             models=[self._model_to_result(m) for m in self.models],
+            prompt_hash=self.prompt_hash,
         )
 
     def _model_to_result(self, m: ModelBenchResult) -> BenchModelResult:
@@ -291,6 +295,7 @@ class BenchEngine:
             gate_mode=self._gate_mode,
             models=results,
             judge_method=JudgeMethod.LLM_JUDGE if scoring else None,
+            prompt_hash=bundle.prompt_hash,
         )
 
     async def _score_freeform(

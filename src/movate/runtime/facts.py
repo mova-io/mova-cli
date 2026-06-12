@@ -58,6 +58,11 @@ def fact_from_run_record(
     attributes: dict[str, object] = {
         "provider": record.provider,
         "pricing_version": record.pricing_version,
+        # ADR 102 D4: prompt-version identity on the integration surface,
+        # so readers can group spend/error rates by prompt version without
+        # coupling to RunRecord internals.
+        "agent_version": record.agent_version,
+        "prompt_hash": record.prompt_hash,
     }
     # The concrete model string lives on the per-turn records (the chosen
     # fallback may differ from the spec's preference); the last turn is the

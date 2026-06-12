@@ -57,6 +57,20 @@ class BaselineDiff:
         return self.baseline.dataset_hash != self.current.dataset_hash
 
     @property
+    def prompt_changed(self) -> bool | None:
+        """Whether the prompt template changed between baseline and current.
+
+        ``None`` when either side predates ADR 102 (no ``prompt_hash``
+        persisted) — rendered as "unknown", never guessed. Informational
+        only: like ``dataset_changed``, it never enters
+        :meth:`is_regression` — changing a prompt and regressing is
+        exactly the case the gate must keep failing.
+        """
+        if self.baseline.prompt_hash is None or self.current.prompt_hash is None:
+            return None
+        return self.baseline.prompt_hash != self.current.prompt_hash
+
+    @property
     def baseline_age_seconds(self) -> float:
         return (self.current.created_at - self.baseline.created_at).total_seconds()
 
@@ -96,15 +110,18 @@ def format_delta(value: float, *, percent: bool = False) -> str:
 
 def regression_summary(diff: BaselineDiff, *, tolerance: float) -> str:
     """One-line summary suitable for CI logs."""
+    changed = diff.prompt_changed
+    changed_word = "unknown" if changed is None else ("yes" if changed else "no")
+    prompt_note = f" prompt_changed={changed_word}"
     if diff.is_regression(tolerance=tolerance):
         return (
             f"REGRESSION mean_score Δ={format_delta(diff.mean_score_delta)} "
             f"pass_rate Δ={format_delta(diff.pass_rate_delta)} "
-            f"(tolerance ±{tolerance:.2f})"
+            f"(tolerance ±{tolerance:.2f})" + prompt_note
         )
     return (
         f"OK mean_score Δ={format_delta(diff.mean_score_delta)} "
-        f"pass_rate Δ={format_delta(diff.pass_rate_delta)}"
+        f"pass_rate Δ={format_delta(diff.pass_rate_delta)}" + prompt_note
     )
 
 

@@ -104,6 +104,10 @@ async def test_bench_no_judge_two_models(
 
     assert isinstance(summary, BenchSummary)
     assert len(summary.models) == 2
+    # ADR 102 D1: the engine stamps the bundle's prompt-template hash and
+    # to_record carries it onto the persisted row.
+    assert summary.prompt_hash == bundle.prompt_hash
+    assert summary.to_record().prompt_hash == bundle.prompt_hash
     for row in summary.models:
         assert len(row.runs) == 2
         assert row.error_count == 0

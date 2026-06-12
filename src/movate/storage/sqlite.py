@@ -1296,6 +1296,13 @@ _MIGRATIONS = [
     # Additive nullable column — NULL on every manual submit and every
     # pre-ADR-100 row, byte-for-byte the prior behavior.
     "ALTER TABLE jobs ADD COLUMN origin TEXT",
+    # ADR 102 D1: prompt-version join key. sha256 of the raw prompt template
+    # at eval/bench time — agent_version doesn't change on local prompt
+    # edits, this does. Nullable: NULL on pre-ADR-102 rows and on
+    # workflow-level evals (no single prompt), exactly the dimension_means
+    # additive-column pattern above.
+    "ALTER TABLE evals ADD COLUMN prompt_hash TEXT",
+    "ALTER TABLE bench ADD COLUMN prompt_hash TEXT",
 ]
 
 
@@ -1592,8 +1599,8 @@ class SqliteProvider:
                 eval_id, tenant_id, agent, agent_version, dataset_hash,
                 judge_method, judge_provider, runs_per_case, gate_mode,
                 threshold, mean_score, pass_rate, sample_count,
-                total_cost_usd, created_at, dimension_means
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                total_cost_usd, created_at, dimension_means, prompt_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 e.eval_id,
@@ -1612,6 +1619,7 @@ class SqliteProvider:
                 e.total_cost_usd,
                 e.created_at.isoformat(),
                 json.dumps(e.dimension_means) if e.dimension_means is not None else None,
+                e.prompt_hash,
             ),
         )
         await self._db.commit()
@@ -1759,8 +1767,18 @@ class SqliteProvider:
         return out
 
     async def save_bench(self, b: BenchRecord) -> None:
+        # Explicit column list (not positional) — the additive ``prompt_hash``
+        # column (ADR 102, appended by the migration) sits after created_at
+        # in migrated DBs, so positional VALUES would misalign. Same rationale
+        # as save_eval's dimension_means.
         await self._db.execute(
-            "INSERT INTO bench VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO bench (
+                bench_id, tenant_id, agent, agent_version, input,
+                judge_method, judge_provider, runs_per_model, gate_mode,
+                models, created_at, prompt_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             (
                 b.bench_id,
                 b.tenant_id,
@@ -1773,6 +1791,7 @@ class SqliteProvider:
                 b.gate_mode,
                 json.dumps([m.model_dump() for m in b.models]),
                 b.created_at.isoformat(),
+                b.prompt_hash,
             ),
         )
         await self._db.commit()
@@ -5897,6 +5916,7 @@ def _row_to_bench(row: aiosqlite.Row) -> BenchRecord:
         gate_mode=row["gate_mode"],
         models=[BenchModelResult.model_validate(m) for m in json.loads(row["models"])],
         created_at=datetime.fromisoformat(row["created_at"]),
+        prompt_hash=dict(row).get("prompt_hash"),
     )
 
 
@@ -6046,6 +6066,7 @@ def _row_to_eval(row: aiosqlite.Row) -> EvalRecord:
         total_cost_usd=row["total_cost_usd"],
         created_at=datetime.fromisoformat(row["created_at"]),
         dimension_means=json.loads(raw_dim_means) if raw_dim_means else None,
+        prompt_hash=dict(row).get("prompt_hash"),
     )
 
 

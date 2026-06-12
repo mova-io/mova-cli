@@ -556,6 +556,10 @@ class EvalSummary:
     """10-category weighted composite scorecard with production readiness
     verdict. Present whenever at least one v0.8 dimension is scored.
     None for legacy datasets that only scored accuracy (exact-match)."""
+    prompt_hash: str | None = None
+    """sha256 of the bundle's raw prompt template (ADR 102 D1) — the
+    prompt-version join key persisted onto the :class:`EvalRecord`.
+    ``None`` for workflow-level evals, which have no single prompt."""
 
     @property
     def sample_count(self) -> int:
@@ -608,6 +612,7 @@ class EvalSummary:
             sample_count=self.sample_count,
             total_cost_usd=self.total_cost_usd,
             dimension_means=dim_means or None,
+            prompt_hash=self.prompt_hash,
         )
 
 
@@ -1597,6 +1602,7 @@ class EvalEngine:
             objective_summaries=objective_summaries,
             dimensional_means=dimensional_means,
             scorecard=scorecard,
+            prompt_hash=bundle.prompt_hash,
         )
 
     # ---------------------------------------------------------- private
