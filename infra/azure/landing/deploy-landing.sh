@@ -14,6 +14,7 @@ set -euo pipefail
 RG="${RG:-movate-dev-rg}"
 APP="${APP:-movate-dev-landing}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "${HERE}/../../.." && pwd)"
 
 # shellcheck source=/dev/null
 source "${HERE}/urls.env"
@@ -30,7 +31,19 @@ if [[ -z "$CP_TOKEN" ]]; then
   echo "   Re-run with: CP_TOKEN=\"\$MDK_DEV_KEY\" ./deploy-landing.sh" >&2
 fi
 
+# Pattern Catalog (#catalog in-page view) — statically generated from the mdk
+# registry (movate.templates, the catalog behind `mdk patterns list`) so the
+# page can never drift from what `mdk init --pattern` accepts. Needs the repo's
+# uv env; fails the deploy loudly rather than shipping a page with a dead tile.
+echo "→ rendering the pattern catalog from the registry (render_catalog.py)"
+CATALOG_HTML="$(cd "${ROOT}" && uv run python "${HERE}/render_catalog.py")"
+if [[ -z "$CATALOG_HTML" ]]; then
+  echo "✗ render_catalog.py produced no output — pattern catalog would be empty" >&2
+  exit 1
+fi
+
 html="$(cat "${HERE}/index.html.tmpl")"
+html="${html//__PATTERN_CATALOG__/$CATALOG_HTML}"
 html="${html//__OPENWEBUI_URL__/$OPENWEBUI_URL}"
 html="${html//__PLAYGROUND_URL__/$PLAYGROUND_URL}"
 html="${html//__GRAFANA_URL__/$GRAFANA_URL}"

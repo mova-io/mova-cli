@@ -11,8 +11,16 @@ reproducible.
   tile targets (the source of truth for the layout/tiles). Also hosts the
   **Agent Control Plane** in-page view (see below).
 - `urls.env` — the tile target URLs (override any via the environment).
-- `deploy-landing.sh` — renders the template with the URLs and updates the
-  landing Container App's `HTML_B64`.
+- `render_catalog.py` — statically generates the **Pattern Catalog** in-page
+  view (hash route `#catalog`) from the mdk registry (`movate.templates`, the
+  same catalog as `mdk patterns list`): one card per pattern with name, kind,
+  topology, description and the `mdk init <target-dir> --pattern <name>`
+  snippet. Run by `deploy-landing.sh` (needs the repo's uv env), substituted
+  into the template's `__PATTERN_CATALOG__` placeholder — the landing app
+  serves a single HTML doc, so the catalog lives in-page like the control
+  plane, not as a separate `catalog.html`.
+- `deploy-landing.sh` — renders the template with the URLs + the generated
+  pattern catalog and updates the landing Container App's `HTML_B64`.
 
 ## Agent Control Plane (ADR 090)
 The 🎛️ tile opens an **in-page** view (hash route `#control-plane`) — the landing
