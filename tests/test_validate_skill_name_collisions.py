@@ -133,7 +133,10 @@ def test_colliding_skill_names_fail_validation(tmp_path: Path) -> None:
         tmp_path, sibling_impl="def run(payload, ctx):\n    return {'b': 2}  # different\n"
     )
     result = runner.invoke(cli_app, ["validate", str(wf_a)])
-    combined = result.stdout + result.stderr
+    # Rich wraps console output at the terminal width (narrower in CI), which
+    # can split a path or name mid-token — normalize away newlines before any
+    # substring assertion.
+    combined = (result.stdout + result.stderr).replace("\n", "")
     assert result.exit_code == 2, combined
     assert "ambiguous cross-workflow skill name" in combined
     assert "sim-thing" in combined
@@ -146,7 +149,10 @@ def test_byte_identical_duplicate_passes(tmp_path: Path) -> None:
     """The redact-pii convention: byte-identical duplicates are interchangeable."""
     wf_a = _tree(tmp_path, sibling_impl="def run(payload, ctx):\n    return {'a': 1}\n")
     result = runner.invoke(cli_app, ["validate", str(wf_a)])
-    combined = result.stdout + result.stderr
+    # Rich wraps console output at the terminal width (narrower in CI), which
+    # can split a path or name mid-token — normalize away newlines before any
+    # substring assertion.
+    combined = (result.stdout + result.stderr).replace("\n", "")
     assert result.exit_code == 0, combined
     assert "ambiguous" not in combined
 
