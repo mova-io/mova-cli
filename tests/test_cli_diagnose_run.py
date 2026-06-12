@@ -14,6 +14,7 @@ at the failing activity + retry storm, not a generic "the workflow failed").
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -466,9 +467,12 @@ class TestFailureModes:
     def test_help_documents_dual_dispatch(self) -> None:
         result = runner.invoke(cli_app, ["diagnose", "--help"])
         assert result.exit_code == 0
-        assert "show" in result.stdout
-        assert "workflow run id" in result.stdout
-        assert "--no-llm" in result.stdout
+        # Rich renders help with ANSI codes + wraps at the terminal width
+        # (narrower in CI) — strip both before substring assertions.
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout).replace("\n", "")
+        assert "show" in plain
+        assert "workflow run id" in plain
+        assert "--no-llm" in plain
 
 
 # ---------------------------------------------------------------------------
