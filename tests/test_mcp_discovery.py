@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import httpx
 import pytest
 
 import movate.core.skill_backend.mcp as mcp_mod
@@ -20,6 +21,7 @@ from movate.core import mcp_discovery
 from movate.core.mcp_discovery import (
     MCPDiscoveryError,
     _filter_tools,
+    _is_mutating,
     _mint_bundle,
     _sanitize_segment,
     discover_mcp_skill_bundles,
@@ -47,7 +49,9 @@ class _FakeBackend:
         self._hang_for = hang_for or set()
         self.closed = False
 
-    async def discover_tools(self, entry: str, server_name: str) -> list[dict[str, Any]]:
+    async def discover_tools(
+        self, entry: str, server_name: str, auth: str | None = None
+    ) -> list[dict[str, Any]]:
         if server_name in self._raise_for:
             raise RuntimeError("connection refused")
         if server_name in self._hang_for:
@@ -132,6 +136,40 @@ def test_merge_agent_overrides_project() -> None:
     merged = merge_mcp_servers(proj, agent)
     assert [m.name for m in merged] == ["gh", "jira", "slack"]
     assert merged[0].entry == "agent"  # agent wins on name collision
+
+
+def test_mint_bundle_threads_credentials_to_auth() -> None:
+    # ADR 101 D3: credentials_ref → implementation.auth so the HTTP transport
+    # injects an Authorization header at dispatch.
+    server = MCPServerRef(
+        name="gh", entry="https://mcp.x/api", credentials_ref="bearer-from-env:GH"
+    )
+    bundle = _mint_bundle(server, _tool("search"))
+    assert bundle.spec.implementation.auth == "bearer-from-env:GH"
+
+
+def test_mint_bundle_no_credentials_leaves_auth_unset() -> None:
+    bundle = _mint_bundle(MCPServerRef(name="gh", entry="npx x"), _tool("search"))
+    assert bundle.spec.implementation.auth is None
+
+
+@pytest.mark.parametrize(
+    ("annotations", "expected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"readOnlyHint": True}, False),
+        ({"readOnlyHint": False}, True),
+        ({"destructiveHint": True}, True),
+        ({"destructiveHint": False}, False),
+        ({"readOnlyHint": True, "destructiveHint": True}, True),
+    ],
+)
+def test_is_mutating_maps_annotations(annotations: dict[str, Any] | None, expected: bool) -> None:
+    tool: dict[str, Any] = {"name": "t", "inputSchema": {"type": "object"}}
+    if annotations is not None:
+        tool["annotations"] = annotations
+    assert _is_mutating(tool) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +272,41 @@ async def test_unsanitizable_tool_skipped_softly(monkeypatch: pytest.MonkeyPatch
     res = await discover_mcp_skill_bundles([MCPServerRef(name="gh", entry="x")])
     assert [b.spec.name for b in res.bundles] == ["gh-good-one"]
     assert any("123bad" in w for w in res.warnings)
+
+
+# ---------------------------------------------------------------------------
+# HTTP transport auth injection (ADR 101 D3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_http_spawn_injects_authorization_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["headers"] = kwargs.get("headers")
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    monkeypatch.setenv("GH_TOKEN", "s3cret")
+
+    backend = mcp_mod.MCPSkillBackend()
+
+    # Stub the JSON-RPC handshake so _http_spawn completes without a real server.
+    async def _fake_rpc(session: Any, *, method: str, params: Any, skill_name: str) -> Any:
+        return {"protocolVersion": "2024-11-05"}
+
+    async def _fake_notify(session: Any, *, method: str, skill_name: str) -> None:
+        return None
+
+    monkeypatch.setattr(backend, "_http_rpc_call", _fake_rpc)
+    monkeypatch.setattr(backend, "_http_rpc_notify", _fake_notify)
+
+    await backend._ensure_http_session("https://mcp.x/api", "gh", "bearer-from-env:GH_TOKEN")
+    assert captured["headers"] == {"Authorization": "Bearer s3cret"}
 
 
 # ---------------------------------------------------------------------------

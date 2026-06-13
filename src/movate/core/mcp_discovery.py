@@ -135,6 +135,12 @@ def _mint_bundle(server: MCPServerRef, tool: dict[str, Any]) -> SkillBundle:
     if not isinstance(input_schema, dict):
         input_schema = {"type": "object"}
 
+    backend_config: dict[str, Any] = {"entry": server.entry, "tool": tool_name}
+    # An HTTP MCP server may be token-gated; carry the auth spec so the bridge
+    # threads it into the dispatch path (ADR 101 D3). Ignored by stdio.
+    if server.credentials_ref:
+        backend_config["auth"] = server.credentials_ref
+
     descriptor = ToolDescriptor(
         name=f"{server.name}.{segment}",
         version=_MINTED_VERSION,
@@ -143,16 +149,30 @@ def _mint_bundle(server: MCPServerRef, tool: dict[str, Any]) -> SkillBundle:
         input_schema=input_schema,
         # MCP tools don't declare an output schema; leave permissive.
         output_schema={},
-        backend=ToolBackendConfig(
-            kind="mcp",
-            # ``tool`` carries the VERBATIM name so the backend's tools/call is
-            # byte-exact; ``entry`` is the server command / URL.
-            config={"entry": server.entry, "tool": tool_name},
-        ),
+        backend=ToolBackendConfig(kind="mcp", config=backend_config),
         credentials_ref=server.credentials_ref,
-        governance=ToolGovernance(default_grant=True),
+        governance=ToolGovernance(default_grant=True, mutating=_is_mutating(tool)),
     )
     return tool_descriptor_to_skill_bundle(descriptor)
+
+
+def _is_mutating(tool: dict[str, Any]) -> bool:
+    """Read MCP tool annotations to flag write/destructive tools (ADR 101 D3).
+
+    MCP servers may attach ``annotations`` with ``readOnlyHint`` /
+    ``destructiveHint`` (both optional, hints not guarantees). We map them to
+    ``ToolGovernance.mutating`` so a write-capable tool is *labelled* — surfaced
+    by ``mdk mcp inspect`` and available to future policy/HITL gating. Absent
+    annotations → ``False`` (unknown; the conservative default that matches the
+    existing ToolGovernance default). Note: there is no HITL gate in the agent
+    tool-use loop today, so this is metadata, not yet enforcement.
+    """
+    ann = tool.get("annotations")
+    if not isinstance(ann, dict):
+        return False
+    if ann.get("destructiveHint") is True:
+        return True
+    return ann.get("readOnlyHint") is False
 
 
 def _fingerprint(tools: list[dict[str, Any]]) -> str:
@@ -197,7 +217,7 @@ async def discover_mcp_skill_bundles(
         for server in servers:
             try:
                 descriptors = await asyncio.wait_for(
-                    backend.discover_tools(server.entry, server.name),
+                    backend.discover_tools(server.entry, server.name, server.credentials_ref),
                     timeout=DISCOVERY_TIMEOUT_S,
                 )
             except (TimeoutError, asyncio.TimeoutError) as exc:  # noqa: UP041

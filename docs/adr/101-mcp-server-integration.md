@@ -169,11 +169,23 @@ Discovery does not invent a new trust model — it populates the ADR 052 one:
   which a tool the author didn't (directly or by omission) authorize reaches the
   agent — the same guarantee `ToolResolver`'s allowlist check gives
   (`resolver.py:188`).
-- **Credentials.** `credentials_ref` resolves at **dispatch** time, not load
-  time, through the same credential-resolution seam the registry's
-  `credentials_ref` already uses — injected into the stdio child's env (stdio)
-  or as an `Authorization` header (HTTP) by the backend. A missing/denied
-  credential is a `SkillError(BACKEND_ERROR)` at call time, never a crash.
+- **Credentials.** `credentials_ref` reuses the existing **`bearer-from-env:VAR`**
+  convention (the same field + resolver `kind: http` skills use). For an HTTP(S)
+  server it resolves to an `Authorization: Bearer <VAR>` header applied at
+  **both discovery and dispatch** (threaded `MCPServerRef.credentials_ref` →
+  `ToolDescriptor.backend.config["auth"]` → `SkillImplementation.auth` →
+  `MCPSkillBackend._http_spawn`). For a stdio server it's unnecessary — the
+  subprocess inherits the worker env, so the server reads its own token var
+  (`GITHUB_TOKEN`, …) directly. A missing/empty env var is a
+  `SkillError(BACKEND_ERROR)` at use time, never a crash. (A central
+  secret-store resolver — `kv://` etc. — is deferred; the env-var convention is
+  what deploys consistently with Container Apps secret injection.)
+- **Mutating tools labelled.** MCP `annotations` (`readOnlyHint`/
+  `destructiveHint`) map to `ToolGovernance.mutating` on the minted descriptor
+  and surface in `mdk mcp inspect` (a "writes?" column). This is **metadata
+  today**: the agent tool-use loop has no HITL gate to route mutating calls
+  through (that machinery is workflow-node-only), so enforcement — a HITL gate
+  or policy denial in the agent loop — is a tracked follow-up.
 - **Governance gate visibility.** Because discovered tools become declared
   `ToolDescriptor`s/`SkillBundle`s, the ADR 093 SKILL gate and `mdk validate`
   see them — closing the "wrapper hides a side-effect" blind spot ADR 097 called
@@ -310,6 +322,12 @@ boundary and is treated as one (CLAUDE.md §10):
   load-bearing one fails loud (`required: true`). Drift is surfaced, not silent.
 - The hand-rolled JSON-RPC client stays the one MCP client; no new dependency,
   no second tool-execution path.
+- **Deploy:** stdio servers spawn on the **worker** (where `load_agent`
+  discovery + dispatch run), but the runtime image is `python:3.11-slim` with no
+  Node. An opt-in `--build-arg INSTALL_NODE=1` adds `nodejs`/`npm` so
+  `npx`-based servers run in-cluster; OFF by default keeps the image lean.
+  HTTP/SSE servers need only egress. Absent Node, a declared stdio server
+  fails-soft at discovery (warning) unless `required: true`.
 - Risks accepted: load-time discovery adds a bounded network/subprocess cost to
   `load_agent` for agents that declare servers (mitigated by caching + per-server
   timeout + default fail-soft); in-memory descriptors mean discovered tools

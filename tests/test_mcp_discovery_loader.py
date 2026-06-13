@@ -23,7 +23,9 @@ class _FakeBackend:
     def __init__(self, tools_by_server: dict[str, list[dict[str, Any]]]) -> None:
         self._tools = tools_by_server
 
-    async def discover_tools(self, entry: str, server_name: str) -> list[dict[str, Any]]:
+    async def discover_tools(
+        self, entry: str, server_name: str, auth: str | None = None
+    ) -> list[dict[str, Any]]:
         return self._tools.get(server_name, [])
 
     async def aclose(self) -> None:
@@ -111,7 +113,9 @@ def test_required_server_failure_fails_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class _Raising:
-        async def discover_tools(self, entry: str, server_name: str) -> list[dict[str, Any]]:
+        async def discover_tools(
+            self, entry: str, server_name: str, auth: str | None = None
+        ) -> list[dict[str, Any]]:
             raise RuntimeError("unreachable")
 
         async def aclose(self) -> None:

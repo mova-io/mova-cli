@@ -187,9 +187,14 @@ class MCPServerRef(BaseModel):
     credentials_ref: str | None = Field(
         default=None,
         description=(
-            "Optional credential reference resolved at dispatch (not load) "
-            "time — injected into the stdio child's env or as an HTTP "
-            "Authorization header. Mirrors ``ToolDescriptor.credentials_ref``."
+            "Optional auth for the server (ADR 101 D3). For an HTTP(S) server, a "
+            "``bearer-from-env:VAR`` spec — ``VAR``'s value is sent as "
+            "``Authorization: Bearer <value>`` (same shape + resolver as a "
+            "``kind: http`` skill's ``auth``), applied at both discovery and "
+            "dispatch. For a stdio server this is unnecessary: the subprocess "
+            "inherits the worker env, so the server reads its own token var "
+            "(e.g. ``GITHUB_TOKEN``) directly. Resolved at use time, never "
+            "inlined."
         ),
     )
     required: bool = Field(

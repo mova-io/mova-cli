@@ -65,6 +65,22 @@ COPY scripts/calver_version.py ./scripts/
 RUN MOVATE_BUILD_VERSION="${MOVATE_BUILD_VERSION}" \
     uv sync --all-extras --no-extra airflow --no-dev --frozen
 
+# ADR 101 D5 — optional Node.js so stdio MCP servers (the common
+# `npx -y @modelcontextprotocol/server-*` shape) can run in-cluster. OFF by
+# default to keep the image lean on python:3.11-slim — HTTP/SSE MCP servers
+# need nothing extra, and an agent that declares no stdio mcp_servers pays
+# zero. Build the runtime/worker with `--build-arg INSTALL_NODE=1` when a
+# deployed agent's mcp_servers entry must spawn a Node-based server on the
+# worker (load_agent discovery + dispatch run there). The deploy CLI surfaces
+# this flag; absent node, a stdio server fails-soft at discovery (warning)
+# unless marked `required: true`.
+ARG INSTALL_NODE=0
+RUN if [ "$INSTALL_NODE" = "1" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends nodejs npm \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 # Bake the default templates so `movate init` works inside the
 # container if an operator shells in. Production runs ignore this.
 COPY src/movate/templates/ /opt/movate/.venv/lib/python3.11/site-packages/movate/templates/

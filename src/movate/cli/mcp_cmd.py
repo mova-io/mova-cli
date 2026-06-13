@@ -139,7 +139,7 @@ def inspect(
     """
     import asyncio  # noqa: PLC0415
 
-    from movate.core.mcp_discovery import _sanitize_segment  # noqa: PLC0415
+    from movate.core.mcp_discovery import _is_mutating, _sanitize_segment  # noqa: PLC0415
     from movate.core.skill_backend.base import SkillError  # noqa: PLC0415
     from movate.core.skill_backend.mcp import MCPSkillBackend  # noqa: PLC0415
 
@@ -170,14 +170,16 @@ def inspect(
     )
     table.add_column("tool (wire name)", style="bold")
     table.add_column("skill identifier", style="cyan")
+    table.add_column("writes?", justify="center")
     table.add_column("description", overflow="fold")
     for t in discovered:
         wire = t.get("name", "?")
         seg = _sanitize_segment(wire) if isinstance(wire, str) else None
         ident = f"{name}-{seg}" if seg else "[red](unmintable)[/red]"
+        writes = "[yellow]✎[/yellow]" if _is_mutating(t) else ""
         desc = t.get("description", "")
         desc = desc.strip().split("\n")[0][:120] if isinstance(desc, str) else ""
-        table.add_row(str(wire), ident, desc)
+        table.add_row(str(wire), ident, writes, desc)
     console.print(table)
     console.print(
         f"[dim]Declare under mcp_servers: as "

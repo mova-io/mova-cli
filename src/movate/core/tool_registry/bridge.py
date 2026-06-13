@@ -60,6 +60,11 @@ def tool_descriptor_to_skill_bundle(
     # Copy kind-specific fields.
     if kind == SkillImplementationKind.MCP:
         impl_kwargs["tool"] = config.get("tool", "")
+        # ADR 101 D3: an optional ``bearer-from-env:VAR`` auth spec for an
+        # HTTP MCP server (ignored by the stdio transport). Reuses the same
+        # ``auth`` field + resolver the HTTP backend uses.
+        if config.get("auth"):
+            impl_kwargs["auth"] = config["auth"]
     elif kind == SkillImplementationKind.HTTP:
         impl_kwargs["method"] = config.get("method", "POST")
         impl_kwargs["auth"] = config.get("auth")
