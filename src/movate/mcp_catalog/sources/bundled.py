@@ -37,11 +37,15 @@ def _load_entries() -> tuple[CatalogEntry, ...]:
 
 
 def _looks_pinned(entry: str) -> bool:
-    """Heuristic: a stdio command pinning ``@<version>`` or any http URL counts."""
+    """Heuristic: an entry that nails a concrete version (or is an http URL).
+
+    Recognizes npm ``pkg@1.2.3`` and PyPI/uvx ``pkg==1.2.3`` pins; treats any
+    http(s) URL as pinned (the endpoint is the version).
+    """
     if entry.lower().startswith(("http://", "https://")):
         return True
-    # npm-style pin: a token containing ``@<something>`` after the package name.
-    return "@" in entry.rsplit("/", maxsplit=1)[-1] or "@" in entry.rsplit(" ", 1)[-1]
+    last = entry.rsplit(" ", 1)[-1]  # the package token
+    return "==" in last or "@" in last.rsplit("/", maxsplit=1)[-1]
 
 
 class BundledSource:

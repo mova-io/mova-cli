@@ -23,7 +23,7 @@ servers:
     title: Filesystem
     description: Read and write files within allowed directories.
     transport: stdio
-    entry: "npx -y @modelcontextprotocol/server-filesystem@2025.3.28"
+    entry: "npx -y @modelcontextprotocol/server-filesystem@2026.1.14"
     homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"
     tags: [files, local]
     tools_hint: [read_file, write_file, list_directory, search_files]
@@ -32,7 +32,7 @@ servers:
     title: Slack
     description: Post messages and read channels/threads in a Slack workspace.
     transport: stdio
-    entry: "npx -y @modelcontextprotocol/server-slack@2025.3.28"
+    entry: "npx -y @modelcontextprotocol/server-slack@2025.4.25"
     credentials: "bearer-from-env:SLACK_BOT_TOKEN"
     homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/slack"
     tags: [chat, collaboration]
@@ -42,7 +42,7 @@ servers:
     title: PostgreSQL
     description: Read-only SQL queries and schema inspection over a Postgres database.
     transport: stdio
-    entry: "npx -y @modelcontextprotocol/server-postgres@2025.3.28"
+    entry: "npx -y @modelcontextprotocol/server-postgres@0.6.2"
     credentials: "bearer-from-env:POSTGRES_CONNECTION_STRING"
     homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres"
     tags: [data, sql, database]
@@ -52,7 +52,9 @@ servers:
     title: Fetch
     description: Fetch a URL and return its content as markdown for the model to read.
     transport: stdio
-    entry: "npx -y @modelcontextprotocol/server-fetch@2025.3.28"
+    # fetch is a PyPI package run via uvx (NOT npm — verified against the
+    # registries 2026-06-13: @modelcontextprotocol/server-fetch is 404 on npm).
+    entry: "uvx mcp-server-fetch==2026.6.4"
     homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch"
     tags: [web, http, retrieval]
     tools_hint: [fetch]
