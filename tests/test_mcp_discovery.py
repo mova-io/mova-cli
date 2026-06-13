@@ -27,7 +27,7 @@ from movate.core.mcp_discovery import (
     discover_mcp_skill_bundles,
     discover_sync,
 )
-from movate.core.models import MCPServerRef, merge_mcp_servers
+from movate.core.models import MCPServerRef, SkillSideEffects, merge_mcp_servers
 from movate.core.skill_backend.base import SkillError
 from movate.core.skill_backend.mcp import _apply_http_auth, _HttpSession
 
@@ -153,6 +153,19 @@ def test_mint_bundle_threads_credentials_to_auth() -> None:
 def test_mint_bundle_no_credentials_leaves_auth_unset() -> None:
     bundle = _mint_bundle(MCPServerRef(name="gh", entry="npx x"), _tool("search"))
     assert bundle.spec.implementation.auth is None
+
+
+def test_mint_bundle_maps_mutating_to_side_effects() -> None:
+    # ADR 105 D1: a destructive MCP tool → side_effects=mutates-state so the
+    # SkillPolicy confirm/deny gate can see it (default → read-only).
+    server = MCPServerRef(name="gh", entry="npx x")
+    destructive = {
+        "name": "delete_repo",
+        "inputSchema": {"type": "object"},
+        "annotations": {"destructiveHint": True},
+    }
+    assert _mint_bundle(server, destructive).spec.side_effects is SkillSideEffects.MUTATES_STATE
+    assert _mint_bundle(server, _tool("search")).spec.side_effects is SkillSideEffects.READ_ONLY
 
 
 @pytest.mark.parametrize(

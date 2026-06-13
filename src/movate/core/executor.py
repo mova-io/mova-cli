@@ -99,6 +99,10 @@ _COST_DRIFT_THRESHOLD = 0.15
 # loop fails loud rather than silently burning budget.
 _MAX_TOOL_TURNS_DEFAULT = 10
 
+# ADR 105 D3: called before dispatching a confirm-category tool.
+# ``(skill_name, side_effects_value, input) -> approved``.
+ApprovalCallback = Callable[[str, str, dict[str, Any]], bool]
+
 
 class Executor:
     def __init__(
@@ -116,6 +120,7 @@ class Executor:
         guardrails: GuardrailsConfig | None = None,
         memory_store: MemoryStore | None = None,
         cache: CacheProvider | None = None,
+        approve: ApprovalCallback | None = None,
     ) -> None:
         """One of ``provider`` (legacy single-runtime) OR ``registry``
         (multi-runtime, v0.6+) must be set. Passing ``provider`` is
@@ -150,6 +155,12 @@ class Executor:
         # enforced at the top of execute() so a bundle that bypasses
         # `mdk validate` can't sneak past the gate.
         self._skill_policy = skill_policy or SkillPolicy()
+        # ADR 105 D3: optional call-time approval callback for tools whose
+        # side_effects are in ``SkillPolicy.confirm_side_effects``. Signature
+        # ``(skill_name, side_effects_value, input) -> approved: bool``. When
+        # None (the headless / runtime default), a confirm-category tool is
+        # fail-closed (declined) — a write needs an approver, and none is wired.
+        self._approve = approve
         # Optional per-agent memory store. When set, every successful run
         # writes {input, output, run_id} under key "last_run" for the
         # agent — visible via `mdk memory get <agent> last_run`. Failure
@@ -292,6 +303,34 @@ class Executor:
             violation = self._skill_policy.check_skill(skill_name, side_effects)
             if violation is not None:
                 raise PolicyViolationError(violation)
+
+    def _enforce_confirm(self, skill: Any, skill_input: dict[str, Any]) -> None:
+        """Require call-time approval for a confirm-category tool (ADR 105 D2/D3).
+
+        No-op unless the skill's ``side_effects`` is in
+        ``SkillPolicy.confirm_side_effects`` (default None → zero overhead). When
+        it is, the approval callback decides; absent a callback (headless) the
+        call is fail-closed. A non-approval raises ``SkillError`` so the caller's
+        existing handler surfaces it to the model as a tool result — the agent
+        adapts instead of crashing.
+        """
+        se = skill.spec.side_effects
+        if not self._skill_policy.requires_confirm(se):
+            return
+        from movate.core.skill_backend.base import SkillError, SkillErrorType  # noqa: PLC0415
+
+        approved = False
+        if self._approve is not None:
+            approved = bool(self._approve(skill.spec.name, se.value, skill_input))
+        if not approved:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"tool {skill.spec.name!r} requires human approval for its "
+                    f"{se.value!r} side effect and was not approved; the action "
+                    f"was not performed"
+                ),
+            )
 
     @property
     def tracer(self) -> Tracer:
@@ -1590,6 +1629,10 @@ class Executor:
                 )
                 _t0 = time.monotonic()
                 try:
+                    # ADR 105: gate mutating/confirm-category tools on approval
+                    # before they run. Raises SkillError (declined) → handled
+                    # below like any tool error, surfaced to the model.
+                    self._enforce_confirm(skill, _input)
                     output = await dispatch_skill(skill, _input, ctx)
                     lat = (time.monotonic() - _t0) * 1000
                     result = json.dumps(output)

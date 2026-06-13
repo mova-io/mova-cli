@@ -23,6 +23,7 @@ from movate.core.models import (
     SkillCost,
     SkillImplementation,
     SkillImplementationKind,
+    SkillSideEffects,
     SkillSpec,
 )
 from movate.core.skill_loader import SkillBundle
@@ -80,6 +81,17 @@ def tool_descriptor_to_skill_bundle(
     input_schema = descriptor.input_schema or {"type": "object"}
     output_schema = descriptor.output_schema or {"type": "object"}
 
+    # ADR 105 D1: propagate the governance mutating flag (set by MCP discovery
+    # from a tool's destructiveHint/readOnlyHint annotations, ADR 101) into the
+    # skill's side_effects so the SkillPolicy gate can actually see it. Without
+    # this the bundle defaults to read-only and a discovered write tool slips a
+    # strict policy.
+    side_effects = (
+        SkillSideEffects.MUTATES_STATE
+        if descriptor.governance.mutating
+        else SkillSideEffects.READ_ONLY
+    )
+
     spec = SkillSpec(
         api_version="movate/v1",
         kind="Skill",
@@ -90,6 +102,7 @@ def tool_descriptor_to_skill_bundle(
         schema=SchemaPaths(input=input_schema, output=output_schema),
         implementation=SkillImplementation(**impl_kwargs),
         cost=SkillCost(),
+        side_effects=side_effects,
         tags=descriptor.tags,
     )
 

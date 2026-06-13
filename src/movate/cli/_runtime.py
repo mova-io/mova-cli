@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+from typing import Any
 
 from movate.core.cache import build_cache
 from movate.core.config import load_project_config
@@ -88,6 +89,32 @@ def _try_register_native_adapters(registry: ProviderRegistry, *, mock: bool) -> 
     registry.register(AgentRuntime.LYZR, LyzrProvider())
 
 
+def _interactive_approve(skill_name: str, side_effects: str, skill_input: dict[str, Any]) -> bool:
+    """Prompt the operator to approve a confirm-category tool (ADR 105 D3).
+
+    Used only by the local CLI runtime. Fail-closed when there's no TTY (piped /
+    CI) — a side-effecting tool must not auto-run unattended.
+    """
+    import json  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    import typer  # noqa: PLC0415
+    from rich.console import Console  # noqa: PLC0415
+
+    err = Console(stderr=True)
+    if not sys.stdin.isatty():
+        err.print(
+            f"[yellow]⚠ tool {skill_name!r} ({side_effects}) needs approval but "
+            f"no TTY is attached — declining.[/yellow]"
+        )
+        return False
+    err.print(
+        f"\n[bold yellow]Approve {side_effects} tool[/bold yellow] [bold]{skill_name}[/bold]?"
+    )
+    err.print(f"[dim]{json.dumps(skill_input)[:400]}[/dim]")
+    return typer.confirm("  proceed?", default=False)
+
+
 async def build_local_runtime(*, mock: bool) -> LocalRuntime:
     """Construct the local runtime for a CLI invocation.
 
@@ -133,6 +160,11 @@ async def build_local_runtime(*, mock: bool) -> LocalRuntime:
         # Opt-in LLM response cache (default NoOp / OFF). Selected by
         # MOVATE_LLM_CACHE=memory; unset → zero behavior change.
         cache=build_cache(),
+        # ADR 105 D3: interactive approval for confirm-category tools when this
+        # is a local, attended CLI run. Headless/runtime executors pass no
+        # callback (fail-closed). No-op unless the project sets
+        # SkillPolicy.confirm_side_effects.
+        approve=_interactive_approve,
     )
     return LocalRuntime(executor=executor, provider=provider, storage=storage, tracer=tracer)
 

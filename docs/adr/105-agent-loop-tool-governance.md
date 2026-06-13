@@ -1,8 +1,8 @@
 # ADR 105 — Agent-loop tool governance: a confirm/HITL gate for mutating tools
 
-Status: Proposed
+Status: Accepted
 Date: 2026-06-13
-Accepted: — (pending review)
+Accepted: 2026-06-13 — approved by Jeremy. Shipped: D1 (mutating→side_effects in the bridge), D2 (`confirm_side_effects` on SkillPolicy), D3 sync (interactive `mdk run`/`dev` approval callback) + headless fail-closed, D6 (default-off). The confirm check lives in the executor (which owns the policy) rather than threaded through `SkillExecutionContext` — equivalent, no Protocol change. Deferred: D3b (ADR 077/089 durable approval for headless), D4 agent-level tightening, richer D5 records.
 Deciders: Engineering — extend the existing `SkillPolicy` gate (don't add a
 second one) with a `confirm` posture + an approval seam, and make the mutating
 label actually reach the gate. (CLAUDE.md §7: extend the existing seam.)
