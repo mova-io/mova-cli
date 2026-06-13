@@ -321,7 +321,7 @@ def test_cli_add_writes_valid_stanza(tmp_path: Path) -> None:
     entry = data["mcp_servers"][0]
     assert entry["name"] == "github"
     assert entry["entry"].startswith("npx -y @modelcontextprotocol/server-github@")
-    assert entry["credentials_ref"] == "bearer-from-env:GITHUB_TOKEN"
+    assert entry["credentials_ref"] == "bearer-from-env:GITHUB_PERSONAL_ACCESS_TOKEN"
     assert entry["include_tools"] == ["search_repositories"]
     # The written stanza must parse as a real MCPServerRef.
     MCPServerRef.model_validate(entry)

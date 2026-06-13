@@ -14,7 +14,7 @@ servers:
     description: Repositories, issues, pull requests, and code search.
     transport: stdio
     entry: "npx -y @modelcontextprotocol/server-github@2025.4.8"
-    credentials: "bearer-from-env:GITHUB_TOKEN"
+    credentials: "bearer-from-env:GITHUB_PERSONAL_ACCESS_TOKEN"
     homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/github"
     tags: [dev, scm, code]
     tools_hint: [search_repositories, get_file_contents, create_issue, list_commits]
