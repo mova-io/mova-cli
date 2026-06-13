@@ -32,6 +32,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -1235,13 +1236,21 @@ def add_mcp(
     from movate.core.skill_backend.mcp import MCPSkillBackend  # noqa: PLC0415
 
     backend = MCPSkillBackend()
+
+    async def _probe() -> list[dict[str, Any]]:
+        # discover + aclose MUST share one event loop: a stdio subprocess is
+        # bound to the loop that spawned it, so a second asyncio.run() to close
+        # it raises "Event loop is closed".
+        try:
+            return await backend.discover_tools(entry, skill_name)
+        finally:
+            await backend.aclose()
+
     try:
-        discovered = asyncio.run(backend.discover_tools(entry, skill_name))
+        discovered = asyncio.run(_probe())
     except SkillError as exc:
         err_console.print(f"[red]✗ failed to connect to MCP server:[/red] {exc.message}")
         raise typer.Exit(code=2) from None
-    finally:
-        asyncio.run(backend.aclose())
 
     if not discovered:
         err_console.print("[red]✗ server reported zero tools.[/red]")

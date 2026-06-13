@@ -414,16 +414,20 @@ async def test_tools_call_falls_back_to_text_json(
 
 
 @pytest.mark.asyncio
-async def test_tools_call_text_not_json_errors(
+async def test_tools_call_plain_text_is_wrapped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Server emitted a text content block with non-JSON contents.
-    Surfaces as backend_error so the operator sees the bug."""
+    """A text content block that isn't JSON is wrapped as {"content": text}.
+
+    Most MCP tools (echo, fetch, search, summaries) return prose, not a JSON
+    object — wrapping keeps the value usable in the tool-use loop instead of
+    erroring (a skill needing a typed object still enforces it via its output
+    schema at dispatch_skill)."""
     fake = _FakeProcess(
         stdout_lines=[
             *_handshake_lines(),
             _tools_list_line("get_issue", request_id=2),
-            _tools_call_line(text="this is not json at all", request_id=3),
+            _tools_call_line(text="The sum of 5 and 7 is 12.", request_id=3),
         ]
     )
     _install_fake_spawn(monkeypatch, fake)
@@ -431,20 +435,19 @@ async def test_tools_call_text_not_json_errors(
     bundle = load_skill(skill_dir)
     backend = MCPSkillBackend()
     try:
-        with pytest.raises(SkillError) as info:
-            await backend.execute(bundle, {"repo": "x", "issue_number": 1}, _ctx())
+        result = await backend.execute(bundle, {"repo": "x", "issue_number": 1}, _ctx())
     finally:
         await backend.aclose()
-    assert info.value.type == SkillErrorType.BACKEND_ERROR
-    assert "JSON" in info.value.message
+    assert result == {"content": "The sum of 5 and 7 is 12."}
 
 
 @pytest.mark.asyncio
-async def test_tools_call_text_json_array_is_validation_failed(
+async def test_tools_call_text_json_array_is_wrapped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Content text parses as JSON but isn't a dict (e.g. an array).
-    Surfaces as validation_failed — the output schema requires an object."""
+    """Content text that parses as a JSON non-object (array) is wrapped too —
+    {"content": [...]} — rather than erroring; the object contract is enforced
+    (if needed) by the skill's output schema at dispatch."""
     fake = _FakeProcess(
         stdout_lines=[
             *_handshake_lines(),
@@ -457,11 +460,10 @@ async def test_tools_call_text_json_array_is_validation_failed(
     bundle = load_skill(skill_dir)
     backend = MCPSkillBackend()
     try:
-        with pytest.raises(SkillError) as info:
-            await backend.execute(bundle, {"repo": "x", "issue_number": 1}, _ctx())
+        result = await backend.execute(bundle, {"repo": "x", "issue_number": 1}, _ctx())
     finally:
         await backend.aclose()
-    assert info.value.type == SkillErrorType.VALIDATION_FAILED
+    assert result == {"content": [1, 2, 3]}
 
 
 # ---------------------------------------------------------------------------

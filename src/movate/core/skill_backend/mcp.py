@@ -71,6 +71,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shlex
 import time
 from collections import deque
@@ -157,13 +158,25 @@ class _HttpSession:
 
     client: httpx.AsyncClient
     url: str
+    # Same as ``url`` but with any secret query-param value redacted — used in
+    # log/error messages so an ``?api_key=`` credential never leaks.
+    display_url: str = ""
     next_id: int = _INITIAL_ID
     initialized: bool = False
+    # MCP Streamable HTTP session id (ADR 101). The server issues an
+    # ``Mcp-Session-Id`` on the ``initialize`` response; every subsequent
+    # request MUST echo it or the server rejects with "No valid session ID".
+    session_id: str | None = None
     # Tools the server reported via tools/list — populated lazily.
     tools_known: set[str] | None = None
     # Full tools/list response: list of tool descriptors (name, description,
     # inputSchema). Stored for multi-tool discovery.
     tools_descriptors: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # Default the masked display URL to the real URL when no secret is in it.
+        if not self.display_url:
+            self.display_url = self.url
 
 
 class MCPSkillBackend:
@@ -527,40 +540,8 @@ class MCPSkillBackend:
                 ),
             )
 
-        # Preferred: structuredContent (modern MCP servers).
-        structured = result.get("structuredContent")
-        if isinstance(structured, dict):
-            return structured
-
-        # Fallback: parse content[0].text as JSON.
-        text = _extract_text(result.get("content"))
-        if text is None:
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"mcp skill {skill_name!r}: server returned neither "
-                    "structuredContent nor any text content; can't extract a "
-                    "result dict"
-                ),
-            )
-        try:
-            parsed = json.loads(text)
-        except ValueError as exc:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"mcp skill {skill_name!r}: server's content text wasn't valid JSON: {exc}"
-                ),
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"mcp skill {skill_name!r}: server returned content of "
-                    f"type {type(parsed).__name__}, expected a JSON object"
-                ),
-            )
-        return parsed
+        # structuredContent → JSON-object text → wrapped text (see helper).
+        return _result_to_dict(result, skill_name)
 
     # ------------------------------------------------------------------
     # JSON-RPC wire protocol
@@ -684,18 +665,16 @@ class MCPSkillBackend:
         """Open an HTTP client and perform the MCP handshake."""
         import httpx as _httpx  # noqa: PLC0415
 
-        headers: dict[str, str] = {}
-        if auth:
-            from movate.core.skill_backend.http import _build_auth_header  # noqa: PLC0415
-
-            headers["Authorization"] = _build_auth_header(auth, skill_name)
+        # Resolve the credential spec into request headers and/or a URL
+        # query-param, plus a masked display URL for logs/errors (ADR 101 D3).
+        effective_url, display_url, headers = _apply_http_auth(url, auth, skill_name)
 
         client = _httpx.AsyncClient(
             timeout=_httpx.Timeout(30.0, connect=10.0),
             follow_redirects=True,
             headers=headers,
         )
-        session = _HttpSession(client=client, url=url)
+        session = _HttpSession(client=client, url=effective_url, display_url=display_url)
 
         try:
             handshake_result = await self._http_rpc_call(
@@ -792,38 +771,7 @@ class MCPSkillBackend:
                 ),
             )
 
-        structured = result.get("structuredContent")
-        if isinstance(structured, dict):
-            return structured
-
-        text = _extract_text(result.get("content"))
-        if text is None:
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"mcp skill {skill_name!r}: server returned neither "
-                    "structuredContent nor any text content; can't extract a "
-                    "result dict"
-                ),
-            )
-        try:
-            parsed = json.loads(text)
-        except ValueError as exc:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"mcp skill {skill_name!r}: server's content text wasn't valid JSON: {exc}"
-                ),
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"mcp skill {skill_name!r}: server returned content of "
-                    f"type {type(parsed).__name__}, expected a JSON object"
-                ),
-            )
-        return parsed
+        return _result_to_dict(result, skill_name)
 
     # ------------------------------------------------------------------
     # HTTP/SSE JSON-RPC wire protocol
@@ -852,27 +800,32 @@ class MCPSkillBackend:
             "method": method,
             "params": params,
         }
+        headers = {"Accept": "application/json, text/event-stream"}
+        if session.session_id:
+            headers["Mcp-Session-Id"] = session.session_id
         try:
-            resp = await session.client.post(
-                session.url,
-                json=request,
-                headers={"Accept": "application/json, text/event-stream"},
-            )
+            resp = await session.client.post(session.url, json=request, headers=headers)
         except Exception as exc:
             raise SkillError(
                 type=SkillErrorType.BACKEND_ERROR,
                 message=(
                     f"mcp skill {skill_name!r}: HTTP request to "
-                    f"{session.url} failed: {type(exc).__name__}: {exc}"
+                    f"{session.display_url} failed: {type(exc).__name__}: {exc}"
                 ),
             ) from exc
+
+        # Capture the Streamable-HTTP session id (issued on ``initialize``) so
+        # later requests echo it. Header lookup is case-insensitive in httpx.
+        sid = resp.headers.get("mcp-session-id")
+        if sid:
+            session.session_id = sid
 
         if resp.is_error:
             raise SkillError(
                 type=SkillErrorType.BACKEND_ERROR,
                 message=(
                     f"mcp skill {skill_name!r}: HTTP {resp.status_code} "
-                    f"from {session.url}: {resp.text[:500]}"
+                    f"from {session.display_url}: {resp.text[:500]}"
                 ),
             )
 
@@ -888,7 +841,7 @@ class MCPSkillBackend:
                 type=SkillErrorType.BACKEND_ERROR,
                 message=(
                     f"mcp skill {skill_name!r}: HTTP response from "
-                    f"{session.url} wasn't valid JSON: {exc}"
+                    f"{session.display_url} wasn't valid JSON: {exc}"
                 ),
             ) from exc
 
@@ -922,10 +875,13 @@ class MCPSkillBackend:
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             message["params"] = params
+        headers = {"Accept": "application/json, text/event-stream"}
+        if session.session_id:
+            headers["Mcp-Session-Id"] = session.session_id
         import contextlib  # noqa: PLC0415
 
         with contextlib.suppress(Exception):
-            await session.client.post(session.url, json=message)
+            await session.client.post(session.url, json=message, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1077,103 @@ def _extract_text(content: Any) -> str | None:
             if isinstance(text, str):
                 return text
     return None
+
+
+def _apply_http_auth(
+    url: str, auth: str | None, skill_name: str
+) -> tuple[str, str, dict[str, str]]:
+    """Resolve a credential spec for the HTTP transport (ADR 101 D3).
+
+    Returns ``(effective_url, display_url, headers)``:
+
+    * ``bearer-from-env:VAR`` → ``Authorization: Bearer <VAR>`` header; URL
+      unchanged. (Shares the ``kind: http`` resolver.)
+    * ``apikey-query:PARAM=VAR`` → append ``?PARAM=<VAR>`` (or ``&``) to the
+      URL — for hosted servers that authenticate by query param (e.g. Smithery's
+      ``?api_key=``), where a Bearer token is rejected. ``display_url`` masks the
+      value so it never appears in logs/errors.
+    * ``None`` → no auth.
+
+    A missing/empty env var, or an unrecognized spec, raises ``SkillError`` so
+    the failure is loud and the operator knows which var to set.
+    """
+    if not auth:
+        return url, url, {}
+    if auth.startswith("bearer-from-env:"):
+        from movate.core.skill_backend.http import _build_auth_header  # noqa: PLC0415
+
+        return url, url, {"Authorization": _build_auth_header(auth, skill_name)}
+    if auth.startswith("apikey-query:"):
+        spec = auth.removeprefix("apikey-query:")
+        if "=" not in spec:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: apikey-query spec {auth!r} must be "
+                    f"'apikey-query:<param>=<ENV_VAR>'"
+                ),
+            )
+        param, var = (s.strip() for s in spec.split("=", 1))
+        value = os.environ.get(var) if (param and var) else None
+        if not value:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: env var {var!r} (for {param} query "
+                    f"auth) is unset or empty; set it or change the credential spec"
+                ),
+            )
+        sep = "&" if "?" in url else "?"
+        effective = f"{url}{sep}{param}={value}"
+        display = f"{url}{sep}{param}=***"
+        return effective, display, {}
+    raise SkillError(
+        type=SkillErrorType.BACKEND_ERROR,
+        message=(
+            f"mcp skill {skill_name!r}: unsupported credential spec {auth!r} "
+            f"(expected 'bearer-from-env:VAR' or 'apikey-query:param=VAR')"
+        ),
+    )
+
+
+def _result_to_dict(result: dict[str, Any], skill_name: str) -> dict[str, Any]:
+    """Turn a ``tools/call`` result into the JSON-object a skill returns.
+
+    Shared by the stdio + HTTP transports so both behave identically. Order:
+
+    1. ``structuredContent`` (modern servers) → used directly.
+    2. text content that parses as a JSON **object** → used directly.
+    3. **any other text** (prose, a JSON scalar/array) → wrapped as
+       ``{"content": <value>}``.
+
+    The wrapping in (3) is deliberate: most MCP tools return human-readable
+    *text* (echo, fetch, search, summaries), not a JSON object. Erroring on
+    those — as this did before — made the majority of real servers unusable
+    from an agent's tool-use loop. Wrapping keeps the value available to the
+    model; a skill that genuinely needs a typed object still enforces it via
+    its output schema at ``dispatch_skill`` (a clear validation error, not a
+    backend crash). ``isError`` is handled by the caller before this point.
+    """
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+
+    text = _extract_text(result.get("content"))
+    if text is None:
+        raise SkillError(
+            type=SkillErrorType.VALIDATION_FAILED,
+            message=(
+                f"mcp skill {skill_name!r}: server returned neither "
+                "structuredContent nor any text content; can't extract a result"
+            ),
+        )
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return {"content": text}  # plain prose — the common case
+    if isinstance(parsed, dict):
+        return parsed
+    return {"content": parsed}  # JSON scalar/array — wrap so it's a dict
 
 
 def _parse_sse_response(

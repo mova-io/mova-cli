@@ -297,23 +297,43 @@ class SkillPolicy(BaseModel):
             "must declare ``skills: []`` to validate."
         ),
     )
+    confirm_side_effects: list[SkillSideEffects] | None = Field(
+        default=None,
+        description=(
+            "Categories that require human approval at call time (ADR 105). A "
+            "category here is treated as permitted by the deny gate but each "
+            "invocation must be approved (the executor's approval callback) "
+            "before dispatch; an unapproved call is declined and surfaced to "
+            "the model as a tool error, not a crash. ``None`` (default) → no "
+            "confirm gate (today's behavior). Typical write-capable agent: "
+            "``allowed_side_effects: [read-only, network]``, "
+            "``confirm_side_effects: [mutates-state, filesystem]``."
+        ),
+    )
 
     def is_permissive(self) -> bool:
-        """True if the policy imposes no restrictions on skill side-effects."""
+        """True if the policy imposes no deny restrictions on skill side-effects."""
         return self.allowed_side_effects is None
+
+    def requires_confirm(self, side_effects: SkillSideEffects) -> bool:
+        """True if this category needs call-time approval (ADR 105 D2)."""
+        return self.confirm_side_effects is not None and side_effects in self.confirm_side_effects
 
     def check_skill(self, skill_name: str, side_effects: SkillSideEffects) -> str | None:
         """Return a violation message if ``side_effects`` isn't allowed, or None.
 
         Doesn't raise — returning a string lets callers aggregate
         violations across every skill an agent declares in one pass.
+        A ``confirm_side_effects`` category counts as permitted here (the
+        per-call approval gate, not the deny gate, governs it).
         """
         if self.allowed_side_effects is None:
             return None
-        if side_effects in self.allowed_side_effects:
+        permitted = set(self.allowed_side_effects) | set(self.confirm_side_effects or [])
+        if side_effects in permitted:
             return None
-        allowed_str = ", ".join(sorted(s.value for s in self.allowed_side_effects))
-        if not self.allowed_side_effects:
+        allowed_str = ", ".join(sorted(s.value for s in permitted)) if permitted else ""
+        if not permitted:
             return (
                 f"skill {skill_name!r} has side_effects={side_effects.value!r} but "
                 f"project policy allows no skill side-effects (empty allowlist)"

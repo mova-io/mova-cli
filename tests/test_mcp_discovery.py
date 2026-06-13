@@ -27,7 +27,9 @@ from movate.core.mcp_discovery import (
     discover_mcp_skill_bundles,
     discover_sync,
 )
-from movate.core.models import MCPServerRef, merge_mcp_servers
+from movate.core.models import MCPServerRef, SkillSideEffects, merge_mcp_servers
+from movate.core.skill_backend.base import SkillError
+from movate.core.skill_backend.mcp import _apply_http_auth, _HttpSession
 
 # ---------------------------------------------------------------------------
 # Fake backend installed at the import seam
@@ -151,6 +153,19 @@ def test_mint_bundle_threads_credentials_to_auth() -> None:
 def test_mint_bundle_no_credentials_leaves_auth_unset() -> None:
     bundle = _mint_bundle(MCPServerRef(name="gh", entry="npx x"), _tool("search"))
     assert bundle.spec.implementation.auth is None
+
+
+def test_mint_bundle_maps_mutating_to_side_effects() -> None:
+    # ADR 105 D1: a destructive MCP tool → side_effects=mutates-state so the
+    # SkillPolicy confirm/deny gate can see it (default → read-only).
+    server = MCPServerRef(name="gh", entry="npx x")
+    destructive = {
+        "name": "delete_repo",
+        "inputSchema": {"type": "object"},
+        "annotations": {"destructiveHint": True},
+    }
+    assert _mint_bundle(server, destructive).spec.side_effects is SkillSideEffects.MUTATES_STATE
+    assert _mint_bundle(server, _tool("search")).spec.side_effects is SkillSideEffects.READ_ONLY
 
 
 @pytest.mark.parametrize(
@@ -307,6 +322,78 @@ async def test_http_spawn_injects_authorization_header(monkeypatch: pytest.Monke
 
     await backend._ensure_http_session("https://mcp.x/api", "gh", "bearer-from-env:GH_TOKEN")
     assert captured["headers"] == {"Authorization": "Bearer s3cret"}
+
+
+@pytest.mark.asyncio
+async def test_http_session_id_captured_and_echoed() -> None:
+    # MCP Streamable HTTP: the server issues Mcp-Session-Id on initialize and
+    # rejects later requests that don't echo it. Verify capture + echo.
+    class _Resp:
+        def __init__(self, body: dict[str, Any], hdrs: dict[str, str]) -> None:
+            self._b, self.headers, self.status_code, self.text = body, hdrs, 200, ""
+
+        @property
+        def is_error(self) -> bool:
+            return False
+
+        def json(self) -> dict[str, Any]:
+            return self._b
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self._resps = [
+                _Resp({"jsonrpc": "2.0", "id": 1, "result": {}}, {"mcp-session-id": "abc123"}),
+                _Resp({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}, {}),
+            ]
+
+        async def post(self, url: str, json: Any = None, headers: Any = None) -> Any:
+            self.calls.append({"headers": headers or {}})
+            return self._resps.pop(0)
+
+    backend = mcp_mod.MCPSkillBackend()
+    client = _Client()
+    sess = _HttpSession(client=client, url="https://x/mcp")  # type: ignore[arg-type]
+
+    await backend._http_rpc_call(sess, method="initialize", params={}, skill_name="x")
+    assert sess.session_id == "abc123"  # captured from the initialize response
+
+    await backend._http_rpc_call(sess, method="tools/list", params={}, skill_name="x")
+    assert client.calls[1]["headers"].get("Mcp-Session-Id") == "abc123"  # echoed
+
+
+def test_apply_http_auth_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TOK", "sek")
+    url, display, headers = _apply_http_auth("https://x/mcp", "bearer-from-env:TOK", "s")
+    assert url == "https://x/mcp" and display == "https://x/mcp"
+    assert headers == {"Authorization": "Bearer sek"}
+
+
+def test_apply_http_auth_query_param_masks_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SMITHERY_API_KEY", "sk-123")
+    url, display, headers = _apply_http_auth(
+        "https://server.smithery.ai/a/b/mcp", "apikey-query:api_key=SMITHERY_API_KEY", "s"
+    )
+    assert url == "https://server.smithery.ai/a/b/mcp?api_key=sk-123"  # real key for the request
+    assert display == "https://server.smithery.ai/a/b/mcp?api_key=***"  # masked for logs
+    assert headers == {}
+
+
+def test_apply_http_auth_query_param_appends_with_amp(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("K", "v")
+    url, _, _ = _apply_http_auth("https://x/mcp?foo=1", "apikey-query:api_key=K", "s")
+    assert url == "https://x/mcp?foo=1&api_key=v"
+
+
+def test_apply_http_auth_missing_env_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NOPE", raising=False)
+    with pytest.raises(SkillError, match="unset or empty"):
+        _apply_http_auth("https://x/mcp", "apikey-query:api_key=NOPE", "s")
+
+
+def test_apply_http_auth_unknown_shape_raises() -> None:
+    with pytest.raises(SkillError, match="unsupported credential spec"):
+        _apply_http_auth("https://x/mcp", "kv://something", "s")
 
 
 # ---------------------------------------------------------------------------
