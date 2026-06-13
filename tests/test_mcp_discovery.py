@@ -18,6 +18,7 @@ import pytest
 
 import movate.core.skill_backend.mcp as mcp_mod
 from movate.core import mcp_discovery
+from movate.core.skill_backend.mcp import _HttpSession
 from movate.core.mcp_discovery import (
     MCPDiscoveryError,
     _filter_tools,
@@ -307,6 +308,44 @@ async def test_http_spawn_injects_authorization_header(monkeypatch: pytest.Monke
 
     await backend._ensure_http_session("https://mcp.x/api", "gh", "bearer-from-env:GH_TOKEN")
     assert captured["headers"] == {"Authorization": "Bearer s3cret"}
+
+
+@pytest.mark.asyncio
+async def test_http_session_id_captured_and_echoed() -> None:
+    # MCP Streamable HTTP: the server issues Mcp-Session-Id on initialize and
+    # rejects later requests that don't echo it. Verify capture + echo.
+    class _Resp:
+        def __init__(self, body: dict[str, Any], hdrs: dict[str, str]) -> None:
+            self._b, self.headers, self.status_code, self.text = body, hdrs, 200, ""
+
+        @property
+        def is_error(self) -> bool:
+            return False
+
+        def json(self) -> dict[str, Any]:
+            return self._b
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self._resps = [
+                _Resp({"jsonrpc": "2.0", "id": 1, "result": {}}, {"mcp-session-id": "abc123"}),
+                _Resp({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}}, {}),
+            ]
+
+        async def post(self, url: str, json: Any = None, headers: Any = None) -> Any:
+            self.calls.append({"headers": headers or {}})
+            return self._resps.pop(0)
+
+    backend = mcp_mod.MCPSkillBackend()
+    client = _Client()
+    sess = _HttpSession(client=client, url="https://x/mcp")  # type: ignore[arg-type]
+
+    await backend._http_rpc_call(sess, method="initialize", params={}, skill_name="x")
+    assert sess.session_id == "abc123"  # captured from the initialize response
+
+    await backend._http_rpc_call(sess, method="tools/list", params={}, skill_name="x")
+    assert client.calls[1]["headers"].get("Mcp-Session-Id") == "abc123"  # echoed
 
 
 # ---------------------------------------------------------------------------

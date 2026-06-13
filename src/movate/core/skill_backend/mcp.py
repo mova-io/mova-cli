@@ -159,6 +159,10 @@ class _HttpSession:
     url: str
     next_id: int = _INITIAL_ID
     initialized: bool = False
+    # MCP Streamable HTTP session id (ADR 101). The server issues an
+    # ``Mcp-Session-Id`` on the ``initialize`` response; every subsequent
+    # request MUST echo it or the server rejects with "No valid session ID".
+    session_id: str | None = None
     # Tools the server reported via tools/list — populated lazily.
     tools_known: set[str] | None = None
     # Full tools/list response: list of tool descriptors (name, description,
@@ -789,12 +793,11 @@ class MCPSkillBackend:
             "method": method,
             "params": params,
         }
+        headers = {"Accept": "application/json, text/event-stream"}
+        if session.session_id:
+            headers["Mcp-Session-Id"] = session.session_id
         try:
-            resp = await session.client.post(
-                session.url,
-                json=request,
-                headers={"Accept": "application/json, text/event-stream"},
-            )
+            resp = await session.client.post(session.url, json=request, headers=headers)
         except Exception as exc:
             raise SkillError(
                 type=SkillErrorType.BACKEND_ERROR,
@@ -803,6 +806,12 @@ class MCPSkillBackend:
                     f"{session.url} failed: {type(exc).__name__}: {exc}"
                 ),
             ) from exc
+
+        # Capture the Streamable-HTTP session id (issued on ``initialize``) so
+        # later requests echo it. Header lookup is case-insensitive in httpx.
+        sid = resp.headers.get("mcp-session-id")
+        if sid:
+            session.session_id = sid
 
         if resp.is_error:
             raise SkillError(
@@ -859,10 +868,13 @@ class MCPSkillBackend:
         message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             message["params"] = params
+        headers = {"Accept": "application/json, text/event-stream"}
+        if session.session_id:
+            headers["Mcp-Session-Id"] = session.session_id
         import contextlib  # noqa: PLC0415
 
         with contextlib.suppress(Exception):
-            await session.client.post(session.url, json=message)
+            await session.client.post(session.url, json=message, headers=headers)
 
 
 # ---------------------------------------------------------------------------
