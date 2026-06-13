@@ -299,7 +299,7 @@ class MCPSkillBackend:
         impl = skill.spec.implementation
 
         async with self._spawn_lock:
-            http_session = await self._ensure_http_session(impl.entry, skill.spec.name)
+            http_session = await self._ensure_http_session(impl.entry, skill.spec.name, impl.auth)
 
         if http_session.tools_known is None:
             tools_known, descriptors = await self._http_list_tools(http_session, skill.spec.name)
@@ -618,16 +618,19 @@ class MCPSkillBackend:
         self,
         entry: str,
         skill_name: str,
+        auth: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return the full tools/list descriptors for *entry*.
 
-        Used by ``mdk skills add-mcp`` to discover and display available
-        tools. Returns a list of ``{"name": ..., "description": ...,
-        "inputSchema": ...}`` dicts.
+        Used by ``mdk skills add-mcp`` and ADR 101 load-time discovery to list
+        available tools. Returns a list of ``{"name": ..., "description": ...,
+        "inputSchema": ...}`` dicts. ``auth`` (a ``bearer-from-env:VAR`` spec)
+        authenticates the HTTP transport so a token-gated server can be listed;
+        it is ignored for stdio (those servers read their own inherited env).
         """
         if _is_http_entry(entry):
             async with self._spawn_lock:
-                http_session = await self._ensure_http_session(entry, skill_name)
+                http_session = await self._ensure_http_session(entry, skill_name, auth)
             if http_session.tools_known is None:
                 tools_known, descriptors = await self._http_list_tools(http_session, skill_name)
                 http_session.tools_known = tools_known
@@ -659,22 +662,38 @@ class MCPSkillBackend:
     # HTTP/SSE session management
     # ------------------------------------------------------------------
 
-    async def _ensure_http_session(self, url: str, skill_name: str) -> _HttpSession:
-        """Get or create an HTTP/SSE session for *url*."""
+    async def _ensure_http_session(
+        self, url: str, skill_name: str, auth: str | None = None
+    ) -> _HttpSession:
+        """Get or create an HTTP/SSE session for *url*.
+
+        ``auth`` is an optional ``bearer-from-env:VAR`` spec (ADR 101 D3): when
+        present, the resolved token is set as a default ``Authorization`` header
+        on the client. Sessions are keyed by URL; the first session's auth wins
+        if the same URL is reached with differing specs (one MCP server = one
+        auth in practice).
+        """
         existing = self._http_sessions.get(url)
         if existing is not None:
             return existing
-        session = await self._http_spawn(url, skill_name)
+        session = await self._http_spawn(url, skill_name, auth)
         self._http_sessions[url] = session
         return session
 
-    async def _http_spawn(self, url: str, skill_name: str) -> _HttpSession:
+    async def _http_spawn(self, url: str, skill_name: str, auth: str | None = None) -> _HttpSession:
         """Open an HTTP client and perform the MCP handshake."""
         import httpx as _httpx  # noqa: PLC0415
+
+        headers: dict[str, str] = {}
+        if auth:
+            from movate.core.skill_backend.http import _build_auth_header  # noqa: PLC0415
+
+            headers["Authorization"] = _build_auth_header(auth, skill_name)
 
         client = _httpx.AsyncClient(
             timeout=_httpx.Timeout(30.0, connect=10.0),
             follow_redirects=True,
+            headers=headers,
         )
         session = _HttpSession(client=client, url=url)
 

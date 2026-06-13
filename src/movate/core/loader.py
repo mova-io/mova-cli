@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import logging
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,8 +31,10 @@ from movate.core.config import (
     load_project_config,
 )
 from movate.core.layered_defaults import apply_defaults_to_raw
-from movate.core.models import AgentSpec
+from movate.core.models import AgentSpec, MCPServerRef
 from movate.core.schema_shorthand import SchemaShorthandError, compile_shorthand
+
+_log = logging.getLogger(__name__)
 
 
 class AgentLoadError(Exception):
@@ -76,6 +79,22 @@ def _resolve_project_root(agent_dir: Path) -> Path:
     # at the project root level (legacy layout). Falls back to the
     # agent's immediate parent.
     return agent_dir.parent
+
+
+def _project_mcp_servers(project_root: Path) -> list[MCPServerRef]:
+    """Read the project-level ``mcp_servers`` block (ADR 101 D1).
+
+    Reads from the project root's base config file using the same filename
+    precedence as project-root detection (``project.yaml`` → ``policy.yaml`` →
+    ``movate.yaml``), tying MCP discovery to the agent's actual project rather
+    than the current working directory. Returns an empty list when no project
+    config exists (the common case for single-agent / test-fixture loads).
+    """
+    for marker in _PROJECT_MARKERS:
+        candidate = project_root / marker
+        if candidate.is_file():
+            return load_project_config(candidate).mcp_servers
+    return []
 
 
 @dataclass
@@ -401,6 +420,38 @@ def load_agent(  # noqa: PLR0912 — orchestrator; branch count is inherent
             )
         except SkillLoadError as exc:
             raise AgentLoadError(f"skills resolution failed: {exc}") from exc
+
+    # ---- ADR 101: discover external MCP servers' tools as skills ----
+    # Merge project-level + agent-level ``mcp_servers`` (agent overrides
+    # project on name collision), then list each server's tools and register
+    # them as SkillBundles alongside the per-agent skills. Agents (and
+    # projects) that declare no servers pay zero cost — the merged list is
+    # empty and discovery returns immediately. Discovery is fail-soft per
+    # server unless the ref sets ``required: true`` (see ADR 101 D5).
+    #
+    # Lazy import: keeps the subprocess/httpx MCP machinery out of every
+    # non-MCP agent load and avoids a module-load cycle.
+    project_mcp_servers = _project_mcp_servers(project_root)
+    if spec.mcp_servers or project_mcp_servers:
+        from movate.core.mcp_discovery import (  # noqa: PLC0415
+            MCPDiscoveryError,
+            discover_sync,
+        )
+        from movate.core.models import merge_mcp_servers  # noqa: PLC0415
+
+        merged_servers = merge_mcp_servers(project_mcp_servers, spec.mcp_servers)
+        try:
+            discovery = discover_sync(
+                merged_servers,
+                agent_name=spec.name,
+                existing_skill_names={b.spec.name for b in skills_resolved},
+            )
+        except MCPDiscoveryError as exc:
+            raise AgentLoadError(f"mcp server discovery failed: {exc}") from exc
+
+        for w in discovery.warnings:
+            _log.warning("agent %s: mcp discovery: %s", spec.name, w)
+        skills_resolved.extend(discovery.bundles)
 
     # Resolve declared contexts. Two-tier registry: project-level
     # (`<project_root>/contexts/<name>.md`) is the shared base; agent-

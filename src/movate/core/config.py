@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from movate.core.models import AgentRuntime, SkillSideEffects
+from movate.core.models import AgentRuntime, MCPServerRef, SkillSideEffects
 
 log = logging.getLogger(__name__)
 
@@ -715,6 +715,17 @@ class ProjectConfig(BaseModel):
             "filename (minus extension) via ``contexts: [name]``; the "
             "loader walks this directory and prepends each declared "
             "context to the prompt. See :mod:`movate.core.context_loader`."
+        ),
+    )
+    mcp_servers: list[MCPServerRef] = Field(
+        default_factory=list,
+        description=(
+            "External MCP servers shared by every agent in the project "
+            "(ADR 101). Each agent's own ``mcp_servers`` block is merged on "
+            "top (agent overrides project on name collision); see "
+            "``movate.core.models.merge_mcp_servers``. Unlike ``defaults:`` "
+            "(which fills only model params/timeouts/budget), this block is "
+            "unioned by server name. Empty/absent = no project-level servers."
         ),
     )
     bench: BenchConfig = Field(default_factory=BenchConfig)
