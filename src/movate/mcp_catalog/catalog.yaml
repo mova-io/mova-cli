@@ -1,0 +1,58 @@
+# Bundled MCP catalog (ADR 103 D1) — curated, reviewed, pinned.
+#
+# This is the CURATED trust tier: the offline default source for
+# `mdk mcp list` / `mdk mcp search` / `mdk mcp add`. Adding an entry is a
+# reviewed data change (this file), not a code change. Entries generalize the
+# ADR 051 connector pack to the MCP-server era.
+#
+# Each entry maps to an ADR 101 `mcp_servers:` block when added to an agent.
+# Pin versions where the ecosystem allows (`@x.y.z`) so an import is
+# reproducible. `credentials` is the ADR 101 D3 `bearer-from-env:VAR` hint.
+servers:
+  - name: github
+    title: GitHub
+    description: Repositories, issues, pull requests, and code search.
+    transport: stdio
+    entry: "npx -y @modelcontextprotocol/server-github@2025.4.8"
+    credentials: "bearer-from-env:GITHUB_TOKEN"
+    homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/github"
+    tags: [dev, scm, code]
+    tools_hint: [search_repositories, get_file_contents, create_issue, list_commits]
+
+  - name: filesystem
+    title: Filesystem
+    description: Read and write files within allowed directories.
+    transport: stdio
+    entry: "npx -y @modelcontextprotocol/server-filesystem@2025.3.28"
+    homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"
+    tags: [files, local]
+    tools_hint: [read_file, write_file, list_directory, search_files]
+
+  - name: slack
+    title: Slack
+    description: Post messages and read channels/threads in a Slack workspace.
+    transport: stdio
+    entry: "npx -y @modelcontextprotocol/server-slack@2025.3.28"
+    credentials: "bearer-from-env:SLACK_BOT_TOKEN"
+    homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/slack"
+    tags: [chat, collaboration]
+    tools_hint: [slack_post_message, slack_list_channels, slack_get_thread_replies]
+
+  - name: postgres
+    title: PostgreSQL
+    description: Read-only SQL queries and schema inspection over a Postgres database.
+    transport: stdio
+    entry: "npx -y @modelcontextprotocol/server-postgres@2025.3.28"
+    credentials: "bearer-from-env:POSTGRES_CONNECTION_STRING"
+    homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres"
+    tags: [data, sql, database]
+    tools_hint: [query, list_tables, describe_table]
+
+  - name: fetch
+    title: Fetch
+    description: Fetch a URL and return its content as markdown for the model to read.
+    transport: stdio
+    entry: "npx -y @modelcontextprotocol/server-fetch@2025.3.28"
+    homepage: "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch"
+    tags: [web, http, retrieval]
+    tools_hint: [fetch]
