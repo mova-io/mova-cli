@@ -99,4 +99,90 @@ def serve(
     serve_stdio(server, sys.stdin, sys.stdout)
 
 
+@mcp_app.command("inspect")
+def inspect(
+    entry: str = typer.Argument(
+        ...,
+        help=(
+            "MCP server to probe: a stdio command (e.g. "
+            "'npx -y @modelcontextprotocol/server-github') or an http(s):// URL."
+        ),
+    ),
+    name: str = typer.Option(
+        "server",
+        "--name",
+        "-n",
+        help=(
+            "Server handle used to preview the namespaced skill identifiers "
+            "an agent would get (<name>.<tool>). Cosmetic for inspect."
+        ),
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the raw tools/list descriptors as JSON and exit."
+    ),
+) -> None:
+    """Probe an external MCP server and print its tools — without wiring anything (ADR 101 D4).
+
+    The "what would I get if I declared this under ``mcp_servers:``?" check.
+    Connects, calls ``tools/list``, and prints each tool with the namespaced
+    skill identifier discovery would mint. Read-only: no files written, no
+    skill registered. Auth uses ambient env (a token already exported); the
+    ``credentials_ref`` injection path applies at run time, not here.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Probe a stdio server[/dim]
+      [dim]$ mdk mcp inspect 'npx -y @modelcontextprotocol/server-github' -n github[/dim]
+
+      [dim]# Probe a remote server, machine-readable[/dim]
+      [dim]$ mdk mcp inspect https://mcp.example.com/api --json[/dim]
+    """
+    import asyncio  # noqa: PLC0415
+
+    from movate.core.mcp_discovery import _sanitize_segment  # noqa: PLC0415
+    from movate.core.skill_backend.base import SkillError  # noqa: PLC0415
+    from movate.core.skill_backend.mcp import MCPSkillBackend  # noqa: PLC0415
+
+    err_console.print(f"[dim]connecting to MCP server: {entry}[/dim]")
+    backend = MCPSkillBackend()
+    try:
+        discovered = asyncio.run(backend.discover_tools(entry, name))
+    except SkillError as exc:
+        err_console.print(f"[red]✗ failed to connect to MCP server:[/red] {exc.message}")
+        raise typer.Exit(code=2) from None
+    finally:
+        asyncio.run(backend.aclose())
+
+    if as_json:
+        import json  # noqa: PLC0415
+
+        console.print_json(json.dumps(discovered))
+        return
+
+    if not discovered:
+        err_console.print("[yellow]server reported zero tools.[/yellow]")
+        return
+
+    from rich.table import Table  # noqa: PLC0415
+
+    table = Table(
+        title=f"{len(discovered)} tool(s) on {entry}", show_header=True, header_style="bold"
+    )
+    table.add_column("tool (wire name)", style="bold")
+    table.add_column("skill identifier", style="cyan")
+    table.add_column("description", overflow="fold")
+    for t in discovered:
+        wire = t.get("name", "?")
+        seg = _sanitize_segment(wire) if isinstance(wire, str) else None
+        ident = f"{name}-{seg}" if seg else "[red](unmintable)[/red]"
+        desc = t.get("description", "")
+        desc = desc.strip().split("\n")[0][:120] if isinstance(desc, str) else ""
+        table.add_row(str(wire), ident, desc)
+    console.print(table)
+    console.print(
+        f"[dim]Declare under mcp_servers: as "
+        f"`- name: {name}` / `entry: {entry}` to register these.[/dim]"
+    )
+
+
 __all__ = ["mcp_app"]

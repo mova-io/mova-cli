@@ -115,6 +115,137 @@ class SkillRef(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# MCPServerRef — agent.yaml / project.yaml ``mcp_servers:`` list element
+# (ADR 101 D1; additive, backward-compat)
+# ---------------------------------------------------------------------------
+
+# Server handle: lowercase, letter-start, alphanumeric + hyphens. Used as the
+# namespace prefix for the server's discovered tools (``<name>.<tool>``), so it
+# must be a valid leading segment of a tool-registry descriptor name.
+_MCP_SERVER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+class MCPServerRef(BaseModel):
+    """An external MCP server an agent (or project) may use (ADR 101 D1).
+
+    Declared under ``mcp_servers:`` in ``agent.yaml`` (per-agent) or
+    ``project.yaml`` (shared by every agent in the project). At agent-load
+    time the discovery phase (``movate.core.mcp_discovery``) connects to each
+    server, lists its tools, and registers them — filtered + governed — as
+    skills the executor can call. Execution reuses the existing
+    ``kind: mcp`` :class:`SkillImplementation` backend; this ref only adds
+    *declaration + discovery*.
+
+    Example::
+
+        mcp_servers:
+          - name: github
+            entry: "npx -y @modelcontextprotocol/server-github"
+            include_tools: ["search_repositories", "get_file_contents"]
+            credentials_ref: "kv://github-mcp-token"
+            required: false
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description=(
+            "Namespace under which this server's tools are registered "
+            "(``<name>.<tool>``). Lowercase, letter-start, alphanumeric + "
+            "hyphens. Must be unique within the merged agent+project list."
+        ),
+    )
+    entry: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "How to reach the server: a stdio command (e.g. "
+            "``npx -y @some/mcp-package``, tokenized with shlex) or an "
+            "``http(s)://`` URL. Same semantics as a ``kind: mcp`` skill's "
+            "``implementation.entry``."
+        ),
+    )
+    include_tools: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional allowlist of tool names to register (verbatim MCP tool "
+            "names as reported by ``tools/list``). When set, only these are "
+            "registered. Mutually exclusive with ``exclude_tools``. Absent "
+            "(the default) → every tool the server reports."
+        ),
+    )
+    exclude_tools: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional denylist of tool names to skip. Mutually exclusive with "
+            "``include_tools``. Absent → no denylist."
+        ),
+    )
+    credentials_ref: str | None = Field(
+        default=None,
+        description=(
+            "Optional credential reference resolved at dispatch (not load) "
+            "time — injected into the stdio child's env or as an HTTP "
+            "Authorization header. Mirrors ``ToolDescriptor.credentials_ref``."
+        ),
+    )
+    required: bool = Field(
+        default=False,
+        description=(
+            "Load-time failure policy. ``false`` (default) → fail-soft: if the "
+            "server is unreachable / handshake fails / ``tools/list`` times "
+            "out, the agent loads WITHOUT its tools and a warning is emitted. "
+            "``true`` → fail-hard: agent load raises, so a load-bearing server "
+            "can't silently vanish."
+        ),
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        if not _MCP_SERVER_NAME_RE.match(v):
+            raise ValueError(
+                f"mcp_servers name {v!r} must be lowercase, start with a "
+                f"letter, and contain only alphanumerics and hyphens "
+                f"(e.g. 'github', 'jira-cloud')"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_filters(self) -> MCPServerRef:
+        if self.include_tools is not None and self.exclude_tools is not None:
+            raise ValueError(
+                f"mcp_servers entry {self.name!r}: include_tools and "
+                f"exclude_tools are mutually exclusive — set at most one"
+            )
+        return self
+
+
+def merge_mcp_servers(
+    project_servers: list[MCPServerRef],
+    agent_servers: list[MCPServerRef],
+) -> list[MCPServerRef]:
+    """Merge project- and agent-declared MCP servers (ADR 101 D1).
+
+    Union by ``name``: the project's servers are the base; an agent's servers
+    are appended, and an agent entry whose ``name`` matches a project entry
+    **overrides** it wholesale (the agent author's explicit intent wins).
+    Project order is preserved; agent-only servers follow in declaration
+    order. The result has no duplicate names.
+    """
+    by_name: dict[str, MCPServerRef] = {s.name: s for s in project_servers}
+    order: list[str] = [s.name for s in project_servers]
+    for s in agent_servers:
+        if s.name not in by_name:
+            order.append(s.name)
+        by_name[s.name] = s  # agent overrides project on name collision
+    return [by_name[n] for n in order]
+
+
+# ---------------------------------------------------------------------------
 # Agent specification (mirrors agent.yaml)
 # ---------------------------------------------------------------------------
 
@@ -1618,6 +1749,26 @@ class AgentSpec(BaseModel):
             "Resolved at agent-load time via the ToolResolver against the "
             "tenant's tool registry. Empty list (the default) means no "
             "registry tools; the agent uses only its per-agent skills."
+        ),
+    )
+
+    # ---- ADR 101: external MCP servers ----
+    # Optional ``mcp_servers:`` block. Each entry declares an external MCP
+    # server (stdio command or HTTP(S) URL); at agent-load time the discovery
+    # phase lists the server's tools and registers them — filtered + governed —
+    # as skills, reusing the existing ``kind: mcp`` backend for execution.
+    # SCHEMA FLAG (additive, backward-compatible): empty list is the default;
+    # existing agent.yaml files that omit this block load unchanged, and agents
+    # that omit it pay zero discovery cost.
+
+    mcp_servers: list[MCPServerRef] = Field(
+        default_factory=list,
+        description=(
+            "External MCP servers this agent may use (ADR 101). Each server's "
+            "tools are discovered at load time and registered as callable "
+            "skills. Composes with project-level ``mcp_servers`` (agent "
+            "overrides project on name collision). Empty list (the default) "
+            "means no MCP discovery for this agent."
         ),
     )
 
