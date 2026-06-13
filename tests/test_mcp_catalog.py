@@ -20,13 +20,10 @@ from movate.core.models import MCPServerRef
 from movate.mcp_catalog.models import CatalogEntry, TrustTier
 from movate.mcp_catalog.sources import UnknownSourceError, resolve_sources
 from movate.mcp_catalog.sources.bundled import BundledSource
-from movate.mcp_catalog.sources.community import (
-    GlamaSource,
-    McpSoSource,
-    _map_directory_record,
-)
 from movate.mcp_catalog.sources.github import GitHubRegistrySource
 from movate.mcp_catalog.sources.official import OfficialRegistrySource, _map_record
+from movate.mcp_catalog.sources.smithery import SmitherySource
+from movate.mcp_catalog.sources.smithery import _map as _smithery_map
 
 runner = CliRunner(mix_stderr=False)
 
@@ -174,21 +171,20 @@ def test_resolve_sources_default_excludes_community() -> None:
 
 def test_resolve_sources_specific_and_all() -> None:
     assert [s.name for s in resolve_sources("bundled")] == ["bundled"]
-    # 'all' includes the community + github sources; default does not.
+    # 'all' includes the github + community (smithery) sources; default does not.
     assert set(s.name for s in resolve_sources("all")) == {
         "bundled",
         "official",
         "github",
-        "glama",
-        "mcp.so",
+        "smithery",
     }
 
 
 def test_resolve_sources_community_only_via_explicit() -> None:
-    # Community sources are reachable ONLY when named explicitly (ADR 104 D4).
-    assert [s.name for s in resolve_sources("glama")] == ["glama"]
-    assert [s.name for s in resolve_sources("mcp.so")] == ["mcp.so"]
-    assert "glama" not in [s.name for s in resolve_sources(None)]
+    # Community sources (smithery) are reachable ONLY when named explicitly,
+    # or via 'all' (ADR 104 D4) — never in the default set.
+    assert [s.name for s in resolve_sources("smithery")] == ["smithery"]
+    assert "smithery" not in [s.name for s in resolve_sources(None)]
 
 
 def test_resolve_sources_unknown_raises() -> None:
@@ -219,54 +215,51 @@ async def test_github_source_filters_to_namespace(monkeypatch: pytest.MonkeyPatc
 
 
 # ---------------------------------------------------------------------------
-# Community directories: defensive mapping + trust tagging (no network)
+# Smithery source: deterministic gateway mapping + trust tagging (no network)
 # ---------------------------------------------------------------------------
 
 
-def test_community_map_npm_package() -> None:
-    e = _map_directory_record(
-        {"name": "acme/srv", "package": "@acme/srv", "version": "1.0.0", "description": "d"},
-        source="glama",
+def test_smithery_map_builds_gateway_entry() -> None:
+    e = _smithery_map(
+        {
+            "qualifiedName": "upstash/context7-mcp",
+            "displayName": "Context7",
+            "description": "Docs lookup.",
+        }
     )
     assert e is not None
-    assert e.entry == "npx -y @acme/srv@1.0.0"
-    assert e.transport == "stdio"
+    assert e.name == "context7-mcp"
+    assert e.transport == "http"
+    assert e.entry == "https://server.smithery.ai/upstash/context7-mcp/mcp"
+    # Query-param credential spec → key stays in env, never in the stored URL.
+    assert e.credentials == "apikey-query:api_key=SMITHERY_API_KEY"
     assert e.trust is TrustTier.COMMUNITY
-    assert e.source == "glama"
+    assert e.source == "smithery"
+    assert e.publisher == "upstash"
+    assert e.pinned is True
 
 
-def test_community_map_command_and_remote() -> None:
-    cmd = _map_directory_record({"name": "x", "command": "npx -y foo@1"}, source="mcp.so")
-    assert cmd is not None and cmd.transport == "stdio" and cmd.entry == "npx -y foo@1"
-    rem = _map_directory_record({"name": "y", "serverUrl": "https://m/sse"}, source="glama")
-    assert rem is not None and rem.transport == "http"
-
-
-def test_community_map_unrunnable_is_none() -> None:
-    assert (
-        _map_directory_record({"name": "x", "description": "no runnable bits"}, source="glama")
-        is None
-    )
-    assert _map_directory_record({"description": "no name"}, source="glama") is None
+def test_smithery_map_unusable_is_none() -> None:
+    assert _smithery_map({"displayName": "no qualifiedName"}) is None
 
 
 @pytest.mark.asyncio
-async def test_community_source_maps_via_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
-    for src in (GlamaSource(), McpSoSource()):
+async def test_smithery_source_maps_via_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    src = SmitherySource()
 
-        async def fake_fetch(query: str, limit: int) -> list[dict[str, object]]:
-            return [{"name": "acme/srv", "package": "@acme/srv", "version": "2.0.0"}]
+    async def fake_fetch(query: str, limit: int) -> list[dict[str, object]]:
+        return [{"qualifiedName": "acme/cool", "displayName": "Cool", "description": "d"}]
 
-        monkeypatch.setattr(src, "_fetch", fake_fetch)
-        out = await src.search("srv")
-        assert [e.name for e in out] == ["srv"]
-        assert out[0].trust is TrustTier.COMMUNITY
-        assert out[0].source == src.name
+    monkeypatch.setattr(src, "_fetch", fake_fetch)
+    out = await src.search("cool")
+    assert [e.name for e in out] == ["cool"]
+    assert out[0].entry == "https://server.smithery.ai/acme/cool/mcp"
+    assert out[0].trust is TrustTier.COMMUNITY
 
 
 @pytest.mark.asyncio
-async def test_community_source_failsoft(monkeypatch: pytest.MonkeyPatch) -> None:
-    src = GlamaSource()
+async def test_smithery_source_failsoft(monkeypatch: pytest.MonkeyPatch) -> None:
+    src = SmitherySource()
 
     async def empty(query: str, limit: int) -> list[dict[str, object]]:
         return []

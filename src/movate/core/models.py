@@ -187,14 +187,15 @@ class MCPServerRef(BaseModel):
     credentials_ref: str | None = Field(
         default=None,
         description=(
-            "Optional auth for the server (ADR 101 D3). For an HTTP(S) server, a "
-            "``bearer-from-env:VAR`` spec — ``VAR``'s value is sent as "
-            "``Authorization: Bearer <value>`` (same shape + resolver as a "
-            "``kind: http`` skill's ``auth``), applied at both discovery and "
-            "dispatch. For a stdio server this is unnecessary: the subprocess "
+            "Optional auth for the server (ADR 101 D3). For an HTTP(S) server, "
+            "either ``bearer-from-env:VAR`` (sent as ``Authorization: Bearer "
+            "<VAR>``) or ``apikey-query:PARAM=VAR`` (appends ``?PARAM=<VAR>`` to "
+            "the URL — for hosted servers like Smithery that authenticate by "
+            "query param). Both resolve ``VAR`` from the env at use time (never "
+            "inlined) and apply at discovery + dispatch; the secret is masked in "
+            "logs. For a stdio server this is unnecessary: the subprocess "
             "inherits the worker env, so the server reads its own token var "
-            "(e.g. ``GITHUB_TOKEN``) directly. Resolved at use time, never "
-            "inlined."
+            "(e.g. ``GITHUB_PERSONAL_ACCESS_TOKEN``) directly."
         ),
     )
     required: bool = Field(

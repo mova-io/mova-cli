@@ -71,6 +71,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shlex
 import time
 from collections import deque
@@ -157,6 +158,9 @@ class _HttpSession:
 
     client: httpx.AsyncClient
     url: str
+    # Same as ``url`` but with any secret query-param value redacted — used in
+    # log/error messages so an ``?api_key=`` credential never leaks.
+    display_url: str = ""
     next_id: int = _INITIAL_ID
     initialized: bool = False
     # MCP Streamable HTTP session id (ADR 101). The server issues an
@@ -168,6 +172,11 @@ class _HttpSession:
     # Full tools/list response: list of tool descriptors (name, description,
     # inputSchema). Stored for multi-tool discovery.
     tools_descriptors: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # Default the masked display URL to the real URL when no secret is in it.
+        if not self.display_url:
+            self.display_url = self.url
 
 
 class MCPSkillBackend:
@@ -656,18 +665,16 @@ class MCPSkillBackend:
         """Open an HTTP client and perform the MCP handshake."""
         import httpx as _httpx  # noqa: PLC0415
 
-        headers: dict[str, str] = {}
-        if auth:
-            from movate.core.skill_backend.http import _build_auth_header  # noqa: PLC0415
-
-            headers["Authorization"] = _build_auth_header(auth, skill_name)
+        # Resolve the credential spec into request headers and/or a URL
+        # query-param, plus a masked display URL for logs/errors (ADR 101 D3).
+        effective_url, display_url, headers = _apply_http_auth(url, auth, skill_name)
 
         client = _httpx.AsyncClient(
             timeout=_httpx.Timeout(30.0, connect=10.0),
             follow_redirects=True,
             headers=headers,
         )
-        session = _HttpSession(client=client, url=url)
+        session = _HttpSession(client=client, url=effective_url, display_url=display_url)
 
         try:
             handshake_result = await self._http_rpc_call(
@@ -803,7 +810,7 @@ class MCPSkillBackend:
                 type=SkillErrorType.BACKEND_ERROR,
                 message=(
                     f"mcp skill {skill_name!r}: HTTP request to "
-                    f"{session.url} failed: {type(exc).__name__}: {exc}"
+                    f"{session.display_url} failed: {type(exc).__name__}: {exc}"
                 ),
             ) from exc
 
@@ -818,7 +825,7 @@ class MCPSkillBackend:
                 type=SkillErrorType.BACKEND_ERROR,
                 message=(
                     f"mcp skill {skill_name!r}: HTTP {resp.status_code} "
-                    f"from {session.url}: {resp.text[:500]}"
+                    f"from {session.display_url}: {resp.text[:500]}"
                 ),
             )
 
@@ -834,7 +841,7 @@ class MCPSkillBackend:
                 type=SkillErrorType.BACKEND_ERROR,
                 message=(
                     f"mcp skill {skill_name!r}: HTTP response from "
-                    f"{session.url} wasn't valid JSON: {exc}"
+                    f"{session.display_url} wasn't valid JSON: {exc}"
                 ),
             ) from exc
 
@@ -1070,6 +1077,63 @@ def _extract_text(content: Any) -> str | None:
             if isinstance(text, str):
                 return text
     return None
+
+
+def _apply_http_auth(
+    url: str, auth: str | None, skill_name: str
+) -> tuple[str, str, dict[str, str]]:
+    """Resolve a credential spec for the HTTP transport (ADR 101 D3).
+
+    Returns ``(effective_url, display_url, headers)``:
+
+    * ``bearer-from-env:VAR`` → ``Authorization: Bearer <VAR>`` header; URL
+      unchanged. (Shares the ``kind: http`` resolver.)
+    * ``apikey-query:PARAM=VAR`` → append ``?PARAM=<VAR>`` (or ``&``) to the
+      URL — for hosted servers that authenticate by query param (e.g. Smithery's
+      ``?api_key=``), where a Bearer token is rejected. ``display_url`` masks the
+      value so it never appears in logs/errors.
+    * ``None`` → no auth.
+
+    A missing/empty env var, or an unrecognized spec, raises ``SkillError`` so
+    the failure is loud and the operator knows which var to set.
+    """
+    if not auth:
+        return url, url, {}
+    if auth.startswith("bearer-from-env:"):
+        from movate.core.skill_backend.http import _build_auth_header  # noqa: PLC0415
+
+        return url, url, {"Authorization": _build_auth_header(auth, skill_name)}
+    if auth.startswith("apikey-query:"):
+        spec = auth.removeprefix("apikey-query:")
+        if "=" not in spec:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: apikey-query spec {auth!r} must be "
+                    f"'apikey-query:<param>=<ENV_VAR>'"
+                ),
+            )
+        param, var = (s.strip() for s in spec.split("=", 1))
+        value = os.environ.get(var) if (param and var) else None
+        if not value:
+            raise SkillError(
+                type=SkillErrorType.BACKEND_ERROR,
+                message=(
+                    f"mcp skill {skill_name!r}: env var {var!r} (for {param} query "
+                    f"auth) is unset or empty; set it or change the credential spec"
+                ),
+            )
+        sep = "&" if "?" in url else "?"
+        effective = f"{url}{sep}{param}={value}"
+        display = f"{url}{sep}{param}=***"
+        return effective, display, {}
+    raise SkillError(
+        type=SkillErrorType.BACKEND_ERROR,
+        message=(
+            f"mcp skill {skill_name!r}: unsupported credential spec {auth!r} "
+            f"(expected 'bearer-from-env:VAR' or 'apikey-query:param=VAR')"
+        ),
+    )
 
 
 def _result_to_dict(result: dict[str, Any], skill_name: str) -> dict[str, Any]:

@@ -48,16 +48,20 @@ def _registry() -> dict[str, MCPRegistrySource]:
     and lets each source own its own (possibly httpx-bearing) setup.
     """
     from movate.mcp_catalog.sources.bundled import BundledSource  # noqa: PLC0415
-    from movate.mcp_catalog.sources.community import GlamaSource, McpSoSource  # noqa: PLC0415
     from movate.mcp_catalog.sources.github import GitHubRegistrySource  # noqa: PLC0415
     from movate.mcp_catalog.sources.official import OfficialRegistrySource  # noqa: PLC0415
+    from movate.mcp_catalog.sources.smithery import SmitherySource  # noqa: PLC0415
 
+    # Glama + mcp.so were prototyped but their public APIs expose no runnable
+    # launch spec (only descriptions/repos), so they can't produce an `mdk mcp
+    # add` entry — verified live during E2E. Smithery is the runnable community
+    # registry (stable qualifiedName → Streamable-HTTP gateway URL), so it
+    # replaces them as the COMMUNITY source.
     sources: list[MCPRegistrySource] = [
         BundledSource(),
         OfficialRegistrySource(),
         GitHubRegistrySource(),
-        GlamaSource(),
-        McpSoSource(),
+        SmitherySource(),
     ]
     return {s.name: s for s in sources}
 
