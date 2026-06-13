@@ -57,7 +57,16 @@ def show(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """Show the current state of one job."""
+    """Show the current state of one job.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Check a job printed by `mdk submit`[/dim]
+      $ mdk jobs show job_01H...
+
+      [dim]# Grab the result run id once it finishes[/dim]
+      $ mdk jobs show job_01H... -o json | jq -r .result_run_id
+    """
     view = asyncio.run(
         _fetch_one(job_id=job_id, target=target, suppress=output_format == TableJson.JSON)
     )
@@ -213,7 +222,13 @@ def list_agents(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """List agents registered on the target runtime."""
+    """List agents registered on the target runtime.
+
+    [bold]Examples:[/bold]
+
+      [dim]# What's deployed on prod?[/dim]
+      $ mdk jobs list-agents -t prod
+    """
     listing = asyncio.run(_fetch_agents(target=target, suppress=output_format == TableJson.JSON))
     if output_format == TableJson.JSON:
         stdout.print(listing.model_dump_json(indent=2), soft_wrap=True, highlight=False)
@@ -255,6 +270,14 @@ def reap(
 
     In production the worker loop + scheduler tick run this automatically;
     this command is an operator escape hatch for the local queue.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Reclaim stale jobs with the default timeout[/dim]
+      $ mdk jobs reap
+
+      [dim]# Treat jobs stuck >1h as orphaned[/dim]
+      $ mdk jobs reap --visibility-timeout 3600
     """
     requeued, dead_lettered = asyncio.run(_reap(visibility_timeout=visibility_timeout))
     if output_format == TableJson.JSON:

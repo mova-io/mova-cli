@@ -164,7 +164,19 @@ def list_cmd(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """List catalog entries visible to the caller (filtered + paginated)."""
+    """List catalog entries visible to the caller (filtered + paginated).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Browse everything[/dim]
+      $ mdk catalog list
+
+      [dim]# Just the Movate-published RAG agents[/dim]
+      $ mdk catalog list --source movate --shape rag_qa
+
+      [dim]# Search + limit, machine-readable[/dim]
+      $ mdk catalog list --q returns --limit 10 -o json
+    """
 
     _name, base_url, token = _resolved_target(target)
     payload = asyncio.run(
@@ -222,7 +234,13 @@ def search_cmd(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """Alias for ``mdk catalog list --q <query>``."""
+    """Alias for ``mdk catalog list --q <query>``.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Find entries mentioning "returns"[/dim]
+      $ mdk catalog search returns
+    """
 
     list_cmd(
         source=None,
@@ -275,7 +293,16 @@ def show_cmd(
         TableJson.TABLE, "--output", "-o", case_sensitive=False
     ),
 ) -> None:
-    """Show detail for one catalog entry (and optionally one version)."""
+    """Show detail for one catalog entry (and optionally one version).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Latest version of an entry[/dim]
+      $ mdk catalog show faq-starter
+
+      [dim]# A pinned version[/dim]
+      $ mdk catalog show faq-starter --version 0.2.0
+    """
 
     _name, base_url, token = _resolved_target(target)
     entry = asyncio.run(_fetch_entry(base_url=base_url, token=token, slug=slug, source=source))
@@ -388,7 +415,14 @@ def submit_cmd(
     version: str = typer.Option("0.1.0", "--version"),
     target: str | None = typer.Option(None, "--target", "-t"),
 ) -> None:
-    """Submit a tenant-private catalog entry from ``<from-dir>``."""
+    """Submit a tenant-private catalog entry from ``<from-dir>``.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Publish a local agent dir as a private catalog entry[/dim]
+      $ mdk catalog submit returns-bot --from-dir ./agents/returns-bot \\
+          --title "Returns Bot" --shape rag_qa --tag support
+    """
 
     _name, base_url, token = _resolved_target(target)
     bundle = _tar_from_dir(from_dir)
@@ -425,7 +459,14 @@ def publish_version_cmd(
     ),
     target: str | None = typer.Option(None, "--target", "-t"),
 ) -> None:
-    """Publish a new version of a tenant-private entry."""
+    """Publish a new version of a tenant-private entry.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Ship v0.2.0 of an existing entry[/dim]
+      $ mdk catalog publish-version returns-bot --version 0.2.0 \\
+          --from-dir ./agents/returns-bot
+    """
 
     _name, base_url, token = _resolved_target(target)
     bundle = _tar_from_dir(from_dir)
@@ -457,7 +498,13 @@ def rate_cmd(
     source: str = typer.Option("movate", "--source", help="Namespace whose entry you're rating."),
     target: str | None = typer.Option(None, "--target", "-t"),
 ) -> None:
-    """Record a 1-5 rating for one catalog entry."""
+    """Record a 1-5 rating for one catalog entry.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Rate an entry 5 stars with a note[/dim]
+      $ mdk catalog rate faq-starter --rating 5 --comment "great defaults"
+    """
 
     _name, base_url, token = _resolved_target(target)
     body = {"rating": rating, "comment": comment, "source": source}
@@ -485,7 +532,13 @@ def sync_cmd(
 
     v1's server-side handler is a STUB — it logs the intent and bumps
     the watermark. The production wiring against ``catalog.movate.io``
-    is a separate Movate-side build (ADR 041 D4)."""
+    is a separate Movate-side build (ADR 041 D4).
+
+    [bold]Examples:[/bold]
+
+      [dim]# Pull the latest Movate-published entries[/dim]
+      $ mdk catalog sync --source movate
+    """
 
     _name, base_url, token = _resolved_target(target)
     payload = asyncio.run(

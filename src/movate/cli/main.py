@@ -164,7 +164,6 @@ from movate.cli import (  # noqa: E402
     migrate_state_cmd,
     monitor_cmd,
     plan_cmd,
-    project_cmd,
     promote_cmd,
     replay_cmd,
     report_cmd,
@@ -426,9 +425,6 @@ app.command("compose", rich_help_panel=PANEL_DEVELOP)(compose_cmd.compose)
 # Sits next to `compose` (multi-agent) and `init` (single agent) since all
 # three answer "how do I scaffold a new thing?"
 app.command("plan", rich_help_panel=PANEL_DEVELOP)(plan_cmd.plan)
-# `project` — manage projects + attach agents. Mirrors the unified
-# runtime create endpoint (POST /api/v1/projects/{id}/agents).
-app.add_typer(project_cmd.project_app, name="project", rich_help_panel=PANEL_DEVELOP)
 # `import state` (item 26) restores a `mdk export state` DR backup of
 # control-plane state — the escape-hatch counterpart to the export.
 import_app.command("state")(import_state_cmd)

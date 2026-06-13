@@ -184,7 +184,13 @@ def set_schedule(
 def list_schedules(
     output_format: Report = typer.Option(Report.TABLE, "--format", case_sensitive=False),
 ) -> None:
-    """List this project's continuous-eval schedules."""
+    """List this project's continuous-eval schedules.
+
+    [bold]Examples:[/bold]
+
+      [dim]# What's on a cadence right now?[/dim]
+      $ mdk eval-schedule list
+    """
     schedules = asyncio.run(_list())
     if output_format == Report.JSON:
         console.print_json(data=[s.model_dump(mode="json") for s in schedules])
@@ -219,7 +225,13 @@ def clear_schedule(
         shell_complete=complete_agent_path,
     ),
 ) -> None:
-    """Remove an agent's continuous-eval schedule."""
+    """Remove an agent's continuous-eval schedule.
+
+    [bold]Examples:[/bold]
+
+      [dim]# Stop scheduling evals for an agent[/dim]
+      $ mdk eval-schedule clear faq-agent
+    """
     agent_name = _resolve_agent_name(agent)
     deleted = asyncio.run(_delete(agent_name))
     if deleted:
