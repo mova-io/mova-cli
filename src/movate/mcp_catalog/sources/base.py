@@ -48,9 +48,17 @@ def _registry() -> dict[str, MCPRegistrySource]:
     and lets each source own its own (possibly httpx-bearing) setup.
     """
     from movate.mcp_catalog.sources.bundled import BundledSource  # noqa: PLC0415
+    from movate.mcp_catalog.sources.community import GlamaSource, McpSoSource  # noqa: PLC0415
+    from movate.mcp_catalog.sources.github import GitHubRegistrySource  # noqa: PLC0415
     from movate.mcp_catalog.sources.official import OfficialRegistrySource  # noqa: PLC0415
 
-    sources: list[MCPRegistrySource] = [BundledSource(), OfficialRegistrySource()]
+    sources: list[MCPRegistrySource] = [
+        BundledSource(),
+        OfficialRegistrySource(),
+        GitHubRegistrySource(),
+        GlamaSource(),
+        McpSoSource(),
+    ]
     return {s.name: s for s in sources}
 
 
