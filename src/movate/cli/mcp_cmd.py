@@ -149,13 +149,21 @@ def inspect(
 
     err_console.print(f"[dim]connecting to MCP server: {entry}[/dim]")
     backend = MCPSkillBackend()
+
+    async def _probe() -> list[dict[str, Any]]:
+        # discover + aclose MUST share one event loop: the stdio subprocess is
+        # bound to the loop that spawned it, so tearing it down in a second
+        # asyncio.run() raises "Event loop is closed".
+        try:
+            return await backend.discover_tools(entry, name)
+        finally:
+            await backend.aclose()
+
     try:
-        discovered = asyncio.run(backend.discover_tools(entry, name))
+        discovered = asyncio.run(_probe())
     except SkillError as exc:
         err_console.print(f"[red]✗ failed to connect to MCP server:[/red] {exc.message}")
         raise typer.Exit(code=2) from None
-    finally:
-        asyncio.run(backend.aclose())
 
     if as_json:
         import json  # noqa: PLC0415
@@ -420,18 +428,22 @@ def add_catalog(  # noqa: PLR0912 — orchestrator: resolve → validate → pro
 
         err_console.print(f"[dim]probing {entry.entry} …[/dim]")
         backend = MCPSkillBackend()
+
+        async def _probe() -> list[dict[str, Any]]:
+            # Single event loop for spawn + teardown (see inspect()).
+            try:
+                return await backend.discover_tools(entry.entry, entry.name, entry.credentials)
+            finally:
+                await backend.aclose()
+
         try:
-            discovered = asyncio.run(
-                backend.discover_tools(entry.entry, entry.name, entry.credentials)
-            )
+            discovered = asyncio.run(_probe())
             console.print(f"[green]✓[/green] reachable — {len(discovered)} tool(s)")
         except SkillError as exc:
             err_console.print(
                 f"[yellow]⚠ couldn't probe now ({exc.message}); writing the "
                 f"declaration anyway (it'll discover at agent load).[/yellow]"
             )
-        finally:
-            asyncio.run(backend.aclose())
 
     action = _add_server_to_yaml(target, server_entry)
     console.print(f"[green]✓[/green] {action} mcp_server [bold]{entry.name}[/bold] in {target}")

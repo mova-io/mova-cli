@@ -527,40 +527,8 @@ class MCPSkillBackend:
                 ),
             )
 
-        # Preferred: structuredContent (modern MCP servers).
-        structured = result.get("structuredContent")
-        if isinstance(structured, dict):
-            return structured
-
-        # Fallback: parse content[0].text as JSON.
-        text = _extract_text(result.get("content"))
-        if text is None:
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"mcp skill {skill_name!r}: server returned neither "
-                    "structuredContent nor any text content; can't extract a "
-                    "result dict"
-                ),
-            )
-        try:
-            parsed = json.loads(text)
-        except ValueError as exc:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"mcp skill {skill_name!r}: server's content text wasn't valid JSON: {exc}"
-                ),
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"mcp skill {skill_name!r}: server returned content of "
-                    f"type {type(parsed).__name__}, expected a JSON object"
-                ),
-            )
-        return parsed
+        # structuredContent → JSON-object text → wrapped text (see helper).
+        return _result_to_dict(result, skill_name)
 
     # ------------------------------------------------------------------
     # JSON-RPC wire protocol
@@ -792,38 +760,7 @@ class MCPSkillBackend:
                 ),
             )
 
-        structured = result.get("structuredContent")
-        if isinstance(structured, dict):
-            return structured
-
-        text = _extract_text(result.get("content"))
-        if text is None:
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"mcp skill {skill_name!r}: server returned neither "
-                    "structuredContent nor any text content; can't extract a "
-                    "result dict"
-                ),
-            )
-        try:
-            parsed = json.loads(text)
-        except ValueError as exc:
-            raise SkillError(
-                type=SkillErrorType.BACKEND_ERROR,
-                message=(
-                    f"mcp skill {skill_name!r}: server's content text wasn't valid JSON: {exc}"
-                ),
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise SkillError(
-                type=SkillErrorType.VALIDATION_FAILED,
-                message=(
-                    f"mcp skill {skill_name!r}: server returned content of "
-                    f"type {type(parsed).__name__}, expected a JSON object"
-                ),
-            )
-        return parsed
+        return _result_to_dict(result, skill_name)
 
     # ------------------------------------------------------------------
     # HTTP/SSE JSON-RPC wire protocol
@@ -1121,6 +1058,46 @@ def _extract_text(content: Any) -> str | None:
             if isinstance(text, str):
                 return text
     return None
+
+
+def _result_to_dict(result: dict[str, Any], skill_name: str) -> dict[str, Any]:
+    """Turn a ``tools/call`` result into the JSON-object a skill returns.
+
+    Shared by the stdio + HTTP transports so both behave identically. Order:
+
+    1. ``structuredContent`` (modern servers) → used directly.
+    2. text content that parses as a JSON **object** → used directly.
+    3. **any other text** (prose, a JSON scalar/array) → wrapped as
+       ``{"content": <value>}``.
+
+    The wrapping in (3) is deliberate: most MCP tools return human-readable
+    *text* (echo, fetch, search, summaries), not a JSON object. Erroring on
+    those — as this did before — made the majority of real servers unusable
+    from an agent's tool-use loop. Wrapping keeps the value available to the
+    model; a skill that genuinely needs a typed object still enforces it via
+    its output schema at ``dispatch_skill`` (a clear validation error, not a
+    backend crash). ``isError`` is handled by the caller before this point.
+    """
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+
+    text = _extract_text(result.get("content"))
+    if text is None:
+        raise SkillError(
+            type=SkillErrorType.VALIDATION_FAILED,
+            message=(
+                f"mcp skill {skill_name!r}: server returned neither "
+                "structuredContent nor any text content; can't extract a result"
+            ),
+        )
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return {"content": text}  # plain prose — the common case
+    if isinstance(parsed, dict):
+        return parsed
+    return {"content": parsed}  # JSON scalar/array — wrap so it's a dict
 
 
 def _parse_sse_response(
