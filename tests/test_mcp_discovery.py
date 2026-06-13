@@ -18,7 +18,6 @@ import pytest
 
 import movate.core.skill_backend.mcp as mcp_mod
 from movate.core import mcp_discovery
-from movate.core.skill_backend.mcp import _HttpSession
 from movate.core.mcp_discovery import (
     MCPDiscoveryError,
     _filter_tools,
@@ -29,6 +28,7 @@ from movate.core.mcp_discovery import (
     discover_sync,
 )
 from movate.core.models import MCPServerRef, merge_mcp_servers
+from movate.core.skill_backend.mcp import _HttpSession
 
 # ---------------------------------------------------------------------------
 # Fake backend installed at the import seam
