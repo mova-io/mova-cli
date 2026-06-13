@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-06-13
-Accepted: 2026-06-13 — approved by Jeremy. Ratified: one `MCPRegistrySource` Protocol, not four hardcoded paths; bundled+official ON by default, community (mcp.so/Glama) opt-in + pin/warn; inbound import only — outbound publish deliberately deferred to its own ADR + product sign-off.
+Accepted: 2026-06-13 — approved by Jeremy. Ratified: one `MCPRegistrySource` Protocol, not four hardcoded paths; bundled+official ON by default, community (mcp.so/Glama) opt-in + pin/warn; inbound import only — outbound publish **PARKED** (decided not to pursue now; revive only on a product signal via its own ADR).
 Deciders: Engineering — a `MCPRegistrySource` adapter Protocol with one
 implementation per external registry (CLAUDE.md §7: new source = new adapter
 behind an existing seam, not four hardcoded integrations). Inbound (import) only;
@@ -138,14 +138,16 @@ hammer a registry, and a source timeout/error is fail-soft per source (the other
 
 ## Boundary (out of scope — explicit)
 
-- **Outbound publish (MDK → registries).** "Publish MDK MCP servers" and "make
-  MDK agents exportable/searchable" on these directories is a separate decision:
-  it defines a *published artifact* (an MDK agent/skill exposed via `mdk mcp
-  serve`, ADR 025), ownership of the registry listing, naming/namespacing,
-  versioning, and the security of an externally-discoverable MDK surface. It
-  needs its own ADR and product sign-off — deliberately not bundled with inbound
-  import. The `MCPRegistrySource` Protocol is read-only; a future
-  `MCPRegistryPublisher` seam would be its outbound counterpart.
+- **Outbound publish (MDK → registries) — PARKED (decided 2026-06-13, Jeremy).**
+  "Publish MDK MCP servers" and "make MDK agents exportable/searchable" on these
+  directories is **explicitly not being pursued now** — not merely deferred. It
+  is a product + security decision (the *published artifact* — an MDK agent/skill
+  exposed via `mdk mcp serve`, ADR 025 — registry-listing ownership,
+  naming/namespacing, versioning, and the security of an externally-discoverable
+  MDK surface) that needs its own ADR + product sign-off before any work starts.
+  This ADR's `MCPRegistrySource` Protocol is read-only by design; the outbound
+  counterpart (`MCPRegistryPublisher`) is named only so reviving it later is
+  cheap — it is intentionally unbuilt. Revisit only on a concrete product signal.
 - **Live-source supply-chain hardening beyond pin+tier+warn** (signature/digest
   *verification*, a trusted-publisher allowlist, provenance attestation) — the
   Phase 3 hardening ADR. This ADR establishes the tiers + pinning; enforcement
@@ -181,8 +183,9 @@ hammer a registry, and a source timeout/error is fail-soft per source (the other
 - The author always sees where an entry came from and whether it's pinned; the
   runtime path (ADR 101) is unchanged and unaware of where a declaration
   originated.
-- Outbound publish remains an open, separately-owned decision — this ADR neither
-  commits to nor precludes it, and names the seam it would use.
+- Outbound publish is **parked** (decided, not deferred) — the read-only source
+  Protocol neither builds nor precludes it, and names the `MCPRegistryPublisher`
+  seam a future ADR would use if a product signal revives it.
 - Estimated scope: ~3 PRs — (1) `MCPRegistrySource` Protocol + `BundledSource`
   refactor + `--source` plumbing; (2) `OfficialRegistrySource` (+ caching,
   fail-soft); (3) GitHub adapter, then community adapters behind the trust gate.
