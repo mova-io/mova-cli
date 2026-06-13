@@ -29,6 +29,7 @@ between tagged releases.
 
 | version | tag | what landed |
 |---|---|---|
+| 0.9.x | _unreleased_ | First-class **MCP** integration: `mcp_servers:` declaration + load-time tool discovery (stdio + Streamable HTTP), credentials (`bearer-from-env`/`apikey-query`), catalog + registries (`mdk mcp list\|search\|add\|inspect`; bundled · official · github · smithery), and a human-approval gate for mutating tools (`confirm_side_effects`). ADRs 101/103/104/105. |
 | 0.8.x | [`v0.8.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.8.0) | Knowledge Base pipeline: `mdk kb ingest` (PDF/DOCX/HTML/OCR), hybrid BM25+vector+RRF search, multi-hop retrieval, LLM rerank, citation accuracy eval, conversation threads, memory subsystem. Guided `mdk eval` wizard, 10-category scorecard, live progress. |
 | 0.7.x | [`v0.7.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.7.0) | Native Anthropic + OpenAI providers, parallel tool-use dispatch, Microsoft Teams bot (slices 3.1.a–3.1.e), Runtime API (agent CRUD, runs, eval, trace endpoints). |
 | 0.6.x | [`v0.6.0`](https://github.com/mova-io/mova-cli/releases/tag/v0.6.0) | Skills system (Python/HTTP/MCP backends, `mdk skills list|scaffold|run`), four-dimension eval scoring, per-objective gating, Azure Bicep IaC + `mdk deploy`, `movate watch` hot-reload. |
@@ -95,6 +96,10 @@ that v1.0 builds on.
 | Thread history auto-injection | `thread_id` in run request | ✓ v0.8 |
 | Agent-level guardrails (PII / topic / content) | `guardrails:` in `agent.yaml` or `policy.yaml` | ✓ v0.8 |
 | Memory subsystem | `mdk memory set\|get\|list` · `SqliteStore` / `InMemoryStore` | ✓ v0.8 |
+| First-class MCP servers (stdio + Streamable HTTP) | `mcp_servers:` in `agent.yaml`/`project.yaml` — load-time tool discovery | ✓ v0.9 |
+| MCP catalog + registries | `mdk mcp list\|search\|add\|inspect` (bundled · official · github · smithery) | ✓ v0.9 |
+| MCP credentials | `bearer-from-env:` / `apikey-query:` (masked in logs) | ✓ v0.9 |
+| Human-approval gate for write tools | `policy.yaml: skills.confirm_side_effects` (interactive · fail-closed headless) | ✓ v0.9 |
 
 ## Prerequisites
 
@@ -665,6 +670,24 @@ Default is permissive (`allowed_side_effects: None` — every category
 accepted). An empty list `[]` is the strictest config: no skills at
 all, agents must declare `skills: []` to validate.
 
+**Confirm / human-approval gate (ADR 105).** Between "allow" and "deny" sits
+`confirm_side_effects` — categories a write-capable agent may use *only with
+human approval at call time*. A confirm-category tool passes the deny gate, but
+each invocation is gated: `mdk run`/`dev` prompt interactively; headless/runtime
+executors are **fail-closed** (the call is declined and surfaced to the model as
+a tool error, so the agent adapts rather than crashes).
+
+```yaml
+# policy.yaml — a write-capable agent that asks before it writes
+skills:
+  allowed_side_effects: [read-only, network]
+  confirm_side_effects: [mutates-state, filesystem]
+```
+
+Discovered MCP tools carry their `destructiveHint` into `side_effects`, so this
+gate covers them too — the recommended control before pointing autonomous agents
+at write-capable MCP servers.
+
 ## Skills — agents that use tools
 
 An agent can invoke reusable callables ("skills") mid-turn. Declare each
@@ -817,62 +840,79 @@ The backend handles the failure modes you'd expect:
 Only `bearer-from-env:VAR` auth is supported today; basic-auth and
 arbitrary-header forms land in a follow-up PR.
 
-### MCP skills — plug in a Model Context Protocol server
+### MCP — plug in Model Context Protocol servers
 
-For skills that live behind an MCP server (Anthropic's tool-server
-protocol), use `implementation.kind: mcp`. Operators can wire up
-internal tool servers, npx-installed community servers, or
-customer-hosted bridges to legacy systems without writing Python.
+MCP is a first-class integration surface (ADRs 101/103/104/105). Declare an
+external MCP server once and its tools are **discovered at load time** and
+registered as callable skills — no per-tool wiring, no Python. Both transports
+are supported and validated end-to-end against real servers:
+
+* **stdio** — `entry` is a command (`npx -y …`, `uvx …`, `docker run …`); the
+  backend spawns it, handshakes, and reuses the process.
+* **Streamable HTTP** — `entry` is an `http(s)://` URL; full MCP
+  Streamable-HTTP including `Mcp-Session-Id` session handling.
+
+#### Declare servers in `agent.yaml` / `project.yaml`
 
 ```yaml
-# skills/github-issue/skill.yaml
-api_version: movate/v1
-kind: Skill
-name: github-issue
-version: 0.1.0
-description: Fetch a GitHub issue via the github-mcp bridge.
-
-schema:
-  input:
-    repo: string
-    issue_number: integer
-  output:
-    title: string
-    body: string
-
-implementation:
-  kind: mcp
-  entry: npx -y @movate/github-mcp        # command to spawn the MCP server
-  tool: get_issue                         # which tool on the server to call
+# agent.yaml — per-agent; or put it in project.yaml to share across agents
+mcp_servers:
+  - name: github                                   # tools register as github.<tool>
+    entry: "npx -y @modelcontextprotocol/server-github@2025.4.8"
+    include_tools: ["search_repositories", "get_file_contents"]  # optional allow/deny
+    credentials_ref: "bearer-from-env:GITHUB_PERSONAL_ACCESS_TOKEN"
+    required: false                                # fail-soft (default) vs fail-hard
 ```
 
-The backend spawns the server subprocess on first use, performs the
-MCP handshake (`initialize` → `notifications/initialized`), and
-reuses the running process across every subsequent tool call to the
-same server. Multiple skills pointing at the same `entry` command
-share one subprocess.
+At load time each server's `tools/list` is enumerated, filtered, and minted as
+governed skills the executor calls like any other. Agent + project lists merge
+(agent overrides project by name). Agents that declare no servers pay zero cost.
 
-Two response shapes are supported:
+* **Credentials** (resolved at use time, masked in logs, never inlined):
+  `bearer-from-env:VAR` → `Authorization: Bearer`; `apikey-query:param=VAR` →
+  `?param=<VAR>` for hosted servers (e.g. Smithery). stdio servers just inherit
+  the worker env.
+* **Failure modes:** an unreachable/timed-out server is fail-soft (warns,
+  skips its tools) unless `required: true`. Plain-text tool results are wrapped
+  as `{"content": …}`; structured results pass through. Same `SkillError`
+  taxonomy as Python/HTTP skills.
+* **Governance (ADR 105):** a tool's `destructiveHint`/`readOnlyHint` maps to
+  its `side_effects`, so `SkillPolicy` gates write tools — see *Skill policy*.
+* **Deploy:** stdio servers need Node in the worker image — build with
+  `--build-arg INSTALL_NODE=1`. HTTP servers need only egress.
 
-* **`structuredContent`** (modern MCP servers) — used directly as
-  the skill's output.
-* **`content[0].text`** parsed as JSON — fallback for older servers
-  that haven't adopted the structured form.
+#### Discover + pin from registries — `mdk mcp`
 
-Failure modes map to the same `SkillError` taxonomy as Python + HTTP:
+```bash
+# Browse the curated, offline catalog (bundled, pinned)
+mdk mcp list
 
-* Subprocess fails to start / dies mid-call → `backend_error`
-* Tool name not in the server's `tools/list` → `backend_error` with
-  the available list
-* Server reports `isError: true` or returns a JSON-RPC error
-  envelope → `backend_error` with the server's message
-* Response content isn't a JSON object → `validation_failed`
-* Server hangs past the budget → `timeout`
+# Search the catalog + the official MCP registry (community sources are opt-in)
+mdk mcp search github
+mdk mcp search context7 --source smithery        # --source bundled|official|github|smithery|all
 
-The implementation is hand-rolled (no external `mcp` SDK dep) — the
-protocol surface we use is small enough that a focused client is
-cleaner than adding a library. HTTP/SSE transport for remote MCP
-servers lands in a follow-up if real customer demand surfaces.
+# Resolve an entry, probe it live, and write a pinned mcp_servers block
+mdk mcp add github --agent agents/support-bot --tools search_repositories
+mdk mcp add context7 --project                    # shared across the project
+
+# Probe any server's tools without wiring anything ("what would I get?")
+mdk mcp inspect "npx -y @modelcontextprotocol/server-everything" -n everything
+
+# Expose MDK's own authoring catalog as an MCP server (ADR 025)
+mdk mcp serve
+```
+
+Sources are pluggable behind one `MCPRegistrySource` Protocol with a trust
+gate: **bundled** (curated, offline) + **official** (registry.modelcontextprotocol.io)
+are on by default; **github** and **smithery** require an explicit `--source`
+(or `all`). `mdk mcp add` only writes a declaration — it never auto-installs or
+runs a server, and prints which credential env var to set.
+
+Legacy per-skill MCP (`implementation.kind: mcp` in a `skill.yaml`) still works
+for a single hand-wired tool; `mcp_servers:` is the first-class path. No external
+`mcp` SDK dependency — the JSON-RPC client is hand-rolled (stdio + Streamable
+HTTP). See [docs/adr/101-mcp-server-integration.md](docs/adr/101-mcp-server-integration.md),
+[103](docs/adr/103-mcp-catalog.md), [104](docs/adr/104-mcp-registry-sources.md).
 
 ### Operator commands
 
@@ -1009,6 +1049,8 @@ transitional `movate` alias.
 | `mdk fmt` | Normalize YAML / prompt / JSONL style |
 | `mdk watch` | Re-run `validate` on file change |
 | `mdk skills` | Inspect / scaffold / test the skill registry (Python · HTTP · MCP) |
+| `mdk mcp` | Discover + pin external MCP servers: `list` · `search` · `add` · `inspect` · `serve` |
+| `mdk tools` | Manage the shared tool registry (`list` · `info` · `publish` · `resolve`) |
 | `mdk contexts` | List / inspect / attach shared prompt-context files |
 | `mdk kb` / `mdk knowledge` | Knowledge-base ingest + hybrid search; corpus validation |
 | `mdk schema` | Author / compile schema files (shorthand ↔ JSON Schema) |
